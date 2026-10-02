@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# temp/ —— 参照项目（temp/adi）只读参考，永不入库。
+# 这是硬约束：.githooks/pre-commit 会拒绝任何 temp/ 下的暂存内容。
+# ─────────────────────────────────────────────────────────────────────────────
+/temp/
+
+# Rust
+/target/
+/.cargo-target/
+**/*.rs.bk
+**/Cargo.lock.bak
+
+# Node / SPA（构建期依赖，运行期零依赖）
+node_modules/
+web/dist/
+web/.vite/
+npm-debug.log*
+yarn-error.log*
+
+# 构建产物
+/dist/
+/out/
+/dist-exe/
+
+# BitFlip 工程库（用户数据，落库位置默认在目标文件旁）
+*.bfp
+*.bfp-journal
+*.bfp.tmp
+
+# 测试样本：由脚本生成，不入库（本机 C: 仅剩 ~2.8GB，样本必须可再生）
+/tests/fixtures/generated/
+/tests/fixtures/**/*.bin
+/tests/fixtures/**/*.exe
+/tests/fixtures/**/*.dll
+/tests/fixtures/**/*.so
+/tests/fixtures/**/*.o
+/tests/fixtures/**/*.a
+/tests/fixtures/**/*.lib
+/tests/fixtures/**/*.obj
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

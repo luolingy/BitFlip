@@ -1,0 +1,39 @@
+#!/bin/sh
+# BitFlip —— 入库守卫。
+#
+# 规则（不可绕过，除非显式 --no-verify）：
+#   1. temp/ 下的任何内容禁止入库。temp/adi 是只读参照项目，不是本仓库的一部分。
+#   2. 大体积二进制样本禁止入库（应由 tests/fixtures 脚本按需生成）。
+#
+# 启用方式（新克隆后执行一次）：
+#   git config core.hooksPath .githooks
+
+set -eu
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+fail=0
+
+temp_paths=$(printf '%s\n' "$staged" | grep -iE '^temp/' || true)
+if [ -n "$temp_paths" ]; then
+  echo "pre-commit 拒绝：temp/ 目录内容禁止入库。" >&2
+  printf '%s\n' "$temp_paths" >&2
+  fail=1
+fi
+
+# 单文件上限 8MB —— 样本、缓存、工程库都不该进仓库。
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  [ -f "$path" ] || continue
+  size=$(wc -c < "$path" | tr -d ' ')
+  if [ "$size" -gt 8388608 ]; then
+    echo "pre-commit 拒绝：$path 体积 ${size}B > 8MB，二进制产物应走脚本生成。" >&2
+    fail=1
+  fi
+done <<EOF
+$staged
+EOF
+
+if [ "$fail" -ne 0 ]; then
+  exit 1
+fi
