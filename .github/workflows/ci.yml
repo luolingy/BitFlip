@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust（fmt / clippy / test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 第一道防线是 .gitignore 与人工检查；CI 再兜一层，确保 temp/ 永不入库。
+      - name: 禁止 temp/ 入库
+        run: |
+          if git ls-files 'temp/' | grep -q .; then
+            echo "::error::temp/ 下的文件被提交了（见 CLAUDE.md §0）"
+            git ls-files 'temp/'
+            exit 1
+          fi
+          echo "temp/ 未被跟踪，OK"
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: Clippy（warnings 视为错误）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 单元与集成测试
+        run: cargo test --workspace
+
+  bundle:
+    name: 端到端（构建 SPA + 内嵌 + 服务冒烟）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: 构建二进制（此时 dist 已存在，会被内嵌）
+        run: cargo build --release -p bitflip-app -p bitflip-cli
+
+      - name: 生成的样本可被识别
+        run: |
+          mkdir -p tests/fixtures/generated
+          printf 'const char *bf = "ci";\nint bf_add(int a,int b){return a+b;}\n' > /tmp/sample.c
+          clang -c /tmp/sample.c -o tests/fixtures/generated/elf-x86_64.o
+          clang -c --target=aarch64-unknown-linux-gnu /tmp/sample.c -o tests/fixtures/generated/elf-aarch64.o
+          llvm-ar rcs tests/fixtures/generated/libelf.a tests/fixtures/generated/elf-x86_64.o
+          ./target/release/bitflip-cli info tests/fixtures/generated/libelf.a
+
+      - name: 服务冒烟测试（令牌 + Origin）
+        run: |
+          set -euo pipefail
+          ./target/release/bitflip-cli serve tests/fixtures/generated/elf-x86_64.o \
+            --no-open --port 8790 --token ci-token &
+          server_pid=$!
+          trap 'kill $server_pid 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8790/; then break; fi
+            sleep 0.5
+          done
+
+          echo "--- 带令牌：期望 200"
+          curl -sf -H 'X-BitFlip-Token: ci-token' http://127.0.0.1:8790/api/health | tee /dev/stderr | grep -q '"ok":true'
+
+          echo "--- 无令牌：期望 403"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8790/api/health)
+          test "$code" = "403" || { echo "期望 403，实际 $code"; exit 1; }
+
+          echo "--- 恶意 Origin：期望 403"
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'X-BitFlip-Token: ci-token' -H 'Origin: http://evil.example' \
+            http://127.0.0.1:8790/api/health)
+          test "$code" = "403" || { echo "期望 403，实际 $code"; exit 1; }
+
+      - name: 前端确实被内嵌
+        run: ./target/release/bitflip-cli version | grep -q '已内嵌'

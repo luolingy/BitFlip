@@ -1,0 +1,18 @@
+[package]
+name = "bitflip-analyze"
+description = "BitFlip 的分析流水线：作业边界、进度、取消与阶段划分"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

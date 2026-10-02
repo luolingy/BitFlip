@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitflip/bitflip"
+homepage = "https://github.com/bitflip/bitflip"
+keywords = ["reverse-engineering", "disassembler", "pe", "elf", "static-analysis"]
+categories = ["development-tools::debugging"]
+
+[workspace.dependencies]
+# 内部 crate
+bitflip-arch = { path = "crates/bitflip-arch", version = "0.0.1" }
+bitflip-loader = { path = "crates/bitflip-loader", version = "0.0.1" }
+bitflip-analyze = { path = "crates/bitflip-analyze", version = "0.0.1" }
+bitflip-symbols = { path = "crates/bitflip-symbols", version = "0.0.1" }
+bitflip-project = { path = "crates/bitflip-project", version = "0.0.1" }
+bitflip-core = { path = "crates/bitflip-core", version = "0.0.1" }
+bitflip-server = { path = "crates/bitflip-server", version = "0.0.1" }
+bitflip-cli = { path = "crates/bitflip-cli", version = "0.0.1" }
+
+# 外部依赖（版本与 docs/DECISIONS.md 一致）
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+mime_guess = "2"
+rand = "0.8"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# 仅测试用
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+# M0 起允许缺失文档（公共 API 的文档在 M1 补齐后收紧为 warn）。
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# pedantic 留到 M1 稳定后按需逐条开启；一次全开会把真实问题淹没在噪音里。
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "unwind"

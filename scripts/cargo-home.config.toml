@@ -1,0 +1,17 @@
+# CARGO_HOME 配置模板 —— 由 scripts/cargo.ps1 在首次运行时复制到 .cargo-home/config.toml
+#
+# 用途：
+#   1) 沙箱/权限只允许写仓库内路径，CARGO_HOME 必须落在仓库里；
+#   2) 本机 cargo 的 libcurl/Schannel 无法出网，改为经本地 Node 代理访问 crates.io
+#      （代理见 scripts/crates-proxy.mjs）。
+#
+# 不需要代理的机器（CI、网络正常的开发机）请直接使用系统 cargo，不要用本模板。
+
+[source.crates-io]
+replace-with = "bitflip-local-proxy"
+
+[source.bitflip-local-proxy]
+registry = "sparse+http://127.0.0.1:8765/index/"
+
+[net]
+retry = 3

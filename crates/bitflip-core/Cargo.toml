@@ -1,0 +1,25 @@
+[package]
+name = "bitflip-core"
+description = "BitFlip 引擎门面：打开目标、查询、标注、导出（对外稳定 API）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bitflip-analyze = { workspace = true }
+bitflip-arch = { workspace = true }
+bitflip-loader = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

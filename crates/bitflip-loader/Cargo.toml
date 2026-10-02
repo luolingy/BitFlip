@@ -1,0 +1,21 @@
+[package]
+name = "bitflip-loader"
+description = "BitFlip 的容器与对象格式解析层（PE/COFF、ELF、ar/MSVC .lib、raw）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bitflip-arch = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

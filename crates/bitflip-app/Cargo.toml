@@ -1,0 +1,21 @@
+[package]
+name = "bitflip-app"
+description = "BitFlip 应用入口：启动本地服务并打开浏览器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "bitflip"
+path = "src/main.rs"
+
+[dependencies]
+bitflip-cli = { workspace = true }
+
+[lints]
+workspace = true

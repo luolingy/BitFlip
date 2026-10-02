@@ -77,6 +77,51 @@ CLAUDE.md §0 写入硬约束。
 **理由**：这四项与"支持大二进制、覆盖率、可增量标注、UI 不假死"的目标直接冲突（详见 PLAN.md §2）。
 FlatBuffers 降级为**导出格式**（供外部工具消费），不作为工程库。
 
+### ADR-0007 · 许可证：MIT OR Apache-2.0 双许可
+
+**状态**：已决（用户确认，对应决策门 D6）
+**决策**：项目以 `MIT OR Apache-2.0` 双许可发布（`LICENSE-MIT`、`LICENSE-APACHE`，
+`Cargo.toml` 的 `license` 字段为 `MIT OR Apache-2.0`）。
+
+**理由**
+- 双许可是 Rust 生态的事实标准（Rust 自身、tokio、axum、serde 均为双许可），
+  使用方可以按需选择，兼容性摩擦最小。
+- 与计划引入的依赖许可兼容：capstone（BSD-3-Clause）、goblin（MIT）、axum/tokio（MIT）、
+  iced-x86（MIT）。Apache-2.0 的专利授权条款对企业使用方更友好。
+
+**代价**：贡献者需要接受双许可（`CONTRIBUTING` 后续补充 DCO/CLA 说明，M1 前完成）。
+
+### ADR-0008 · 开发环境网络：仓库内 crates.io 代理 + 仓库内 CARGO_HOME
+
+**状态**：已决（M0 期间的环境适配）
+**决策**：本机（受限沙箱）里 `curl`/`Invoke-WebRequest`/cargo 自带的 libcurl 走 Schannel 时
+`AcquireCredentialsHandle` 失败（`SEC_E_NO_CREDENTIALS`），而 Node 的 TLS 正常。
+因此提供两件事：
+
+1. `scripts/crates-proxy.mjs`：Node 实现的 crates.io 稀疏索引 + 包体代理（默认 `127.0.0.1:8765`，
+   磁盘缓存在 `.crates-proxy-cache/`）；
+2. `scripts/cargo.ps1`：把 `CARGO_HOME` 指向仓库内 `.cargo-home/`，
+   该目录的 `config.toml` 把 `crates-io` 替换为本地代理。
+
+**理由**
+- 这是**环境适配**，不是产品设计：BitFlip 本身对网络没有任何要求，CI 与普通开发机照常直连 crates.io。
+- 必须落在仓库内有两个原因：沙箱只允许写工作区；C: 盘空间不足。
+
+**代价与限制**
+- 本机所有 cargo 命令必须经由 `scripts/cargo.ps1`（或自行设置 `CARGO_HOME`），否则会尝试写 `C:\Users\...\.cargo` 而失败。
+- `.cargo-home/config.toml` 里的源替换必须**始终生效**：先用 `--offline` 拉到的包不会出现在
+  `crates-io` 源下，混用会报 "no matching package named ... found"。
+- `Cargo.lock` 入库，保证后续可离线、可复现构建。
+
+### ADR-0009 · npm 缓存重定向到仓库内
+
+**状态**：已决（M0 期间的环境适配）
+**决策**：npm 安装在 `web/` 下执行，并显式带 `--cache .npm-cache`；
+`web/.npmrc` 只固定 registry（`registry.npmmirror.com`），不写相对 cache 路径
+（npm 对相对路径的解析基准不保证）。
+
+**理由**：与 ADR-0004 同因 —— C: 盘空间不足且沙箱拒绝写 C:；`node_modules` 与 npm 缓存都在仓库内，随工作区一起清理。
+
 ## 待决（决策门）
 
 | ID | 决策 | 期限 | 候选与倾向 |
@@ -86,4 +131,5 @@ FlatBuffers 降级为**导出格式**（供外部工具消费），不作为工�
 | D3 | 解码后端 | M2 末 | capstone 单后端（简单、多架构）vs 加 iced-x86（x86 文本与属性精度更高）。倾向：M2 只包 capstone，接口留后端抽象 |
 | D4 | PDB/DWARF 范围 | M8 前 | 先函数名 + 行号；类型系统后置 |
 | D5 | 反编译器 | M10 评审 | 默认不做 |
-| D6 | 许可证 | **M0 前** | MIT / Apache-2.0；需与依赖（capstone BSD、goblin MIT、axum MIT）兼容 |
+| ~~D6~~ | ~~许可证~~ | — | **已决：见 ADR-0007（MIT OR Apache-2.0 双许可）** |
+

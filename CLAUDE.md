@@ -53,6 +53,14 @@
 
 ## 5. 提交前自检
 
+一条命令跑完（推荐）：
+
+```powershell
+& .\scripts\preflight.ps1
+```
+
+等价的手工步骤：
+
 ```
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
@@ -76,3 +84,42 @@ git diff --cached --name-only | Select-String '^temp/' # 有输出即中止
 > 已知限制：`.githooks/pre-commit` 在受限沙箱里无法启动（git 通过 `sh.exe` 跑钩子，
 > 沙箱会拒绝其 `CreateFileMapping`，表现为 `sh.exe: fatal error`）。
 > 因此钩子只是**第二道**防线，第一道是上面这条手动检查 —— 两者都不可省。
+
+## 6. 本机脚本约定（踩过的坑，别重犯）
+
+这些是 Windows PowerShell 5.1 + 受限沙箱下的硬性约束。改了脚本就必须重新验证，
+不要凭"看起来对"就提交。
+
+1. **`.ps1` 一律只写 ASCII。** PS 5.1 把无 BOM 的脚本按 ANSI 读取，中文注释/字符串会
+   破坏解析（典型报错 `The string is missing the terminator`）。
+2. **`param()` 里只能有一个参数。** 声明第二个（哪怕从未使用）会让
+   `ValueFromRemainingArguments` 错位：`test --workspace` 变成 `--workspace '' test`。
+   验证方法：写一个只打印 `$args` 的临时脚本对比。
+3. **不要用 `$ErrorActionPreference = 'Stop'`。** 原生命令（cargo、clang、gcc）把进度与
+   警告写在 stderr，PS 5.1 会把每一行 stderr 变成终止性错误。用 `'Continue'` +
+   检查 `$LASTEXITCODE`。
+4. **原生命令的参数用引号数组。** `-Wl,-e,_start` 这类会被 PS 当参数解析器吃掉；
+   写成 `@('-Wl,-e,_start')`。
+5. **`Get-Content -Raw` 对空文件返回 `$null`**，`[regex]::Match($null, ...)` 会抛
+   `ArgumentNullException`。先 `[string]` 转换。
+6. **Node 子进程不可用。** 本沙箱里 Node 的 `child_process.spawn` 一律 `EPERM`，
+   因此不能从 Node 拉起被测进程；需要"起服务再测"的脚本用 PowerShell 写
+   （见 `scripts/smoke-port-fallback.ps1`），Node 脚本只做 HTTP 客户端
+   （见 `scripts/smoke-server.mjs`）。
+7. **cargo 必须走包装脚本。** 直接 `cargo` 会尝试写 `C:\Users\...\.cargo` 并失败；
+   用 `& .\scripts\cargo.ps1 ...`（它设置仓库内的 `CARGO_HOME`）。
+8. **npm 必须带 `--cache .npm-cache`**，否则写 C: 盘被拒（见 ADR-0009）。
+
+## 7. 分析准确性的底线
+
+BitFlip 的立身之本是"说的就是真的"。下列做法一律禁止：
+
+- **不用假名冒充识别结果。** 分析不出来的函数就叫"未识别"，不要生成 `func_xxx` 之类的
+  占位名让界面看起来完整（这是参照实现的教训，见 `docs/PLAN.md` §2）。
+- **拿不到就说拿不到。** 未知字段用 `None` / `null` + `notes` 里的原因说明，
+  不要用 `0`、空串或默认值代替。
+- **未实现的能力明确报错。** 返回 `BitFlipError::NotYetImplemented { feature }`（要写清
+  计划里程碑），而不是返回空集合让 UI 显示"分析完成但什么都没有"。
+- **降级要写在界面上。** 例如文件超过 8 MiB 嗅探窗口、归档成员被截断，
+  都必须在结论里出现，不能悄悄少给数据。
+

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BitFlip · 前端资源未构建</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #0d1117;
+        color: #e6edf3;
+        font: 15px/1.7 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      }
+      main { max-width: 640px; padding: 32px; }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      .brand { color: #58a6ff; }
+      code, pre {
+        font-family: "Cascadia Mono", Consolas, monospace;
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+      }
+      code { padding: 1px 6px; }
+      pre { padding: 12px 14px; overflow-x: auto; }
+      ol { padding-left: 20px; }
+      .hint { color: #8b949e; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1><span class="brand">BitFlip</span> · 比特翻转</h1>
+      <p>
+        服务已经起来了（这说明 Rust 侧一切正常），但 <strong>Web 前端资源还没有构建</strong>，
+        所以没有界面可以渲染。
+      </p>
+      <ol>
+        <li>构建前端（只需一次）：</li>
+      </ol>
+      <pre><code>cd web
+npm install
+npm run build</code></pre>
+      <ol start="2">
+        <li>重新构建 Rust 二进制，让前端产物被内嵌进去：</li>
+      </ol>
+      <pre><code>cargo build --release -p bitflip-app</code></pre>
+      <p class="hint">
+        开发前端时也可以直接跑 <code>npm run dev</code>（Vite 开发服务器），
+        它会把 <code>/api</code> 代理到本服务，改动即时生效。
+      </p>
+      <p class="hint">接口仍然是可用的：<code>GET /api/health</code>（需要访问令牌）。</p>
+    </main>
+  </body>
+</html>

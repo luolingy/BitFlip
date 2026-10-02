@@ -12,7 +12,10 @@
 
 # Node / SPA（构建期依赖，运行期零依赖）
 node_modules/
-web/dist/
+web/.npm-cache/
+# web/dist 由 `npm run build` 生成；保留目录本身（rust-embed 需要它存在）
+web/dist/*
+!web/dist/.gitkeep
 web/.vite/
 npm-debug.log*
 yarn-error.log*
@@ -37,6 +40,12 @@ yarn-error.log*
 /tests/fixtures/**/*.a
 /tests/fixtures/**/*.lib
 /tests/fixtures/**/*.obj
+
+# 本地开发缓存与探测目录
+/.crates-proxy-cache/
+/.npm-cache/
+/.probe/
+/.cargo-home/
 
 # IDE / OS
 .idea/

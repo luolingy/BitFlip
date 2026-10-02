@@ -1,0 +1,27 @@
+{
+  "name": "bitflip-web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "BitFlip · 比特翻转 —— 本地 Web 界面（构建产物被 rust-embed 内嵌进二进制）",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2"
+  }
+}

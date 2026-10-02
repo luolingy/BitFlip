@@ -1,0 +1,14 @@
+# 需要拉取新依赖时使用：cargo fetch --config scripts/crates-proxy.toml
+#
+# 前提：另开终端运行 `node scripts/crates-proxy.mjs`（见该文件头部说明）。
+# 这里把 crates-io 源替换为本地代理，cargo 只与 127.0.0.1 明文通信，
+# 绕开本机 Schannel 无法出网的问题。
+#
+# 注意：本文件**不**被 cargo 自动加载，必须显式 --config 传入，
+# 以免影响网络正常的机器（CI、其他开发机直接走 crates.io）。
+
+[source.crates-io]
+replace-with = "bitflip-local-proxy"
+
+[source.bitflip-local-proxy]
+registry = "sparse+http://127.0.0.1:8765/index/"

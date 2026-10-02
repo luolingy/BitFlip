@@ -1,0 +1,9 @@
+# 仓库级 cargo 配置（跨平台，可提交）。
+#
+# 构建目录固定在仓库内：本机 C: 盘仅剩约 2.8GB，Rust 构建产物以 GB 计，
+# 不能落在默认的 $CARGO_HOME 或用户目录。见 CLAUDE.md §3、docs/DECISIONS.md ADR-0004。
+[build]
+target-dir = ".cargo-target"
+
+[term]
+color = "auto"

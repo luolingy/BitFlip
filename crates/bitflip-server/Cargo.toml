@@ -1,0 +1,30 @@
+[package]
+name = "bitflip-server"
+description = "BitFlip 的本地 HTTP/WS 服务：token 与 Origin 双重校验、内嵌 SPA 资源"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bitflip-core = { workspace = true }
+axum = { workspace = true }
+mime_guess = { workspace = true }
+rand = { workspace = true }
+rust-embed = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true

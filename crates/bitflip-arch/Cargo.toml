@@ -1,0 +1,16 @@
+[package]
+name = "bitflip-arch"
+description = "BitFlip 的架构、ABI 与指令解码抽象层"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
