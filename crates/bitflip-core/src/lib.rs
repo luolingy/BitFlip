@@ -14,7 +14,10 @@ mod error;
 mod session;
 
 pub use error::BitflipError;
-pub use session::{AnalysisSummary, OpenOptions, Session, TargetInfo};
+pub use session::{
+    AnalysisSummary, ExportInfo, ImportInfo, ObjectInfo, OpenOptions, RelocInfo, SectionInfo,
+    SegmentInfo, Session, SymbolInfo, TargetInfo, INFO_FORMAT_VERSION,
+};
 
 /// 重新导出作业/进度契约，方便嵌入方只依赖 `bitflip-core`。
 pub use bitflip_analyze::{

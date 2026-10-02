@@ -1,9 +1,9 @@
-//! `info`：只做识别，不启动服务。
+//! `info`：只做识别与结构解析，不启动服务。
 
 use std::path::Path;
 
 use anyhow::Context;
-use bitflip_core::{OpenOptions, Session, TargetInfo};
+use bitflip_core::{ObjectInfo, OpenOptions, Session, TargetInfo};
 
 /// 打印目标识别结论。`json` 时输出稳定的 wire 契约（供脚本消费）。
 pub fn run_info(target: &Path, json: bool, verbose: bool) -> anyhow::Result<()> {
@@ -12,7 +12,13 @@ pub fn run_info(target: &Path, json: bool, verbose: bool) -> anyhow::Result<()> 
     let session = Session::open(target, OpenOptions::default())?;
 
     if json {
-        let text = serde_json::to_string_pretty(session.info()).context("序列化识别结论失败")?;
+        // JSON 模式输出完整解析结果（含 format_version），供脚本消费
+        let payload = serde_json::json!({
+            "format_version": session.info().format_version,
+            "target": session.info(),
+            "parsed": session.parsed(),
+        });
+        let text = serde_json::to_string_pretty(&payload).context("序列化识别结论失败")?;
         println!("{text}");
         return Ok(());
     }
@@ -65,6 +71,14 @@ fn print_human(info: &TargetInfo, session: &Session) {
         );
     }
 
+    // ── 解析结果 ──
+    if let Some(parsed) = session.parsed() {
+        print_parsed(parsed);
+    } else {
+        println!();
+        println!("解析      未产生结构结果（原因见下方说明）");
+    }
+
     if !info.notes.is_empty() {
         println!();
         println!("说明");
@@ -94,6 +108,150 @@ fn print_human(info: &TargetInfo, session: &Session) {
             println!("  … 其余 {} 个未显示", members.len() - 20);
         }
     }
+}
+
+/// 打印解析结果：段、节、各表的计数与降级说明。
+fn print_parsed(parsed: &ObjectInfo) {
+    if let Some(kind) = &parsed.format_type {
+        println!("格式      {kind}");
+    }
+    if let Some(abi) = &parsed.os_abi {
+        println!("目标      {abi}");
+    }
+    if let Some(subsystem) = &parsed.subsystem {
+        println!("子系统    {subsystem}");
+    }
+
+    // 段（内存视角）—— 分析走地址空间，这是权威视图
+    if !parsed.segments.is_empty() {
+        println!();
+        println!("段（内存视角，共 {} 个）", parsed.segments.len());
+        println!(
+            "  {:<20} {:<18} {:<12} {:<6} 类别",
+            "名称", "虚拟地址", "大小", "权限"
+        );
+        for segment in parsed.segments.iter().take(40) {
+            println!(
+                "  {:<20} 0x{:<16} 0x{:<10x} {:<6} {}",
+                truncate(&segment.name, 20),
+                segment.vaddr,
+                segment.vsize,
+                segment.perms,
+                segment.kind_label
+            );
+        }
+        if parsed.segments.len() > 40 {
+            println!("  … 其余 {} 个未显示", parsed.segments.len() - 40);
+        }
+    }
+
+    // 节（文件视角）
+    if !parsed.sections.is_empty() {
+        println!();
+        println!("节（文件视角，共 {} 个）", parsed.sections.len());
+        println!(
+            "  {:<20} {:<18} {:<12} {:<10} {:<6} 类别",
+            "名称", "虚拟地址", "文件偏移", "大小", "权限"
+        );
+        for section in parsed.sections.iter().take(40) {
+            println!(
+                "  {:<20} 0x{:<16} 0x{:<10x} 0x{:<8x} {:<6} {}",
+                truncate(&section.name, 20),
+                section.vaddr,
+                section.file_offset,
+                section.file_size,
+                section.perms,
+                section.kind_label
+            );
+        }
+        if parsed.sections.len() > 40 {
+            println!("  … 其余 {} 个未显示", parsed.sections.len() - 40);
+        }
+    }
+
+    // 各表计数
+    let mut stats: Vec<String> = Vec::new();
+    if !parsed.imports.is_empty() {
+        stats.push(format!("导入 {}", parsed.imports.len()));
+    }
+    if !parsed.exports.is_empty() {
+        stats.push(format!("导出 {}", parsed.exports.len()));
+    }
+    if !parsed.symbols.is_empty() {
+        stats.push(format!("符号 {}", parsed.symbols.len()));
+    }
+    if !parsed.relocations.is_empty() {
+        stats.push(format!("重定位 {}", parsed.relocations.len()));
+    }
+    if !stats.is_empty() {
+        println!();
+        println!("表        {}", stats.join("，"));
+    }
+
+    // 依赖模块（去重）
+    if !parsed.imports.is_empty() {
+        let mut modules: Vec<&str> = parsed.imports.iter().map(|i| i.module.as_str()).collect();
+        modules.sort_unstable();
+        modules.dedup();
+        println!();
+        println!("依赖模块（{} 个）", modules.len());
+        for module in modules.iter().take(30) {
+            let count = parsed
+                .imports
+                .iter()
+                .filter(|import| import.module == *module)
+                .count();
+            if count > 1 {
+                println!("  {module}（{count} 个符号）");
+            } else {
+                println!("  {module}");
+            }
+        }
+        if modules.len() > 30 {
+            println!("  … 其余 {} 个未显示", modules.len() - 30);
+        }
+    }
+
+    // 导出
+    if !parsed.exports.is_empty() {
+        println!();
+        println!("导出（最多显示 30 个）");
+        for export in parsed.exports.iter().take(30) {
+            let suffix = export
+                .forwarder
+                .as_ref()
+                .map_or_else(String::new, |forwarder| format!(" -> {forwarder}"));
+            println!("  0x{}  {}{}", export.address, export.name, suffix);
+        }
+        if parsed.exports.len() > 30 {
+            println!("  … 其余 {} 个未显示", parsed.exports.len() - 30);
+        }
+    }
+
+    // 解析器自己的降级说明
+    if !parsed.notes.is_empty() {
+        println!();
+        println!("结构说明");
+        for note in &parsed.notes {
+            println!("  · {note}");
+        }
+    }
+}
+
+/// 按显示宽度截断（非 ASCII 按 2 宽度估算，避免中英混排时表格错位）。
+fn truncate(text: &str, max: usize) -> String {
+    let mut width = 0;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let char_width = if ch.is_ascii() { 1 } else { 2 };
+        if width + char_width > max {
+            out.push('…');
+            return out;
+        }
+        width += char_width;
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]

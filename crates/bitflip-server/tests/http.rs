@@ -174,6 +174,152 @@ async fn target_endpoint_returns_opened_target() {
 }
 
 #[tokio::test]
+async fn sections_endpoint_returns_parsed_structure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("sample.elf");
+    // 一个含 .text 与 .data 两个真实节的 ELF64，用来验证"结构"页的数据源。
+    let bytes = build_elf_with_two_sections();
+    std::fs::write(&path, &bytes).expect("写入样本");
+
+    let session = Session::open(&path, OpenOptions::default()).expect("打开样本");
+    let state = test_state(Some(session.target_info())).with_parsed(session.parsed().cloned());
+
+    let (status, body) = send(state, get_with_token("/api/sections")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 顶层必须带版本号，UI 靠它判断字段含义
+    assert_eq!(body["format_version"], 1);
+
+    let parsed = &body["parsed"];
+    assert!(!parsed.is_null(), "应有解析结果: {body}");
+
+    let sections = parsed["sections"].as_array().expect("节数组");
+    assert_eq!(
+        sections.len(),
+        3,
+        "应有 .text/.data/.shstrtab 三个节: {sections:?}"
+    );
+
+    let names: Vec<&str> = sections
+        .iter()
+        .map(|s| s["name"].as_str().expect("节名"))
+        .collect();
+    // SHT_NULL 占位节被有意排除，因此这里只出现三个真实节
+    assert_eq!(names, vec![".text", ".data", ".shstrtab"]);
+
+    // 地址必须是定长 16 位小写十六进制（wire 契约）
+    let addr = sections[0]["vaddr"].as_str().expect("虚拟地址");
+    assert_eq!(addr.len(), 16, "地址应为定长 16 位: {addr}");
+    assert_eq!(addr, "0000000000401000");
+
+    // 权限与类别要能直接渲染
+    assert_eq!(sections[0]["perms"], "r-x");
+    assert_eq!(sections[0]["kind"], "code");
+    assert_eq!(sections[0]["kind_label"], "代码");
+    assert_eq!(sections[1]["perms"], "rw-");
+    assert_eq!(sections[1]["kind"], "data");
+    assert_eq!(sections[2]["kind"], "strtab");
+    // 不参与映射的节不应声称有读权限
+    assert_eq!(sections[2]["perms"], "---");
+    assert_eq!(sections[2]["loaded"], false);
+}
+
+#[tokio::test]
+async fn sections_endpoint_reports_malformed_file_without_failing() {
+    // 畸形文件必须仍然返回 200 + 识别结论，parsed 为 null，
+    // 失败原因出现在 notes 里 —— 而不是 500 或空响应（CLAUDE.md §7）。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("broken.elf");
+    let mut bytes = build_elf_with_two_sections();
+    bytes.truncate(20); // 截断成读不出节表的长度
+    std::fs::write(&path, &bytes).expect("写入样本");
+
+    let session = Session::open(&path, OpenOptions::default()).expect("打开样本");
+    assert!(session.parsed().is_none(), "截断文件不应产生解析结果");
+
+    let notes = &session.info().notes;
+    assert!(
+        notes.iter().any(|n| n.contains("解析失败")),
+        "应在 notes 里说明失败原因: {notes:?}"
+    );
+
+    let state = test_state(Some(session.target_info())).with_parsed(session.parsed().cloned());
+    let (status, body) = send(state, get_with_token("/api/sections")).await;
+
+    assert_eq!(status, StatusCode::OK, "畸形文件不应导致 5xx");
+    assert!(body["parsed"].is_null(), "解析失败时 parsed 应为 null");
+    assert_eq!(body["target"]["object"], "elf", "识别结论仍应可用");
+}
+
+#[tokio::test]
+async fn sections_endpoint_requires_token() {
+    let (status, _) = send(test_state(None), get("/api/sections")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// 构造一个含 `.text` 与 `.data` 两个节的 ELF64 样本。
+fn build_elf_with_two_sections() -> Vec<u8> {
+    // 布局：[ELF 头 64][.text 数据 16][.data 数据 16][shstrtab][节表 3*64]
+    let mut bytes = vec![0u8; 0x400];
+    bytes[..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2; // 64 位
+    bytes[5] = 1; // 小端
+    bytes[6] = 1;
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    bytes[18..20].copy_from_slice(&62u16.to_le_bytes()); // x86_64
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&0x401000u64.to_le_bytes()); // e_entry
+    bytes[40..48].copy_from_slice(&0x300u64.to_le_bytes()); // e_shoff
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    bytes[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    bytes[60..62].copy_from_slice(&4u16.to_le_bytes()); // e_shnum（NULL + .text + .data + .shstrtab）
+    bytes[62..64].copy_from_slice(&3u16.to_le_bytes()); // e_shstrndx（第 3 个节 = shstrtab）
+
+    // .text 数据 @ 0x100，.data 数据 @ 0x120
+    bytes[0x100..0x110].copy_from_slice(&[0x90u8; 16]);
+    bytes[0x120..0x130].copy_from_slice(&[0x11u8; 16]);
+
+    // .shstrtab @ 0x200
+    let names = b"\0.text\0.data\0.shstrtab\0";
+    bytes[0x200..0x200 + names.len()].copy_from_slice(names);
+
+    let shoff = 0x300usize;
+
+    // 节 0：SHT_NULL（全 0）
+    // 节 1：.text —— 名字偏移 1，PROGBITS，ALLOC|EXECINSTR
+    let s1 = shoff + 64;
+    bytes[s1..s1 + 4].copy_from_slice(&1u32.to_le_bytes());
+    bytes[s1 + 4..s1 + 8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
+    bytes[s1 + 8..s1 + 16].copy_from_slice(&0x6u64.to_le_bytes()); // ALLOC|EXEC
+    bytes[s1 + 24..s1 + 32].copy_from_slice(&0x100u64.to_le_bytes()); // sh_offset
+    bytes[s1 + 32..s1 + 40].copy_from_slice(&16u64.to_le_bytes()); // sh_size
+    bytes[s1 + 48..s1 + 56].copy_from_slice(&16u64.to_le_bytes()); // sh_addralign
+
+    // 节 2：.data —— 名字偏移 7，PROGBITS，ALLOC|WRITE
+    let s2 = shoff + 128;
+    bytes[s2..s2 + 4].copy_from_slice(&7u32.to_le_bytes());
+    bytes[s2 + 4..s2 + 8].copy_from_slice(&1u32.to_le_bytes());
+    bytes[s2 + 8..s2 + 16].copy_from_slice(&0x3u64.to_le_bytes()); // ALLOC|WRITE
+    bytes[s2 + 24..s2 + 32].copy_from_slice(&0x120u64.to_le_bytes());
+    bytes[s2 + 32..s2 + 40].copy_from_slice(&16u64.to_le_bytes());
+    bytes[s2 + 48..s2 + 56].copy_from_slice(&16u64.to_le_bytes());
+
+    // 节 2 的 sh_addr 需要是 0x402000 才能验证 vaddr 映射；这里补上。
+    bytes[s1 + 16..s1 + 24].copy_from_slice(&0x401000u64.to_le_bytes());
+    bytes[s2 + 16..s2 + 24].copy_from_slice(&0x402000u64.to_le_bytes());
+
+    // 节 3：.shstrtab —— 名字偏移 13，SHT_STRTAB，指向放名字的那段
+    let s3 = shoff + 192;
+    bytes[s3..s3 + 4].copy_from_slice(&13u32.to_le_bytes());
+    bytes[s3 + 4..s3 + 8].copy_from_slice(&3u32.to_le_bytes()); // SHT_STRTAB
+    bytes[s3 + 24..s3 + 32].copy_from_slice(&0x200u64.to_le_bytes()); // sh_offset
+    bytes[s3 + 32..s3 + 40].copy_from_slice(&(names.len() as u64).to_le_bytes());
+    bytes[s3 + 48..s3 + 56].copy_from_slice(&1u64.to_le_bytes());
+
+    bytes
+}
+
+#[tokio::test]
 async fn static_assets_are_served_without_token_and_spa_falls_back() {
     // 根路径：无论 SPA 是否已构建都必须给出可渲染的 HTML
     let (status, content_type, body) = send_raw(test_state(None), get("/")).await;

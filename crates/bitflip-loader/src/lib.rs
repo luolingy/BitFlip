@@ -13,6 +13,15 @@
 
 mod sniff;
 
+pub mod coff;
+pub mod elf;
+pub mod object;
+pub mod pe;
+pub mod reader;
+
+#[cfg(test)]
+mod fuzz;
+
 use bitflip_arch::{ArchSpec, Endian};
 use thiserror::Error;
 

@@ -51,6 +51,12 @@ pub struct AppState {
     token: Arc<str>,
     allowed_origins: Arc<[String]>,
     target: Option<Arc<TargetInfo>>,
+    /// 目标的完整解析结果。
+    ///
+    /// 与 `target` 分开：`target` 是无条件的嗅探结论，`parsed` 可能因为
+    /// 文件畸形而不存在。UI 需要在"识别出来了但解析失败"时仍然能显示
+    /// 识别结论与失败原因，而不是一片空白（CLAUDE.md §7）。
+    parsed: Option<Arc<bitflip_core::ObjectInfo>>,
     started: Instant,
 }
 
@@ -62,8 +68,16 @@ impl AppState {
             token: token.into(),
             allowed_origins: Arc::from(Vec::new()),
             target: target.map(Arc::new),
+            parsed: None,
             started: Instant::now(),
         }
+    }
+
+    /// 附带解析结果。
+    #[must_use]
+    pub fn with_parsed(mut self, parsed: Option<bitflip_core::ObjectInfo>) -> Self {
+        self.parsed = parsed.map(Arc::new);
+        self
     }
 
     /// 追加允许的 `Origin` 白名单。
@@ -83,6 +97,12 @@ impl AppState {
     #[must_use]
     pub fn target(&self) -> Option<&TargetInfo> {
         self.target.as_deref()
+    }
+
+    /// 本次会话的解析结果（可能因文件畸形而不存在）。
+    #[must_use]
+    pub fn parsed(&self) -> Option<&bitflip_core::ObjectInfo> {
+        self.parsed.as_deref()
     }
 
     /// 已运行时长。
@@ -124,6 +144,7 @@ pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/target", get(target))
+        .route("/api/sections", get(sections))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -167,6 +188,34 @@ async fn target(State(state): State<AppState>) -> Response {
         Some(info) => Json(info.clone()).into_response(),
         None => error_response(StatusCode::NOT_FOUND, "本次会话没有打开目标"),
     }
+}
+
+/// 段/节视图响应。
+#[derive(Serialize)]
+struct SectionsResponse {
+    /// wire 版本号（与 `TargetInfo::format_version` 同源）。
+    format_version: u32,
+    /// 目标识别结论（总是存在）。
+    target: TargetInfo,
+    /// 完整解析结果；`null` 表示解析失败，原因在 `target.notes` 里。
+    parsed: Option<bitflip_core::ObjectInfo>,
+}
+
+/// 段/节视图：一次返回识别结论 + 解析结果。
+///
+/// 合并成一个请求而不是两个，是为了让 UI 的"结构"页只有一次往返 ——
+/// 两部分数据必须同时呈现才有意义（只显示节表而没有格式/架构不完整）。
+async fn sections(State(state): State<AppState>) -> Response {
+    let Some(info) = state.target() else {
+        return error_response(StatusCode::NOT_FOUND, "本次会话没有打开目标");
+    };
+
+    Json(SectionsResponse {
+        format_version: info.format_version,
+        target: info.clone(),
+        parsed: state.parsed().cloned(),
+    })
+    .into_response()
 }
 
 // ── 鉴权 ────────────────────────────────────────────────────────────────────

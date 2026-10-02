@@ -7,11 +7,20 @@ ELF（exec/so/o/a）、raw 固件镜像，以及 x86/x64/ARM64/ARM/RISC-V/MIPS �
 打开方式是 `bitflip <target>`，它在 `127.0.0.1` 上启动本地 HTTP 服务并用浏览器打开 UI ——
 UI 走 Web 是为了跨平台，不需要为每个平台维护原生 GUI 外壳。
 
-**状态：M0 已完成（骨架可用）。** 现在能做的事：
+**状态：M1 已完成（能真正读懂 ELF / PE / COFF）。** 现在能做的事：
 
 - 打开目标、识别容器/对象格式/架构/入口点（PE、COFF、ELF、ar 与 MSVC `.lib`、raw；Mach-O 仅识别）；
-- 起来一个本地服务，浏览器里能看到目标信息与三栏界面骨架；
-- 其余能力（解码、函数识别、交叉引用、注释持久化……）按里程碑推进，**界面上未实现的入口一律置灰并标注里程碑**。
+- **完整解析 ELF32/64 与 PE32/PE32+**：段表、节表、导入表、导出表、符号表、重定位、`.pdata`、
+  `.NET` CLI 头（仅识别）、架构相关标志位；
+- **`bitflip info <目标>`**：人类可读的段/节/导入/导出清单，或 `--json` 拿到带版本号的稳定 schema；
+- **浏览器里的段/节结构视图**：段（内存视角）与节（文件视角）分页签，含虚拟地址、文件偏移、
+  权限、内容类别、是否映射，并高亮入口点所在的节；
+- 解析失败**不会**让目标打不开：识别结论照常显示，失败原因写在说明里；
+- 其余能力（解码、函数识别、交叉引用、注释持久化……）按里程碑推进，
+  **界面上未实现的入口一律置灰并标注里程碑**。
+
+解析结果的正确性由 `scripts/verify-elf.ps1` 对照 `llvm-readobj` 逐项校验，
+并由结构化模糊测试保证畸形输入只返回错误、绝不 panic。
 
 ## 快速开始
 
@@ -34,8 +43,14 @@ cd web && npm install --cache .npm-cache && npm run build && cd ..
 cargo build --release -p bitflip-app
 ```
 
-本机（Windows 沙箱）特有的两条约束：所有 cargo 命令走 `./scripts/cargo.ps1`（它把 `CARGO_HOME`
-指向仓库内），npm 必须带 `--cache .npm-cache`（C: 盘空间不足）。原因见 `docs/DECISIONS.md` ADR-0008/0009。
+本机（Windows 沙箱）特有的三条约束：所有 cargo 命令走 `./scripts/cargo.ps1`（它把 `CARGO_HOME`
+指向仓库内），npm 必须带 `--cache .npm-cache`（C: 盘空间不足），而 `vite build` 在受限沙箱里
+**必然失败**（vite 加载配置时会 `execFile` 子进程，沙箱一律 `EPERM`）。原因见
+`docs/DECISIONS.md` ADR-0008/0009。沙箱里请改用等价且已验证的构建路径：
+
+```bash
+node scripts/build-web.mjs     # rolldown 直出，不依赖子进程
+```
 
 ## 安全模型
 

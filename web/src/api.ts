@@ -9,6 +9,8 @@ const TOKEN_STORAGE_KEY = "bitflip.token";
 
 /** 服务返回的目标识别结论。字段与 `bitflip-core::TargetInfo` 一一对应。 */
 export interface TargetInfo {
+  /** wire 契约版本号；字段含义变化时递增。 */
+  format_version?: number;
   path: string;
   file_size: number;
   container: string;
@@ -29,6 +31,95 @@ export interface TargetInfo {
   notes: string[];
   sniffed_bytes: number;
   file_truncated: boolean;
+}
+
+/** 一个节（文件视角）。对应 `bitflip-core::SectionInfo`。 */
+export interface SectionInfo {
+  name: string;
+  /** 定长 16 位小写十六进制。 */
+  vaddr: string;
+  file_offset: number;
+  file_size: number;
+  /** `rwx` 形式，例如 `r-x`。 */
+  perms: string;
+  kind: string;
+  kind_label: string;
+  loaded: boolean;
+}
+
+/** 一个段（内存视角）。对应 `bitflip-core::SegmentInfo`。 */
+export interface SegmentInfo {
+  name: string;
+  vaddr: string;
+  vsize: number;
+  file_offset: number | null;
+  file_size: number | null;
+  perms: string;
+  kind: string;
+  kind_label: string;
+}
+
+/** 一个符号。对应 `bitflip-core::SymbolInfo`。 */
+export interface SymbolInfo {
+  name: string;
+  value: string;
+  size: number;
+  defined: boolean;
+  is_function: boolean;
+  is_weak: boolean;
+  section: string | null;
+  source: string;
+}
+
+/** 一个导入项。对应 `bitflip-core::ImportInfo`。 */
+export interface ImportInfo {
+  module: string;
+  name: string | null;
+  ordinal: number | null;
+  iat_slot: string | null;
+}
+
+/** 一个导出项。对应 `bitflip-core::ExportInfo`。 */
+export interface ExportInfo {
+  name: string;
+  ordinal: number | null;
+  address: string;
+  forwarder: string | null;
+}
+
+/** 一条重定位。对应 `bitflip-core::RelocInfo`。 */
+export interface RelocInfo {
+  address: string;
+  kind: string;
+  raw_kind: number;
+  symbol: string | null;
+}
+
+/** 完整解析结果。对应 `bitflip-core::ObjectInfo`。 */
+export interface ObjectInfo {
+  id: string;
+  format_type: string | null;
+  os_abi: string | null;
+  subsystem: string | null;
+  is_dynamic_library: boolean;
+  is_executable: boolean;
+  is_relocatable: boolean;
+  is_stripped: boolean;
+  segments: SegmentInfo[];
+  sections: SectionInfo[];
+  imports: ImportInfo[];
+  exports: ExportInfo[];
+  symbols: SymbolInfo[];
+  relocations: RelocInfo[];
+  notes: string[];
+}
+
+/** `/api/sections` 响应：识别结论 + 解析结果。 */
+export interface SectionsResponse {
+  format_version: number;
+  target: TargetInfo;
+  /** `null` 表示解析失败，原因在 `target.notes` 与 `target` 的识别结论里。 */
+  parsed: ObjectInfo | null;
 }
 
 /** `/api/health` 响应。 */
@@ -127,6 +218,28 @@ export async function fetchTarget(token: string | null): Promise<TargetInfo | nu
     }
     throw error;
   }
+}
+
+/** 段/节结构视图；无目标时返回 `null`。 */
+export async function fetchSections(token: string | null): Promise<SectionsResponse | null> {
+  try {
+    return await request<SectionsResponse>("/api/sections", token);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/** 把定长十六进制地址渲染成带 `0x` 前缀的形式。 */
+export function formatAddress(address: string | null | undefined): string {
+  if (!address) {
+    return "-";
+  }
+  // 去掉前导 0，但至少保留一位
+  const trimmed = address.replace(/^0+/, "") || "0";
+  return `0x${trimmed}`;
 }
 
 /** 把字节数渲染成人类可读形式。 */

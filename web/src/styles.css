@@ -281,6 +281,119 @@ button:not(:disabled):hover {
   background: var(--bg-raised);
 }
 
+/* ── 段/节结构视图（M1）────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.tab {
+  background: transparent;
+  color: var(--text-dim);
+  border-color: transparent;
+}
+
+.tab-active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--bg-raised);
+}
+
+.table-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+
+.data-table td {
+  padding: 6px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  white-space: nowrap;
+}
+
+.data-table tbody tr:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.data-table .num {
+  text-align: right;
+}
+
+/* 等宽权限串：用颜色区分 r/w/x，扫一眼就能看出可执行段 */
+.perms {
+  letter-spacing: 1px;
+}
+
+.row-entry {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  letter-spacing: 0.3px;
+  vertical-align: middle;
+}
+
+.badge-entry {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.placeholder-block {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+}
+
+.struct-footer {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.nav-active {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.nav-active .nav-name {
+  color: var(--text);
+}
+
 .disasm-head,
 .disasm-body {
   display: grid;

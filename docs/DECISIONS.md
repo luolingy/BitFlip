@@ -122,6 +122,38 @@ FlatBuffers 降级为**导出格式**（供外部工具消费），不作为工�
 
 **理由**：与 ADR-0004 同因 —— C: 盘空间不足且沙箱拒绝写 C:；`node_modules` 与 npm 缓存都在仓库内，随工作区一起清理。
 
+### ADR-0010 · SPA 构建提供不依赖子进程的备用路径
+
+**状态**：已决（M1 期间的环境适配）
+**决策**：SPA 有两条等价构建路径，产物一致：
+
+1. `cd web && npm run build`（vite）—— 普通开发机与 CI 使用；
+2. `node scripts/build-web.mjs`（rolldown 直出 + 单独复制 CSS）—— 受限沙箱使用，
+   脚本内自校验产物大小并确认 React 运行时确实被打进去。
+
+**背景**：M1 需要在浏览器里验证段/节结构视图，而在本机沙箱下 `vite build` 必然失败：
+
+```
+spawn EPERM
+  at optimizeSafeRealPathSync (vite/dist/node/chunks/node.js)
+```
+
+vite 在加载配置时会 `execFile` 解析真实路径，而沙箱禁止 Node 创建子进程
+（CLAUDE.md §6 trap 6）。这不是项目缺陷 —— 在普通终端里 `npm run build` 正常。
+
+**理由**
+- 段/节视图是 M1 的验收项，不能因为"本机构建不出来"就不验证。
+- 备用路径只依赖已安装的 `rolldown`（vite 8 的底层打包器），不引入新依赖、不下载任何东西。
+- 产物与 vite 版本**同源同依赖**：同一份 `src/`，只是少了文件名哈希。
+
+**代价与限制**
+- 产物文件名不含内容哈希，因此不能依赖长缓存；对内嵌进二进制的场景无影响。
+- 样式必须由脚本单独复制（rolldown 已不再支持把 CSS 打进 JS bundle），
+  故入口拆成 `src/entry.tsx`（无 CSS import）与 `src/main.tsx`（vite 用的带 CSS 入口）。
+- `web/index.html` 入库并被脚本读取，保证标题/lang/meta 只有一处定义；
+  资源引用固定为 `/assets/app.js` 与 `/assets/app.css`，脚本会校验这一点。
+- **两条路径都必须保持可用**：改前端构建相关配置时要同时验证。
+
 ## 待决（决策门）
 
 | ID | 决策 | 期限 | 候选与倾向 |

@@ -40,7 +40,8 @@ pub fn serve_blocking(request: ServeRequest) -> anyhow::Result<()> {
 
 async fn serve_async(request: ServeRequest) -> anyhow::Result<()> {
     // 先打开目标：路径不对要立刻失败，而不是先起服务再报错。
-    let info = Session::open(&request.target, OpenOptions::default())?.target_info();
+    let session = Session::open(&request.target, OpenOptions::default())?;
+    let info = session.target_info();
     print_target(&info);
 
     let host: IpAddr = request
@@ -58,7 +59,11 @@ async fn serve_async(request: ServeRequest) -> anyhow::Result<()> {
     let token = request.token.unwrap_or_else(generate_token);
     let bound = bitflip_server::bind(host, request.port, 10).await?;
     let origins = default_allowed_origins(bound.addr.port(), &request.allow_origins);
-    let state = AppState::new(token.clone(), Some(info)).with_allowed_origins(origins);
+    // 解析结果随会话一起交给服务层：UI 的"结构"页需要它。
+    // 解析失败时传 None，前端会显示识别结论 + 失败原因。
+    let state = AppState::new(token.clone(), Some(info))
+        .with_parsed(session.parsed().cloned())
+        .with_allowed_origins(origins);
 
     let url = format!("http://{}/#token={}", display_addr(bound.addr), token);
     print_banner(&url);
