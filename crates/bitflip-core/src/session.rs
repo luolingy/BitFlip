@@ -307,6 +307,16 @@ pub struct TargetInfo {
     pub file_truncated: bool,
 }
 
+/// 完整解析（而非嗅探）允许的最大文件大小。
+///
+/// 解析要把整个文件读进内存，之后再按虚拟地址随机访问，因此上限由**内存**
+/// 决定，而不是由嗅探窗口决定。取 512 MiB：能覆盖绝大多数真实二进制，
+/// 又不至于在只有几 GB 可用内存的机器上把进程打爆。
+///
+/// 超过这个上限时明确拒绝并说清原因，绝不给"基于部分数据"的结论
+/// （CLAUDE.md §7）。
+pub const MAX_FULL_PARSE_BYTES: u64 = 512 * 1024 * 1024;
+
 impl TargetInfo {
     fn from_guess(path: &Path, file_size: u64, guess: &Guess) -> Self {
         Self {
@@ -442,11 +452,24 @@ impl Session {
     /// 归档（`.a` / `.lib`）的成员解析属于 M5；M1 只解析单对象文件，
     /// 对归档明确说明"sections 描述的是容器"而不是假装解析了成员。
     fn parse_target(path: &Path, file_size: u64, guess: &Guess) -> Result<Object, String> {
-        // 超过嗅探窗口的文件只读了前缀，解析会产生误导性的结论
-        if guess.file_truncated {
+        // 嗅探窗口与解析上限是**两件不同的事**，早先版本把它们混成了一个。
+        //
+        // 嗅探只读文件前缀（8 MiB）是为了便宜：文件头与容器目录都在前面，
+        // 读 100MB 去认一个格式是浪费。所以 `guess.file_truncated` 对**识别**
+        // 来说只是"结论只覆盖前 8 MiB"的说明，不是"不许解析"的理由 ——
+        // 下面的 `std::fs::read` 会把整个文件读进来。
+        //
+        // 之前这里直接以 `file_truncated` 为由拒绝解析，后果是**任何大于 8 MiB
+        // 的目标都拿不到解析结果，也就完全无法反汇编**（M2 的 100MB 验收标准
+        // 因此结构性地无法达成）。而拒绝的理由"避免基于残缺数据的结论"
+        // 并不成立：真正读进解析器的是完整文件。
+        //
+        // 所以真正需要守的是**内存**上限，不是嗅探窗口。超过这个上限时仍然
+        // 明确拒绝并说清原因，而不是悄悄给出不完整的结果（CLAUDE.md §7）。
+        if file_size > MAX_FULL_PARSE_BYTES {
             return Err(format!(
-                "文件 {file_size} 字节超过读取上限 {} 字节，本次不做完整解析（避免给出基于残缺数据的结论）",
-                bitflip_loader::SNIFF_WINDOW
+                "文件 {file_size} 字节超过完整解析上限 {} 字节：本次只做识别，不做解析与反汇编",
+                MAX_FULL_PARSE_BYTES
             ));
         }
 

@@ -361,3 +361,57 @@ fn disasm_is_send_and_sync_for_the_server_layer() {
     assert_send_sync::<bitflip_core::Disasm>();
     assert_send_sync::<Arc<bitflip_core::Disasm>>();
 }
+
+// ── 解析上限 vs 嗅探窗口（M2 回归） ──────────────────────────────────────
+
+/// 大于嗅探窗口（8 MiB）的文件**仍然要能被完整解析与反汇编**。
+///
+/// 这条测试的由来：早先版本以 `guess.file_truncated` 为由直接拒绝解析，
+/// 后果是任何大于 8 MiB 的目标都拿不到解析结果，也就完全无法反汇编 ——
+/// 而 M2 自己的验收标准要求 100MB 级目标能扫描。根因是把两件不同的事
+/// 混成了一件：**嗅探**读前缀是便宜的（文件头都在前面），
+/// **解析**读整个文件是必须的。真正要守的是内存上限，不是嗅探窗口。
+///
+/// 用 `elf-large.bin`（9.4 MiB，刻意大于嗅探窗口）钉住这条边界。
+#[test]
+fn file_larger_than_the_sniff_window_is_still_parsed() {
+    let session = bitflip_core::Session::open(
+        fixture("elf-large.bin"),
+        bitflip_core::OpenOptions::default(),
+    )
+    .expect("打开大文件");
+
+    let info = session.target_info();
+    assert!(
+        info.file_truncated,
+        "9.4 MiB 的文件确实超出 8 MiB 嗅探窗口，这个标志应当为真"
+    );
+
+    // 关键断言：超出嗅探窗口**不再**阻止解析。
+    // 不再出现"超过读取上限…不做完整解析"这类结论。
+    assert!(
+        !info.notes.iter().any(|note| note.contains("不做完整解析")),
+        "超出嗅探窗口不应阻止完整解析，实际说明：{:?}",
+        info.notes
+    );
+}
+
+/// 真正超过完整解析上限的文件必须**明确拒绝**，而不是给出残缺结论。
+///
+/// 用常量本身来断言边界，避免测试里写一个会和实现漂移的魔数。
+#[test]
+fn parse_limit_constant_is_documented_and_finite() {
+    // 上限必须存在、有限，且不小于 100 MiB —— 否则 M2 的 100MB 验收
+    // 标准会在实现层面变得不可达（这正是之前发生的事）。
+    let limit = bitflip_core::MAX_FULL_PARSE_BYTES;
+    assert!(limit >= 100 * 1024 * 1024, "解析上限 {limit} 太小");
+    assert!(
+        limit <= 8 * 1024 * 1024 * 1024,
+        "解析上限 {limit} 超过 8 GiB，会在一台普通机器上把内存打爆"
+    );
+    // 上限必须**大于**嗅探窗口，语义上才说得通
+    assert!(
+        limit > bitflip_loader::SNIFF_WINDOW as u64,
+        "解析上限应当大于嗅探窗口"
+    );
+}

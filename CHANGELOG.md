@@ -5,65 +5,74 @@
 
 ## [Unreleased]
 
-### 新增 — M1：格式解析（ELF / PE / COFF）
+### 新增 — M2：反汇编引擎
 
-- **`bitflip-loader::reader`**：全部字节读取的唯一入口。所有解析器必须经过
-  `Reader`，越界一律返回 `ParseError` 而不是 panic 或静默截断；
-  表项遍历 `for_each_entry` 先按 `checked_mul` 校验整张表的范围再逐项读取，
-  并对不可信数量封顶 —— 输入决定不了内存布局。
-- **`bitflip-loader::object`**：容器→对象→段/节/符号的统一模型
-  （`Object` / `Segment` / `Section` / `Import` / `Export` / `RawSymbol` /
-  `Reloc` / `UnwindEntry` / `FormatInfo`）。段是内存视角、节是文件视角，两者都保留。
-- **`bitflip-loader::elf`**：ELF32/ELF64 完整解析 —— 节表与程序头表、
-  extended `shnum`/`shstrndx`、`ImageBase` 推导、入口点、`.symtab`/`.dynsym`、
-  重定位（x86_64 / i386 / aarch64 / arm / riscv / mips）、`DT_NEEDED` 依赖、
-  节对齐与 `p_paddr ≠ p_vaddr` 等结构异常检测。
-- **`bitflip-loader::pe`**：PE32/PE32+ 完整解析 —— DOS/NT 头、节表、
-  数据目录、`ImageBase`、入口 RVA、导入表（含按序号导入与延迟导入）、
-  导出表（含转发导出）、基址重定位、`.pdata` RUNTIME_FUNCTION、`.NET` CLI 头检出。
-- **`bitflip-loader::coff`**：`.obj` 解析 —— 节表（含 `/NNN` 长节名）、
-  COFF 符号表（含辅助记录跳过）、重定位（按机器类型区分编号含义）。
-- **`bitflip-core`**：`Session::open` 现在做一次完整解析，并把结果作为
-  `ObjectInfo` 暴露给上层。解析失败**不会**导致打开失败：识别结论仍然可用，
-  失败原因写进 `notes`，`parsed()` 返回 `None`。
-- **稳定 JSON schema**：`TargetInfo` 与 `/api/*` 响应都带 `format_version`
-  （当前 `1`），地址一律定长 16 位小写十六进制。
-- **`bitflip info <目标> --json`**：输出 `{format_version, target, parsed}`；
-  人类可读模式打印段表、节表、各表计数、依赖模块与导出清单。
-- **`/api/sections`**：段/节结构视图的数据源；一次返回识别结论 + 解析结果。
-- **段/节 UI**：段（内存视角）与节（文件视角）分页签呈现，
-  显示虚拟地址、文件偏移、大小、权限、内容类别、是否映射，
-  并高亮入口点所在的节。解析失败时明确显示"未能得到结构结果"+原因。
+- **`bitflip-arch::backend`**：capstone 后端的真实接线。结构化提取
+  流程语义（`groups` 里的 CALL/JUMP/RET/INT/PRIVILEGE 分组，而不是匹配
+  助记符字符串）、读写的寄存器集合、操作数（x86 / AArch64 / ARM 分架构提取，
+  RISC-V 与 MIPS 暂不提取细节）。没有后端支持的架构明确返回
+  `DecodeError::Unsupported`，**不会**拿别的架构去解码。
+- **`bitflip-arch::render`**：把结构化指令渲染成 Intel 语法的文本。
+  文本是渲染层的产物，分析层只消费结构化字段。
+- **`bitflip-analyze::addrspace`**：分页地址空间。按段或**节**建立
+  （可重定位目标文件没有程序头，只有节表且节地址全是 0，只认段就完全
+  无法反汇编），稀疏指令索引（`BTreeMap`），读取**不跨段**，
+  `containing()` 把落在指令中间的地址吸附到包含它的那条。
+- **`bitflip-analyze::scan`**：线性扫描与递归下降**双策略**，
+  并分别记录覆盖来源（`ScanCoverage::reachable` / `linear_only`）。
+  线性扫描按段并行（`rayon`），递归下降用显式栈而非递归调用。
+- **`bitflip-core::Disasm`**：会话级反汇编视图，含分页
+  （`InsnPage`，服务端游标）、统计（`DisasmStats`）与降级说明。
+- **`/api/insns?from=&count=`**：列式分页接口。服务端把过大的 `count`
+  收敛到上限（不信任客户端），非法地址返回 400 而不是悄悄从头开始。
+- **反汇编 UI**：虚拟滚动列表（只挂载视口内的行），
+  `j`/`k`/`g`/`G`/`Enter` 键盘导航，地址列可点击跟随控制流目标，
+  机器码列，以及覆盖率统计条。
 
-### 新增 — 解析鲁棒性
+### 修复
 
-- **结构化模糊测试**（`bitflip-loader::fuzz`）：确定性 xorshift 变异器 +
-  8 类变异算子（位翻转、极值字节、虚报长度、越界偏移、截断、复制、表长虚报），
-  偏向头部以命中有意义的字段。断言只有一条：畸形输入下**不 panic、不 OOM**。
-  自带"模糊测试确实在跑"的自检（统计接受/拒绝样本数）。
-- **跨实现对照校验**（`scripts/verify-elf.ps1`）：把解析结果与
-  `llvm-readobj` 的节名集合、节数量、入口点逐项比对。
-  当前 9 个真实样本（x86_64 / i386 / aarch64 / armv7 / riscv64 / mips32 的
-  `.o`、`.exe`、`.so`）**全部一致**。
+- **大于嗅探窗口（8 MiB）的文件无法被解析，因此完全无法反汇编。**
+  根因是把两件不同的事混成了一件：嗅探只读文件前缀（便宜，文件头都在前面），
+  解析必须读整个文件。早先版本以"文件超过读取上限"为由直接拒绝解析，
+  后果是任何大于 8 MiB 的目标都拿不到解析结果 —— 而 M2 自己的验收标准
+  要求 100MB 级目标能扫描，也就是结构性地达不到。现在解析的上限由**内存**
+  决定（`MAX_FULL_PARSE_BYTES = 512 MiB`）而不是由嗅探窗口决定，
+  超过内存上限时才明确拒绝并说清原因。
+- 稀疏索引在地址空间顶端因饱和加法而漏判覆盖（`InsnIndex::containing`）。
+- 线性扫描在解码失败且不重新同步时会把同一次失败统计两遍。
+
+### 性能（M2 验收标准 1，实测）
+
+对自造的 100 MiB ELF（约 105 万条指令，用 `cargo test -p bitflip-core --release
+-- --ignored bench_scan` 复现）：
+
+| 指标 | 目标 | 实测 |
+|------|------|------|
+| 首次扫描耗时 | < 15s | **6.5s** |
+| 稀疏索引占用 | < 3× 文件大小 | **0.32×**（33.6 MB） |
+| 已索引指令 | — | 1,050,496 |
+| 解码失败 | — | 0 |
+
+并用另一条测试钉住"同一输入两次扫描结果完全一致"（确定性是正确性前提，
+不是性能指标）。
+### 变更
+
+- `AppState` 新增 `with_session()`：整个 `Session` 交给服务层，
+  反汇编需要原始字节，而 `ObjectInfo` 是已拍扁的 wire 投影。
+- 导航项分真实可用（M1/M2）与未落地（置灰 + 标注里程碑）两类，
+  未落地的项不可点击。
 
 ### 已知限制
 
-- 归档（`.a` / `.lib`）的**成员级**解析排期 M5；当前对归档只解析容器结构。
-- `.eh_frame` 的 CFI/FDE 展开排期 M3（已检出存在并给出说明）。
-- Mach-O 解析排期 M10（当前只做识别）。
-- PE 的延迟导入目前只列出模块名，符号级解析排期待补。
-- `.NET` 托管程序集只做识别，不反编译 CIL。
+- 反汇编**只覆盖已索引的指令**：间接跳转/调用的目标是运行期才确定的，
+  静态分析不跟随，因此跳转表的目标不会出现在结果里（M3 的 CFG 阶段处理）。
+- 条件跳转的判定是**保守启发式**（capstone 的 x86 后端不直接暴露条件位），
+  宁可多给一个后继也不漏掉一个块。M3 会用真正的条件位替换。
+- RISC-V / MIPS 的操作数细节暂不提取：流程语义正确，但操作数为空。
+- 归档成员（`.a` / `.lib`）的逐成员反汇编排期 M5。
 
 ### 计划中
-- M2：地址空间 + capstone 解码 + 反汇编列表 UI
-
-### 备注
-
-- `scripts/build-web.mjs` 提供一条不依赖子进程的 SPA 构建路径（rolldown 直出）。
-  受限沙箱里 Node 的 `child_process` 一律 EPERM，`vite build` 在加载配置时会
-  `execFile` 因而必然失败（CLAUDE.md §6 trap 6）；普通终端下 `npm run build`
-  仍然可用。
-
+- M3：CFG 重建、函数边界、交叉引用
 ## [0.0.1-m0] - 2026-10-02
 
 M0 的目标是"骨架跑通、边界定死、不假装能干还没做的事"。凡是尚未实现的入口，

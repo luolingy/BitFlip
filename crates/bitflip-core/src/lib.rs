@@ -21,7 +21,7 @@ pub use disasm::{
 pub use error::BitflipError;
 pub use session::{
     AnalysisSummary, ExportInfo, ImportInfo, ObjectInfo, OpenOptions, RelocInfo, SectionInfo,
-    SegmentInfo, Session, SymbolInfo, TargetInfo, INFO_FORMAT_VERSION,
+    SegmentInfo, Session, SymbolInfo, TargetInfo, INFO_FORMAT_VERSION, MAX_FULL_PARSE_BYTES,
 };
 
 /// 重新导出作业/进度契约，方便嵌入方只依赖 `bitflip-core`。

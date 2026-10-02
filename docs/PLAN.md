@@ -203,6 +203,8 @@ loader     arch      analyze    symbols    project
 3. 10 万条注解下改名操作 p95 < 50ms（基准测试）。
 
 风险：数据库选型影响全身。D2 必须在本阶段**开始前**定案，不允许中途换。
+**状态：D2 已在 M2 结束时定案（ADR-0012）—— 主数据 SQLite、派生物独立 `.bda` 文件。
+这样本阶段的写入路径已无待定项，可以按 `docs/D2-STORAGE-ANALYSIS.md` §6 的清单落地。**
 
 ### M5 · 静态库 / 动态库 / 归档 + 多架构
 
@@ -381,8 +383,8 @@ loader     arch      analyze    symbols    project
 | ID | 决策 | 影响 | 状态 |
 |----|------|------|------|
 | D1 | 脚本层：rquickjs（JS） / mlua（Lua） / wasmtime（WASM 插件） | M7 起全部脚本能力与插件生态 | 待定（M6 末） |
-| D2 | 工程库：SQLite(rusqlite) / 自研 append-only log + 索引快照 | M4 起所有持久化，巨型文件 IO 表现 | 待定（M4 前，**阻塞性**） |
-| D3 | 解码后端：capstone 单后端 / + iced-x86（x86 质量） | 指令文本质量与属性精度 | 待定（M2 末，先只包 capstone） |
+| ~~D2~~ | ~~工程库：SQLite / 自研日志~~ | M4 起所有持久化 | **已决：主数据 SQLite + 派生物独立文件（ADR-0012，分析见 `D2-STORAGE-ANALYSIS.md`）** |
+| ~~D3~~ | ~~解码后端：capstone / + iced-x86~~ | 指令文本质量与属性精度 | **已决：capstone 单后端，接口保持后端抽象（ADR-0011）** |
 | D4 | PDB/DWARF 依赖范围 | M8 工作量与体积 | 待定（M8 前） |
 | D5 | 是否做反编译器 | 数倍于全部既有工作量 | 待定（M10 评审） |
 | D6 | 许可证 | 依赖兼容性（capstone BSD、goblin MIT），对外分发方式 | **M0 前** |
