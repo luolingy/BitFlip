@@ -91,10 +91,16 @@ git diff --cached --name-only | Select-String '^temp/' # 有输出即中止
 不要凭"看起来对"就提交。
 
 1. **`.ps1` 一律只写 ASCII。** PS 5.1 把无 BOM 的脚本按 ANSI 读取，中文注释/字符串会
-   破坏解析（典型报错 `The string is missing the terminator`）。
-2. **`param()` 里只能有一个参数。** 声明第二个（哪怕从未使用）会让
-   `ValueFromRemainingArguments` 错位：`test --workspace` 变成 `--workspace '' test`。
-   验证方法：写一个只打印 `$args` 的临时脚本对比。
+   破坏解析（典型报错 `The string is missing the terminator`）。检查方法：
+   `Get-Content x.ps1 -Raw | Select-String '[^\x00-\x7F]'`。
+2. **`scripts/cargo.ps1` 不要加 `param()` 块**，用裸 `$args` 转发。两个已验证的坑：
+   - 声明第二个参数（哪怕从未使用）会让 `ValueFromRemainingArguments` 错位：
+     `test --workspace` 变成 `@('--workspace','','test')`；
+   - 有 `param()` 就会启用 common parameters，PS 会把重复的短选项绑到自己的参数上：
+     `build -p a -p b` 报 `parameter 'PipelineVariable' is specified more than once`
+     （`-p` 是 `-PipelineVariable` 的前缀）。
+   改动后必须手工验证四条命令：`build --workspace`、`test --workspace`、
+   `clippy --all-targets -- -D warnings`、`build --release -p bitflip-app -p bitflip-cli`。
 3. **不要用 `$ErrorActionPreference = 'Stop'`。** 原生命令（cargo、clang、gcc）把进度与
    警告写在 stderr，PS 5.1 会把每一行 stderr 变成终止性错误。用 `'Continue'` +
    检查 `$LASTEXITCODE`。
@@ -109,6 +115,8 @@ git diff --cached --name-only | Select-String '^temp/' # 有输出即中止
 7. **cargo 必须走包装脚本。** 直接 `cargo` 会尝试写 `C:\Users\...\.cargo` 并失败；
    用 `& .\scripts\cargo.ps1 ...`（它设置仓库内的 `CARGO_HOME`）。
 8. **npm 必须带 `--cache .npm-cache`**，否则写 C: 盘被拒（见 ADR-0009）。
+9. **`try/finally` 里的清理会毁掉测试。** 冒烟测试的 `finally` 若用来杀进程，
+   必须在所有断言**之后**执行，否则服务在断言前就死了，测试会对着死端口"通过"。
 
 ## 7. 分析准确性的底线
 

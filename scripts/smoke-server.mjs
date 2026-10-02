@@ -1,6 +1,19 @@
 // End-to-end smoke test against a running bitflip server.
 // Exercises exactly what M0 promises: token + Origin enforcement, health payload,
-// target payload, static asset serving, SPA fallback, and the not-built-in case.
+// target payload, static asset serving, and SPA fallback.
+//
+// Usage (two terminals, or a background job for the server):
+//   bitflip-cli serve <target> --no-open --port 8790 --token smoketoken123 \
+//       --allow-origin http://127.0.0.1:5173
+//   node scripts/smoke-server.mjs
+//
+// Set BITFLIP_EXPECT_DEV_ORIGIN=1 when the server was started with
+// --allow-origin http://127.0.0.1:5173 (otherwise the script expects that origin
+// to be rejected, which is the correct behaviour without the flag).
+//
+// NOTE: this script only makes HTTP requests. It never spawns the server itself --
+// child_process.spawn is denied (EPERM) in this sandbox. For the "start two
+// servers and check port fallback" case, use scripts/smoke-port-fallback.ps1.
 import { setTimeout as sleep } from "node:timers/promises";
 
 const BASE = "http://127.0.0.1:8790";
@@ -62,7 +75,19 @@ const goodOrigin = await get("/api/health", { "x-bitflip-token": TOKEN, origin: 
 check("same-origin -> 200", goodOrigin.status === 200, `got ${goodOrigin.status}`);
 
 const allowListed = await get("/api/health", { "x-bitflip-token": TOKEN, origin: "http://127.0.0.1:5173" });
-check("allow-listed dev origin -> 200", allowListed.status === 200, `got ${allowListed.status}`);
+// Only allowed when the server was started with
+//   --allow-origin http://127.0.0.1:5173
+// which is what the documented dev workflow does (see web/README.md). Without the
+// flag this MUST be 403 -- the allow-list is explicit, never "any localhost".
+if (process.env.BITFLIP_EXPECT_DEV_ORIGIN === "1") {
+  check("allow-listed dev origin -> 200", allowListed.status === 200, `got ${allowListed.status}`);
+} else {
+  check(
+    "dev origin is rejected unless --allow-origin was passed",
+    allowListed.status === 403,
+    `got ${allowListed.status}`,
+  );
+}
 
 console.log("\nhealth payload");
 const health = JSON.parse(headerToken.text);
