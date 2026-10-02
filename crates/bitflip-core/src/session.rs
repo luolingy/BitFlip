@@ -9,7 +9,9 @@ use bitflip_loader::object::{Object, ObjectId};
 use bitflip_loader::{sniff_file, ContainerKind, Guess, ObjectKind};
 use serde::Serialize;
 
+use crate::disasm::Disasm;
 use crate::error::BitflipError;
+use bitflip_analyze::ScanOptions as DisasmScanOptions;
 
 /// 地址的 wire 表示：定长小写 16 位十六进制（CLAUDE.md §4）。
 fn hex16(value: u64) -> String {
@@ -370,6 +372,15 @@ pub struct Session {
     info: TargetInfo,
     object: Option<ObjectInfo>,
     object_raw: Option<Arc<Object>>,
+    /// 整个文件的字节。
+    ///
+    /// 分析层需要按虚拟地址随机访问原始字节（反汇编、字符串搜索、交叉引用）。
+    /// 用 `Arc<[u8]>` 而不是每次读盘：同一份字节要服务成千上万次查询，
+    /// 且 `AddrSpace` 需要与它共享生命周期。
+    ///
+    /// 代价是文件大小的一份常驻内存 —— 这是 M2 验收指标里
+    /// "内存 < 3× 文件大小"预算中的 1×。
+    bytes: Arc<[u8]>,
 }
 
 impl Session {
@@ -396,12 +407,33 @@ impl Session {
             }
         };
 
+        // 读入完整字节：分析层需要按虚拟地址随机访问。
+        //
+        // 只在解析成功时才读 ——  解析失败的目标反汇编无从谈起，
+        // 没必要为一个"打不开的格式"占住文件大小的内存。
+        let bytes: Arc<[u8]> = if object_raw.is_some() {
+            match std::fs::read(&path) {
+                Ok(data) => Arc::from(data),
+                Err(error) => {
+                    // 读失败不能让整个打开失败（嗅探与解析结论仍然有效），
+                    // 但必须让用户知道反汇编不可用
+                    info.notes.push(format!(
+                        "读取文件字节失败（{error}），反汇编与字节级查询将不可用"
+                    ));
+                    Arc::from(Vec::new())
+                }
+            }
+        } else {
+            Arc::from(Vec::new())
+        };
+
         Ok(Self {
             path,
             guess,
             info,
             object,
             object_raw,
+            bytes,
         })
     }
 
@@ -455,6 +487,47 @@ impl Session {
     #[must_use]
     pub fn object(&self) -> Option<&Arc<Object>> {
         self.object_raw.as_ref()
+    }
+
+    /// 建立反汇编（线性 + 递归下降扫描）。
+    ///
+    /// 每次调用都会重新扫描 —— 因此**服务层应当缓存结果**，不要每个请求调一次。
+    /// 这里不做内部缓存是因为：会话本身是不可变的（`Session` 只读打开的目标），
+    /// 把可变的分析状态塞进去会让"打开目标"的语义变得含糊；
+    /// 缓存属于服务层的职责（见 `bitflip-server` 的 `AppState`）。
+    ///
+    /// 失败的情形：
+    /// - 目标没有解析成功（格式不认识 / 解析失败）—— 原因在 `info().notes`；
+    /// - 没有可执行的段 —— 目标里没有代码，反汇编无从谈起。
+    ///
+    /// 这两种都是**如实拒绝**，而不是返回一个空的反汇编让 UI 显示"分析完成"。
+    pub fn disassemble(&self, options: DisasmScanOptions) -> Result<Disasm, BitflipError> {
+        let Some(object) = self.object_raw.as_ref() else {
+            let reason = self
+                .info
+                .notes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "目标尚未成功解析，无法反汇编".to_string());
+            return Err(BitflipError::unavailable(reason));
+        };
+
+        // 有没有可执行的代码区？段和节都要看 —— 可重定位目标文件（`.o`/`.obj`）
+        // 没有程序头，只有节表（见 `AddrSpace::from_sections`）。
+        let has_exec = object.segments.iter().any(|segment| segment.perms.execute)
+            || object.sections.iter().any(|section| section.perms.execute);
+        if !has_exec {
+            return Err(BitflipError::unavailable(format!(
+                "目标里没有可执行区域（{} 个段 / {} 个节），没有可供反汇编的代码",
+                object.segments.len(),
+                object.sections.len()
+            )));
+        }
+
+        let bytes: Arc<[u8]> = self.bytes.clone();
+        // 扫描产生的 notes（合成地址、截断、解码失败）随 `Disasm` 一起返回，
+        // 由 UI 显示 —— 分析质量的"折扣"必须写在界面上（CLAUDE.md §7）。
+        Ok(Disasm::build(object, bytes, options))
     }
 
     /// 目标路径。

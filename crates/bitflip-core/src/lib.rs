@@ -10,9 +10,14 @@
 //! 分层依赖方向：`cli/app → server → core → {loader, arch, analyze, symbols, project}`，
 //! 下层永不反向依赖（CLAUDE.md §4）。
 
+mod disasm;
 mod error;
 mod session;
 
+pub use disasm::{
+    hex16, parse_address, Disasm, DisasmStats, InsnPage, InsnWire, DEFAULT_PAGE_SIZE,
+    DISASM_FORMAT_VERSION, MAX_PAGE_SIZE,
+};
 pub use error::BitflipError;
 pub use session::{
     AnalysisSummary, ExportInfo, ImportInfo, ObjectInfo, OpenOptions, RelocInfo, SectionInfo,
@@ -24,6 +29,10 @@ pub use bitflip_analyze::{
     CancelToken, EventSink, JobError, JobEvent, JobHandle, JobId, JobState, NullSink, Progress,
     StageId,
 };
+
+/// 重新导出扫描选项：它是 [`Session::disassemble`] 的参数类型，
+/// 嵌入方需要构造它而不必直接依赖 `bitflip-analyze`。
+pub use bitflip_analyze::ScanOptions as DisasmScanOptions;
 
 /// 重新导出架构规格（嵌入方做架构相关判断时使用，不需要直接依赖 `bitflip-arch`）。
 pub use bitflip_arch::{Arch, ArchSpec, Endian, Mode};

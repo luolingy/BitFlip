@@ -141,7 +141,7 @@ async fn allowed_origin_passes() {
 async fn target_endpoint_returns_opened_target() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("sample.exe");
-    let mut bytes = vec![0u8; 0x200];
+    let mut bytes = vec![0u8; 0x220];
     bytes[0] = b'M';
     bytes[1] = b'Z';
     bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
@@ -336,4 +336,210 @@ async fn static_assets_are_served_without_token_and_spa_falls_back() {
     // 静态资源不需要令牌，但 API 仍然需要
     let (status, _) = send(test_state(None), get("/api/health")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ── 反汇编端点（M2） ────────────────────────────────────────────────────────
+
+/// 构造一个带可执行节、能被真实解码的最小 ELF64。
+///
+/// 与 `build_elf_with_two_sections` 的区别：这个的 `.text` 里放的是
+/// **真实可解码的 x86-64 机器码**（`nop` 与 `ret`），因此可以验证
+/// "扫描 → 解码 → 渲染"整条链路，而不只是看节表。
+fn build_elf_with_code() -> Vec<u8> {
+    let names = b"\0.text\0.shstrtab\0";
+    // 节表从 0x80 开始，3 个 64 字节的节头占到 0x140。
+    // 代码与字符串表必须放在**节表之后** —— 曾把 text_off 定在 0x100，
+    // 结果节头把代码覆盖成 [07,00,00,00]，测试才发现（这正是它该做的）。
+    let text_off = 0x180usize;
+    // nop; nop; nop; ret
+    let code: [u8; 4] = [0x90, 0x90, 0x90, 0xC3];
+
+    let mut bytes = vec![0u8; 0x220];
+    // ── ELF64 头 ──
+    bytes[0..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2; // ELFCLASS64
+    bytes[5] = 1; // ELFDATA2LSB
+    bytes[6] = 1; // EV_CURRENT
+                  // e_type = ET_REL(1)：可重定位目标文件，正好覆盖"无程序头"这条路径
+    bytes[16..18].copy_from_slice(&1u16.to_le_bytes());
+    // e_machine = EM_X86_64(62)
+    bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+
+    let shoff = 0x80usize;
+    let shnum = 3u16;
+    let shstrndx = 2u16;
+    bytes[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    bytes[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    bytes[60..62].copy_from_slice(&shnum.to_le_bytes());
+    bytes[62..64].copy_from_slice(&shstrndx.to_le_bytes());
+
+    // ── 机器码 ──
+    bytes[text_off..text_off + 4].copy_from_slice(&code);
+    // ── 节名字符串表 ──
+    let names_off = 0x1a0usize;
+    bytes[names_off..names_off + names.len()].copy_from_slice(names);
+
+    // 节 0：SHT_NULL（全零，保持不动）
+    // 节 1：.text —— ALLOC|EXEC，size=4
+    let s1 = shoff + 64;
+    bytes[s1..s1 + 4].copy_from_slice(&1u32.to_le_bytes()); // sh_name -> ".text"
+    bytes[s1 + 4..s1 + 8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
+    bytes[s1 + 8..s1 + 16].copy_from_slice(&0x6u64.to_le_bytes()); // ALLOC|EXEC
+    bytes[s1 + 24..s1 + 32].copy_from_slice(&(text_off as u64).to_le_bytes());
+    bytes[s1 + 32..s1 + 40].copy_from_slice(&4u64.to_le_bytes());
+    bytes[s1 + 48..s1 + 56].copy_from_slice(&16u64.to_le_bytes());
+    // 节 2：.shstrtab
+    let s2 = shoff + 128;
+    bytes[s2..s2 + 4].copy_from_slice(&7u32.to_le_bytes()); // sh_name -> ".shstrtab"
+    bytes[s2 + 4..s2 + 8].copy_from_slice(&3u32.to_le_bytes()); // SHT_STRTAB
+    bytes[s2 + 24..s2 + 32].copy_from_slice(&(names_off as u64).to_le_bytes());
+    bytes[s2 + 32..s2 + 40].copy_from_slice(&(names.len() as u64).to_le_bytes());
+    bytes[s2 + 48..s2 + 56].copy_from_slice(&1u64.to_le_bytes());
+
+    bytes
+}
+
+fn write_temp(name: &str, data: &[u8]) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut path = std::env::temp_dir();
+    // 进程 id + 单调计数：并行测试共享同一个进程，只用 pid 会互相覆盖
+    // （这曾让三个测试同时读写同一个文件而随机失败）。
+    path.push(format!(
+        "bitflip-test-{}-{}-{name}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, data).expect("写入临时目标");
+    path
+}
+
+fn state_with_target(data: &[u8]) -> (AppState, std::path::PathBuf) {
+    let path = write_temp("code.elf", data);
+    let session = bitflip_core::Session::open(&path, bitflip_core::OpenOptions::default())
+        .expect("打开临时目标");
+    let state = AppState::new(TOKEN, None).with_session(std::sync::Arc::new(session));
+    (state, path)
+}
+
+#[tokio::test]
+async fn insns_endpoint_returns_decoded_instructions() {
+    let (state, path) = state_with_target(&build_elf_with_code());
+    let (status, body) = send(state, get_with_token("/api/insns?from=0&count=16")).await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(status, StatusCode::OK, "响应: {body}");
+    assert_eq!(body["format_version"], 1);
+    assert_eq!(
+        body["page"]["format_version"],
+        bitflip_core::DISASM_FORMAT_VERSION
+    );
+
+    let instructions = body["page"]["instructions"]
+        .as_array()
+        .expect("instructions 应是数组");
+    assert!(!instructions.is_empty(), "应当解出指令，完整响应: {body}");
+
+    let first = &instructions[0];
+    assert_eq!(first["address"].as_str().expect("address").len(), 16);
+    assert_eq!(first["bytes"], "90");
+    assert_eq!(first["text"], "nop");
+    assert_eq!(first["flow"], "flow");
+
+    // 统计必须存在，且能说明覆盖率而不是笼统的"完成"
+    assert!(body["stats"]["indexed"].as_u64().expect("indexed") >= 4);
+    assert!(body["stats"]["mapped_bytes"].as_u64().expect("mapped") >= 4);
+}
+
+#[tokio::test]
+async fn insns_endpoint_clamps_oversized_count() {
+    let (state, path) = state_with_target(&build_elf_with_code());
+    let (status, body) = send(state, get_with_token("/api/insns?count=999999")).await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["page"]["requested"].as_u64().expect("requested"),
+        bitflip_core::MAX_PAGE_SIZE as u64,
+        "服务端必须把过大的 count 收敛到上限，不信任客户端"
+    );
+}
+
+#[tokio::test]
+async fn insns_endpoint_rejects_garbage_address() {
+    let (state, path) = state_with_target(&build_elf_with_code());
+    let (status, body) = send(state, get_with_token("/api/insns?from=zzz")).await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "非法地址必须报错而不是悄悄从头开始: {body}"
+    );
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(message.contains("地址无法解析"), "错误信息: {message}");
+}
+
+#[tokio::test]
+async fn insns_endpoint_beyond_end_returns_empty_page() {
+    let (state, path) = state_with_target(&build_elf_with_code());
+    // 注意：可重定位目标文件的地址是**合成的**（基址 0x1_0000_0000），
+    // 所以"超出末尾"要用远高于合成基址的地址。用一个低于基址的地址会
+    // 反向吸附到第一条指令 —— 那是 containing() 的正确语义，不是 bug。
+    let (status, body) = send(
+        state,
+        get_with_token("/api/insns?from=000000010000ffff&count=8"),
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["page"]["returned"], 0);
+    assert_eq!(body["page"]["next"], Value::Null);
+    assert!(body["page"]["instructions"]
+        .as_array()
+        .expect("数组")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn insns_endpoint_requires_token() {
+    let (state, path) = state_with_target(&build_elf_with_code());
+    let (status, _) = send(state, get("/api/insns")).await;
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn insns_endpoint_reports_unavailable_target_clearly() {
+    // 没有打开目标：必须明确说"没有目标"，而不是 500 或空页
+    let (status, body) = send(test_state(None), get_with_token("/api/insns")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "响应: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("没有打开目标"),
+        "错误信息应说明原因: {body}"
+    );
+}
+
+#[tokio::test]
+async fn insns_scan_happens_once_and_is_cached() {
+    // 同一个 state 连续请求两次：结果必须一致，且第二次不应重扫。
+    // 这里能验证的是"结果一致 + 统计稳定"；真正的性能由 bench 覆盖。
+    let (state, path) = state_with_target(&build_elf_with_code());
+
+    let (_, first) = send(state.clone(), get_with_token("/api/insns?count=8")).await;
+    let (_, second) = send(state, get_with_token("/api/insns?count=8")).await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        first["page"]["instructions"], second["page"]["instructions"],
+        "缓存后两次请求必须给出相同结果"
+    );
+    assert_eq!(first["stats"], second["stats"]);
 }

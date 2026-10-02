@@ -23,6 +23,14 @@ pub enum BitflipError {
     #[error("输入无效: {0}")]
     InvalidInput(String),
 
+    /// 该目标上做不了这项分析（格式没解析成功、没有可执行段等）。
+    ///
+    /// 与 [`BitflipError::NotYetImplemented`] 的区别很重要：
+    /// 那是"我们还没写"，这是"这个目标本身没有可分析的东西"。
+    /// 前者会随版本消失，后者不会 —— 混在一起会让用户以为等版本就够了。
+    #[error("该目标无法分析: {0}")]
+    AnalysisUnavailable(String),
+
     /// 作业执行失败。
     #[error("作业失败: {0}")]
     Job(#[from] bitflip_analyze::JobError),
@@ -37,5 +45,11 @@ impl BitflipError {
     #[must_use]
     pub const fn not_implemented(feature: &'static str) -> Self {
         Self::NotYetImplemented { feature }
+    }
+
+    /// 便捷构造"该目标无法分析"错误。
+    #[must_use]
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::AnalysisUnavailable(reason.into())
     }
 }

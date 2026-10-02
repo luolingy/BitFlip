@@ -15,6 +15,7 @@ import {
   type SectionsResponse,
   type TargetInfo,
 } from "./api";
+import { DisassemblyView } from "./DisassemblyView";
 
 type LoadState =
   | { kind: "loading" }
@@ -32,23 +33,29 @@ type LoadState =
  * `ready: true` 的项在本里程碑真实可用；其余一律标注里程碑并置灰。
  * 不做"点了没反应"的假入口（CLAUDE.md §7）。
  */
+type ViewId = "structure" | "disasm";
+
 const NAV_SECTIONS: readonly {
+  /** 只有 `ready: true` 的项才是真实可切换的视图。 */
+  id: ViewId | null;
   title: string;
   milestone: string;
   hint: string;
   ready: boolean;
 }[] = [
-  { title: "段与节", milestone: "M1", hint: "地址空间、节表、入口点", ready: true },
-  { title: "函数", milestone: "M5", hint: "函数识别 + 置信度合并", ready: false },
-  { title: "符号", milestone: "M3", hint: "符号来源与优先级", ready: false },
-  { title: "交叉引用", milestone: "M6", hint: "谁引用了我 / 我引用了谁", ready: false },
-  { title: "字符串", milestone: "M7", hint: "字符串提取与引用定位", ready: false },
-  { title: "签名匹配", milestone: "M8", hint: "库函数签名识别", ready: false },
+  { id: "structure", title: "段与节", milestone: "M1", hint: "地址空间、节表、入口点", ready: true },
+  { id: "disasm", title: "反汇编", milestone: "M2", hint: "线性 + 递归下降双策略扫描", ready: true },
+  { id: null, title: "函数", milestone: "M5", hint: "函数识别 + 置信度合并", ready: false },
+  { id: null, title: "符号", milestone: "M3", hint: "符号来源与优先级", ready: false },
+  { id: null, title: "交叉引用", milestone: "M6", hint: "谁引用了我 / 我引用了谁", ready: false },
+  { id: null, title: "字符串", milestone: "M7", hint: "字符串提取与引用定位", ready: false },
+  { id: null, title: "签名匹配", milestone: "M8", hint: "库函数签名识别", ready: false },
 ];
 
 export function App() {
   const token = useMemo(resolveToken, []);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [view, setView] = useState<ViewId>("structure");
 
   const load = useCallback(async () => {
     setState({ kind: "loading" });
@@ -138,13 +145,24 @@ export function App() {
           <PaneTitle title="导航" />
           <ul className="nav-list">
             {NAV_SECTIONS.map((section) => (
-              <li
-                key={section.title}
-                className={section.ready ? "nav-item nav-active" : "nav-item nav-disabled"}
-              >
-                <span className="nav-name">{section.title}</span>
-                <span className="nav-milestone">{section.milestone}</span>
-                <span className="nav-hint">{section.hint}</span>
+              <li key={section.id ?? section.title}>
+                <button
+                  type="button"
+                  className={
+                    section.ready
+                      ? section.id === view
+                        ? "nav-item nav-active nav-clickable"
+                        : "nav-item nav-clickable"
+                      : "nav-item nav-disabled"
+                  }
+                  onClick={section.id ? () => setView(section.id as ViewId) : undefined}
+                  disabled={!section.ready}
+                  aria-current={section.id === view ? "page" : undefined}
+                >
+                  <span className="nav-name">{section.title}</span>
+                  <span className="nav-milestone">{section.milestone}</span>
+                  <span className="nav-hint">{section.hint}</span>
+                </button>
               </li>
             ))}
           </ul>
@@ -154,8 +172,14 @@ export function App() {
         </aside>
 
         <main className="pane pane-center">
-          <PaneTitle title="段与节" />
-          {parsed ? (
+          <PaneTitle title={view === "disasm" ? "反汇编" : "段与节"} />
+          {view === "disasm" ? (
+            parsed ? (
+              <DisassemblyView token={token} />
+            ) : (
+              <ParseFailure target={target} />
+            )
+          ) : parsed ? (
             <StructureView parsed={parsed} target={target} />
           ) : (
             <ParseFailure target={target} />

@@ -1,6 +1,6 @@
 [package]
 name = "bitflip-analyze"
-description = "BitFlip 的分析流水线：作业边界、进度、取消与阶段划分"
+description = "BitFlip 的分析流水线：地址空间、解码扫描、作业边界与进度"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+bitflip-arch = { workspace = true }
+bitflip-loader = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

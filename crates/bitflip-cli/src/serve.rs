@@ -59,10 +59,11 @@ async fn serve_async(request: ServeRequest) -> anyhow::Result<()> {
     let token = request.token.unwrap_or_else(generate_token);
     let bound = bitflip_server::bind(host, request.port, 10).await?;
     let origins = default_allowed_origins(bound.addr.port(), &request.allow_origins);
-    // 解析结果随会话一起交给服务层：UI 的"结构"页需要它。
-    // 解析失败时传 None，前端会显示识别结论 + 失败原因。
-    let state = AppState::new(token.clone(), Some(info))
-        .with_parsed(session.parsed().cloned())
+    // 整个会话交给服务层：结构页需要解析结果，反汇编页还需要原始字节。
+    // 用 `with_session` 而不是分别传 target/parsed，避免三者之间出现
+    // "一个有一份、另一个是旧的" 这种不一致状态。
+    let state = AppState::new(token.clone(), None)
+        .with_session(std::sync::Arc::new(session))
         .with_allowed_origins(origins);
 
     let url = format!("http://{}/#token={}", display_addr(bound.addr), token);

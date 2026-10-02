@@ -124,11 +124,26 @@ impl Decoder for UnsupportedDecoder {
 
 /// 按架构规格取解码器。
 ///
-/// M2 之前一律返回 [`UnsupportedDecoder`]：调用方能正常工作（拿到明确的错误），
-/// 不会因为"没有解码器"而 panic，也不会得到编造的反汇编。
+/// M2 起返回真实的 capstone 后端；capstone 没有对应后端（如 wasm32）时
+/// 退回 [`UnsupportedDecoder`]，调用方拿到的是明确的
+/// [`DecodeError::Unsupported`]，而不是编造的反汇编。
+///
+/// 这样调用方不需要处理"有没有解码器"这个分支 —— 拿到的永远是
+/// 一个可用的 [`Decoder`]，只是能力不同。
 #[must_use]
 pub fn decoder_for(spec: ArchSpec) -> Box<dyn Decoder> {
-    Box::new(UnsupportedDecoder::new(spec))
+    match crate::backend::CapstoneDecoder::new(spec) {
+        Ok(decoder) => Box::new(decoder),
+        Err(error) => {
+            tracing::debug!(
+                arch = %spec.arch,
+                mode = %spec.mode,
+                %error,
+                "没有可用的解码后端，退回 UnsupportedDecoder"
+            );
+            Box::new(UnsupportedDecoder::new(spec))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -139,7 +154,9 @@ mod tests {
     #[test]
     fn unsupported_decoder_reports_clearly() {
         let spec = ArchSpec::from_arch(Arch::X86_64, Mode::M64, Endian::Little);
-        let dec = decoder_for(spec);
+        // 直接构造占位解码器（M0–M1 的行为）：它必须明确报"尚未支持"，
+        // 而不是猜一个结果。
+        let dec = UnsupportedDecoder::new(spec);
         assert_eq!(dec.spec(), spec);
         let err = dec.decode_one(&[0x90], 0x1000).unwrap_err();
         assert_eq!(
@@ -151,5 +168,31 @@ mod tests {
         );
         assert!(err.to_string().contains("尚未支持解码"));
         assert!(dec.decode_many(&[0x90; 16], 0x1000, 8).is_empty());
+    }
+
+    #[test]
+    fn decoder_for_returns_real_backend_for_supported_arch() {
+        // M2 起 x86_64 必须拿到真实解码器，而不是占位实现
+        let spec = ArchSpec::from_arch(Arch::X86_64, Mode::M64, Endian::Little);
+        let dec = decoder_for(spec);
+        assert_eq!(dec.spec(), spec);
+        let insn = dec.decode_one(&[0x90], 0x1000).expect("nop 应能解码");
+        assert_eq!(insn.len, 1);
+    }
+
+    #[test]
+    fn decoder_for_falls_back_to_unsupported_for_unknown_arch() {
+        // wasm32 没有 capstone 后端：必须退回占位解码器并明确报错，
+        // 而不是 panic，也不是拿别的架构去解 wasm 字节。
+        let spec = ArchSpec::from_arch(Arch::Wasm32, Mode::M32, Endian::Little);
+        let dec = decoder_for(spec);
+        let err = dec.decode_one(&[0x00; 8], 0x1000).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::Unsupported {
+                arch: Arch::Wasm32,
+                mode: Mode::M32
+            }
+        );
     }
 }

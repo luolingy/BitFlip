@@ -57,6 +57,30 @@ pub struct AppState {
     /// 文件畸形而不存在。UI 需要在"识别出来了但解析失败"时仍然能显示
     /// 识别结论与失败原因，而不是一片空白（CLAUDE.md §7）。
     parsed: Option<Arc<bitflip_core::ObjectInfo>>,
+    /// 本次会话打开的目标（反汇编需要它）。
+    ///
+    /// 保留整个 `Session` 而不是只保留 `ObjectInfo`：反汇编需要在原始字节上
+    /// 建地址空间，而 `ObjectInfo` 是已经"拍扁"成 wire 类型的投影，
+    /// 丢了段/节与文件偏移的对应关系。
+    session: Option<Arc<bitflip_core::Session>>,
+    /// 反汇编结果（惰性建立并缓存的）。
+    ///
+    /// ## 为什么要缓存，而不是每个请求重扫
+    ///
+    /// 一次扫描要建立地址空间、跑线性 + 递归下降解码。对 100MB 目标，
+    /// 这是秒级到十几秒的工作量。UI 每滚动一屏就发一个请求，
+    /// 如果不缓存，滚动会退化成"每次重扫 100MB" —— 这是参照实现里
+    /// "同步阻塞分析"那类设计的具体后果。
+    ///
+    /// ## 为什么用 `OnceLock` 而不是 `Mutex<Option<..>>`
+    ///
+    /// 我们要的是"只算一次"而不是"互斥更新"。`OnceLock` 让并发的
+    /// 首个请求里只有一个真正去扫，其余阻塞等待同一份结果 ——
+    /// 而 `Mutex<Option>` 会退化成"每个请求都重算一遍并互相覆盖"。
+    ///
+    /// 惰性而不是在 `serve` 时预先算：用户可能只想看段表，
+    /// 不该为此付出一次 100MB 扫描的代价。
+    disasm: Arc<std::sync::OnceLock<Result<Arc<bitflip_core::Disasm>, String>>>,
     started: Instant,
 }
 
@@ -69,8 +93,22 @@ impl AppState {
             allowed_origins: Arc::from(Vec::new()),
             target: target.map(Arc::new),
             parsed: None,
+            session: None,
+            disasm: Arc::new(std::sync::OnceLock::new()),
             started: Instant::now(),
         }
+    }
+
+    /// 附带整个会话（同时带上识别结论与解析结果）。
+    ///
+    /// 这是 `serve` 的推荐用法：一次给全，避免状态之间不一致
+    /// （比如 `target` 有而 `parsed` 没有，但实际会话是解析成功的）。
+    #[must_use]
+    pub fn with_session(mut self, session: Arc<bitflip_core::Session>) -> Self {
+        self.target = Some(Arc::new(session.info().clone()));
+        self.parsed = session.parsed().cloned().map(Arc::new);
+        self.session = Some(session);
+        self
     }
 
     /// 附带解析结果。
@@ -110,6 +148,44 @@ impl AppState {
     pub fn uptime(&self) -> Duration {
         self.started.elapsed()
     }
+
+    /// 取反汇编（惰性建立，只成功建立一次）。
+    ///
+    /// 返回 `Arc` 以便跨请求共享，避免每次响应都克隆整个指令索引。
+    ///
+    /// 失败会被缓存 —— 一个"没有可执行段"的目标不会因为用户多刷新几次
+    /// 就变得可以反汇编，重试只是浪费 CPU。
+    ///
+    /// # Errors
+    ///
+    /// 返回该目标无法反汇编的原因（未解析成功 / 没有可执行区域）。
+    pub fn disasm(&self) -> Result<Arc<bitflip_core::Disasm>, String> {
+        // 先取已算好的结果（快速路径，不持锁）
+        if let Some(ready) = self.disasm.get() {
+            return match ready {
+                Ok(disasm) => Ok(Arc::clone(disasm)),
+                Err(reason) => Err(reason.clone()),
+            };
+        }
+
+        // 没有会话就没有目标：这是"sections 也没得看"的情形
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标".to_string());
+        };
+
+        // get_or_init 保证并发首请求里只有一个真正执行扫描
+        let result = self.disasm.get_or_init(|| {
+            match session.disassemble(bitflip_core::DisasmScanOptions::default()) {
+                Ok(disasm) => Ok(Arc::new(disasm)),
+                Err(error) => Err(error.to_string()),
+            }
+        });
+
+        match result {
+            Ok(disasm) => Ok(Arc::clone(disasm)),
+            Err(reason) => Err(reason.clone()),
+        }
+    }
 }
 
 /// 生成访问令牌：32 字节随机数的十六进制表示（64 字符）。
@@ -145,6 +221,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/target", get(target))
         .route("/api/sections", get(sections))
+        .route("/api/insns", get(insns))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -214,6 +291,75 @@ async fn sections(State(state): State<AppState>) -> Response {
         format_version: info.format_version,
         target: info.clone(),
         parsed: state.parsed().cloned(),
+    })
+    .into_response()
+}
+
+/// 反汇编分页响应。
+#[derive(Serialize)]
+struct InsnsResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 本页内容。
+    page: bitflip_core::InsnPage,
+    /// 扫描统计（UI 用来说明覆盖率，而不是笼统的"分析完成"）。
+    stats: bitflip_core::DisasmStats,
+    /// 本目标的降级说明（合成地址、截断、无法解码的字节数…）。
+    ///
+    /// 单列一个字段而不是塞进 `target.notes`：这些是**分析期**产生的说明，
+    /// 而 `target.notes` 是解析期的。混在一起会让用户分不清
+    /// "文件有问题"和"分析有取舍"。
+    notes: Vec<String>,
+}
+
+/// 查询参数：反汇编分页。
+#[derive(serde::Deserialize)]
+struct InsnsQuery {
+    /// 起始地址。接受 `0x` 前缀或裸十六进制；省略则从地址空间开头开始。
+    from: Option<String>,
+    /// 请求条数；服务端会 clamp 到 `MAX_PAGE_SIZE`。
+    count: Option<usize>,
+}
+
+/// 反汇编分页：`GET /api/insns?from=<hex>&count=<n>`。
+///
+/// 列式分页而不是一次返回全部：100 万条指令序列化成 JSON 是几百 MB，
+/// 浏览器和内存都撑不住。服务端只渲染请求的那一页。
+async fn insns(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<InsnsQuery>,
+) -> Response {
+    let disasm = match state.disasm() {
+        Ok(disasm) => disasm,
+        Err(reason) => {
+            // 400 而不是 404：目标是存在的，只是它没有可反汇编的内容。
+            // 404 会让客户端以为"目标不存在"而去重新打开文件。
+            return error_response(StatusCode::BAD_REQUEST, &reason);
+        }
+    };
+
+    // 地址解析失败要明确报错，而不是悄悄从头开始 ——
+    // 那会让用户以为自己跳转成功了，其实只是回到了开头。
+    let from = match query.from.as_deref() {
+        None | Some("") => 0,
+        Some(text) => match bitflip_core::parse_address(text) {
+            Some(addr) => addr,
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("地址无法解析：{text:?}（需要 16 进制，可带 0x 前缀）"),
+                );
+            }
+        },
+    };
+
+    let count = query.count.unwrap_or(bitflip_core::DEFAULT_PAGE_SIZE);
+
+    Json(InsnsResponse {
+        format_version: bitflip_core::DISASM_FORMAT_VERSION,
+        page: disasm.page(from, count),
+        stats: disasm.wire_stats(),
+        notes: disasm.notes.clone(),
     })
     .into_response()
 }

@@ -122,6 +122,70 @@ export interface SectionsResponse {
   parsed: ObjectInfo | null;
 }
 
+/** 一条指令（列式 wire 表示）。对应 `bitflip-core::InsnWire`。 */
+export interface InsnWire {
+  /** 定长 16 位小写十六进制地址。 */
+  address: string;
+  /** 编码长度（字节）。 */
+  length: number;
+  /** 机器码（小写十六进制，无分隔）。 */
+  bytes: string;
+  /** 渲染后的指令文本。 */
+  text: string;
+  /** 稳定短名：`flow` / `call` / `jump` / `cond-jump` / `ret` / `trap` / `unknown`。 */
+  flow: string;
+  /** 流程的中文标签。 */
+  flow_label: string;
+  /** 直接控制流目标；间接跳转/调用为 `null`。 */
+  target: string | null;
+  /**
+   * 是否被递归下降证明可达。
+   *
+   * 这是**可信度**信号：线性扫描会把数据误当指令，因此
+   * `reachable === false` 的行必须被显著地区分显示，而不是与可达指令同样对待。
+   */
+  reachable: boolean;
+}
+
+/** 一页反汇编。对应 `bitflip-core::InsnPage`。 */
+export interface InsnPage {
+  format_version: number;
+  /** 本页起始地址（定长十六进制）。 */
+  from: string;
+  /** 请求的条数上限。 */
+  requested: number;
+  /** 实际返回的条数。 */
+  returned: number;
+  /** 下一页游标；`null` 表示后面没有更多已索引指令。 */
+  next: string | null;
+  has_more: boolean;
+  instructions: InsnWire[];
+}
+
+/** 扫描统计。对应 `bitflip-core::DisasmStats`。 */
+export interface DisasmStats {
+  indexed: number;
+  /** 递归下降可达的条数。 */
+  reachable: number;
+  /** 仅线性扫描覆盖的条数（可信度较低）。 */
+  linear_only: number;
+  decode_failures: number;
+  executable_segments: number;
+  truncated: number;
+  mapped_bytes: number;
+  /** 索引常驻内存估算（字节）。 */
+  index_bytes: number;
+}
+
+/** `/api/insns` 响应。 */
+export interface InsnsResponse {
+  format_version: number;
+  page: InsnPage;
+  stats: DisasmStats;
+  /** 分析期产生的降级说明（合成地址、截断、无法解码的字节数…）。 */
+  notes: string[];
+}
+
 /** `/api/health` 响应。 */
 export interface HealthResponse {
   ok: boolean;
@@ -240,6 +304,26 @@ export function formatAddress(address: string | null | undefined): string {
   // 去掉前导 0，但至少保留一位
   const trimmed = address.replace(/^0+/, "") || "0";
   return `0x${trimmed}`;
+}
+
+/**
+ * 取一页反汇编。
+ *
+ * `from` 传定长十六进制地址或其前缀；传 `null` 表示从头开始。
+ * 地址落在某条指令中间时，服务端会吸附到**包含**该地址的那条指令
+ * （见 `InsnIndex::containing`），因此这里不需要客户端的额外处理。
+ */
+export function fetchInsns(
+  token: string | null,
+  from: string | null,
+  count: number,
+): Promise<InsnsResponse> {
+  const params = new URLSearchParams();
+  if (from) {
+    params.set("from", from);
+  }
+  params.set("count", String(count));
+  return request<InsnsResponse>(`/api/insns?${params.toString()}`, token);
 }
 
 /** 把字节数渲染成人类可读形式。 */

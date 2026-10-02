@@ -26,9 +26,11 @@ bitflip-cli = { path = "crates/bitflip-cli", version = "0.0.1" }
 # 外部依赖（版本与 docs/DECISIONS.md 一致）
 anyhow = "1"
 axum = "0.8"
+capstone = "0.14"
 clap = { version = "4", features = ["derive", "env"] }
 mime_guess = "2"
 rand = "0.8"
+rayon = "1"
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

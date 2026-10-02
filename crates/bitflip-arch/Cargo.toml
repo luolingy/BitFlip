@@ -11,6 +11,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+capstone = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
