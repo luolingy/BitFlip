@@ -55,9 +55,13 @@ M0 的目标是"骨架跑通、边界定死、不假装能干还没做的事"。
   - `scripts/gen-fixtures.ps1`：用 clang 交叉编译 / mingw / MSVC / llvm-ar /
     llvm-lib 生成 21 个样本（PE、COFF、ELF 六种架构、静态库、raw、截断、超窗口），
     **样本不入库**，缺失的工具链会逐条报告而不是静默跳过；
-  - `scripts/preflight.ps1`：一条命令跑完 `temp/` 守卫 + fmt + clippy + test + 前端类型检查；
-  - `scripts/smoke-server.mjs`、`scripts/smoke-port-fallback.ps1`：端到端冒烟测试；
-  - `.github/workflows/ci.yml`：fmt/clippy/test 门禁 + 构建 SPA 后的服务冒烟测试。
+  - `scripts/preflight.ps1`：一条命令跑完 `temp/` 守卫 + fmt + clippy + test +
+    前端类型检查 + 回环绑定校验；
+  - `scripts/smoke-server.mjs`、`scripts/smoke-port-fallback.ps1`、
+    `scripts/smoke-bind.ps1`：三个端到端冒烟测试（令牌/Origin、端口回退与令牌隔离、
+    **只绑回环地址对着真实监听套接字验证**）；
+  - `.github/workflows/ci.yml`：fmt/clippy/test 门禁 + 构建 SPA 后的服务冒烟测试
+    （含 403 用例、只绑回环校验、`bitflip <target>` 用户入口可起服务）。
 - **许可证**：MIT OR Apache-2.0 双许可（ADR-0007）。
 - **文档**：`docs/DECISIONS.md` 增补 ADR-0007（许可证）、ADR-0008（本地 crates 代理）、
   ADR-0009（npm 缓存重定向）；D6 决策门关闭。

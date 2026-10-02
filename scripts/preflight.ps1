@@ -1,19 +1,22 @@
 # BitFlip preflight: one-shot version of the CLAUDE.md section 5 checklist.
 #
-# Runs: staged temp/ guard, cargo fmt --check, clippy -D warnings, tests, and
-# (when web/node_modules exists) the SPA typecheck. Exits non-zero if any step
-# fails, so it can be used in a pre-push hook or by hand.
+# Runs: staged temp/ guard, cargo fmt --check, clippy -D warnings, tests,
+# (when web/node_modules exists) the SPA typecheck, and (when a built binary
+# exists) the bind-address smoke test.
+#
+# Exits non-zero if any step fails, so it can be used by hand or in a hook.
 #
 # Usage:
 #   & .\scripts\preflight.ps1
-#   & .\scripts\preflight.ps1 -SkipWeb
+#   & .\scripts\preflight.ps1 -SkipWeb -SkipSmoke
 #
 # NOTE: keep this file ASCII-only. Windows PowerShell 5.1 reads non-BOM files as
 # ANSI, so any non-ASCII byte breaks parsing (see CLAUDE.md section 6).
 
 [CmdletBinding()]
 param(
-    [switch]$SkipWeb
+    [switch]$SkipWeb,
+    [switch]$SkipSmoke
 )
 
 $ErrorActionPreference = 'Continue'
@@ -89,6 +92,22 @@ try {
             Write-Host ""
             Write-Host "=== npm run typecheck"
             Write-Host "--- SKIP (web/node_modules missing; run: npm install --cache .npm-cache)"
+        }
+    }
+
+    # The loopback-only bind is a security claim, so it is checked against a real
+    # listening socket rather than the CLI default. Skipped when nothing is built.
+    if (-not $SkipSmoke) {
+        $smokeBin = Join-Path $repoRoot '.cargo-target/debug/bitflip-cli.exe'
+        if (Test-Path -LiteralPath $smokeBin) {
+            Invoke-Step -Name 'loopback-only bind' -Action {
+                & (Join-Path $PSScriptRoot 'smoke-bind.ps1') -Bin '.cargo-target/debug/bitflip-cli.exe' | Out-Host
+            } | Out-Null
+        }
+        else {
+            Write-Host ""
+            Write-Host "=== loopback-only bind"
+            Write-Host "--- SKIP (no debug binary; run: & .\scripts\cargo.ps1 build --workspace)"
         }
     }
 

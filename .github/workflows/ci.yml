@@ -104,5 +104,55 @@ jobs:
             http://127.0.0.1:8790/api/health)
           test "$code" = "403" || { echo "期望 403，实际 $code"; exit 1; }
 
+      - name: 只绑定回环地址
+        run: |
+          set -euo pipefail
+          # 「只绑回环」是 README 里的安全承诺，必须对着真实监听套接字验证，
+          # 而不是只检查 CLI 的默认值。
+          lan_ip=$(hostname -I | awk '{print $1}')
+          if [ -z "$lan_ip" ]; then
+            echo "无法确定非回环地址，跳过"; exit 0
+          fi
+          # 用 8795：与上面那两个步骤的端口（8790 及其回退位 8791）隔开，
+          # 避免步骤之间抢端口导致偶发失败。
+          ./target/release/bitflip-cli serve tests/fixtures/generated/elf-x86_64.o \
+            --no-open --port 8795 --token bind-token &
+          server_pid=$!
+          trap 'kill $server_pid 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8795/; then break; fi
+            sleep 0.5
+          done
+
+          echo "--- 回环地址：期望可达"
+          curl -sf -H 'X-BitFlip-Token: bind-token' http://127.0.0.1:8795/api/health >/dev/null
+
+          echo "--- 非回环地址 $lan_ip：期望不可达"
+          if curl -sf --max-time 5 -o /dev/null "http://$lan_ip:8795/"; then
+            echo "失败：服务在 $lan_ip 上可达，违反只绑回环的承诺"; exit 1
+          fi
+          echo "OK：$lan_ip 不可达"
+
+      - name: bitflip <target> 可起服务（用户实际入口）
+        run: |
+          set -euo pipefail
+          # 这是 README 里告诉用户的第一条命令，必须真的能起服务。
+          # 用 --no-open：CI 无浏览器，否则 open_url 会失败（虽然它会降级，但没必要）。
+          ./target/release/bitflip tests/fixtures/generated/elf-x86_64.o \
+            --no-open --port 8796 --token entry-token > /tmp/entry.log 2>&1 &
+          server_pid=$!
+          trap 'kill $server_pid 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8796/; then break; fi
+            sleep 0.5
+          done
+
+          cat /tmp/entry.log
+          curl -sf -H 'X-BitFlip-Token: entry-token' http://127.0.0.1:8796/api/health | grep -q '"ok":true'
+          # 横幅里的 URL 必须带片段令牌，否则用户点进去会被 403 挡住
+          grep -q '#token=entry-token' /tmp/entry.log
+
       - name: 前端确实被内嵌
         run: ./target/release/bitflip-cli version | grep -q '已内嵌'

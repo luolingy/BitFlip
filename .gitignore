@@ -46,6 +46,10 @@ yarn-error.log*
 /.npm-cache/
 /.probe/
 /.cargo-home/
+# 冒烟测试的输出（preflight 与 smoke-*.ps1 会写这里）
+/.smoke-logs/
+# 临时提交信息文件
+/.commit-msg.txt
 
 # IDE / OS
 .idea/
