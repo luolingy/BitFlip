@@ -60,3 +60,19 @@ cargo test --workspace
 cargo bench --no-run          # 基准能编译
 cd web && npm run typecheck   # SPA 起用后
 ```
+
+**入库守卫（每次 commit 前必做）**：
+
+```
+git diff --cached --name-only | grep -i '^temp/' && echo "禁止提交 temp/" && exit 1
+```
+
+PowerShell 等价：
+
+```powershell
+git diff --cached --name-only | Select-String '^temp/' # 有输出即中止
+```
+
+> 已知限制：`.githooks/pre-commit` 在受限沙箱里无法启动（git 通过 `sh.exe` 跑钩子，
+> 沙箱会拒绝其 `CreateFileMapping`，表现为 `sh.exe: fatal error`）。
+> 因此钩子只是**第二道**防线，第一道是上面这条手动检查 —— 两者都不可省。
