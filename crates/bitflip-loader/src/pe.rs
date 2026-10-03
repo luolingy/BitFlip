@@ -344,17 +344,21 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
             ));
         }
 
-        // .NET 检测
+        // .NET 检测：解析 IMAGE_COR20_HEADER，取出可核实的识别信息。
+        //
+        // PLAN §1.4 对这一项的要求是"仅识别（M3）：识别并提示，不做 CIL 反编译"，
+        // 所以这里只读头、不解元数据表、不反编译。但也不该只报一句"有 CLI 头" ——
+        // 头里的 flags / 入口 RVA / 运行时版本字符串都是**能核实**的事实，
+        // 报出来才知道到底是 .NET 可执行体还是纯 IL 的 DLL。
         if let Some(dir) = opt
             .dirs
             .get(dir::COM_DESCRIPTOR)
             .copied()
             .filter(|d| !d.is_empty())
         {
-            object.note(format!(
-                "包含 CLI 头（RVA {:#x}）：这是一个 .NET 托管程序集，本工具只做识别，不反编译 CIL（见 docs/PLAN.md §1.4）",
-                dir.rva
-            ));
+            for note in describe_cli_header(&reader, &object, dir) {
+                object.note(note);
+            }
         }
     }
 
@@ -1005,6 +1009,229 @@ fn parse_pdata(
         .collect())
 }
 
+/// 解析 `IMAGE_COR20_HEADER` 并返回识别结论（notes）。
+///
+/// PLAN §1.4：这一项只做**识别**，不做 CIL 反编译。但"识别"不等于只报一句
+/// "有 CLI 头" —— 头里有若干**能核实**的事实，报出来才能让用户判断这个文件
+/// 到底是什么：
+///
+/// * `Flags` 的 `ILONLY` / `32BITREQUIRED` / `NATIVE_ENTRYPOINT` —— 决定它是
+///   纯 IL 还是混合模式（C++/CLI），直接影响"能不能当普通 PE 反汇编"；
+/// * `EntryPointToken` —— 托管入口的方法 token（0 表示没有），
+///   **不是** PE 的 `AddressOfEntryPoint`。这两个很容易被混为一谈；
+/// * `MetaData` 目录 —— 元数据根的 RVA/大小；
+/// * `RuntimeVersion` —— 形如 `v4.0.30319` 的版本串，是 BCL 兼容性的直接依据。
+///
+/// `IMAGE_COR20_HEADER` 布局（72 字节，全部小端）：
+/// ```text
+///  0  cb                     u32   头字节数（应为 72）
+///  4  MajorRuntimeVersion    u16
+///  6  MinorRuntimeVersion    u16
+///  8  MetaData               RVA+Size 目录（8 字节）
+/// 16  Flags                  u32
+/// 20  EntryPointToken        u32
+/// 24  Resources              RVA+Size 目录
+/// 32  StrongNameSignature    RVA+Size 目录
+/// 40  CodeManagerTable       RVA+Size 目录
+/// 48  VTableFixups           RVA+Size 目录
+/// 56  ExportAddressTableJumps RVA+Size 目录
+/// 64  ManagedNativeHeader    RVA+Size 目录
+/// ```
+fn describe_cli_header(reader: &Reader<'_>, object: &Object, dir: DataDir) -> Vec<String> {
+    /// CLI 头的固定大小。
+    const COR20_HEADER_SIZE: u64 = 72;
+
+    let mut notes = Vec::new();
+
+    let Some(offset) = rva_to_offset(object, dir.rva) else {
+        notes.push(format!(
+            "包含 CLI 头（RVA {:#x}），但该 RVA 无法映射到文件偏移：CLI 头内容不可读",
+            dir.rva
+        ));
+        return notes;
+    };
+
+    let Ok(_probe) = reader.slice(offset, COR20_HEADER_SIZE, "CLI 头") else {
+        notes.push(format!(
+            "包含 CLI 头（RVA {:#x}，偏移 {offset:#x}），但文件在此处不足 {COR20_HEADER_SIZE} 字节，无法读取",
+            dir.rva
+        ));
+        return notes;
+    };
+
+    // 用 reader 直接在绝对偏移处读：`slice` 只返回字节切片，没有读取方法。
+    let read_u32 = |at: u64, what: &'static str| {
+        reader
+            .u32(offset + at, Endianness::Little, what)
+            .unwrap_or(0)
+    };
+    let read_u16 = |at: u64, what: &'static str| {
+        reader
+            .u16(offset + at, Endianness::Little, what)
+            .unwrap_or(0)
+    };
+
+    let cb = read_u32(0, "cb");
+    let major = read_u16(4, "MajorRuntimeVersion");
+    let minor = read_u16(6, "MinorRuntimeVersion");
+    let metadata_rva = read_u32(8, "MetaData.RVA");
+    let metadata_size = read_u32(12, "MetaData.Size");
+    let flags = read_u32(16, "Flags");
+    let entry_token = read_u32(20, "EntryPointToken");
+
+    // Flags 位定义（ECMA-335 II.25.3.1）
+    const COMIMAGE_FLAGS_ILONLY: u32 = 0x0000_0001;
+    const COMIMAGE_FLAGS_32BITREQUIRED: u32 = 0x0000_0002;
+    const COMIMAGE_FLAGS_32BITPREFERRED: u32 = 0x0002_0000;
+    const COMIMAGE_FLAGS_NATIVE_ENTRYPOINT: u32 = 0x0000_0010;
+    const COMIMAGE_FLAGS_STRONGNAMESIGNED: u32 = 0x0000_0008;
+
+    let mut traits = Vec::new();
+    if flags & COMIMAGE_FLAGS_ILONLY != 0 {
+        traits.push("ILONLY");
+    }
+    if flags & COMIMAGE_FLAGS_NATIVE_ENTRYPOINT != 0 {
+        traits.push("NATIVE_ENTRYPOINT");
+    }
+    if flags & COMIMAGE_FLAGS_32BITREQUIRED != 0 {
+        traits.push("32BITREQUIRED");
+    }
+    if flags & COMIMAGE_FLAGS_32BITPREFERRED != 0 {
+        traits.push("32BITPREFERRED");
+    }
+    if flags & COMIMAGE_FLAGS_STRONGNAMESIGNED != 0 {
+        traits.push("STRONGNAMESIGNED");
+    }
+    let trait_text = if traits.is_empty() {
+        "无标志位".to_string()
+    } else {
+        traits.join("|")
+    };
+
+    // 混合模式（C++/CLI）与纯 IL 的处理方式完全不同，值得单独点出来：
+    // 混合模式里含真实原生代码，可以当普通 PE 反汇编；纯 IL 的 .text
+    // 是 IL 字节码，按 x86/x64 反汇编只会得到一片无意义的指令。
+    let il_only = flags & COMIMAGE_FLAGS_ILONLY != 0;
+    let mixed = !il_only;
+
+    notes.push(format!(
+        "这是一个 .NET 托管程序集（CLI 头 RVA {:#x}，头大小 {cb} 字节，\
+         运行时版本 {major}.{minor}，标志 {trait_text}）",
+        dir.rva
+    ));
+
+    if mixed {
+        notes.push(
+            "该程序集不是纯 IL（缺 ILONLY 标志）：属于混合模式（很可能 C++/CLI），\
+             其中包含真实的原生代码，可以按普通 PE 反汇编；托管部分不做 CIL 反编译"
+                .to_string(),
+        );
+    } else {
+        notes.push(
+            "这是纯 IL 程序集：`.text` 段里是 IL 字节码，按 x86/x64 反汇编不会得到\
+             有意义的指令。本工具只做识别，不反编译 CIL（见 docs/PLAN.md §1.4）"
+                .to_string(),
+        );
+    }
+
+    if entry_token != 0 {
+        // 托管入口是**方法 token**（0x06xxxxxx 方法表 / 0x0Axxxxxx 方法规格），
+        // 不是 PE 头的 AddressOfEntryPoint —— 两者数值相近但含义完全不同。
+        let table = entry_token >> 24;
+        let index = entry_token & 0x00ff_ffff;
+        let table_name = match table {
+            0x06 => "MethodDef",
+            0x0a => "MethodSpec",
+            0x01 => "TypeRef",
+            0x02 => "TypeDef",
+            _ => "未知表",
+        };
+        notes.push(format!(
+            "托管入口是方法 token 0x{entry_token:08x}（{table_name} 表第 {index} 项），\
+             与 PE 头的 AddressOfEntryPoint 不是同一概念"
+        ));
+    } else {
+        notes.push("该程序集没有托管入口（EntryPointToken = 0），通常是类库".to_string());
+    }
+
+    if metadata_size == 0 || metadata_rva == 0 {
+        notes.push(
+            "CLI 头里的 MetaData 目录为空：元数据根不可定位，无法进一步识别程序集内容".to_string(),
+        );
+    } else {
+        notes.push(format!(
+            "元数据根位于 RVA {metadata_rva:#x}（{metadata_size} 字节）：程序集名与类型定义在那里，\
+             M3 不做元数据表解析"
+        ));
+    }
+
+    // 尝试读运行时版本字符串。它是 BCL 兼容性的直接依据，值得单独报。
+    // 形如 "v4.0.30319" 或 "v2.0.50727"，以 NUL 结尾。
+    if let Some(version) = read_runtime_version(reader, object, metadata_rva, metadata_size) {
+        notes.push(format!("目标运行时版本字符串：{version}"));
+    }
+
+    notes
+}
+
+/// 从元数据根读运行时版本字符串。
+///
+/// 布局（`IMAGE_COR20_METADATA`，ECMA-335 II.24.2.1）：
+/// ```text
+///  0  Signature    u32   0x424A5342 ("BSJB")
+///  4  MajorVersion u16
+///  6  MinorVersion u16
+///  8  Reserved     u32
+/// 12  Length       u32   版本字符串字节数（**含** NUL，向上取整到 4 的倍数）
+/// 16  Version      u8[Length]
+/// ```
+///
+/// 只在签名对得上时返回；签名不对说明这不是标准的元数据根，返回 `None`
+/// 让上层如实说"读不出来"，而不是猜一个版本号出来（§7）。
+fn read_runtime_version(
+    reader: &Reader<'_>,
+    object: &Object,
+    metadata_rva: u32,
+    metadata_size: u32,
+) -> Option<String> {
+    // "BSJB" 的**小端**读数。
+    //
+    // 这个字面量极易写错：字节是 `42 53 4a 42`，小端读出来是 0x424a5342，
+    // 而"按书写顺序"写会得到 0x4242534a（大端读数）。第一版就写错了，
+    // 而且**手拼的单元测试跟着一起错**（测试里也写了同一个错常量），
+    // 所以单元测试全绿 —— 直到用真实的 System.dll 才暴露出来。
+    // 保留这条注释：这是"合成样本测不出编码理解错误"的活例子。
+    const SIG_BSJB: u32 = u32::from_le_bytes(*b"BSJB");
+    /// 版本串长度上限：真实值约 10-12 字节。给足余量但不是无限制。
+    const MAX_VERSION_LEN: u32 = 1024;
+
+    if metadata_size < 20 {
+        return None;
+    }
+    let offset = rva_to_offset(object, metadata_rva)?;
+    reader.slice(offset, 20, "元数据根").ok()?;
+    let signature = reader.u32(offset, Endianness::Little, "BSJB 签名").ok()?;
+    if signature != SIG_BSJB {
+        return None;
+    }
+    let length = reader
+        .u32(offset + 12, Endianness::Little, "版本串长度")
+        .ok()?;
+    if length == 0 || length > MAX_VERSION_LEN {
+        return None;
+    }
+    let data = reader
+        .slice(offset + 16, u64::from(length), "版本串")
+        .ok()?;
+    // 去掉尾部 NUL 与对齐填充
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    let text = std::str::from_utf8(&data[..end]).ok()?;
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 /// 解析 COFF 符号表（目标文件）。
 fn parse_coff_symbols(
     reader: &Reader<'_>,
@@ -1167,6 +1394,196 @@ mod tests {
         bytes[sec..sec + 8].copy_from_slice(b".textbss");
         let obj = parse(&bytes, 0, ObjectId::Plain).unwrap();
         assert_eq!(obj.sections[0].name, ".textbss");
+    }
+
+    /// 测试用：CLI 头 + 元数据根需要预留的字节数（72 + 版本串余量）。
+    const COR20_TEST_SIZE: usize = 72 + 128;
+
+    /// 构造一个带 CLI 头的 .NET 程序集。
+    ///
+    /// `flags` 决定是纯 IL 还是混合模式；`entry_token` 为 0 表示类库。
+    /// 同时写入 `IMAGE_COR20_HEADER` 与一个可被识别的元数据根
+    /// （含 `BSJB` 签名与版本串），以便验证版本串确实被读出来了。
+    fn pe64_with_cli(flags: u32, entry_token: u32, runtime_version: &str) -> Vec<u8> {
+        let mut bytes = minimal_pe64();
+        let opt = 0x84 + 20;
+        // CLI 头必须落在节声明覆盖的范围内，`rva_to_offset` 才能映射到它：
+        // .text 是 RVA 0x1000 / SizeOfRawData 0x400 / PointerToRawData 0x200。
+        // 这里放到 RVA 0x1200（节内偏移 0x200，文件偏移 0x400），
+        // 与节表的声明保持一致 —— 否则解析器会（正确地）说"映射不到"。
+        let cli_rva: u32 = 0x1200;
+        let cli_off = 0x200 + (cli_rva as usize - 0x1000);
+        // 头 + 元数据根需要约 140 字节，撑到 0x400+0x140 之后
+        let need = cli_off + COR20_TEST_SIZE;
+        if bytes.len() < need {
+            bytes.resize(need, 0);
+        }
+
+        // 数据目录 14 项 = CLI
+        let dir_cli = opt + 112 + 14 * 8;
+        bytes[dir_cli..dir_cli + 4].copy_from_slice(&cli_rva.to_le_bytes());
+        bytes[dir_cli + 4..dir_cli + 8].copy_from_slice(&72u32.to_le_bytes());
+
+        // 元数据根紧随 CLI 头之后
+        let meta_rva = cli_rva + 72;
+        let meta_off = cli_off + 72;
+
+        // ── IMAGE_COR20_HEADER ──
+        bytes[cli_off..cli_off + 4].copy_from_slice(&72u32.to_le_bytes()); // cb
+        bytes[cli_off + 4..cli_off + 6].copy_from_slice(&2u16.to_le_bytes()); // Major
+        bytes[cli_off + 6..cli_off + 8].copy_from_slice(&5u16.to_le_bytes()); // Minor
+        bytes[cli_off + 8..cli_off + 12].copy_from_slice(&meta_rva.to_le_bytes());
+        bytes[cli_off + 12..cli_off + 16].copy_from_slice(&64u32.to_le_bytes()); // MetaData.Size
+        bytes[cli_off + 16..cli_off + 20].copy_from_slice(&flags.to_le_bytes());
+        bytes[cli_off + 20..cli_off + 24].copy_from_slice(&entry_token.to_le_bytes());
+
+        // ── 元数据根 ──
+        // 用 u32::from_le_bytes 从字节推常量，而不是手写十六进制字面量：
+        // 手写时极易把 0x424a5342 写成 0x4242534a（大端读数），
+        // 而且测试与实现会一起错、互相"验证"通过。
+        bytes[meta_off..meta_off + 4].copy_from_slice(b"BSJB");
+        bytes[meta_off + 4..meta_off + 6].copy_from_slice(&1u16.to_le_bytes());
+        bytes[meta_off + 6..meta_off + 8].copy_from_slice(&1u16.to_le_bytes());
+        // 版本串长度：含 NUL，向上取整到 4 的倍数
+        let raw_len = runtime_version.len() + 1;
+        let padded = raw_len.div_ceil(4) * 4;
+        bytes[meta_off + 12..meta_off + 16].copy_from_slice(&(padded as u32).to_le_bytes());
+        bytes[meta_off + 16..meta_off + 16 + runtime_version.len()]
+            .copy_from_slice(runtime_version.as_bytes());
+
+        bytes
+    }
+
+    /// 纯 IL 程序集：识别出 .NET，并指出 .text 是 IL 字节码、不可按 x64 反汇编。
+    #[test]
+    fn recognizes_pure_il_dotnet_assembly() {
+        const ILONLY: u32 = 0x0000_0001;
+        let bytes = pe64_with_cli(ILONLY, 0x0600_0002, "v4.0.30319");
+        let obj = parse(&bytes, 0, ObjectId::Plain).unwrap();
+
+        let joined = obj.notes.join("\n");
+        assert!(
+            joined.contains(".NET 托管程序集"),
+            "应识别为 .NET 程序集：{:?}",
+            obj.notes
+        );
+        assert!(
+            joined.contains("ILONLY"),
+            "应报出 ILONLY 标志：{:?}",
+            obj.notes
+        );
+        assert!(
+            joined.contains("纯 IL"),
+            "纯 IL 程序集必须提示 .text 是 IL 字节码、不可按 x64 反汇编：{:?}",
+            obj.notes
+        );
+        // 入口 token 要按"方法 token"解读，而不是冒充 AddressOfEntryPoint
+        assert!(
+            joined.contains("0x06000002") && joined.contains("MethodDef"),
+            "托管入口应报为方法 token：{:?}",
+            obj.notes
+        );
+        assert!(
+            joined.contains("v4.0.30319"),
+            "应读出运行时版本串：{:?}",
+            obj.notes
+        );
+    }
+
+    /// 混合模式（C++/CLI）：必须提示含真实原生代码，可以正常反汇编。
+    ///
+    /// 这条与纯 IL 的结论**相反**，所以不能只判断"有没有 CLI 头"就下结论 ——
+    /// 两种程序的 .text 性质完全不同。
+    #[test]
+    fn recognizes_mixed_mode_assembly_differently() {
+        // 没有 ILONLY，但有 NATIVE_ENTRYPOINT
+        const NATIVE_ENTRYPOINT: u32 = 0x0000_0010;
+        let bytes = pe64_with_cli(NATIVE_ENTRYPOINT, 0x0600_0001, "v4.0.30319");
+        let obj = parse(&bytes, 0, ObjectId::Plain).unwrap();
+
+        let joined = obj.notes.join("\n");
+        assert!(
+            joined.contains("混合模式"),
+            "应识别为混合模式：{:?}",
+            obj.notes
+        );
+        assert!(
+            joined.contains("可以按普通 PE 反汇编"),
+            "混合模式含原生代码，必须说明可以反汇编：{:?}",
+            obj.notes
+        );
+        assert!(
+            !joined.contains("这是纯 IL 程序集"),
+            "混合模式不能被说成纯 IL：{:?}",
+            obj.notes
+        );
+    }
+
+    /// 没有托管入口的是类库，不是可执行体 —— 必须说清楚。
+    #[test]
+    fn library_without_entry_point_says_so() {
+        const ILONLY: u32 = 0x0000_0001;
+        let bytes = pe64_with_cli(ILONLY, 0, "v4.0.30319");
+        let obj = parse(&bytes, 0, ObjectId::Plain).unwrap();
+        let joined = obj.notes.join("\n");
+        assert!(
+            joined.contains("没有托管入口") && joined.contains("类库"),
+            "EntryPointToken=0 应报为类库：{:?}",
+            obj.notes
+        );
+    }
+
+    /// 没有 CLI 数据目录的普通 PE **不能**被说成 .NET。
+    ///
+    /// 这是反面的关键一条：误报会让用户以为一个普通 C++ 程序是托管的。
+    #[test]
+    fn plain_pe_is_not_reported_as_dotnet() {
+        let obj = parse(&minimal_pe64(), 0, ObjectId::Plain).unwrap();
+        let joined = obj.notes.join("\n");
+        assert!(
+            !joined.contains(".NET"),
+            "普通 PE 不该被报成 .NET：{:?}",
+            obj.notes
+        );
+        assert!(!joined.contains("托管"), "普通 PE 不该出现托管字样");
+    }
+
+    /// CLI 头 RVA 指向文件外时，要如实说"读不出来"，不能编造标志位。
+    #[test]
+    fn cli_header_outside_the_file_is_reported_not_guessed() {
+        let mut bytes = minimal_pe64();
+        let opt = 0x84 + 20;
+        let dir_cli = opt + 112 + 14 * 8;
+        // RVA 远超出映像范围
+        bytes[dir_cli..dir_cli + 4].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
+        bytes[dir_cli + 4..dir_cli + 8].copy_from_slice(&72u32.to_le_bytes());
+
+        let obj = parse(&bytes, 0, ObjectId::Plain).unwrap();
+        let joined = obj.notes.join("\n");
+        assert!(joined.contains("CLI 头"), "应提到 CLI 头：{:?}", obj.notes);
+        // 不能因为读不到就默认 ILONLY 之类的结论
+        assert!(
+            !joined.contains("纯 IL") && !joined.contains("混合模式"),
+            "头读不出来时不该给出 IL/混合模式的结论：{:?}",
+            obj.notes
+        );
+    }
+
+    /// 元数据根签名不对时，不编造版本串。
+    #[test]
+    fn bogus_metadata_signature_yields_no_version_string() {
+        let mut bytes = pe64_with_cli(0x0000_0001, 0x0600_0001, "v4.0.30319");
+        let cli_off = 0x200 + (0x1200 - 0x1000);
+        let meta_off = cli_off + 72;
+        // 破坏 BSJB 签名
+        bytes[meta_off] = 0xff;
+        let obj = parse(&bytes, 0, ObjectId::Plain).unwrap();
+        let joined = obj.notes.join("\n");
+        assert!(
+            !joined.contains("v4.0.30319"),
+            "签名不对时不该报出版本串：{:?}",
+            obj.notes
+        );
     }
 
     #[test]
