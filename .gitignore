@@ -46,6 +46,8 @@ yarn-error.log*
 /.npm-cache/
 /.probe/
 /.cargo-home/
+# 构建期临时目录（把 TMP/TEMP 指到仓库内，避免写 C: 盘）
+/.cargo-tmp/
 # 冒烟测试的输出（preflight 与 smoke-*.ps1 会写这里）
 /.smoke-logs/
 # 临时提交信息文件

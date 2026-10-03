@@ -340,3 +340,286 @@ export function formatSize(bytes: number): string {
   }
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
 }
+
+// ── M3：目标级分析 ──────────────────────────────────────────────────────────
+
+/** 一个函数。对应 `bitflip-core::FunctionWire`。 */
+export interface FunctionWire {
+  /** 入口地址（定长 16 位十六进制）。 */
+  start: string;
+  /**
+   * 结束地址（不含）；未知时为 `null`。
+   *
+   * **不要**把 `null` 当成 0 或当成"到段尾"：它表示边界真的没识别出来，
+   * UI 必须显示"未知"而不是编一个范围（CLAUDE.md §7）。
+   */
+  end: string | null;
+  /** 函数名；未命名时为空串（配合 `named === false`）。 */
+  name: string;
+  /** 是否有名字（来自符号/导出/用户标注）。 */
+  named: boolean;
+  /** 名字来源短名：`symbol-table` / `export` / `unwind` / `discovery` / … */
+  source: string;
+  /** 来源的中文标签。 */
+  source_label: string;
+  /** 置信度（0–100）。 */
+  confidence: number;
+  /** 大小；`end` 未知时为 `null`。 */
+  size: number | null;
+}
+
+/** 一条交叉引用。对应 `bitflip-core::XrefWire`。 */
+export interface XrefWire {
+  /** 引用发出的地址。 */
+  from: string;
+  /** 被引用的地址。 */
+  to: string;
+  /** 类型短名：`call` / `jump` / `data`。 */
+  kind: string;
+}
+
+/** 引用类型短名 → 中文标签。 */
+export const XREF_KIND_LABELS: Record<string, string> = {
+  call: "调用",
+  jump: "跳转",
+  data: "数据",
+};
+
+/** 一条字符串。对应 `bitflip-core::StringWire`。 */
+export interface StringWire {
+  address: string;
+  /** 字节长度。 */
+  size: number;
+  /** 编码短名：`ascii` / `utf-16le`。 */
+  encoding: string;
+  text: string;
+}
+
+/** 编码短名 → 中文标签。 */
+export const STRING_ENCODING_LABELS: Record<string, string> = {
+  ascii: "ASCII",
+  "utf-16le": "UTF-16LE",
+};
+
+/** `/api/functions` 响应。 */
+export interface FunctionsResponse {
+  format_version: number;
+  total: number;
+  functions: FunctionWire[];
+  notes: string[];
+}
+
+/** `/api/xrefs` 响应。 */
+export interface XrefsResponse {
+  format_version: number;
+  address: string;
+  from: XrefWire[];
+  to: XrefWire[];
+  /** 包含该地址的函数；`null` 表示没有已知函数覆盖它（真实情形，不是错误）。 */
+  function: FunctionWire | null;
+}
+
+/** `/api/strings` 响应。 */
+export interface StringsResponse {
+  format_version: number;
+  total: number;
+  strings: StringWire[];
+}
+
+/** 十六进制视图的一行。 */
+export interface HexRow {
+  address: string;
+  hex: string;
+  ascii: string;
+}
+
+/** `/api/hex` 响应。 */
+export interface HexResponse {
+  address: string;
+  row_bytes: number;
+  rows: HexRow[];
+  /**
+   * 实际读到的字节数。
+   *
+   * 可能**小于**请求值（到段尾或文件尾）。UI 必须据此提示"已到段尾"，
+   * 否则用户会以为后面还有内容。
+   */
+  bytes_read: number;
+}
+
+/** 一条用户标注。对应 `bitflip-project::Annotation`。 */
+export interface Annotation {
+  /** 定长 16 位小写十六进制。 */
+  address: string;
+  /** 类别短名：`name` / `comment` / `type` / `bookmark` / `patch` / … */
+  kind: string;
+  text: string | null;
+  patch_hex: string | null;
+}
+
+/** `/api/annotations` 响应。 */
+export interface AnnotationsResponse {
+  format_version: number;
+  target_sha256: string;
+  annotations: Annotation[];
+  /** 分析时间；`null` 表示还没跑过分析（或只改过标注）。 */
+  analyzed_at_unix: number | null;
+}
+
+/** 标注类别短名 → 中文标签。 */
+export const ANNOTATION_KIND_LABELS: Record<string, string> = {
+  name: "名称",
+  comment: "注释",
+  type: "类型",
+  bookmark: "书签",
+  patch: "补丁",
+  "function-boundary": "函数边界",
+  "code-data": "代码/数据",
+};
+
+/** 取函数列表；无目标或不可分析时返回 `null`（服务端 400 带原因）。 */
+export async function fetchFunctions(
+  token: string | null,
+  from: string | null,
+  count: number,
+): Promise<FunctionsResponse | null> {
+  const params = new URLSearchParams();
+  if (from) {
+    params.set("from", from);
+  }
+  params.set("count", String(count));
+  return requestOrNull<FunctionsResponse>(`/api/functions?${params.toString()}`, token);
+}
+
+/** 取某地址的交叉引用。 */
+export async function fetchXrefs(
+  token: string | null,
+  address: string,
+): Promise<XrefsResponse | null> {
+  const params = new URLSearchParams({ address });
+  return requestOrNull<XrefsResponse>(`/api/xrefs?${params.toString()}`, token);
+}
+
+/** 取字符串列表（可按子串过滤）。 */
+export async function fetchStrings(
+  token: string | null,
+  contains: string,
+  count: number,
+): Promise<StringsResponse | null> {
+  const params = new URLSearchParams();
+  if (contains) {
+    params.set("contains", contains);
+  }
+  params.set("count", String(count));
+  return requestOrNull<StringsResponse>(`/api/strings?${params.toString()}`, token);
+}
+
+/** 取十六进制视图。 */
+export async function fetchHex(
+  token: string | null,
+  address: string,
+  length: number,
+): Promise<HexResponse | null> {
+  const params = new URLSearchParams({ address, length: String(length) });
+  return requestOrNull<HexResponse>(`/api/hex?${params.toString()}`, token);
+}
+
+/** 取地址范围内的标注。 */
+export async function fetchAnnotations(
+  token: string | null,
+  from: string,
+  to: string,
+): Promise<AnnotationsResponse | null> {
+  const params = new URLSearchParams({ from, to });
+  return requestOrNull<AnnotationsResponse>(`/api/annotations?${params.toString()}`, token);
+}
+
+/**
+ * 写一条标注。
+ *
+ * 服务端**不会**因此重新分析（响应里 `reanalyzed: false`）—— 改名是
+ * 主数据写入，不是分析。UI 不该在改名后重新拉取整个反汇编。
+ */
+export async function putAnnotation(
+  token: string | null,
+  address: string,
+  kind: string,
+  text: string,
+): Promise<void> {
+  await requestJson("PUT", "/api/annotations", token, { address, kind, text });
+}
+
+/** 删除一条标注（幂等）。 */
+export async function deleteAnnotation(
+  token: string | null,
+  address: string,
+  kind: string,
+): Promise<void> {
+  const params = new URLSearchParams({ address, kind });
+  await requestJson("DELETE", `/api/annotations?${params.toString()}`, token, null);
+}
+
+/**
+ * 请求一个"不可用时返回 `null`"的端点。
+ *
+ * 与 `request` 的区别：分析端点在没有目标/目标不可分析时返回 400，
+ * 那是**预期**情形而非异常 —— 面板应当显示原因，而不是抛异常炸掉整页。
+ */
+async function requestOrNull<T>(path: string, token: string | null): Promise<T | null> {
+  try {
+    return await request<T>(path, token);
+  } catch (error) {
+    if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function requestJson(
+  method: string,
+  path: string,
+  token: string | null,
+  body: unknown,
+): Promise<void> {
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["x-bitflip-token"] = token;
+  }
+  const init: RequestInit = { method, headers };
+  if (body !== null) {
+    headers["content-type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(path, init);
+  if (!response.ok) {
+    let message = `请求失败（HTTP ${response.status}）`;
+    try {
+      const parsed: unknown = await response.json();
+      if (parsed && typeof parsed === "object" && "error" in parsed) {
+        const raw = (parsed as { error: unknown }).error;
+        if (typeof raw === "string") {
+          message = raw;
+        }
+      }
+    } catch {
+      // 响应体不是 JSON：保留默认信息。
+    }
+    throw new ApiError(response.status, message);
+  }
+}
+
+/**
+ * 把用户输入的地址规范成定长 16 位小写十六进制。
+ *
+ * 返回 `null` 表示输入不是合法地址 —— **不要**回退到 0：
+ * 那会让用户以为自己跳转成功了，其实只是回到了文件开头。
+ */
+export function normalizeAddress(input: string): string | null {
+  const trimmed = input.trim().replace(/^0x/i, "");
+  if (!/^[0-9a-fA-F]{1,16}$/.test(trimmed)) {
+    return null;
+  }
+  return trimmed.toLowerCase().padStart(16, "0");
+}

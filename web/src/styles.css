@@ -698,3 +698,190 @@ button:not(:disabled):hover {
   opacity: 0.75;
   font-size: 11.5px;
 }
+
+/* ── M3：分析与导航 ───────────────────────────────────────────────────── */
+
+.view-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.back-button {
+  font-size: 12px;
+  padding: 3px 10px;
+}
+
+.back-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.focus-address {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.analysis-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.view-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.jump-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.current-address {
+  font-size: 12.5px;
+  opacity: 0.85;
+}
+
+/* 未命名/未知：用弱化样式显示，一眼区分于真实值 */
+.unnamed,
+.unknown {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+.symbol-name {
+  color: #8fd0ff;
+}
+
+.confidence {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 74px;
+}
+
+.confidence-fill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 14px;
+  transform: translateY(-50%);
+  border-radius: 2px;
+  opacity: 0.28;
+  pointer-events: none;
+}
+
+.confidence-high {
+  background: #5ad18a;
+}
+
+.confidence-mid {
+  background: #e0b040;
+}
+
+.confidence-low {
+  background: #e05a5a;
+}
+
+.confidence-text {
+  position: relative;
+  font-size: 11.5px;
+  opacity: 0.85;
+}
+
+.xref-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+.section-heading {
+  font-size: 13px;
+  margin: 12px 0 4px;
+  opacity: 0.9;
+}
+
+.section-heading .count {
+  opacity: 0.6;
+  font-weight: 400;
+}
+
+.annotation-editor {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.compact-label {
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.string-cell {
+  max-width: 520px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notes-inline {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.truncation-note {
+  margin-left: 6px;
+  color: #e0b040;
+}
+
+.hex-dump {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow: auto;
+}
+
+.hex-row {
+  display: flex;
+  gap: 12px;
+  white-space: pre;
+}
+
+.hex-address {
+  opacity: 0.65;
+}
+
+.hex-ascii {
+  opacity: 0.8;
+}
+
+.row-clickable {
+  cursor: pointer;
+}
+
+.row-clickable:hover {
+  background: rgba(120, 160, 255, 0.1);
+}
+
+.chip-small {
+  font-size: 11px;
+  padding: 1px 6px;
+}
+
+.error-inline {
+  color: #e05a5a;
+  font-size: 12px;
+}

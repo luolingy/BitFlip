@@ -62,7 +62,20 @@ const EMPTY_CURSOR: Cursor = {
  * 都不够 —— 只分页的话一页 512 行还好，但用户按 `G` 跳到末尾、
  * 连续翻几十页后累积的 DOM 依然会拖垮页面。
  */
-export function DisassemblyView({ token }: { token: string | null }) {
+export function DisassemblyView({
+  token,
+  initialAddress,
+}: {
+  token: string | null;
+  /**
+   * 从其他视图跳进来的目标地址。
+   *
+   * 变化时重新加载：这样"函数列表 → 反汇编 → 交叉引用"这条动线
+   * 不需要用户手动再输一次地址。地址落在某条指令中间时服务端会吸附到
+   * 包含它的那条指令，因此这里不需要额外对齐。
+   */
+  initialAddress?: string | null;
+}) {
   const [cursor, setCursor] = useState<Cursor>(EMPTY_CURSOR);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -113,7 +126,23 @@ export function DisassemblyView({ token }: { token: string | null }) {
 
   useEffect(() => {
     void load(null);
+    // 只在挂载时定位到地址空间开头；之后由 initialAddress 的 effect 接管。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [load]);
+
+  // 外部跳转（来自函数/交叉引用/字符串视图）。
+  const externalJump = useRef<string | null>(null);
+  useEffect(() => {
+    if (!initialAddress) {
+      return;
+    }
+    // 同一个地址重复请求时不重载：否则用户点两次同一个函数会白扫两遍。
+    if (externalJump.current === initialAddress) {
+      return;
+    }
+    externalJump.current = initialAddress;
+    void load(initialAddress);
+  }, [initialAddress, load]);
 
   // 视口高度变化要重新计算虚拟窗口
   useEffect(() => {

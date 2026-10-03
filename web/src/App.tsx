@@ -16,6 +16,7 @@ import {
   type TargetInfo,
 } from "./api";
 import { DisassemblyView } from "./DisassemblyView";
+import { FunctionsView, HexView, StringsView, XrefsView } from "./AnalysisViews";
 
 type LoadState =
   | { kind: "loading" }
@@ -33,7 +34,7 @@ type LoadState =
  * `ready: true` 的项在本里程碑真实可用；其余一律标注里程碑并置灰。
  * 不做"点了没反应"的假入口（CLAUDE.md §7）。
  */
-type ViewId = "structure" | "disasm";
+type ViewId = "structure" | "disasm" | "functions" | "xrefs" | "strings" | "hex";
 
 const NAV_SECTIONS: readonly {
   /** 只有 `ready: true` 的项才是真实可切换的视图。 */
@@ -45,17 +46,70 @@ const NAV_SECTIONS: readonly {
 }[] = [
   { id: "structure", title: "段与节", milestone: "M1", hint: "地址空间、节表、入口点", ready: true },
   { id: "disasm", title: "反汇编", milestone: "M2", hint: "线性 + 递归下降双策略扫描", ready: true },
-  { id: null, title: "函数", milestone: "M5", hint: "函数识别 + 置信度合并", ready: false },
-  { id: null, title: "符号", milestone: "M3", hint: "符号来源与优先级", ready: false },
-  { id: null, title: "交叉引用", milestone: "M6", hint: "谁引用了我 / 我引用了谁", ready: false },
-  { id: null, title: "字符串", milestone: "M7", hint: "字符串提取与引用定位", ready: false },
+  // M3 交付了函数识别、交叉引用与字符串提取，这三项不再是"计划中"。
+  { id: "functions", title: "函数", milestone: "M3", hint: "函数识别 + 来源与置信度", ready: true },
+  { id: "xrefs", title: "交叉引用", milestone: "M3", hint: "谁引用了我 / 我引用了谁", ready: true },
+  { id: "strings", title: "字符串", milestone: "M3", hint: "字符串提取与地址定位", ready: true },
+  { id: "hex", title: "十六进制", milestone: "M3", hint: "原始字节视图", ready: true },
+  // 下面这些确实还没做（M8 签名库匹配），保持置灰 —— 不给点了没反应的按钮。
   { id: null, title: "签名匹配", milestone: "M8", hint: "库函数签名识别", ready: false },
 ];
+
+/** 视图标题（与导航项一一对应）。 */
+const VIEW_TITLES: Record<ViewId, string> = {
+  structure: "段与节",
+  disasm: "反汇编",
+  functions: "函数",
+  xrefs: "交叉引用",
+  strings: "字符串",
+  hex: "十六进制",
+};
+
 
 export function App() {
   const token = useMemo(resolveToken, []);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [view, setView] = useState<ViewId>("structure");
+  /**
+   * 当前聚焦的地址。
+   *
+   * 跨视图共享：从函数列表点一个函数，跳到反汇编的那个地址；再切到
+   * 交叉引用看"谁调用了它"。逆向时的动作串就是这样 —— 地址是这条
+   * 动线上的位置，视图只是看它的角度。
+   */
+  const [focus, setFocus] = useState<string | null>(null);
+  /**
+   * 导航历史（地址栈）。
+   *
+   * 逆向是反复跳转的过程，没有"返回"就只能靠手抄地址回去 —— 这也是
+   * 为什么它必须有，而不是"以后再加"的便利功能。
+   */
+  const [history, setHistory] = useState<string[]>([]);
+
+  const navigate = useCallback(
+    (address: string) => {
+      setFocus((current) => {
+        if (current) {
+          setHistory((past) => [...past, current]);
+        }
+        return address;
+      });
+    },
+    [],
+  );
+
+  const goBack = useCallback(() => {
+    setHistory((past) => {
+      // 用 at(-1) 而不是 [length-1]：索引访问在 noUncheckedIndexedAccess 下
+      // 是 `string | undefined`，空数组的情形必须显式处理。
+      const previous = past.at(-1);
+      if (previous === undefined) {
+        return past;
+      }
+      setFocus(previous);
+      return past.slice(0, -1);
+    });
+  }, []);
 
   const load = useCallback(async () => {
     setState({ kind: "loading" });
@@ -172,13 +226,33 @@ export function App() {
         </aside>
 
         <main className="pane pane-center">
-          <PaneTitle title={view === "disasm" ? "反汇编" : "段与节"} />
+          <div className="view-header">
+            <button
+              type="button"
+              className="back-button"
+              onClick={goBack}
+              disabled={history.length === 0}
+              title="返回上一个地址"
+            >
+              ← 返回
+            </button>
+            <PaneTitle title={VIEW_TITLES[view]} />
+            {focus && <span className="mono focus-address">{formatAddress(focus)}</span>}
+          </div>
           {view === "disasm" ? (
             parsed ? (
-              <DisassemblyView token={token} />
+              <DisassemblyView token={token} initialAddress={focus} />
             ) : (
               <ParseFailure target={target} />
             )
+          ) : view === "functions" ? (
+            <FunctionsView token={token} onNavigate={navigate} />
+          ) : view === "xrefs" ? (
+            <XrefsView token={token} initialAddress={focus} onNavigate={navigate} />
+          ) : view === "strings" ? (
+            <StringsView token={token} onNavigate={navigate} />
+          ) : view === "hex" ? (
+            <HexView token={token} initialAddress={focus} />
           ) : parsed ? (
             <StructureView parsed={parsed} target={target} />
           ) : (
