@@ -201,6 +201,7 @@ dependencies = [
  "bitflip-analyze",
  "bitflip-arch",
  "bitflip-loader",
+ "bitflip-project",
  "bitflip-symbols",
  "proptest",
  "serde",
@@ -225,6 +226,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

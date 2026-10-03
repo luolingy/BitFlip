@@ -7,6 +7,7 @@ use bitflip_analyze::{JobHandle, NullSink, StageId};
 use bitflip_arch::ArchSpec;
 use bitflip_loader::object::{Object, ObjectId};
 use bitflip_loader::{sniff_file, ContainerKind, Guess, ObjectKind};
+use bitflip_project::ProjectStore;
 use serde::Serialize;
 
 use crate::disasm::Disasm;
@@ -391,6 +392,11 @@ pub struct Session {
     /// 代价是文件大小的一份常驻内存 —— 这是 M2 验收指标里
     /// "内存 < 3× 文件大小"预算中的 1×。
     bytes: Arc<[u8]>,
+    /// 目标内容哈希（sha256 小写十六进制）。
+    ///
+    /// 懒计算：打开一个 100MB 目标只为看一眼格式时，不该先付一次全文件
+    /// 哈希的代价。用到（打开/创建工程库）时才算。
+    hash: std::sync::OnceLock<String>,
 }
 
 impl Session {
@@ -444,7 +450,45 @@ impl Session {
             object,
             object_raw,
             bytes,
+            hash: std::sync::OnceLock::new(),
         })
+    }
+
+    /// 目标内容哈希（sha256，小写十六进制），首次调用时计算并缓存。
+    ///
+    /// 用内容哈希而不是 size+mtime 作目标身份：同名不同内容的文件必须是
+    /// 不同目标，否则工程库会串味。
+    pub fn target_hash(&self) -> Result<&str, BitflipError> {
+        if let Some(h) = self.hash.get() {
+            return Ok(h.as_str());
+        }
+        let computed = bitflip_project::target_hash(&self.path)
+            .map_err(|e| BitflipError::Project(e.to_string()))?;
+        // get_or_init 是幂等的：并发调用只会有一个值胜出，都拿到同一个引用
+        Ok(self.hash.get_or_init(|| computed).as_str())
+    }
+
+    /// 打开该目标的工程库（不存在则创建），用于读写用户标注。
+    ///
+    /// **标注是主数据，分析结果是可重建的派生物** —— 这个切分是 M4 的
+    /// 核心设计（见 docs/DECISIONS.md D2）。因此：
+    /// * 改名/加注释只写这本库，**不触发重新分析**；
+    /// * 重新分析只重写派生物，**不会丢标注**。
+    pub fn open_project(&self, workspace: impl AsRef<Path>) -> Result<ProjectStore, BitflipError> {
+        let hash = self.target_hash()?.to_string();
+        let path = bitflip_project::primary_path(workspace.as_ref(), &hash);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let store = ProjectStore::create(
+            &path,
+            &hash,
+            self.info.file_size,
+            env!("CARGO_PKG_VERSION"),
+            now,
+        )?;
+        Ok(store)
     }
 
     /// 按嗅探结论选择解析器。

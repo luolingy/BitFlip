@@ -172,6 +172,51 @@ pub use derived::{
 pub use recent::{RecentIndex, RecentStore, RecentTarget, INDEX_FORMAT_VERSION, MAX_RECENT};
 pub use store::{addr_to_i64, i64_to_addr, Annotation, ProjectStore};
 
+/// 计算目标文件的内容哈希（sha256，小写十六进制）。
+///
+/// 目标的身份用**内容哈希**而不是 size+mtime：同名不同内容的文件必须被当作
+/// 不同目标，否则会出现"拿到别人缓存"这种静默错误。size+mtime 还会在
+/// 复制/还原文件之后误判为未变。
+///
+/// 大文件按块读，避免为了算哈希把整个文件再读进内存一遍。
+pub fn target_hash(path: &std::path::Path) -> Result<String, ProjectError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(derived::io_err)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB
+    loop {
+        let n = file.read(&mut buf).map_err(derived::io_err)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+/// 对内存中的字节算哈希（测试与已知内容用）。
+#[must_use]
+pub fn target_hash_bytes(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex_lower(&Sha256::digest(data))
+}
+
+/// 字节转小写十六进制。
+///
+/// 不用 `{:x}` 直接格式化摘要：`sha2` 0.11 的摘要类型不实现 `LowerHex`，
+/// 而且手写能保证**定长小写**这一 wire 契约（与地址表示同一条约定）。
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // 写入 String 不会失败；忽略返回值不丢信息
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

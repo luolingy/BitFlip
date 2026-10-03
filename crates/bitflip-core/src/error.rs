@@ -35,9 +35,19 @@ pub enum BitflipError {
     #[error("作业失败: {0}")]
     Job(#[from] bitflip_analyze::JobError),
 
+    /// 工程库（用户标注主数据）读写失败。
+    #[error("工程库错误: {0}")]
+    Project(String),
+
     /// 内部一致性错误（bug）。
     #[error("内部错误: {0}")]
     Internal(String),
+}
+
+impl From<bitflip_project::ProjectError> for BitflipError {
+    fn from(error: bitflip_project::ProjectError) -> Self {
+        Self::Project(error.to_string())
+    }
 }
 
 impl BitflipError {

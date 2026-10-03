@@ -488,7 +488,11 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn io_err(error: std::io::Error) -> ProjectError {
+/// 把 `io::Error` 转成工程库错误。
+///
+/// `ProjectError::Io` 携带的是字符串而不是 `io::Error`：存储层错误不该把
+/// 底层类型泄漏到上层（与 `rusqlite` 类型不外泄同一条原则）。
+pub fn io_err(error: std::io::Error) -> ProjectError {
     ProjectError::Io(error.to_string())
 }
 
