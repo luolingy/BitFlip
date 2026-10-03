@@ -14,6 +14,7 @@
 mod sniff;
 
 pub mod coff;
+pub mod ehframe;
 pub mod elf;
 pub mod object;
 pub mod pe;

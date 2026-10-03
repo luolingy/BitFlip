@@ -466,11 +466,11 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
     // ── 动态段：依赖列表 ────────────────────────────────────────────────
     parse_dynamic_dependencies(&reader, &header, &section_headers, &shstrtab, &mut object);
 
-    // ── .eh_frame：M3 才解析 FDE ────────────────────────────────────────
-    if object.sections.iter().any(|s| s.name == ".eh_frame") {
-        object
-            .note("存在 .eh_frame，但 CFI/FDE 解析排期在 M3（函数边界推断）；当前未提供展开表条目");
-    }
+    // ── .eh_frame：解析 FDE，恢复函数边界 ───────────────────────────────
+    //
+    // 这是剥离符号场景下**唯一**还能给出精确函数边界的来源（PLAN §M3）。
+    // 只解边界，不解 CFI 指令：栈回溯才需要那部分。
+    parse_eh_frame_entries(&reader, &section_headers, &shstrtab, &mut object);
 
     // ── 格式信息 ────────────────────────────────────────────────────────
     object.format = build_format_info(&header, &object.sections);
@@ -1287,7 +1287,78 @@ fn classify_reloc(machine: u16, raw_kind: u32) -> RelocKind {
     }
 }
 
-/// 从 `PT_DYNAMIC` / `.dynamic` 读 `DT_NEEDED` 依赖，填进 `imports`。
+/// 从 `.eh_frame` 解析 FDE 并填进 `object.unwind`。
+///
+/// 边界情况都写进 `notes`，不静默少给数据（§7）：
+/// * 段存在但读不到 → 说明原因；
+/// * relocatable object（`.o`）：`.eh_frame` 里的地址是重定位前的占位值，
+///   未应用重定位就当成真实地址是**错的**，因此明确标注而不是给假边界；
+/// * 解析中途出错 → 把解析器的 note 浮上来。
+fn parse_eh_frame_entries(
+    reader: &Reader<'_>,
+    raw_sections: &[SectionHeader],
+    shstrtab: &[u8],
+    object: &mut Object,
+) {
+    // 优先找名字精确等于 .eh_frame 的段
+    let Some(raw) = raw_sections.iter().find(|sh| {
+        read_strtab(shstrtab, u64::from(sh.name_offset)).as_deref() == Some(".eh_frame")
+    }) else {
+        return; // 没有 .eh_frame 是正常的，不产生 note
+    };
+
+    if raw.size == 0 {
+        return;
+    }
+
+    // relocatable object：`entry` 为 None 就是 `.o`（见 Object::entry 的文档）。
+    // `.eh_frame` 里的地址尚未重定位，解出来的"边界"不是最终地址。
+    // 这种情况不提供 unwind 条目，并明确说明原因 —— 给假地址比不给更糟。
+    if object.entry.is_none() {
+        object.note(
+            ".eh_frame 存在，但当前目标是可重定位对象（.o），其中的地址尚未重定位；\
+             未提供展开表边界（需要应用重定位后才能给出可信地址）"
+                .to_string(),
+        );
+        return;
+    }
+
+    let Ok(data) = reader.slice(raw.offset, raw.size, ".eh_frame") else {
+        object.note(format!(
+            ".eh_frame（偏移 {:#x}，大小 {}）读取失败，未提供展开表边界",
+            raw.offset, raw.size
+        ));
+        return;
+    };
+
+    let endianness = match object.endian {
+        Endian::Little => Endianness::Little,
+        Endian::Big => Endianness::Big,
+    };
+    let parsed = crate::ehframe::parse_eh_frame(data, raw.addr, endianness);
+
+    for entry in &parsed.fdes {
+        object.unwind.push(crate::object::UnwindEntry {
+            begin: entry.begin,
+            end: entry.end(),
+            unwind_info: 0, // FDE 自身的展开信息地址；M3 不做栈回溯，不填假值
+        });
+    }
+
+    // 解析器的降级说明必须浮到上层
+    for n in &parsed.notes {
+        object.note(n.clone());
+    }
+
+    if !parsed.fdes.is_empty() {
+        object.note(format!(
+            ".eh_frame 提供 {} 条函数边界（来自 FDE）",
+            parsed.fdes.len()
+        ));
+    } else if parsed.notes.is_empty() {
+        object.note(".eh_frame 存在但没有解析出任何 FDE".to_string());
+    }
+}
 fn parse_dynamic_dependencies(
     reader: &Reader<'_>,
     header: &ElfHeader,

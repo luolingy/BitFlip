@@ -359,6 +359,18 @@ fn collect_seeds(object: &Object) -> Vec<u64> {
             seeds.push(symbol.value);
         }
     }
+    // 展开表（PE .pdata / ELF .eh_frame）给出的函数入口。
+    //
+    // 这条对**剥离符号**的目标是关键：符号表没了、导出表也可能是空的，
+    // 此时展开表是唯一还知道"函数从哪开始"的来源。不把它并入种子，
+    // 递归下降就无从进入这些函数 —— 分析结果会是一大片空白，而
+    // `.eh_frame` 明明就在文件里躺着。
+    //
+    // 注意 `m3_acceptance` 的覆盖率测试正依赖这条路径：那里的样本
+    // strip 过，148/154 的边界来自 .eh_frame。
+    for entry in &object.unwind {
+        seeds.push(entry.begin);
+    }
 
     seeds.sort_unstable();
     seeds.dedup();
