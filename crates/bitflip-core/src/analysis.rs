@@ -13,9 +13,9 @@
 //! 内存纪律（PLAN §2，参照实现的 OOM 教训）：构建过程**流式**处理指令 ——
 //! 一次解码一条、立刻归约成 xref/候选，绝不持有整份 `Vec<DecodedInsn>`。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use bitflip_analyze::{merge_candidates, unwind_candidates, StringOptions};
+use bitflip_analyze::{merge_candidates, unwind_candidates, Cfg, StringOptions};
 use bitflip_arch::Flow;
 use bitflip_symbols::{SymbolCandidate, SymbolSource};
 use serde::{Deserialize, Serialize};
@@ -82,7 +82,49 @@ pub struct TargetAnalysis {
     xref_by_from: HashMap<u64, Vec<usize>>,
     xref_by_to: HashMap<u64, Vec<usize>>,
     strings: Vec<StringWire>,
+    /// 每个函数的基本块（按函数入口索引）。M5 引入。
+    cfg_by_function: BTreeMap<u64, CfgWire>,
     notes: Vec<String>,
+}
+
+/// 一个函数的基本块摘要（wire 用）。
+///
+/// 只带"块边界 + 后继/前驱 + 是否终结"，**不带**块内指令列表 ——
+/// 指令由 `/api/insns` 按地址范围查询。这样 CFG 响应的大小与函数长度无关，
+/// 大函数（几万个块）也不会把响应撑爆。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CfgWire {
+    /// 函数入口（定长 16 位小写十六进制）。
+    pub entry: String,
+    /// 基本块数量。
+    pub block_count: usize,
+    /// 边数量。
+    pub edge_count: usize,
+    /// 是否存在环（回边）。
+    pub has_cycle: bool,
+    /// 是否因函数边界未知而截断。
+    pub truncated: bool,
+    /// 缺失说明（中文，面向用户）。
+    pub notes: Vec<String>,
+    /// 各基本块。
+    pub blocks: Vec<BlockWire>,
+}
+
+/// 一个基本块（wire 用）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BlockWire {
+    /// 块首地址。
+    pub start: String,
+    /// 块尾地址（不含）。
+    pub end: String,
+    /// 块内最后一条指令的地址。
+    pub last_insn: String,
+    /// 后继块首地址。
+    pub successors: Vec<String>,
+    /// 前驱块首地址。
+    pub predecessors: Vec<String>,
+    /// 是否以不返回的指令结束。
+    pub terminal: bool,
 }
 
 /// 字符串扫描的单次读取上限：超过则分块流式扫描（跨块边界由状态机衔接）。
@@ -301,12 +343,19 @@ impl TargetAnalysis {
         }
         strings.sort_by_key(|s| u64::from_str_radix(&s.address, 16).unwrap_or(0));
 
+        // ── 基本块 / CFG（M5）──
+        //
+        // 逐函数建图。函数的 `end` 可能未知（只有入口）：此时**不猜边界**，
+        // 只取该入口到下一个已知识别入口之前的指令，并把 truncated 置真。
+        let cfg_by_function = build_cfgs(disasm, &functions, &mut notes);
+
         Self {
             functions,
             xrefs,
             xref_by_from,
             xref_by_to,
             strings,
+            cfg_by_function,
             notes,
         }
     }
@@ -321,6 +370,47 @@ impl TargetAnalysis {
     #[must_use]
     pub fn function_count(&self) -> usize {
         self.functions.len()
+    }
+
+    /// 基本块总数（全部函数的 CFG 之和）。
+    ///
+    /// 这是 `/api/analyze` 里 `basic_blocks` 的真实来源 ——
+    /// M5 之前它诚实地报 0（CFG 还没实现），现在有真值了。
+    #[must_use]
+    pub fn basic_block_count(&self) -> usize {
+        self.cfg_by_function.values().map(|c| c.block_count).sum()
+    }
+
+    /// 某个函数入口的 CFG。
+    #[must_use]
+    pub fn cfg_of(&self, entry: u64) -> Option<&CfgWire> {
+        self.cfg_by_function.get(&entry)
+    }
+
+    /// 全部函数的 CFG（按入口地址升序）。
+    pub fn cfgs(&self) -> impl Iterator<Item = &CfgWire> {
+        self.cfg_by_function.values()
+    }
+
+    /// CFG 总数（有 CFG 的函数个数）。
+    #[must_use]
+    pub fn cfg_count(&self) -> usize {
+        self.cfg_by_function.len()
+    }
+
+    /// 包含某地址的基本块所在的函数。
+    ///
+    /// 返回 `(函数入口, 块)`。用于 UI 从任意指令地址跳到它所属的块。
+    #[must_use]
+    pub fn block_containing(&self, addr: u64) -> Option<(u64, &BlockWire)> {
+        let entry = parse_hex(self.function_containing(addr)?.start.as_str())?;
+        let cfg = self.cfg_by_function.get(&entry)?;
+        let block = cfg.blocks.iter().find(|b| {
+            let s = parse_hex(&b.start);
+            let e = parse_hex(&b.end);
+            matches!((s, e), (Some(s), Some(e)) if addr >= s && addr < e)
+        })?;
+        Some((entry, block))
     }
 
     /// 包含某地址的函数。
@@ -382,6 +472,113 @@ impl TargetAnalysis {
 
 fn parse_hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
+}
+
+/// 逐函数构建 CFG（M5）。
+///
+/// # 边界处理（这是本函数唯一需要判断的事情）
+///
+/// `FunctionWire::end` 可能是 `None` —— 只知道入口，不知道到哪结束。
+/// 此时**不猜**边界，而是取从入口起、到**下一个已知识别入口**之前的指令。
+///
+/// 为什么这是安全的近似：下一个已知函数入口一定**不属于**本函数
+/// （它是另一个函数的起点），所以切在那里不会把别的函数的指令并进来。
+/// 它可能少取（本函数更长）—— 那就 `truncated` 置真如实说明。
+/// 宁可少画几个块，不可多画一个假的。
+///
+/// 边界已知（`Some(end)`）时直接按区间切，不存在这个不确定性。
+fn build_cfgs(
+    disasm: &Disasm,
+    functions: &[FunctionWire],
+    notes: &mut Vec<String>,
+) -> BTreeMap<u64, CfgWire> {
+    let mut out = BTreeMap::new();
+    if functions.is_empty() {
+        return out;
+    }
+
+    // 已知识别入口（升序，`functions` 已按地址升序）——用于给未知边界兜底。
+    let entries: Vec<u64> = functions
+        .iter()
+        .filter_map(|f| parse_hex(&f.start))
+        .collect();
+
+    let mut truncated_functions = 0usize;
+
+    for f in functions {
+        let Some(entry) = parse_hex(&f.start) else {
+            continue;
+        };
+        let declared_end = f.end.as_deref().and_then(parse_hex);
+
+        // 未知边界时的兜底上界：下一个更大的识别入口。
+        // `partition_point` 找到第一个 > entry 的位置。
+        let fallback_end = entries
+            .partition_point(|&e| e <= entry)
+            .checked_sub(0)
+            .and_then(|p| entries.get(p).copied());
+
+        let (upper, boundary_unknown) = match declared_end {
+            Some(end) => (end, false),
+            None => match fallback_end {
+                Some(next) => (next, true),
+                // 最后一个函数且边界未知：只能扫到它自己的指令用完为止。
+                // `u64::MAX` 表示"不设上界"，由 AddrSpace 的区间决定实际范围。
+                None => (u64::MAX, true),
+            },
+        };
+        if boundary_unknown {
+            truncated_functions += 1;
+        }
+
+        // 收集该范围内的指令。`disasm.index` 是地址→长度的有序索引，
+        // 直接按区间取，不做全表扫描。
+        let mut insns: Vec<bitflip_arch::DecodedInsn> = Vec::new();
+        for (addr, len) in disasm.index.range(entry, upper) {
+            let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
+                continue;
+            };
+            if let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) {
+                insns.push(insn);
+            }
+        }
+        if insns.is_empty() {
+            continue;
+        }
+
+        let cfg = Cfg::build(&insns);
+        out.insert(
+            entry,
+            CfgWire {
+                entry: f.start.clone(),
+                block_count: cfg.block_count(),
+                edge_count: cfg.edge_count(),
+                has_cycle: cfg.has_cycle(),
+                truncated: cfg.truncated() || boundary_unknown,
+                notes: cfg.notes().to_vec(),
+                blocks: cfg
+                    .blocks()
+                    .map(|b| BlockWire {
+                        start: hex16(b.start),
+                        end: hex16(b.end),
+                        last_insn: hex16(b.last_insn),
+                        successors: b.successors.iter().copied().map(hex16).collect(),
+                        predecessors: b.predecessors.iter().copied().map(hex16).collect(),
+                        terminal: b.terminal,
+                    })
+                    .collect(),
+            },
+        );
+    }
+
+    if truncated_functions > 0 {
+        notes.push(format!(
+            "有 {truncated_functions} 个函数的边界未知，其 CFG 按“到下一个已知函数入口之前”构建\
+             （可能少画块，不会多画）"
+        ));
+    }
+
+    out
 }
 
 /// 桩的最大字节数。
@@ -702,6 +899,8 @@ mod tests {
             xref_by_from: HashMap::new(),
             xref_by_to: HashMap::new(),
             strings: Vec::new(),
+            // 本测试只关心 function_containing，不建 CFG。
+            cfg_by_function: BTreeMap::new(),
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());

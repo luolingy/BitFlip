@@ -510,3 +510,187 @@ async fn annotation_write_requires_token() {
 
     assert_eq!(status, StatusCode::FORBIDDEN, "响应: {body}");
 }
+
+// ── M5：分析摘要与 CFG ──────────────────────────────────────────────────────
+
+/// `/api/analyze` 必须给出**真实的**基本块数，而不是恒为 0。
+///
+/// 这条盯的是一个具体的历史：M3/M4 期间 `basic_blocks` 诚实地返回 0
+/// （CFG 还没实现），但当时没有任何端点能读出它 —— 于是"诚实的 0"
+/// 与"字段忘了接上"在外部看起来完全一样。M5 实现了 CFG，
+/// 这个断言就用来防止它悄悄退回 0。
+#[tokio::test]
+async fn analyze_reports_real_basic_block_count() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let (status, body) = send(state, get_with_token("/api/analyze")).await;
+
+    assert_eq!(status, StatusCode::OK, "响应: {body}");
+    let blocks = body["basic_blocks"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("basic_blocks 应是数字：{body}"));
+    assert!(
+        blocks > 0,
+        "M5 起 basic_blocks 必须是真实计数；拿到 0 说明 CFG 没接上：{body}"
+    );
+
+    // 交叉校验：每个函数至少一个基本块，所以块数 >= 函数数。
+    let functions = body["functions"].as_u64().expect("functions");
+    assert!(
+        blocks >= functions,
+        "基本块数（{blocks}）不该少于函数数（{functions}）：每个函数至少有一个块"
+    );
+
+    // functions_with_cfg 应当等于有 CFG 的函数数；它不可能超过函数总数。
+    let with_cfg = body["functions_with_cfg"]
+        .as_u64()
+        .expect("functions_with_cfg");
+    assert!(
+        with_cfg <= functions,
+        "有 CFG 的函数数（{with_cfg}）不可能超过函数总数（{functions}）"
+    );
+}
+
+/// `/api/cfg` 必须要求 `entry`：CFG 是按函数定义的。
+///
+/// 这里**不**返回空对象，因为"没有指定函数"和"这个函数没有基本块"
+/// 是两件不同的事。悄悄给一个空图会让调用方以为分析成功。
+#[tokio::test]
+async fn cfg_endpoint_requires_entry() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let (status, body) = send(state, get_with_token("/api/cfg")).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "响应: {body}");
+    let text = body["error"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("entry"),
+        "错误信息应说明缺少 entry 参数：{body}"
+    );
+}
+
+/// `/api/cfg` 对垃圾地址要报错，不能悄悄回退到 0。
+#[tokio::test]
+async fn cfg_endpoint_rejects_garbage_address() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let (status, body) = send(state, get_with_token("/api/cfg?entry=zzzz")).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "响应: {body}");
+}
+
+/// 指定一个**不存在**的函数入口：应返回 200 + `cfg: null`，
+/// 而不是 404 或空图。
+///
+/// 语义差别很重要：地址格式合法、只是那个位置没有函数 ——
+/// 这是"拿到了答案：没有"，不是"请求失败"。
+#[tokio::test]
+async fn cfg_endpoint_reports_absent_function_as_null() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    // 一个格式合法、但没有函数的地址
+    let (status, body) = send(state, get_with_token("/api/cfg?entry=0000000000401abc")).await;
+
+    assert_eq!(status, StatusCode::OK, "响应: {body}");
+    assert!(
+        body["cfg"].is_null(),
+        "没有函数的地址应返回 cfg: null（而不是空图）：{body}"
+    );
+    assert_eq!(
+        body["entry"], "0000000000401abc",
+        "entry 应原样回显为定长十六进制：{body}"
+    );
+}
+
+/// CFG 的结构自洽性：块区间有序、后继必是块首、前驱/后继对称。
+///
+/// 用真实的合成 ELF 走一遍 HTTP，确认 wire 层没有把 CFG 改坏
+/// （地址是字符串，任何一处格式化错误都会在这里暴露）。
+#[tokio::test]
+async fn cfg_endpoint_returns_structurally_consistent_graph() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+
+    // 先拿函数列表，找第一个有 CFG 的函数
+    let (status, body) = send(state.clone(), get_with_token("/api/functions")).await;
+    assert_eq!(status, StatusCode::OK, "响应: {body}");
+    let functions = body["functions"].as_array().expect("functions");
+    assert!(!functions.is_empty(), "合成目标应识别出函数：{body}");
+
+    let mut checked = 0usize;
+    for f in functions {
+        let entry = f["start"].as_str().expect("start");
+        let (status, body) = send(
+            state.clone(),
+            get_with_token(&format!("/api/cfg?entry={entry}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "entry={entry} 响应: {body}");
+        let Some(cfg) = body["cfg"].as_object() else {
+            continue;
+        };
+        checked += 1;
+
+        let blocks = cfg["blocks"].as_array().expect("blocks");
+        let starts: Vec<&str> = blocks
+            .iter()
+            .map(|b| b["start"].as_str().expect("start"))
+            .collect();
+
+        let mut prev_end: Option<&str> = None;
+        for b in blocks {
+            let start = b["start"].as_str().expect("start");
+            let end = b["end"].as_str().expect("end");
+            let last = b["last_insn"].as_str().expect("last_insn");
+
+            assert_eq!(start.len(), 16, "块首应是定长 16 位十六进制：{start}");
+            assert_eq!(end.len(), 16, "块尾应是定长 16 位十六进制：{end}");
+            assert_eq!(last.len(), 16, "块尾指令应是定长十六进制：{last}");
+            assert!(start < end, "块区间不能为空：{start}..{end}");
+            assert!(
+                last >= start && last < end,
+                "块尾指令 {last} 必须落在 {start}..{end} 内"
+            );
+            if let Some(pe) = prev_end {
+                assert_eq!(start, pe, "块之间不能有空洞或重叠（前一块结束于 {pe}）");
+            }
+            prev_end = Some(end);
+
+            // 每条后继必须是某个块的首地址，且该块的前驱里有本块
+            for succ in b["successors"].as_array().expect("successors") {
+                let s = succ.as_str().expect("successor");
+                assert!(
+                    starts.contains(&s),
+                    "后继 {s} 不是任何块的首地址 —— 图里有悬空边"
+                );
+                let target = blocks
+                    .iter()
+                    .find(|x| x["start"].as_str() == Some(s))
+                    .expect("目标块");
+                let preds: Vec<&str> = target["predecessors"]
+                    .as_array()
+                    .expect("predecessors")
+                    .iter()
+                    .map(|p| p.as_str().expect("pred"))
+                    .collect();
+                assert!(
+                    preds.contains(&start),
+                    "边 {start} → {s} 存在，但目标块的前驱里没有 {start} —— 前驱/后继不对称"
+                );
+            }
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "至少要检查到一个带 CFG 的函数，否则本测试什么都没验证"
+    );
+}
+
+/// CFG 端点也要令牌。
+#[tokio::test]
+async fn cfg_endpoint_requires_token() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let request = Request::builder()
+        .uri("/api/cfg?entry=0000000000401000")
+        .body(Body::empty())
+        .expect("构造请求");
+    let (status, body) = send(state, request).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "响应: {body}");
+}

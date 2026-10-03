@@ -6,6 +6,7 @@
 //! 阶段划分（`docs/ARCHITECTURE.md` §5）在 M2 起逐个落地；M0 先固定契约与边界语义。
 
 mod addrspace;
+mod cfg;
 mod functions;
 mod job;
 mod scan;
@@ -16,6 +17,7 @@ pub use addrspace::{
     index_insn, AddrSpace, AddrSpaceError, ByteSource, InsnIndex, MappedSegment, PAGE_MASK,
     PAGE_SIZE, SYNTHETIC_BASE,
 };
+pub use cfg::{build_functions, BasicBlock, Cfg};
 pub use functions::{merge_candidates, unwind_candidates, ConflictKind, Function};
 pub use job::{
     run_guarded, CancelToken, EventSink, JobError, JobEvent, JobHandle, JobId, JobState, NullSink,

@@ -204,6 +204,23 @@ impl AppState {
             .map_err(|error| error.to_string())
     }
 
+    /// 分析摘要（计数汇总）。
+    ///
+    /// 与 [`AppState::analysis`] 共用缓存：`Session` 内部把 `TargetAnalysis`
+    /// 放在 `OnceLock` 里，所以这里再取一次不会重算。
+    ///
+    /// # Errors
+    ///
+    /// 返回该目标无法分析的原因。
+    pub fn summary(&self) -> Result<bitflip_core::AnalysisSummary, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标".to_string());
+        };
+        session
+            .analyze(&session.detached_job())
+            .map_err(|error| error.to_string())
+    }
+
     /// 打开（或创建）本次会话的工程库，用于读写标注。
     ///
     /// 工作区取目标文件所在目录下的 `.bitflip`。这样"打开一个 exe"
@@ -284,6 +301,8 @@ pub fn router(state: AppState) -> Router {
         // 函数/xref/字符串三张表在 100MB 目标上都可能上万条，
         // 合并返回会让"只想看字符串"的请求也付出序列化函数表的代价。
         .route("/api/functions", get(functions))
+        .route("/api/analyze", get(analyze))
+        .route("/api/cfg", get(cfg))
         .route("/api/xrefs", get(xrefs))
         .route("/api/strings", get(strings))
         .route("/api/hex", get(hex))
@@ -449,6 +468,117 @@ struct FunctionsResponse {
     functions: Vec<bitflip_core::FunctionWire>,
     /// 分析期的降级说明。
     notes: Vec<String>,
+}
+
+/// 分析摘要响应：`GET /api/analyze`。
+///
+/// 这个端点存在的理由是**让"基本块数"这类汇总值有个真实的出口**。
+/// M3/M4 期间 `AnalysisSummary::basic_blocks` 一直诚实地返回 0
+/// （CFG 尚未实现），但没有任何接口能把它读出来 —— 于是"诚实的 0"
+/// 和"没接上"在外部看起来一模一样。M5 让它是真值，并在此暴露。
+#[derive(Serialize)]
+struct AnalyzeResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 已索引的指令数。
+    instructions: usize,
+    /// 识别出的函数数。
+    functions: usize,
+    /// 基本块总数（全部函数之和）。
+    basic_blocks: usize,
+    /// 交叉引用数。
+    xrefs: usize,
+    /// 有 CFG 的函数数。
+    functions_with_cfg: usize,
+    /// 分析期的降级说明。
+    notes: Vec<String>,
+}
+
+/// 分析摘要：`GET /api/analyze`。
+async fn analyze(State(state): State<AppState>) -> Response {
+    let summary = match state.summary() {
+        Ok(s) => s,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    Json(AnalyzeResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        instructions: summary.instructions,
+        functions: summary.functions,
+        basic_blocks: summary.basic_blocks,
+        xrefs: summary.xrefs,
+        functions_with_cfg: analysis.cfg_count(),
+        notes: analysis.notes().to_vec(),
+    })
+    .into_response()
+}
+
+/// 单个函数的 CFG 响应：`GET /api/cfg?entry=<hex>`。
+#[derive(Serialize)]
+struct CfgResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 请求的函数入口（定长十六进制）。
+    entry: String,
+    /// 该函数的 CFG；入口不存在时为 `null`。
+    ///
+    /// 用 `null` 而不是空图：**"这个入口没有 CFG"与"这个函数没有基本块"
+    /// 是两件不同的事**，前者要如实说"没有"，后者是数据。
+    cfg: Option<bitflip_core::CfgWire>,
+    /// 一并返回该函数的信息，省一次往返；找不到时为 `null`。
+    function: Option<bitflip_core::FunctionWire>,
+}
+
+/// CFG 查询参数。
+#[derive(serde::Deserialize)]
+struct CfgQuery {
+    /// 函数入口地址（十六进制）。
+    entry: Option<String>,
+}
+
+/// 单个函数的控制流图：`GET /api/cfg?entry=<hex>`。
+///
+/// `entry` 必填：CFG 是**按函数**定义的，没有一个"整个目标的 CFG" ——
+/// 那会是一堆互不相连的图，没有任何分析价值。
+/// 因此缺少 entry 时返回 400 并说明原因，而不是返回空对象。
+async fn cfg(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CfgQuery>,
+) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let Some(raw) = query.entry.as_deref() else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "缺少 entry 参数：CFG 是按函数定义的，请指定函数入口地址（十六进制）",
+        );
+    };
+    let entry = match parse_optional_address(Some(raw)) {
+        Ok(v) => v,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+
+    let cfg = analysis.cfg_of(entry).cloned();
+    let function = analysis
+        .functions()
+        .iter()
+        .find(|f| bitflip_core::parse_address(&f.start) == Some(entry))
+        .cloned();
+
+    Json(CfgResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        entry: bitflip_core::hex16(entry),
+        cfg,
+        function,
+    })
+    .into_response()
 }
 
 /// 函数列表查询参数。

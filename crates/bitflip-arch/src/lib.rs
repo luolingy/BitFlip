@@ -18,7 +18,9 @@ mod types;
 
 pub use backend::{BackendError, CapstoneDecoder, DecoderBackend};
 pub use decode::{decoder_for, Abi, DecodeError, Decoder, UnsupportedDecoder};
-pub use insn::{DecodedInsn, Flow, MemRef, MnemonicId, Operand, RegId, RegSet};
+pub use insn::{
+    ConditionCode, DecodedInsn, Flow, MemRef, MnemonicId, Operand, RegId, RegSet, ShiftKind,
+};
 pub use render::{flow_label, format_insn, text_style, TextStyle};
 pub use types::{Arch, ArchSpec, Endian, Mode};
 

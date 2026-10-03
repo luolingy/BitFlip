@@ -683,9 +683,9 @@ impl Session {
             // 用 try_from 而不是 as：截断会静默给出错误的指令数。
             instructions: usize::try_from(disasm.wire_stats().indexed).unwrap_or(usize::MAX),
             functions: analysis.function_count(),
-            // 基本块划分排期在 M5（需要 CFG 分析）；这里如实返回 0，
-            // 不拿"函数数 × 常数"之类的东西凑一个看起来完整的数字。
-            basic_blocks: 0,
+            // M5 起基本块是真的了：`analysis` 逐函数建了 CFG。
+            // （M3/M4 期间这里诚实地返回 0 —— CFG 那时确实不存在。）
+            basic_blocks: analysis.basic_block_count(),
             xrefs: analysis.xref_count(),
         })
     }
