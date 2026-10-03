@@ -79,6 +79,12 @@ try {
         & $cargoWrapper test --workspace
     } | Out-Null
 
+    # PLAN M5 acceptance criterion 3. Cheap (a grep) and guards an invariant
+    # that decays silently, so it runs before the slow web/smoke steps.
+    Invoke-Step -Name 'arch layering (M5 gate)' -Action {
+        & (Join-Path $PSScriptRoot 'check-arch-layering.ps1') | Out-Host
+    } | Out-Null
+
     if (-not $SkipWeb) {
         $webDir = Join-Path $repoRoot 'web'
         $nodeModules = Join-Path $webDir 'node_modules'

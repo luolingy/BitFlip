@@ -1,5 +1,7 @@
 //! 结构化指令表示与寄存器集合。
 
+use std::fmt;
+
 use crate::types::Arch;
 
 /// interned 之后的助记符编号。
@@ -174,6 +176,93 @@ pub enum Operand {
     Mem(MemRef),
     /// 相对于当前指令的位移（rip-relative / PC-relative），值是**相对偏移**。
     PcRelative(i64),
+    /// 寄存器 + 移位/扩展修饰（AArch64 `add w10, w8, w10, lsl #1` 里的
+    /// `lsl #1`；AArch32 的 `LSL #n` / `ASR #n`）。
+    ///
+    /// ## 为什么必须单独建模，不能丢掉
+    ///
+    /// `add w10, w8, w10` 与 `add w10, w8, w10, lsl #1` 算的是**不同的东西**
+    /// （后者等于 `w8 + 2*w10`）。移位信息若在解码时被丢弃，反汇编会显示成
+    /// 一条语法正确、语义错误的指令 —— 这是最难被发现的一类错误：
+    /// 输出看起来完全合理，只有对着外部反汇编器逐条比才能看出来。
+    ///
+    /// 之前在 `convert_arm64_operand` 里正是这么丢的（capstone 把它放在
+    /// `op.shift`，而转换只取了 `reg`）。本变体是那个 bug 的修复。
+    Shifted {
+        /// 被修饰的寄存器。
+        reg: RegId,
+        /// 移位/扩展类型。
+        kind: ShiftKind,
+        /// 移位量（位）。
+        amount: u32,
+    },
+}
+
+/// 移位/扩展类型（AArch64 的 `LSL/LSR/ASR/ROR` 与 `UXTB` 系列）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftKind {
+    /// 逻辑左移。
+    Lsl,
+    /// 逻辑右移。
+    Lsr,
+    /// 算术右移。
+    Asr,
+    /// 循环右移。
+    Ror,
+    /// 无符号扩展字节。
+    Uxtb,
+    /// 无符号扩展半字。
+    Uxth,
+    /// 无符号扩展字（32→64）。
+    Uxtw,
+    /// 无符号扩展双字（AArch64 里是空操作，但编码允许）。
+    Uxtx,
+    /// 有符号扩展字节。
+    Sxtb,
+    /// 有符号扩展半字。
+    Sxth,
+    /// 有符号扩展字。
+    Sxtw,
+    /// 有符号扩展双字。
+    Sxtx,
+}
+
+impl ShiftKind {
+    /// 稳定的汇编文本（小写，与 capstone/LLVM 一致）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lsl => "lsl",
+            Self::Lsr => "lsr",
+            Self::Asr => "asr",
+            Self::Ror => "ror",
+            Self::Uxtb => "uxtb",
+            Self::Uxth => "uxth",
+            Self::Uxtw => "uxtw",
+            Self::Uxtx => "uxtx",
+            Self::Sxtb => "sxtb",
+            Self::Sxth => "sxth",
+            Self::Sxtw => "sxtw",
+            Self::Sxtx => "sxtx",
+        }
+    }
+
+    /// 是否是扩展（`Uxtb`…）而非移位。扩展类通常不写移位量，
+    /// 除非量不为 0（例如 `uxtw #2`）。
+    #[must_use]
+    pub const fn is_extend(self) -> bool {
+        matches!(
+            self,
+            Self::Uxtb
+                | Self::Uxth
+                | Self::Uxtw
+                | Self::Uxtx
+                | Self::Sxtb
+                | Self::Sxth
+                | Self::Sxtw
+                | Self::Sxtx
+        )
+    }
 }
 
 /// 控制流语义。上层判断"是不是跳转/调用/返回"只看这里，不看助记符文本。
@@ -214,6 +303,96 @@ impl Flow {
     }
 }
 
+/// 条件码（AArch64 `b.lt` 的 `lt`、AArch32 的 `BEQ` 的 `eq`）。
+///
+/// ## 为什么必须单独建模
+///
+/// 条件码**不在** capstone 的指令 id 里：`b.lt` 与 `b` 的 `InsnId` 相同，
+/// 差别只在编码的 cc 字段里。因此"用 InsnId 查助记符"必然得到裸 `b`。
+///
+/// 后果不是排版问题而是**语义问题**：
+/// - `b 0x210294` 是无条件跳转 —— 执行流一定去那里，**没有顺序后继**；
+/// - `b.lt 0x210294` 是条件跳转 —— 条件为假时**继续往下执行**。
+///
+/// 文本上少一个 `.lt`，读者（和写脚本的人）就会对这段代码的控制流得出
+/// 相反的结论。CFG 分析幸好用的是结构化的 `Flow::Branch { conditional }`，
+/// 所以跳转后继是对的；错的是给用户看的文本 —— 而文本同样要真。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConditionCode {
+    /// `eq` —— 相等。
+    Equal,
+    /// `ne` —— 不等。
+    NotEqual,
+    /// `hs` / `cs` —— 无符号高于或相同。
+    CarrySet,
+    /// `lo` / `cc` —— 无符号低于（借位）。
+    CarryClear,
+    /// `mi` —— 负数。
+    Minus,
+    /// `pl` —— 正数或零。
+    Plus,
+    /// `vs` —— 有溢出。
+    Overflow,
+    /// `vc` —— 无溢出。
+    NoOverflow,
+    /// `hi` —— 无符号高于。
+    UnsignedHigher,
+    /// `ls` —— 无符号低于或相同。
+    UnsignedLowerOrSame,
+    /// `ge` —— 有符号大于等于。
+    SignedGreaterEqual,
+    /// `lt` —— 有符号小于。
+    SignedLessThan,
+    /// `gt` —— 有符号大于。
+    SignedGreaterThan,
+    /// `le` —— 有符号小于等于。
+    SignedLessOrEqual,
+    /// `al` —— 总是（AArch64 里等同于无条件）。
+    Always,
+    /// `nv` —— 从不（保留）。
+    Never,
+}
+
+impl ConditionCode {
+    /// 稳定的汇编后缀（小写）。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Equal => "eq",
+            Self::NotEqual => "ne",
+            Self::CarrySet => "hs",
+            Self::CarryClear => "lo",
+            Self::Minus => "mi",
+            Self::Plus => "pl",
+            Self::Overflow => "vs",
+            Self::NoOverflow => "vc",
+            Self::UnsignedHigher => "hi",
+            Self::UnsignedLowerOrSame => "ls",
+            Self::SignedGreaterEqual => "ge",
+            Self::SignedLessThan => "lt",
+            Self::SignedGreaterThan => "gt",
+            Self::SignedLessOrEqual => "le",
+            Self::Always => "al",
+            Self::Never => "nv",
+        }
+    }
+
+    /// 该条件是否值得写成后缀。
+    ///
+    /// `al`（always）与 `nv`（never）在 AArch64 里是"无条件"的编码形式，
+    /// 汇编器通常直接写裸 `b`，因此渲染时不追加后缀。
+    #[must_use]
+    pub const fn is_meaningful(self) -> bool {
+        !matches!(self, Self::Always | Self::Never)
+    }
+}
+
+impl fmt::Display for ConditionCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 一条解码后的指令。
 ///
 /// 这是**解码阶段的瞬时结果**，不是存储格式：工程库与传输层使用列式（SoA）表示，
@@ -232,6 +411,11 @@ pub struct DecodedInsn {
     pub flow: Flow,
     /// 直接控制流目标（间接跳转/调用为 `None`）。
     pub target: Option<u64>,
+    /// 条件码；无条件指令为 `None`。
+    ///
+    /// 见 [`ConditionCode`]：它不在指令 id 里，因此必须单独带出来，
+    /// 否则 `b.lt` 会被渲染成无条件的 `b`。
+    pub condition: Option<ConditionCode>,
     /// 操作数。
     pub operands: Vec<Operand>,
     /// 读到的寄存器。

@@ -397,6 +397,10 @@ fn convert(
     // capstone 的 id 用作助记符标识的来源 —— 渲染层用它反查名字。
     let mnemonic = MnemonicId(insn.id().0);
 
+    // 条件码。**必须**单独取：它不在 `InsnId` 里，`b.lt` 与 `b` 的 id 相同。
+    // 不取的话渲染层只能拿到裸 `b`，把条件跳转显示成无条件跳转。
+    let condition = convert_condition(detail, arch);
+
     DecodedInsn {
         addr,
         len,
@@ -404,10 +408,52 @@ fn convert(
         mnemonic,
         flow,
         target,
+        condition,
         operands,
         reads,
         writes,
         privileged,
+    }
+}
+
+/// 从 capstone 的 detail 里取条件码。
+///
+/// x86 不从这里取：x86 的条件分支有**各自独立的助记符**（`je`/`jne`/`jl`…），
+/// 名字里已经带了条件，`InsnId` 就能区分。AArch64/AArch32 则是同一个 `b`
+/// 配一个 cc 字段，名字里看不出来。所以只有 ARM 系需要这条路径。
+fn convert_condition(detail: &InsnDetail<'_>, arch: Arch) -> Option<crate::insn::ConditionCode> {
+    use crate::insn::ConditionCode;
+
+    match arch {
+        Arch::Aarch64 => {
+            let cc = detail.arch_detail().arm64()?.cc();
+            use capstone::arch::arm64::Arm64CC;
+            Some(match cc {
+                Arm64CC::ARM64_CC_EQ => ConditionCode::Equal,
+                Arm64CC::ARM64_CC_NE => ConditionCode::NotEqual,
+                Arm64CC::ARM64_CC_HS => ConditionCode::CarrySet,
+                Arm64CC::ARM64_CC_LO => ConditionCode::CarryClear,
+                Arm64CC::ARM64_CC_MI => ConditionCode::Minus,
+                Arm64CC::ARM64_CC_PL => ConditionCode::Plus,
+                Arm64CC::ARM64_CC_VS => ConditionCode::Overflow,
+                Arm64CC::ARM64_CC_VC => ConditionCode::NoOverflow,
+                Arm64CC::ARM64_CC_HI => ConditionCode::UnsignedHigher,
+                Arm64CC::ARM64_CC_LS => ConditionCode::UnsignedLowerOrSame,
+                Arm64CC::ARM64_CC_GE => ConditionCode::SignedGreaterEqual,
+                Arm64CC::ARM64_CC_LT => ConditionCode::SignedLessThan,
+                Arm64CC::ARM64_CC_GT => ConditionCode::SignedGreaterThan,
+                Arm64CC::ARM64_CC_LE => ConditionCode::SignedLessOrEqual,
+                Arm64CC::ARM64_CC_AL => ConditionCode::Always,
+                Arm64CC::ARM64_CC_NV => ConditionCode::Never,
+                // `ARM64_CC_INVALID` 表示"这条指令不设条件码"，是正常情形。
+                _ => return None,
+            })
+        }
+        // AArch32 的条件码在指令编码的高 4 位里，capstone 目前没有通过
+        // 统一接口暴露。**如实返回 `None`**（不猜），CFG 仍然是对的
+        // （靠 `Flow::Branch { conditional }`），只是文本上会显示成裸 `b`。
+        // 这一条写在这里是为了让它可被找到，而不是悄悄漏掉。
+        _ => None,
     }
 }
 
@@ -467,9 +513,18 @@ fn convert_arm64_operand(
 
     match op.op_type {
         Arm64OperandType::Reg(reg) => {
-            if let Some(reg) = opt_reg(reg) {
-                operands.push(crate::insn::Operand::Reg(reg));
+            let Some(reg) = opt_reg(reg) else { return };
+
+            // 移位/扩展修饰必须一起带出来 —— 见 `Operand::Shifted` 的说明。
+            //
+            // capstone 把修饰拆成**两个独立字段**：`shift`（LSL/LSR/ASR/ROR）
+            // 与 `ext`（UXTB…SXTX）。两者互斥，但都要检查。
+            if let Some((kind, amount)) = arm64_modifier(op) {
+                operands.push(crate::insn::Operand::Shifted { reg, kind, amount });
+                return;
             }
+
+            operands.push(crate::insn::Operand::Reg(reg));
         }
         Arm64OperandType::Imm(value) => {
             operands.push(crate::insn::Operand::Imm(value));
@@ -489,6 +544,47 @@ fn convert_arm64_operand(
         }
         _ => {}
     }
+}
+
+/// 取 AArch64 操作数的移位/扩展修饰，返回（类型, 移位量）。
+///
+/// capstone 把它们放在两个字段里：`shift` 管逻辑/算术移位，
+/// `ext` 管符号/零扩展。二者各自用 `*_INVALID` 表示"没有修饰"。
+fn arm64_modifier(
+    op: &capstone::arch::arm64::Arm64Operand,
+) -> Option<(crate::insn::ShiftKind, u32)> {
+    use crate::insn::ShiftKind;
+    use capstone::arch::arm64::{Arm64Extender, Arm64Shift};
+
+    // 先看移位字段。`Lsl(3)` 表示 `lsl #3`。
+    match op.shift {
+        Arm64Shift::Lsl(n) => return Some((ShiftKind::Lsl, n)),
+        Arm64Shift::Lsr(n) => return Some((ShiftKind::Lsr, n)),
+        Arm64Shift::Asr(n) => return Some((ShiftKind::Asr, n)),
+        Arm64Shift::Ror(n) => return Some((ShiftKind::Ror, n)),
+        // MSL（masking shift left）在 AArch64 汇编里写作 `lsl`；保留原样会让
+        // 用户对着外部工具对不上，所以按 LLVM 的显示走 Lsl。
+        Arm64Shift::Msl(n) => return Some((ShiftKind::Lsl, n)),
+        // `Invalid` 不是错误，是"这条指令没有移位修饰"，继续看扩展字段。
+        Arm64Shift::Invalid => {}
+    }
+
+    // 再看扩展字段。
+    let kind = match op.ext {
+        Arm64Extender::ARM64_EXT_UXTB => ShiftKind::Uxtb,
+        Arm64Extender::ARM64_EXT_UXTH => ShiftKind::Uxth,
+        Arm64Extender::ARM64_EXT_UXTW => ShiftKind::Uxtw,
+        Arm64Extender::ARM64_EXT_UXTX => ShiftKind::Uxtx,
+        Arm64Extender::ARM64_EXT_SXTB => ShiftKind::Sxtb,
+        Arm64Extender::ARM64_EXT_SXTH => ShiftKind::Sxth,
+        Arm64Extender::ARM64_EXT_SXTW => ShiftKind::Sxtw,
+        Arm64Extender::ARM64_EXT_SXTX => ShiftKind::Sxtx,
+        // `ARM64_EXT_INVALID` 与 `ARM64_EXT_*` 里将来的新值都落到这里。
+        // 返回 `None` 就是**如实表示"没有可渲染的修饰"**；
+        // 而不是硬编一个默认值假装认识。
+        _ => return None,
+    };
+    Some((kind, 0))
 }
 
 /// arm（AArch32）操作数。
@@ -719,6 +815,170 @@ mod tests {
             .expect("b");
         assert!(matches!(insn.flow, Flow::Branch { .. }));
         assert_eq!(insn.target, Some(0x1008));
+    }
+
+    /// AArch64 的移位修饰必须被保留 —— 这是从真实样本里抓到的 bug。
+    ///
+    /// 样本 `elf-aarch64.exe` 的 `bf_loop` 里有一条
+    /// `add w10, w8, w10, lsl #1`（= w8 + 2*w10）。曾经的转换只取
+    /// `op.shift` 之外的部分，把它渲染成 `add w10, w8, w10`（= w8 + w10）。
+    ///
+    /// 这类 bug 的可怕之处在于**它不会让任何测试变红**：
+    /// 输出语法完全正确、看起来像一条正常指令，语义却错了。
+    /// 只有把真实样本的输出与 `llvm-objdump` 逐条对照才会暴露。
+    ///
+    /// 字节 `0b0a050a` = `add w10, w8, w10, lsl #1`（小端存放）。
+    #[test]
+    fn aarch64_shift_modifier_is_preserved() {
+        let spec = ArchSpec::from_arch(Arch::Aarch64, Mode::M64, Endian::Little);
+        let dec = CapstoneDecoder::new(spec).expect("aarch64 解码器");
+        let insn = dec
+            .decode_one(&[0x0a, 0x05, 0x0a, 0x0b], 0x210278)
+            .expect("add 带 lsl");
+
+        let shifted = insn
+            .operands
+            .iter()
+            .find_map(|op| match op {
+                crate::insn::Operand::Shifted { kind, amount, .. } => Some((*kind, *amount)),
+                _ => None,
+            })
+            .expect(
+                "add w10, w8, w10, lsl #1 必须解析出 Shifted 操作数；\
+                 拿不到就说明移位在解码期被丢掉了（会渲染成语义错误的指令）",
+            );
+
+        assert_eq!(shifted.0, crate::insn::ShiftKind::Lsl);
+        assert_eq!(shifted.1, 1, "移位量应是 1（lsl #1）");
+    }
+
+    /// 没有移位修饰的普通寄存器指令**不应**被误标成 `Shifted`。
+    ///
+    /// 反向确认：上一条测试证明"有修饰时能拿到"，这条证明"没修饰时不硬造"。
+    /// 少了这条，一个"把所有寄存器都当 Shifted"的实现也能过。
+    #[test]
+    fn aarch64_plain_register_is_not_marked_shifted() {
+        let spec = ArchSpec::from_arch(Arch::Aarch64, Mode::M64, Endian::Little);
+        let dec = CapstoneDecoder::new(spec).expect("aarch64 解码器");
+        // 0b000020 = add w0, w1, w0（无移位）
+        let insn = dec
+            .decode_one(&[0x20, 0x00, 0x00, 0x0b], 0x21025c)
+            .expect("add 无移位");
+
+        assert!(
+            insn.operands
+                .iter()
+                .any(|op| matches!(op, crate::insn::Operand::Reg(_))),
+            "无修饰的寄存器应保持 Reg：{:?}",
+            insn.operands
+        );
+        assert!(
+            !insn
+                .operands
+                .iter()
+                .any(|op| matches!(op, crate::insn::Operand::Shifted { .. })),
+            "没有移位就不该出现 Shifted（不能硬造修饰）：{:?}",
+            insn.operands
+        );
+    }
+
+    /// AArch64 的移位修饰必须渲染出来（端到端：解码 → 文本）。
+    ///
+    /// 这条盯的是渲染层：即使解码层保住了修饰，渲染若不认识 `Shifted`
+    /// 也会把它吞掉，输出照样是错的。
+    #[test]
+    fn aarch64_shift_modifier_is_rendered() {
+        let spec = ArchSpec::from_arch(Arch::Aarch64, Mode::M64, Endian::Little);
+        let dec = CapstoneDecoder::new(spec).expect("aarch64 解码器");
+        let insn = dec
+            .decode_one(&[0x0a, 0x05, 0x0a, 0x0b], 0x210278)
+            .expect("add 带 lsl");
+        let text = crate::render::format_insn(&dec, &insn);
+
+        // 与 llvm-objdump 的输出对齐：`add w10, w8, w10, lsl #1`
+        assert!(
+            text.contains("lsl #1"),
+            "渲染结果必须带 `lsl #1`，实际：{text:?}\n\
+             （丢掉移位会让这条指令看起来对、算得不对）"
+        );
+    }
+
+    /// AArch64 条件分支必须带条件码 —— 第二个从真实样本里抓到的 bug。
+    ///
+    /// `b.lt` 与 `b` 的 capstone `InsnId` **相同**，条件在编码的 cc 字段里。
+    /// 只用 id 查助记符会得到裸 `b`，于是条件跳转被显示成无条件跳转：
+    /// 读者会以为执行流一定跳走，实际是"条件为假就往下走"。
+    ///
+    /// 字节 `6b010054` = `b.lt 0x210294`（小端存放）。
+    #[test]
+    fn aarch64_conditional_branch_carries_condition() {
+        let spec = ArchSpec::from_arch(Arch::Aarch64, Mode::M64, Endian::Little);
+        let dec = CapstoneDecoder::new(spec).expect("aarch64 解码器");
+        let insn = dec
+            .decode_one(&[0x6b, 0x01, 0x00, 0x54], 0x210268)
+            .expect("b.lt");
+
+        assert_eq!(
+            insn.condition,
+            Some(crate::insn::ConditionCode::SignedLessThan),
+            "b.lt 必须解析出 LT 条件码；拿到 None 说明条件在解码期被丢了"
+        );
+        assert!(
+            matches!(insn.flow, Flow::Branch { conditional: true }),
+            "条件分支必须同时有两个后继：{:?}",
+            insn.flow
+        );
+
+        let text = crate::render::format_insn(&dec, &insn);
+        assert!(
+            text.starts_with("b.lt"),
+            "渲染必须写成 `b.lt`（与 llvm-objdump 一致），实际：{text:?}"
+        );
+    }
+
+    /// 无条件分支**不该**被加上条件后缀。
+    ///
+    /// 反向确认：上一条证明"有条件时能写出来"，这条证明"没条件时不硬造"。
+    /// 少了它，一个"给所有分支都追加 .al"的实现也能过。
+    #[test]
+    fn aarch64_unconditional_branch_has_no_condition_suffix() {
+        let spec = ArchSpec::from_arch(Arch::Aarch64, Mode::M64, Endian::Little);
+        let dec = CapstoneDecoder::new(spec).expect("aarch64 解码器");
+        // 14000011 = b 0x21029c（无条件）
+        let insn = dec
+            .decode_one(&[0x11, 0x00, 0x00, 0x14], 0x210258)
+            .expect("b");
+
+        // AL 可能来自编码，但它是"无条件"的意思，渲染时必须省略
+        if let Some(cc) = insn.condition {
+            assert!(
+                !cc.is_meaningful(),
+                "无条件 b 不该带出有意义的条件码：{cc:?}"
+            );
+        }
+        let text = crate::render::format_insn(&dec, &insn);
+        assert_eq!(
+            text, "b 0x21029c",
+            "无条件跳转必须渲染成裸 `b`，不能有 `.al` 之类后缀"
+        );
+    }
+
+    /// x86 的条件跳转不依赖 cc 字段：条件在助记符里（`je`/`jl`…）。
+    /// 这条确认我们没有把 ARM 的处理方式错误地套到 x86 上。
+    #[test]
+    fn x86_conditional_jump_keeps_its_own_mnemonic() {
+        let dec = decoder();
+        // 74 05 = je +5
+        let insn = dec.decode_one(&[0x74, 0x05], 0x1000).expect("je");
+        let text = crate::render::format_insn(&dec, &insn);
+        assert!(
+            text.starts_with("je"),
+            "x86 条件跳转的条件在助记符里，不应被改写：{text:?}"
+        );
+        assert!(
+            !text.contains("jmp."),
+            "不该给 x86 助记符加 ARM 风格的 `.cc` 后缀：{text:?}"
+        );
     }
 
     #[test]

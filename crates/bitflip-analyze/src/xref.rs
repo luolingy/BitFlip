@@ -132,6 +132,7 @@ mod tests {
             mnemonic: MnemonicId(1),
             flow,
             target,
+            condition: None,
             operands: ops,
             reads: bitflip_arch::RegSet::new(),
             writes: bitflip_arch::RegSet::new(),

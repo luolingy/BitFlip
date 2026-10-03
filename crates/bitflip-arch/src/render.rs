@@ -65,6 +65,16 @@ pub fn format_insn(decoder: &CapstoneDecoder, insn: &DecodedInsn) -> String {
             .insn_name(capstone::InsnId(insn.mnemonic.0))
             .unwrap_or_else(|| "?".to_string());
 
+        // 条件码是助记符的**后缀**，不是操作数。
+        //
+        // `b.lt` 与 `b` 的 `InsnId` 相同，差别只在 cc 字段；不追加后缀就会
+        // 把条件跳转显示成无条件跳转 —— 读者会以为执行流一定跳走，
+        // 而实际上是"条件为假就往下走"。
+        let mnemonic = match insn.condition {
+            Some(cc) if cc.is_meaningful() => format!("{mnemonic}.{cc}"),
+            _ => mnemonic,
+        };
+
         if insn.operands.is_empty() {
             return mnemonic;
         }
@@ -103,6 +113,21 @@ fn format_operand(cs: &Capstone, op: &Operand) -> String {
         // 而这里是纯渲染层，不该做地址计算。
         Operand::PcRelative(offset) => format!("{offset:+#x}"),
         Operand::Mem(mem) => format_mem(cs, mem),
+        // `reg, lsl #n` / `reg, uxtw #n`。
+        //
+        // 扩展类且量为 0 时按 AArch64 汇编惯例省略 `#0`
+        // （`uxtw` 而不是 `uxtw #0`）—— 与 LLVM/GNU as 输出一致，
+        // 便于和外部反汇编器逐条对拍。
+        Operand::Shifted { reg, kind, amount } => {
+            let name = cs
+                .reg_name(capstone::RegId(reg.0))
+                .unwrap_or_else(|| format!("r{}", reg.0));
+            if kind.is_extend() && *amount == 0 {
+                format!("{name}, {}", kind.as_str())
+            } else {
+                format!("{name}, {} #{amount}", kind.as_str())
+            }
+        }
     }
 }
 
