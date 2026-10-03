@@ -186,6 +186,63 @@ impl AppState {
             Err(reason) => Err(reason.clone()),
         }
     }
+
+    /// 取目标级分析（函数 / 交叉引用 / 字符串），惰性建立并缓存。
+    ///
+    /// 与 [`AppState::disasm`] 同样的理由：一次分析要建地址空间、做两遍解码、
+    /// 合并函数候选、扫字符串。UI 每个请求都重算等于把滚动变成重扫。
+    ///
+    /// # Errors
+    ///
+    /// 返回该目标无法分析的原因（未解析成功 / 没有可分析内容）。
+    pub fn analysis(&self) -> Result<Arc<bitflip_core::TargetAnalysis>, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标".to_string());
+        };
+        session
+            .analysis(&session.detached_job())
+            .map_err(|error| error.to_string())
+    }
+
+    /// 打开（或创建）本次会话的工程库，用于读写标注。
+    ///
+    /// 工作区取目标文件所在目录下的 `.bitflip`。这样"打开一个 exe"
+    /// 就自动在它旁边建立工程，不需要用户先选一个工作区 —— 本地工具
+    /// 不该为一件显而易见的事要求配置。
+    ///
+    /// # Errors
+    ///
+    /// 目标未解析成功、或工程库读写失败。
+    pub fn project(&self) -> Result<bitflip_core::ProjectStore, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标".to_string());
+        };
+        let workspace = session
+            .path()
+            .parent()
+            .map(|p| p.join(".bitflip"))
+            .ok_or_else(|| "目标路径没有父目录，无法定位工程工作区".to_string())?;
+        session
+            .open_project(&workspace)
+            .map_err(|error| error.to_string())
+    }
+
+    /// 按虚拟地址读原始字节（十六进制视图用）。
+    ///
+    /// 读不到就返回**实际读到的部分**，由调用方如实报告长度 ——
+    /// 不用零填充冒充文件内容（CLAUDE.md §7）。
+    ///
+    /// # Errors
+    ///
+    /// 目标未解析成功。
+    pub fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标".to_string());
+        };
+        session
+            .read_virtual(address, length)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// 生成访问令牌：32 字节随机数的十六进制表示（64 字符）。
@@ -222,6 +279,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/target", get(target))
         .route("/api/sections", get(sections))
         .route("/api/insns", get(insns))
+        // ── M3：目标级分析 ──
+        // 各自独立成一个端点，而不是塞进 `/api/target` 一次返回全部：
+        // 函数/xref/字符串三张表在 100MB 目标上都可能上万条，
+        // 合并返回会让"只想看字符串"的请求也付出序列化函数表的代价。
+        .route("/api/functions", get(functions))
+        .route("/api/xrefs", get(xrefs))
+        .route("/api/strings", get(strings))
+        .route("/api/hex", get(hex))
+        // 标注是**主数据**，可读可写可删；写路径不触发重新分析。
+        .route(
+            "/api/annotations",
+            get(annotations)
+                .put(put_annotation)
+                .delete(delete_annotation),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -362,6 +434,493 @@ async fn insns(
         notes: disasm.notes.clone(),
     })
     .into_response()
+}
+
+// ── M3：目标级分析（函数 / 交叉引用 / 字符串）与标注 ───────────────────────
+
+/// 函数列表响应。
+#[derive(Serialize)]
+struct FunctionsResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 总数（分页前）。
+    total: usize,
+    /// 本页函数。
+    functions: Vec<bitflip_core::FunctionWire>,
+    /// 分析期的降级说明。
+    notes: Vec<String>,
+}
+
+/// 函数列表查询参数。
+#[derive(serde::Deserialize)]
+struct FunctionsQuery {
+    /// 起始地址（只看 >= 该地址的函数）。
+    from: Option<String>,
+    /// 请求条数；服务端 clamp。
+    count: Option<usize>,
+}
+
+/// 函数列表：`GET /api/functions?from=<hex>&count=<n>`。
+///
+/// 分页的理由与反汇编相同：几万个函数一次序列化会让浏览器卡死。
+async fn functions(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<FunctionsQuery>,
+) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let from = match parse_optional_address(query.from.as_deref()) {
+        Ok(v) => v,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+
+    let all = analysis.functions();
+    let total = all.len();
+    let count = query
+        .count
+        .unwrap_or(bitflip_core::DEFAULT_PAGE_SIZE)
+        .min(bitflip_core::DEFAULT_PAGE_SIZE);
+
+    // `FunctionWire::start` 是定长十六进制字符串（wire 契约），
+    // 过滤前要先解析回 u64。解析不出来的条目**跳过但不隐藏**：
+    // 正常情况下不可能出现，真出现说明 wire 层有 bug，用 note 提示。
+    let functions: Vec<_> = all
+        .iter()
+        .filter(|f| bitflip_core::parse_address(&f.start).is_some_and(|addr| addr >= from))
+        .take(count)
+        .cloned()
+        .collect();
+
+    Json(FunctionsResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        total,
+        functions,
+        notes: analysis.notes().to_vec(),
+    })
+    .into_response()
+}
+
+/// 交叉引用响应。
+#[derive(Serialize)]
+struct XrefsResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 查询的地址。
+    address: String,
+    /// 从该地址发出的引用。
+    from: Vec<bitflip_core::XrefWire>,
+    /// 指向该地址的引用。
+    to: Vec<bitflip_core::XrefWire>,
+    /// 包含该地址的函数（`null` 表示没有已知函数覆盖它）。
+    ///
+    /// `null` 而不是一个占位函数：地址不在任何已知函数里是**真实**情形
+    /// （数据段、填充区、还没识别的代码），用假函数掩盖会让用户误判。
+    function: Option<bitflip_core::FunctionWire>,
+}
+
+/// 交叉引用查询参数。
+#[derive(serde::Deserialize)]
+struct AddressQuery {
+    /// 目标地址（`0x` 前缀可省）。
+    address: Option<String>,
+    /// `address` 的别名，便于前端直接复用反汇编页的跳转参数名。
+    at: Option<String>,
+}
+
+/// 交叉引用：`GET /api/xrefs?address=<hex>`。
+async fn xrefs(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<AddressQuery>,
+) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let raw = query.address.or(query.at);
+    let Some(raw) = raw else {
+        return error_response(StatusCode::BAD_REQUEST, "缺少 address 参数");
+    };
+    let Some(address) = bitflip_core::parse_address(&raw) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("地址无法解析：{raw:?}（需要 16 进制，可带 0x 前缀）"),
+        );
+    };
+
+    Json(XrefsResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        address: bitflip_core::hex16(address),
+        from: analysis.xrefs_from(address).into_iter().cloned().collect(),
+        to: analysis.xrefs_to(address).into_iter().cloned().collect(),
+        function: analysis.function_containing(address).cloned(),
+    })
+    .into_response()
+}
+
+/// 字符串列表响应。
+#[derive(Serialize)]
+struct StringsResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 总数。
+    total: usize,
+    /// 本页字符串。
+    strings: Vec<bitflip_core::StringWire>,
+}
+
+/// 字符串查询参数。
+#[derive(serde::Deserialize)]
+struct StringsQuery {
+    /// 子串过滤（大小写敏感，按需再加）。
+    contains: Option<String>,
+    /// 请求条数。
+    count: Option<usize>,
+    /// 跳过条数（分页）。
+    offset: Option<usize>,
+}
+
+/// 字符串：`GET /api/strings?contains=<s>&count=<n>&offset=<n>`。
+async fn strings(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<StringsQuery>,
+) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let needle = query.contains.unwrap_or_default();
+    let filtered: Vec<_> = analysis
+        .strings()
+        .iter()
+        .filter(|s| needle.is_empty() || s.text.contains(&needle))
+        .collect();
+    let total = filtered.len();
+
+    let offset = query.offset.unwrap_or(0);
+    let count = query
+        .count
+        .unwrap_or(bitflip_core::DEFAULT_PAGE_SIZE)
+        .min(bitflip_core::DEFAULT_PAGE_SIZE);
+
+    Json(StringsResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        total,
+        strings: filtered
+            .into_iter()
+            .skip(offset)
+            .take(count)
+            .cloned()
+            .collect(),
+    })
+    .into_response()
+}
+
+/// 十六进制视图响应。
+#[derive(Serialize)]
+struct HexResponse {
+    /// 起始地址（回显规范化后的值）。
+    address: String,
+    /// 每行的字节数。
+    row_bytes: usize,
+    /// 行列表。
+    rows: Vec<HexRow>,
+    /// 实际读到的字节数（可能少于请求，到段尾或文件尾）。
+    bytes_read: usize,
+}
+
+/// 十六进制视图的一行。
+#[derive(Serialize)]
+struct HexRow {
+    /// 行首地址。
+    address: String,
+    /// 十六进制字节（每字节两位，小写）。
+    hex: String,
+    /// ASCII 投影（不可打印字符为 `.`）。
+    ascii: String,
+}
+
+/// 十六进制视图查询参数。
+#[derive(serde::Deserialize)]
+struct HexQuery {
+    /// 起始地址。
+    address: Option<String>,
+    /// 请求字节数；服务端 clamp。
+    length: Option<usize>,
+}
+
+/// 每行显示的字节数。
+const HEX_ROW_BYTES: usize = 16;
+/// 单次十六进制视图的字节上限（64 KiB：够看几屏，又不会被拿来下载整个文件）。
+const MAX_HEX_BYTES: usize = 64 * 1024;
+
+/// 十六进制视图：`GET /api/hex?address=<hex>&length=<n>`。
+///
+/// 读不到就如实说读不到：`bytes_read` 会小于请求值，UI 据此显示"到段尾"，
+/// 而不是拿零填充冒充文件内容（§7）。
+async fn hex(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HexQuery>,
+) -> Response {
+    let raw = query.address.unwrap_or_else(|| "0".to_string());
+    let Some(address) = bitflip_core::parse_address(&raw) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("地址无法解析：{raw:?}（需要 16 进制，可带 0x 前缀）"),
+        );
+    };
+
+    let length = query.length.unwrap_or(512).min(MAX_HEX_BYTES);
+
+    let data = match state.read_bytes(address, length) {
+        Ok(d) => d,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let rows: Vec<HexRow> = data
+        .chunks(HEX_ROW_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut hex = String::with_capacity(chunk.len() * 3);
+            let mut ascii = String::with_capacity(chunk.len());
+            for (i, byte) in chunk.iter().enumerate() {
+                if i > 0 {
+                    hex.push(' ');
+                }
+                hex.push_str(&format!("{byte:02x}"));
+                // 只把可打印 ASCII 投影出来；其余用 `.`，
+                // 否则中文/控制字节会把 JSON 和终端搞乱。
+                ascii.push(if (0x20..0x7f).contains(byte) {
+                    *byte as char
+                } else {
+                    '.'
+                });
+            }
+            HexRow {
+                address: bitflip_core::hex16(address + (index * HEX_ROW_BYTES) as u64),
+                hex,
+                ascii,
+            }
+        })
+        .collect();
+
+    Json(HexResponse {
+        address: bitflip_core::hex16(address),
+        row_bytes: HEX_ROW_BYTES,
+        bytes_read: data.len(),
+        rows,
+    })
+    .into_response()
+}
+
+/// 注解（标注）列表响应。
+#[derive(Serialize)]
+struct AnnotationsResponse {
+    /// 格式版本。
+    format_version: u32,
+    /// 目标内容哈希（工程库的身份）。
+    target_sha256: String,
+    /// 本页标注。
+    annotations: Vec<bitflip_core::Annotation>,
+    /// 分析是否已经跑过（UI 据此提示"标注不会被重新分析覆盖"）。
+    analyzed_at_unix: Option<u64>,
+}
+
+/// 标注查询参数。
+#[derive(serde::Deserialize)]
+struct AnnotationsQuery {
+    /// 起始地址（含）。
+    from: Option<String>,
+    /// 结束地址（不含）；省略则取 `from + MAX`。
+    to: Option<String>,
+}
+
+/// 范围查询的默认跨度：一个窗口取 1 MiB 的地址空间内的标注。
+const ANNOTATION_WINDOW: u64 = 1 << 20;
+
+/// 读取标注：`GET /api/annotations?from=<hex>&to=<hex>`。
+async fn annotations(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<AnnotationsQuery>,
+) -> Response {
+    let store = match state.project() {
+        Ok(s) => s,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+    let meta = match store.meta() {
+        Ok(m) => m,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+
+    let from = match parse_optional_address(query.from.as_deref()) {
+        Ok(v) => v,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let to = match query.to.as_deref() {
+        None => from.saturating_add(ANNOTATION_WINDOW),
+        Some(text) => match bitflip_core::parse_address(text) {
+            Some(v) => v,
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("地址无法解析：{text:?}（需要 16 进制，可带 0x 前缀）"),
+                );
+            }
+        },
+    };
+
+    Json(AnnotationsResponse {
+        format_version: bitflip_core::CORE_API_VERSION,
+        target_sha256: meta.target_sha256,
+        annotations: store.range(from, to),
+        analyzed_at_unix: meta.analyzed_at_unix,
+    })
+    .into_response()
+}
+
+/// 写入标注的请求体。
+#[derive(serde::Deserialize)]
+struct AnnotationBody {
+    /// 地址（字符串，接受 `0x` 前缀）。
+    address: String,
+    /// 类别：`name` / `comment` / `bookmark` / …
+    kind: String,
+    /// 文本内容。
+    text: Option<String>,
+    /// 补丁字节（十六进制字符串）。
+    patch_hex: Option<String>,
+}
+
+/// 写入标注：`PUT /api/annotations`。
+///
+/// **这是主数据写入，不触发重新分析** —— UI 改名之后不该等一次全量扫描。
+/// 分析结果（函数/xref/字符串）是派生物，存在独立文件里，与标注互不干扰。
+async fn put_annotation(
+    State(state): State<AppState>,
+    Json(body): Json<AnnotationBody>,
+) -> Response {
+    let store = match state.project() {
+        Ok(s) => s,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let Some(address) = bitflip_core::parse_address(&body.address) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("地址无法解析：{:?}", body.address),
+        );
+    };
+    let Some(kind) = bitflip_core::AnnotationKind::parse(&body.kind) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "标注类别无法识别：{:?}（可用：name/comment/type/bookmark/patch/function-boundary/code-data）",
+                body.kind
+            ),
+        );
+    };
+
+    if body.text.is_none() && body.patch_hex.is_none() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "标注既没有 text 也没有 patch_hex：空标注没有意义，已拒绝",
+        );
+    }
+
+    let annotation = bitflip_core::Annotation {
+        address,
+        kind,
+        text: body.text,
+        patch_hex: body.patch_hex,
+    };
+
+    let now = now_unix();
+    match store.put(&annotation, now) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "address": bitflip_core::hex16(address),
+            "kind": kind.as_str(),
+            "updated_at_unix": now,
+            "reanalyzed": false,
+        }))
+        .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+/// 删除标注：`DELETE /api/annotations?address=<hex>&kind=<kind>`。
+async fn delete_annotation(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<DeleteAnnotationQuery>,
+) -> Response {
+    let store = match state.project() {
+        Ok(s) => s,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let Some(address) = query
+        .address
+        .as_deref()
+        .and_then(bitflip_core::parse_address)
+    else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "缺少或无法解析 address 参数（需要 16 进制）",
+        );
+    };
+    let Some(kind) = query
+        .kind
+        .as_deref()
+        .and_then(bitflip_core::AnnotationKind::parse)
+    else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "缺少或无法识别 kind 参数（可用：name/comment/type/bookmark/patch/function-boundary/code-data）",
+        );
+    };
+
+    match store.delete(address, kind) {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "address": bitflip_core::hex16(address),
+            "kind": kind.as_str(),
+        }))
+        .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+/// 删除标注的查询参数。
+#[derive(serde::Deserialize)]
+struct DeleteAnnotationQuery {
+    /// 地址。
+    address: Option<String>,
+    /// 类别。
+    kind: Option<String>,
+}
+
+/// 当前 Unix 时间（秒）。时钟是基础设施，不从这里往上层传业务语义。
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 解析可选地址参数：缺省为 0。
+///
+/// 与 `insns` 的处理保持一致：解析失败要**报错**，不能悄悄回退到 0 ——
+/// 那会让用户以为自己跳转成功了，其实只是回到了开头。
+fn parse_optional_address(text: Option<&str>) -> Result<u64, String> {
+    match text {
+        None | Some("") => Ok(0),
+        Some(text) => bitflip_core::parse_address(text)
+            .ok_or_else(|| format!("地址无法解析：{text:?}（需要 16 进制，可带 0x 前缀）")),
+    }
 }
 
 // ── 鉴权 ────────────────────────────────────────────────────────────────────

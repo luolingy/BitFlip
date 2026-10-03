@@ -46,6 +46,29 @@ pub struct Annotation {
     pub patch_hex: Option<String>,
 }
 
+impl serde::Serialize for Annotation {
+    /// 手写序列化而不是 `derive`，为的是守住两条 wire 契约：
+    ///
+    /// 1. **地址是定长小写 16 位十六进制字符串**（CLAUDE.md §4）。
+    ///    直接 derive 会把内部的 `u64` 序列化成 JSON 数字，前端拿到的
+    ///    就是 `4198400` 而不是 `"0000000000401000"` —— 一旦有第二个
+    ///    端点这么干，"只有一种地址表示"的约定就破了。
+    /// 2. 类别用稳定短名（`name` / `comment` / …），不用 Rust 的
+    ///    `VariantName` —— 后者随重构改名就会破坏 wire 兼容。
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Annotation", 4)?;
+        s.serialize_field("address", &format!("{:016x}", self.address))?;
+        s.serialize_field("kind", self.kind.as_str())?;
+        s.serialize_field("text", &self.text)?;
+        s.serialize_field("patch_hex", &self.patch_hex)?;
+        s.end()
+    }
+}
+
 impl Annotation {
     /// 构造一条纯文本标注（名字、注释、书签…）。
     #[must_use]

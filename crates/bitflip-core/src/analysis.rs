@@ -75,6 +75,7 @@ pub struct StringWire {
 /// 构建**不**物化指令流：逐条解码、逐条归约（见 [`TargetAnalysis::build`]）。
 /// 产出的三张表（函数/xref/字符串）都是派生物，可整体重建 ——
 /// 这是 ADR-0012 里 `.bda` 文件的内容。
+#[derive(Debug)]
 pub struct TargetAnalysis {
     functions: Vec<FunctionWire>,
     xrefs: Vec<XrefWire>,

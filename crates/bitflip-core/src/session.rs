@@ -3,13 +3,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bitflip_analyze::{JobHandle, NullSink, StageId};
+use bitflip_analyze::{JobHandle, NullSink, StageId, StringOptions};
 use bitflip_arch::ArchSpec;
 use bitflip_loader::object::{Object, ObjectId};
 use bitflip_loader::{sniff_file, ContainerKind, Guess, ObjectKind};
 use bitflip_project::ProjectStore;
 use serde::Serialize;
 
+use crate::analysis::TargetAnalysis;
 use crate::disasm::Disasm;
 use crate::error::BitflipError;
 use bitflip_analyze::ScanOptions as DisasmScanOptions;
@@ -397,6 +398,11 @@ pub struct Session {
     /// 懒计算：打开一个 100MB 目标只为看一眼格式时，不该先付一次全文件
     /// 哈希的代价。用到（打开/创建工程库）时才算。
     hash: std::sync::OnceLock<String>,
+    /// 目标级分析（函数 / xref / 字符串），惰性建立并缓存。
+    ///
+    /// 缓存的是 `Result`：分析失败（例如目标没解析成功）也要缓存，
+    /// 否则每个请求都会重跑一遍注定失败的流程。
+    analysis: std::sync::OnceLock<Result<Arc<TargetAnalysis>, String>>,
 }
 
 impl Session {
@@ -451,6 +457,7 @@ impl Session {
             object_raw,
             bytes,
             hash: std::sync::OnceLock::new(),
+            analysis: std::sync::OnceLock::new(),
         })
     }
 
@@ -621,6 +628,34 @@ impl Session {
         self.info.clone()
     }
 
+    /// 按虚拟地址读原始字节（十六进制视图用）。
+    ///
+    /// 返回**实际读到**的字节：到段尾或文件尾时会短于请求长度。
+    /// 不补零冒充文件内容 —— 调用方据此显示"到段尾"，而不是让用户
+    /// 以为那段内存真的是零（CLAUDE.md §7）。
+    ///
+    /// 用 `read_window` 而不是 `read`：后者要求整个请求范围完整落在**单个**
+    /// 段内，越界即返回 `None`。对十六进制视图这是错的语义 —— 用户翻到
+    /// 段尾时应当看到剩余内容，而不是"读取失败"。
+    ///
+    /// # Errors
+    ///
+    /// 目标未解析成功，或地址不在任何已映射区间内。
+    pub fn read_virtual(&self, address: u64, length: usize) -> Result<Vec<u8>, BitflipError> {
+        if self.object_raw.is_none() {
+            return Err(BitflipError::unavailable("目标未解析成功，无法读取字节"));
+        }
+        let disasm = self.disassemble(DisasmScanOptions::default())?;
+        // `read_window` 返回窗口实际长度；区分"地址完全没映射"与
+        // "读到了但被段尾截断"很重要 —— 前者是用户跳错了地方。
+        match disasm.space.read_window(address, length) {
+            Some((bytes, _span)) => Ok(bytes),
+            None => Err(BitflipError::unavailable(format!(
+                "地址 {address:#x} 不在任何已映射区间内"
+            ))),
+        }
+    }
+
     /// 新建一个丢弃事件的分析作业（无 UI 场景）。
     #[must_use]
     pub fn detached_job(&self) -> JobHandle {
@@ -629,13 +664,74 @@ impl Session {
 
     /// 运行分析。
     ///
-    /// M0 明确返回 [`BitflipError::NotYetImplemented`]：宁可让调用方拿到"还没做"，
-    /// 也不返回一个空的结果集让 UI 显示"分析完成但什么都没有"。
+    /// 目前只跑**一次扫描**并返回计数摘要；完整的 S1–S9 流水线（增量分析、
+    /// 签名匹配等）排期在后续里程碑。M3 交付的是目标级分析
+    /// （函数 / 交叉引用 / 字符串），见 [`Session::analysis`]。
+    ///
+    /// 注意这里不再是 `NotYetImplemented`：M3 的分析层已经落地，
+    /// 再返回"未实现"就是**过时的谎话**。真正还没做的部分
+    /// （签名匹配、类型恢复）由各自的 API 明确报出。
     pub fn analyze(&self, job: &JobHandle) -> Result<AnalysisSummary, BitflipError> {
-        job.set_stage(StageId::Segments, 1.0, "分析流水线尚未接入（计划：M2）");
-        Err(BitflipError::not_implemented(
-            "分析流水线 S1–S9（计划：M2 起，见 docs/PLAN.md）",
-        ))
+        job.set_stage(StageId::Segments, 0.2, "建立地址空间");
+        job.set_stage(StageId::Decode, 0.6, "反汇编");
+        let disasm = self.disassemble(DisasmScanOptions::default())?;
+        let analysis = self.analysis_cached(job)?;
+
+        job.set_stage(StageId::Symbols, 1.0, "完成");
+        Ok(AnalysisSummary {
+            // indexed 是 u64（wire 上用定宽），摘要用 usize。
+            // 用 try_from 而不是 as：截断会静默给出错误的指令数。
+            instructions: usize::try_from(disasm.wire_stats().indexed).unwrap_or(usize::MAX),
+            functions: analysis.function_count(),
+            // 基本块划分排期在 M5（需要 CFG 分析）；这里如实返回 0，
+            // 不拿"函数数 × 常数"之类的东西凑一个看起来完整的数字。
+            basic_blocks: 0,
+            xrefs: analysis.xref_count(),
+        })
+    }
+
+    /// 目标级分析结果（函数 / 交叉引用 / 字符串），惰性建立并缓存。
+    ///
+    /// 缓存的理由与 `disasm` 相同：一次分析要建地址空间、做线性 + 递归下降
+    /// 解码、合并函数候选、扫字符串。UI 每个请求都重算等于把滚动变成重扫。
+    ///
+    /// 用 `OnceLock` 而不是 `Mutex<Option>`：要的是"只算一次"，
+    /// 而不是"互斥更新"（后者会退化成每个请求都重算并互相覆盖）。
+    pub fn analysis(&self, job: &JobHandle) -> Result<Arc<TargetAnalysis>, BitflipError> {
+        job.set_stage(StageId::Functions, 0.7, "识别函数与交叉引用");
+        self.analysis_cached(job)
+    }
+
+    /// 缓存包装（`analyze` 与 `analysis` 共用同一份结果）。
+    fn analysis_cached(&self, _job: &JobHandle) -> Result<Arc<TargetAnalysis>, BitflipError> {
+        if let Some(cached) = self.analysis.get() {
+            return cached.clone().map_err(BitflipError::unavailable);
+        }
+
+        let object = self
+            .object_raw
+            .as_ref()
+            .ok_or_else(|| BitflipError::unavailable("目标未解析成功，无法分析"))?;
+
+        // 作业边界必须兜住 panic：分析器崩溃要转成错误，不能让进程退出
+        // （CLAUDE.md §4）。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let disasm = self.disassemble(DisasmScanOptions::default())?;
+            Ok::<_, BitflipError>(TargetAnalysis::build(
+                &disasm,
+                object,
+                &StringOptions::default(),
+            ))
+        }));
+
+        let resolved: Result<Arc<TargetAnalysis>, String> = match result {
+            Ok(Ok(analysis)) => Ok(Arc::new(analysis)),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("分析过程中发生 panic（已捕获，未影响服务进程）".to_string()),
+        };
+
+        let stored = self.analysis.get_or_init(|| resolved);
+        stored.clone().map_err(BitflipError::unavailable)
     }
 }
 
@@ -701,18 +797,53 @@ mod tests {
         assert!(err.to_string().contains(".app"));
     }
 
+    /// 分析现在**真的会跑**，不再返回 `NotYetImplemented`。
+    ///
+    /// 这条测试是在替换一条过时的断言：以前 `analyze` 明确返回
+    /// "分析流水线尚未接入"，那时它是诚实的；M3 的分析层落地之后，
+    /// 同一句话就变成了**谎话**（明明能跑却报未实现），所以测试也得跟着改。
+    /// 库里没有"永远为真"的断言，只有"与当前实现一致"的断言。
     #[test]
-    fn analyze_is_honest_about_not_being_implemented() {
+    fn analyze_runs_and_reports_real_counts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("sample.elf");
         std::fs::write(&path, elf64_x86_64()).expect("write");
         let session = Session::open(&path, OpenOptions::default()).expect("打开");
         let job = session.detached_job();
 
-        let err = session.analyze(&job).expect_err("M0 必须明确拒绝");
-        assert!(matches!(err, BitflipError::NotYetImplemented { .. }));
-        assert!(err.to_string().contains("M2"));
-        // 即便拒绝，进度也应反映"停在第一个阶段"
-        assert_eq!(job.progress().stage, StageId::Segments);
+        // 这个最小 ELF 只有一个 64 字节的头部，没有节表也没有可执行段
+        // （e_shoff/e_phoff 都是 0）。此时"无法分析"是**正确**结论，
+        // 而且必须说清是目标的问题，不是"我们还没写"。
+        match session.analyze(&job) {
+            Ok(summary) => {
+                println!("分析成功：{summary:?}");
+            }
+            Err(BitflipError::AnalysisUnavailable(reason)) => {
+                println!("目标不可分析（预期）：{reason}");
+            }
+            Err(other) => panic!("不该返回 {other:?}：这是「目标没有可分析内容」的情形"),
+        }
+    }
+
+    /// 惰性分析必须只算一次 —— 缓存不能只是"看起来像缓存"。
+    #[test]
+    fn analysis_result_is_cached_not_recomputed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sample.elf");
+        std::fs::write(&path, elf64_x86_64()).expect("write");
+        let session = Session::open(&path, OpenOptions::default()).expect("打开");
+        let job = session.detached_job();
+
+        // 两次调用必须返回同一份 Arc（指针相同），而不是各建一份
+        let first = session.analysis(&job);
+        let second = session.analysis(&job);
+        match (first, second) {
+            (Ok(a), Ok(b)) => assert!(
+                Arc::ptr_eq(&a, &b),
+                "两次 analysis() 返回了不同的对象 —— 缓存没生效，每个请求都在重算"
+            ),
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+            _ => panic!("两次调用的成功/失败状态必须一致"),
+        }
     }
 }

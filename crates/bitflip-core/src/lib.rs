@@ -39,6 +39,16 @@ pub use bitflip_analyze::ScanOptions as DisasmScanOptions;
 /// 重新导出架构规格（嵌入方做架构相关判断时使用，不需要直接依赖 `bitflip-arch`）。
 pub use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
 
+/// 重新导出用户标注类型与工程库句柄：它们是 [`Session::open_project`] 的
+/// 读写单位，嵌入方不该被迫直接依赖 `bitflip-project` 才能存一条注释。
+///
+/// 注意这是**刻意的例外说明**：ADR-0012 的硬约束是"`rusqlite` 类型不得出现在
+/// `bitflip-core` 的公开 API 里"，而不是"core 不得转发工程库类型"。
+/// `ProjectStore` 的公开方法签名里没有任何 `rusqlite` 类型
+/// （`put`/`get`/`range`/`meta` 只出现 `u64`/`&str`/自有类型），
+/// 所以转发它不违反该约束，却能让嵌入方只依赖 core 一个 crate。
+pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
+
 /// `bitflip-core` 公共 API 版本。
 pub const CORE_API_VERSION: u32 = 1;
 

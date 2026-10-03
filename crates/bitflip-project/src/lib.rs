@@ -68,6 +68,28 @@ impl AnnotationKind {
         // 讨论集中在类型上，而不是散落在存储实现里。
         true
     }
+
+    /// 从短名解析（`as_str` 的逆）。
+    ///
+    /// 大小写不敏感、允许用 `_` 代替 `-`：这是从 HTTP 查询串/JSON 体来的
+    /// 用户输入，纠结连字符会变成无谓的摩擦。
+    ///
+    /// 无法识别时返回 `None`，由调用方报出**可用的取值列表** ——
+    /// 而不是静默回退到某个默认类别（那会把用户的名字当成注释存进去）。
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let normalized = text.trim().to_ascii_lowercase().replace('_', "-");
+        Some(match normalized.as_str() {
+            "name" => Self::Name,
+            "comment" => Self::Comment,
+            "type" => Self::Type,
+            "bookmark" => Self::Bookmark,
+            "patch" => Self::Patch,
+            "function-boundary" => Self::FunctionBoundary,
+            "code-data" => Self::CodeData,
+            _ => return None,
+        })
+    }
 }
 
 /// 工程库元数据。
