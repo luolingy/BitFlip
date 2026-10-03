@@ -10,10 +10,12 @@
 //! 分层依赖方向：`cli/app → server → core → {loader, arch, analyze, symbols, project}`，
 //! 下层永不反向依赖（CLAUDE.md §4）。
 
+mod analysis;
 mod disasm;
 mod error;
 mod session;
 
+pub use analysis::{FunctionWire, StringWire, TargetAnalysis, XrefWire, ANALYSIS_FORMAT_VERSION};
 pub use disasm::{
     hex16, parse_address, Disasm, DisasmStats, InsnPage, InsnWire, DEFAULT_PAGE_SIZE,
     DISASM_FORMAT_VERSION, MAX_PAGE_SIZE,

@@ -6,13 +6,17 @@
 //! 阶段划分（`docs/ARCHITECTURE.md` §5）在 M2 起逐个落地；M0 先固定契约与边界语义。
 
 mod addrspace;
+mod functions;
 mod job;
 mod scan;
+mod strings;
+mod xref;
 
 pub use addrspace::{
     index_insn, AddrSpace, AddrSpaceError, ByteSource, InsnIndex, MappedSegment, PAGE_MASK,
     PAGE_SIZE, SYNTHETIC_BASE,
 };
+pub use functions::{merge_candidates, unwind_candidates, ConflictKind, Function};
 pub use job::{
     run_guarded, CancelToken, EventSink, JobError, JobEvent, JobHandle, JobId, JobState, NullSink,
     Progress, StageId,
@@ -21,6 +25,8 @@ pub use scan::{
     combine, control_flow_targets, scan_linear, scan_recursive, ScanCoverage, ScanOptions,
     ScanStats,
 };
+pub use strings::{extract_strings, StringEncoding, StringEntry, StringOptions};
+pub use xref::{xrefs_of, xrefs_of_all, Xref, XrefKind};
 
 /// 本 crate 的公共 API 版本。
 pub const ANALYZE_API_VERSION: u32 = 1;
