@@ -377,11 +377,16 @@ fn convert(
     } else if is_call {
         Flow::Call
     } else if is_jump {
-        // 有直接目标且不是 call：可能是条件或无条件。
-        // 无目标 = 间接跳转。这里用"有没有目标"做保守区分：
-        // 无目标时不给顺序后继（间接跳转通常不回落到下一条）。
+        // `conditional` 表示"这条跳转是否有两个后继"，它**只**由助记符决定：
+        // `jmp *rax` 是间接跳转，但它仍然是无条件跳转 —— 没有顺序后继。
+        //
+        // 曾经的写法是 `target.is_none() || is_conditional_jump(...)`，把
+        // "目标未知"和"有条件"混成了一个标志。后果是 `jmp *__imp_x(%rip)`
+        // 被标成条件跳转，于是 who-knows 的地方多出一个"顺序后继"，并且
+        // 导入桩识别（要判 `conditional: false` 的间接跳转）一个都匹配不到。
+        // "目标未知"已经由 `target: None` 如实表达，不需要借用 conditional。
         Flow::Branch {
-            conditional: target.is_none() || is_conditional_jump(insn.mnemonic().unwrap_or("")),
+            conditional: is_conditional_jump(insn.mnemonic().unwrap_or("")),
         }
     } else if is_trap {
         Flow::Trap
@@ -639,6 +644,34 @@ mod tests {
         let insn = dec.decode_one(&[0xFF, 0xE0], 0x1000).expect("jmp rax");
         assert!(matches!(insn.flow, Flow::Branch { .. }));
         assert!(insn.target.is_none(), "间接跳转没有静态目标");
+    }
+
+    /// 间接跳转**仍然是无条件跳转**，不能因为"目标未知"就标成条件跳转。
+    ///
+    /// 回归测试：这里曾经写成 `conditional: target.is_none() || is_conditional_jump(...)`，
+    /// 把"目标未知"和"有条件"混成一个标志。后果有两层：
+    ///   * `has_fallthrough()` 对一个根本不会往下走的 `jmp *rax` 返回 true，
+    ///     等于凭空多给后继，CFG 会多出块；
+    ///   * 导入桩识别（判据是 `conditional: false` 的间接跳转）一个都匹配不上，
+    ///     实测让 mingw 静态 exe 的函数覆盖率卡在 92.21%。
+    #[test]
+    fn indirect_jump_is_unconditional_and_has_no_fallthrough() {
+        let dec = decoder();
+        for (bytes, what) in [
+            (vec![0xFF, 0xE0], "jmp rax"),
+            (vec![0xFF, 0x25, 0x00, 0x00, 0x00, 0x00], "jmp *(%rip)"),
+        ] {
+            let insn = dec.decode_one(&bytes, 0x1000).expect(what);
+            assert_eq!(
+                insn.flow,
+                Flow::Branch { conditional: false },
+                "{what} 是无条件跳转"
+            );
+            assert!(
+                !insn.flow.has_fallthrough(),
+                "{what} 没有顺序后继，不该多出一个后继"
+            );
+        }
     }
 
     #[test]

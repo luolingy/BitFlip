@@ -771,6 +771,39 @@ mod tests {
         assert!(index.contains(0x1000));
     }
 
+    /// 间接跳转必须**终止**当前块，不能落到下一条指令。
+    ///
+    /// 这条锁的是 flow 语义：间接跳转的目标未知，但它是**无条件**跳转 ——
+    /// 没有顺序后继。如果它被标成条件跳转，扫描器会继续往 `next` 走，
+    /// 把那些字节也标成可达，等于凭空造出一段控制流。
+    ///
+    /// 回归背景：`bitflip-arch` 曾把"目标未知"和"有条件"混成一个标志，
+    /// 于是真实字节上的 `jmp *__imp_x(%rip)` 被当成条件跳转。假解码器一直是
+    /// 对的（所以单元测试没发现），问题只在真实 capstone 输出上暴露。
+    #[test]
+    fn indirect_jump_ends_the_block_instead_of_falling_through() {
+        // 0x1000: 间接 jmp（2 字节），0x1002 起是"看似合理但实际不可达"的字节
+        let code = vec![0xFF, 0xE0, 0x74, 0x00, 0xC3];
+        let space = code_space(&code, 0x1000);
+        let decoder = FakeDecoder::new();
+        let mut coverage = ScanCoverage::new();
+
+        let (index, _) = scan_recursive(
+            &space,
+            &decoder,
+            &[0x1000],
+            ScanOptions::default(),
+            &mut coverage,
+        );
+
+        assert!(index.contains(0x1000), "间接跳转本身应被解出");
+        assert!(
+            !index.contains(0x1002),
+            "间接跳转之后的字节不可达，不该被当成控制流的后继"
+        );
+        assert_eq!(index.len(), 1, "只应有间接跳转这一条");
+    }
+
     #[test]
     fn recursive_scan_terminates_on_self_loop() {
         // 0x1000: jmp 0x1000（自循环）—— 必须终止，不能死循环

@@ -161,6 +161,51 @@ impl TargetAnalysis {
             }
         }
 
+        // 来源 5：导入桩（import thunk）。
+        //
+        // 静态链接的 mingw 程序在 `.text` 里留着一批一指令函数：
+        // `jmp *__imp_xxx(%rip)` + `nop` 对齐。它们**既没有符号**（已 strip），
+        // **也不会被 call**（调用点直接走 IAT），所以前四个来源一个都碰不到它们 ——
+        // 实测这让覆盖率停在 92.21%，正好卡在 95% 门槛下面。
+        //
+        // 判据严格：从某个指令边界起，必须是无条件间接跳转，且后续指令全是填充，
+        // 且总长不超过一个桩的尺寸。宁可漏，不要误报（§7）。
+        let mut thunk_count = 0usize;
+        for (addr, len) in disasm.index.range(0, u64::MAX) {
+            // 只对"未识别"的位置找桩：已经认出来的函数不用改来源
+            if by_addr.contains_key(&addr) {
+                continue;
+            }
+            let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
+                continue;
+            };
+            let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
+                continue;
+            };
+            // 桩的第一条：无条件跳转，且目标未知（间接 —— 走 IAT）
+            if !matches!(insn.flow, Flow::Branch { conditional: false }) {
+                continue;
+            }
+            if insn.target.is_some() {
+                continue; // 直接跳转是普通尾调用/跳转，不是桩
+            }
+            if !is_import_thunk_tail(&disasm.space, addr, insn.len) {
+                continue;
+            }
+            by_addr.entry(addr).or_default().push(SymbolCandidate {
+                addr,
+                name: String::new(), // 桩也没有名字 —— 不许编
+                source: SymbolSource::ImportThunk,
+                confidence: 60,
+            });
+            thunk_count += 1;
+        }
+        if thunk_count > 0 {
+            notes.push(format!(
+                "识别出 {thunk_count} 个导入桩（`jmp *__imp_xxx` 形式的间接跳转桩）"
+            ));
+        }
+
         // ── xref 提取（与候选收集同一遍流式解码）──
         let mut xrefs: Vec<XrefWire> = Vec::new();
         let mut xref_by_from: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -336,6 +381,81 @@ impl TargetAnalysis {
 
 fn parse_hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
+}
+
+/// 桩的最大字节数。
+///
+/// 典型桩是 `jmp *disp32(%rip)`（6 字节）+ 若干 `nop` 对齐，实测都 <= 16 字节。
+/// 上限刻意取小：宁可漏掉一个畸形桩，也不要把"一段以 jmp 开头的小代码"
+/// 误判成桩（那会凭空造出一个函数，违反 §7）。
+const MAX_THUNK_BYTES: u64 = 16;
+
+/// 桩的判据：`jmp *disp(%rip)` 之后必须是**填充或另一个桩**，不能是真实代码体。
+///
+/// 实测布局（mingw 静态链接 PE）：每个桩恰好 8 字节 ——
+/// `ff 25 <disp32>`（间接跳转，6 字节）+ `90 90`（2 字节 nop 对齐），
+/// 然后**下一个桩紧接着开始**，中间没有空隙。
+///
+/// 所以不能要求"后面全是填充直到段尾/大段空白"：那样第一个桩后面的字节
+/// 立刻就是下一个桩的 `ff 25`，检查必然失败（这正是最初 12 个桩一个都没认出来的原因）。
+///
+/// 正确判据是：**这段小窗口里只允许出现"填充"和"另一个桩的开头"**，
+/// 出现任何别的指令字节就否决。这样既能认出紧密排列的桩，又不会把
+/// `jmp` 开头的普通函数（后面接真实代码）误判成桩。
+fn is_import_thunk_tail(space: &bitflip_analyze::AddrSpace, addr: u64, first_len: u8) -> bool {
+    let rest_start = addr.saturating_add(u64::from(first_len));
+    let window = MAX_THUNK_BYTES.saturating_sub(u64::from(first_len));
+    let Some(tail) = space.read(rest_start, window as usize) else {
+        // 读到段尾：桩贴着段尾结束也算合法
+        return true;
+    };
+
+    let mut i = 0usize;
+    while i < tail.len() {
+        match tail[i] {
+            0x90 => i += 1, // nop 填充
+            0xCC => i += 1, // int3 填充
+            0x66 | 0x0F => {
+                // 多字节 nop（`66 66 ... 0F 1F /0`）
+                if tail[i] == 0x66 {
+                    i += 1;
+                    continue;
+                }
+                if tail.get(i + 1) == Some(&0x1F) {
+                    let modrm = tail.get(i + 2).copied().unwrap_or(0);
+                    let extra = match (modrm >> 6) & 3 {
+                        0 => 0,
+                        1 => 1,
+                        2 => 4,
+                        _ => 0,
+                    };
+                    i += 3 + extra;
+                    continue;
+                }
+                return false;
+            }
+            0xff => {
+                // 下一个桩的开头：`ff 25 <disp32>`。只接受这一种形式；
+                // `ff 15` 之类的间接 call、`ff e0` 的 jmp reg 都不算。
+                if tail.get(i + 1) == Some(&0x25) {
+                    // 这个桩的长度也要在合理范围内，否则就是长函数
+                    let remaining = tail.len() - i;
+                    if remaining < 6 {
+                        return true; // 窗口到头了，视为合法
+                    }
+                    i += 6;
+                    continue;
+                }
+                return false;
+            }
+            0x00 => {
+                // 零填充结尾：后面必须全是零
+                return tail[i..].iter().all(|&b| b == 0x00);
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// 流式字符串扫描状态机。

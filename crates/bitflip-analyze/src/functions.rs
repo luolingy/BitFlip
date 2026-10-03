@@ -71,9 +71,19 @@ pub fn merge_candidates(addr: u64, candidates: Vec<SymbolCandidate>) -> Function
         .collect();
 
     let chosen = preferred(&candidates).cloned();
-    let (name, name_source) = chosen
+    let (mut name, name_source) = chosen
         .map(|c| (c.name, c.source))
         .unwrap_or_else(|| (String::new(), SymbolSource::Discovery));
+
+    // 展开表候选把边界编码在 name 里（约定 `<name>\t<end>`）。边界在上面解析，
+    // 但**标记必须在这里从名字里去掉** —— 否则 UI 会把 "\t140001050" 当成函数名
+    // 显示出来，那是拿编码细节冒充识别结果（CLAUDE.md §7）。
+    // 展开表本身不提供名字，剥掉标记后名字自然为空，UI 会显示"未命名"。
+    if name_source == SymbolSource::Unwind {
+        if let Some((real, _end)) = name.rsplit_once('\t') {
+            name = real.to_string();
+        }
+    }
 
     // 边界候选：来源带 end 的才参与（调用目标/prologue 只知道入口）
     let mut bounds: Vec<(SymbolSource, u64)> = Vec::new();
@@ -133,7 +143,9 @@ pub fn unwind_candidates(entries: &[bitflip_loader::object::UnwindEntry]) -> Vec
         .iter()
         .map(|e| SymbolCandidate {
             addr: e.begin,
-            // 约定：`<name>\t<end-hex>`；名字部分为空，由符号来源补
+            // 约定：`<name>\t<end-hex>`；名字部分为空，由符号来源补。
+            // 注意：`merge_candidates` 会在解析出 end 之后把 `\t<end>` 从名字里剥掉，
+            // 别让这个编码格式漏到界面上。
             name: format!("\t{:x}", e.end),
             source: SymbolSource::Unwind,
             confidence: 85,
