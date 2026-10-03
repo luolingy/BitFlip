@@ -144,7 +144,33 @@ pub enum ProjectError {
     /// 一般 IO 错误。
     #[error("工程库 IO 错误: {0}")]
     Io(String),
+    /// SQLite 层错误（存储引擎细节，不向上层暴露 `rusqlite` 类型）。
+    #[error("工程库存储错误: {0}")]
+    Sqlite(String),
+    /// 旧版本工程库：需要迁移，且迁移路径尚未实现。
+    ///
+    /// 与 `TooNew` 相对 —— 那个是"拒绝以旧读新"，这个是"旧库要升级"。
+    /// 两者都**明确报错**，绝不静默按新格式解析。
+    #[error("工程库版本 {from} 低于当前 {SCHEMA_VERSION}，需要迁移（迁移逻辑见 docs/PLAN.md M4）")]
+    MigrationRequired {
+        /// 文件里的版本。
+        from: u32,
+    },
+    /// 工程库内容损坏或自相矛盾。
+    #[error("工程库内容异常: {0}")]
+    Corrupt(String),
 }
+
+pub mod derived;
+pub mod recent;
+pub mod store;
+
+pub use derived::{
+    clean_stale_tmp, derived_path, primary_path, read as read_derived, write_atomic, FunctionEntry,
+    Snapshot, StringEntry, TableKind, XrefEntry, BDA_FORMAT_VERSION, BDA_MAGIC,
+};
+pub use recent::{RecentIndex, RecentStore, RecentTarget, INDEX_FORMAT_VERSION, MAX_RECENT};
+pub use store::{addr_to_i64, i64_to_addr, Annotation, ProjectStore};
 
 #[cfg(test)]
 mod tests {
