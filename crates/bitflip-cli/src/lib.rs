@@ -3,6 +3,7 @@
 mod browser;
 mod cli;
 mod info;
+mod members;
 mod serve;
 mod tracing_setup;
 
@@ -10,8 +11,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-pub use cli::{Cli, Command, InfoArgs, OpenCli, ServeArgs};
+pub use cli::{Cli, Command, FunctionsArgs, InfoArgs, MembersArgs, OpenCli, ServeArgs, SymbolArgs};
 pub use info::run_info;
+pub use members::{run_functions, run_members, run_symbol};
 pub use serve::{serve_blocking, ServeRequest};
 
 /// `bitflip <target>` 的入口。
@@ -37,6 +39,9 @@ pub fn gui_main() -> ExitCode {
 pub fn cli_main() -> ExitCode {
     match Cli::parse().command {
         Command::Info(args) => report(run_info(&args.target, args.json, args.verbose)),
+        Command::Members(args) => report(run_members(&args)),
+        Command::Functions(args) => report(run_functions(&args)),
+        Command::Symbol(args) => report(run_symbol(&args)),
         Command::Serve(args) => report(serve_blocking(ServeRequest {
             target: args.target,
             host: args.host,

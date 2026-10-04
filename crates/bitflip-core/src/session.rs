@@ -260,6 +260,51 @@ pub struct OpenOptions {
     pub force_raw: bool,
 }
 
+/// 归档成员名的基名：去掉目录部分后的文件名。
+///
+/// 归档里存的名字可能是 `foo/bar/baz.o`（MSVC 的 `.lib` 偶尔这样），
+/// 用户通常只记得 `baz.o`。同时把 `\` 也当分隔符 —— 名字在 Windows 上
+/// 生成时出现过反斜杠。
+///
+/// GNU ar 的长名字段以 `/` 结尾（`foo.o/`）标记"这个名字来自长名表"，
+/// 这里一并去掉，让 `--member foo.o` 能匹配上。
+fn member_basename(name: &str) -> &str {
+    let trimmed = name.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return name;
+    }
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(trimmed)
+}
+
+/// 成员名匹配：把存储名与用户输入都规范化后比较。
+///
+/// 需要这层规范化的原因是**存储名带着给人看的注释**：`bitflip-loader` 会把
+/// GNU 的符号索引成员命名为 `"/ (符号索引)"`，把长名表命名为
+/// `"// (长名表)"` —— 这是有意的（界面上直接显示 `/` 没法解释），
+/// 但它意味着用户敲 `--member /` 会匹配不上自己刚在列表里看到的东西。
+///
+/// 所以这里在比较时把括号注释剥掉，并把结尾的 `/` 也去掉：
+/// `/`、`/ (符号索引)`、`// (长名表)`、`foo.o/` 都能按预期匹配。
+fn member_name_key(name: &str) -> String {
+    // 先剥掉 ` (...)` 形式的显示注释
+    let without_note = match (name.find(" ("), name.ends_with(')')) {
+        (Some(idx), true) => &name[..idx],
+        _ => name,
+    };
+    let trimmed = without_note.trim_end_matches('/');
+    // `//`（长名表）整串都是斜杠，剥完会空 —— 那时保留原串，
+    // 否则长名表会退化成一个空名字，和谁都能撞上。
+    if trimmed.is_empty() {
+        without_note.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// 目标识别结论的对外表示（JSON wire 契约）。
 ///
 /// 所有"未知"都显式表达为 `null` + `notes` 里的原因，不用 0 / 空串冒充。
@@ -433,7 +478,16 @@ impl Session {
         //
         // 只在解析成功时才读 ——  解析失败的目标反汇编无从谈起，
         // 没必要为一个"打不开的格式"占住文件大小的内存。
-        let bytes: Arc<[u8]> = if object_raw.is_some() {
+        //
+        // **归档是例外**：容器本身没有解析结果（`object_raw` 是 `None`，
+        // 因为"可分析对象"是成员而不是容器），但成员级分析恰恰需要
+        // 容器字节才能按偏移切出成员。所以归档必须读。
+        //
+        // 这里曾经漏掉归档，后果是所有 `--member` 都被"数据区间超出文件
+        // （0 字节）"挡回去 —— 一个功能看起来像没实现，其实是少了这一步读。
+        let is_archive =
+            guess.container == ContainerKind::Ar || guess.container == ContainerKind::MsvcLib;
+        let bytes: Arc<[u8]> = if object_raw.is_some() || is_archive {
             match std::fs::read(&path) {
                 Ok(data) => Arc::from(data),
                 Err(error) => {
@@ -525,9 +579,15 @@ impl Session {
         }
 
         if guess.container == ContainerKind::Ar || guess.container == ContainerKind::MsvcLib {
+            // 归档容器本身不是可分析对象：sections/insns 描述的是**成员**的
+            // 概念，把容器当成一个目标只会产出没有意义的结果。
+            //
+            // M5 起成员可以单独分析（见 `Session::member_session`），
+            // 所以这里的错误信息指向正确的用法，而不是"还没做"。
             let count = guess.members.len();
             return Err(format!(
-                "这是归档容器（{count} 个成员）：成员级解析排期在 M5。当前 sections 描述的是容器本身"
+                "这是归档容器（{count} 个成员）：容器本身没有可反汇编的代码。\
+                 请用 `members` 列出成员，再用 `--member <名字>` 指定要分析的成员"
             ));
         }
 
@@ -555,6 +615,184 @@ impl Session {
     #[must_use]
     pub fn parsed(&self) -> Option<&ObjectInfo> {
         self.object.as_ref()
+    }
+
+    /// 归档成员列表（非归档时为空）。
+    ///
+    /// 直接来自嗅探结论：成员表在文件前部，嗅探窗口足够覆盖。
+    /// `truncated` 为真的成员意味着**它的数据超出嗅探窗口** ——
+    /// 那只影响"当时没读全"，不影响下面按偏移重新读取。
+    #[must_use]
+    pub fn members(&self) -> &[bitflip_loader::ArchiveMember] {
+        &self.guess.members
+    }
+
+    /// 按名字或序号找一个归档成员。
+    ///
+    /// 名字匹配支持三种形式（静态库的成员名在工具链之间不一致）：
+    ///
+    /// * 完整名 —— `elf-x86_64.o`；
+    /// * 剥离显示注释与结尾斜杠后的名字 —— 用户敲 `--member /` 能匹配上
+    ///   列表里显示的 `/ (符号索引)`；
+    /// * 基名 —— 用户只记得文件名、不记得库里的路径前缀时。
+    ///
+    /// 只在唯一命中时返回 —— 有歧义时报"不唯一"比随便挑一个诚实。
+    #[must_use]
+    pub fn find_member(&self, name: &str) -> Option<&bitflip_loader::ArchiveMember> {
+        if let Some(exact) = self.members().iter().find(|m| m.name == name) {
+            return Some(exact);
+        }
+
+        let key = member_name_key(name);
+        // 先按"规范化后的完整名"找（作用域更大：`/` 匹配 `/ (符号索引)`）
+        let normalized: Vec<_> = self
+            .members()
+            .iter()
+            .filter(|m| member_name_key(&m.name) == key)
+            .collect();
+        match normalized.as_slice() {
+            [only] => return Some(only),
+            [] => {}
+            // 多个 → 落到基名比较再试一次（基名更严格，可能唯一）
+            _ => {}
+        }
+
+        // 再退化到基名（用户通常只记得 `foo.o`，不记得库里的路径）
+        let basenames: Vec<_> = self
+            .members()
+            .iter()
+            .filter(|m| member_basename(&member_name_key(&m.name)) == key)
+            .collect();
+        match basenames.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// 与 `find_member` 匹配的成员个数：用于区分"找不到"与"不唯一"。
+    #[must_use]
+    pub fn member_match_count(&self, name: &str) -> usize {
+        if self.members().iter().any(|m| m.name == name) {
+            return 1;
+        }
+        let key = member_name_key(name);
+        let normalized = self
+            .members()
+            .iter()
+            .filter(|m| member_name_key(&m.name) == key)
+            .count();
+        if normalized > 0 {
+            return normalized;
+        }
+        self.members()
+            .iter()
+            .filter(|m| member_basename(&member_name_key(&m.name)) == key)
+            .count()
+    }
+
+    /// 打开一个归档成员，得到一个可独立分析的会话（M5）。
+    ///
+    /// # 为什么是"新会话"而不是"给会话加一个成员视图"
+    ///
+    /// 成员是一个**完整的、自足的对象文件**：它有自己的段表、符号表、
+    /// 重定位表。`Session` 的所有分析路径（反汇编、字符串、符号）都建立
+    /// 在"一个对象"的前提上。把成员塞进同一个会话会让每个下游都要问
+    /// "我现在看的是容器还是成员"，那是 bug 的温床。
+    ///
+    /// 代价是成员会话不共享缓存：分析两个成员就是两次分析。可接受 ——
+    /// 用户一次只看一个成员，而正确性比省一次扫描重要。
+    ///
+    /// # Errors
+    ///
+    /// 目标不是归档、成员名找不到或不唯一、成员数据越界、成员解析失败。
+    pub fn member_session(
+        &self,
+        name: &str,
+    ) -> Result<(Self, bitflip_loader::ArchiveMember), BitflipError> {
+        if !self.info.is_archive() {
+            return Err(BitflipError::InvalidInput(format!(
+                "目标不是归档（{}），无法按成员分析：--member 只对 .a / .lib 有意义",
+                self.guess.container.label_zh()
+            )));
+        }
+
+        let count = self.member_match_count(name);
+        if count == 0 {
+            return Err(BitflipError::not_found(format!(
+                "归档成员 {name:?}（共 {} 个成员，用 `members` 子命令列出）",
+                self.members().len()
+            )));
+        }
+        if count > 1 {
+            return Err(BitflipError::InvalidInput(format!(
+                "归档成员 {name:?} 不唯一（{count} 个同名基名），请用完整成员名"
+            )));
+        }
+
+        let member = self
+            .find_member(name)
+            .ok_or_else(|| BitflipError::not_found(format!("归档成员 {name:?}")))?
+            .clone();
+
+        let start = usize::try_from(member.offset).unwrap_or(usize::MAX);
+        let len = usize::try_from(member.size).unwrap_or(usize::MAX);
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| BitflipError::InvalidInput(format!("成员 {name:?} 的偏移+长度溢出")))?;
+        let Some(slice) = self.bytes.get(start..end) else {
+            return Err(BitflipError::InvalidInput(format!(
+                "成员 {name:?} 的数据区间 {start:#x}..{end:#x} 超出文件（{} 字节）",
+                self.bytes.len()
+            )));
+        };
+
+        // 成员自身的格式：归档里可能混有非对象成员（GNU 的长名表 `/`、
+        // 符号索引 `//`、链接器成员的元数据），它们本来就不该被当成
+        // 可分析对象 —— 所以这里如实报"这个成员不是可分析对象"，
+        // 而不是硬塞一个空对象让上层显示"分析完成但什么都没有"。
+        let guess = bitflip_loader::sniff_bytes(slice);
+        let id = ObjectId::ArchiveMember(member.name.clone());
+        let object = match guess.object {
+            ObjectKind::Elf => bitflip_loader::elf::parse(slice, 0, id),
+            ObjectKind::Pe => bitflip_loader::pe::parse(slice, 0, id),
+            ObjectKind::Coff => bitflip_loader::coff::parse(slice, 0, id),
+            other => {
+                return Err(BitflipError::InvalidInput(format!(
+                    "成员 {:?} 不是可分析的对象（识别为 {}）：它可能是归档的元数据成员",
+                    member.name,
+                    other.label_zh()
+                )));
+            }
+        }
+        .map_err(|error| {
+            BitflipError::unavailable(format!(
+                "成员 {:?} 解析失败：{}",
+                member.name,
+                error.summary_zh()
+            ))
+        })?;
+
+        // 成员会话的 info 由成员自己的嗅探结论构造（而不是容器的），
+        // 这样 `bitflip-cli info --member X` 与直接打开 X.o 的结论一致。
+        //
+        // 路径保留"容器#成员"的形式：工程库按目标定位，这个字符串让
+        // 用户一眼看出分析的是哪个成员，也让哈希天然分开（内容不同）。
+        let path = PathBuf::from(format!("{}#{}", self.path.display(), member.name));
+        let info = TargetInfo::from_guess(&path, member.size, &guess);
+
+        Ok((
+            Self {
+                path,
+                guess,
+                info,
+                object: Some(ObjectInfo::from_object(&object)),
+                object_raw: Some(Arc::new(object)),
+                bytes: Arc::from(slice),
+                hash: std::sync::OnceLock::new(),
+                analysis: std::sync::OnceLock::new(),
+            },
+            member,
+        ))
     }
 
     /// 原始解析对象（loader 层类型，供需要精确字节的调用方使用）。

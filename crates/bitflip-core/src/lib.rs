@@ -23,6 +23,10 @@ pub use disasm::{
     DISASM_FORMAT_VERSION, MAX_PAGE_SIZE,
 };
 pub use error::BitflipError;
+
+/// 重新导出归档成员描述：它是 [`Session::members`] / [`Session::member_session`]
+/// 的返回类型，嵌入方（如 CLI）要用它做成员选择而不必直接依赖 `bitflip-loader`。
+pub use bitflip_loader::ArchiveMember;
 pub use session::{
     AnalysisSummary, ExportInfo, ImportInfo, ObjectInfo, OpenOptions, RelocInfo, SectionInfo,
     SegmentInfo, Session, SymbolInfo, TargetInfo, INFO_FORMAT_VERSION, MAX_FULL_PARSE_BYTES,

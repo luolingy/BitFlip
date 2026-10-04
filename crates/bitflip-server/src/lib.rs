@@ -143,6 +143,49 @@ impl AppState {
         self.parsed.as_deref()
     }
 
+    /// 归档成员列表（M5）；非归档时为空。
+    ///
+    /// # Errors
+    ///
+    /// 本次会话没有打开目标。
+    pub fn members(&self) -> Result<Vec<bitflip_core::ArchiveMember>, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标".to_string());
+        };
+        Ok(session.members().to_vec())
+    }
+
+    /// 目标的识别结论（容器类别、是否归档等）。
+    ///
+    /// # Errors
+    ///
+    /// 本次会话没有打开目标。
+    pub fn target_info(&self) -> Result<bitflip_core::TargetInfo, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标".to_string());
+        };
+        Ok(session.info().clone())
+    }
+
+    /// 取一个归档成员的会话（M5）。
+    ///
+    /// 成员分析**不走缓存**，每次请求都重新打开成员。这是刻意的取舍：
+    /// 缓存要按成员名分桶，而用户一次只看一个成员，省下的那点时间
+    /// 换不来"缓存可能过期/串味"的风险。代价是切成员时有几十毫秒的停顿。
+    ///
+    /// # Errors
+    ///
+    /// 目标不是归档、成员不存在、成员不是可分析对象。
+    pub fn member_session(&self, name: &str) -> Result<bitflip_core::Session, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标".to_string());
+        };
+        session
+            .member_session(name)
+            .map(|(member, _)| member)
+            .map_err(|error| error.to_string())
+    }
+
     /// 已运行时长。
     #[must_use]
     pub fn uptime(&self) -> Duration {
@@ -303,6 +346,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/functions", get(functions))
         .route("/api/analyze", get(analyze))
         .route("/api/cfg", get(cfg))
+        .route("/api/members", get(members))
+        .route("/api/members/functions", get(member_functions))
         .route("/api/xrefs", get(xrefs))
         .route("/api/strings", get(strings))
         .route("/api/hex", get(hex))
@@ -457,6 +502,83 @@ async fn insns(
 
 // ── M3：目标级分析（函数 / 交叉引用 / 字符串）与标注 ───────────────────────
 
+/// 归档成员列表响应：`GET /api/members`。
+#[derive(Serialize)]
+struct MembersResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 目标是不是归档。
+    ///
+    /// 显式给出而不是靠"成员数组为空"判断：**"不是归档"与"归档没有成员"
+    /// 是两件事**，前端要据此显示不同的界面文案。
+    is_archive: bool,
+    /// 容器类别（`ar` / `msvc-lib` / 其他）。
+    container: String,
+    /// 成员列表是否被截断（嗅探窗口或上限）。
+    truncated: bool,
+    /// 成员。
+    members: Vec<MemberWire>,
+    /// 识别/解析期的说明。
+    notes: Vec<String>,
+}
+
+/// 单个归档成员的 wire 表示。
+#[derive(Serialize)]
+struct MemberWire {
+    /// 成员名（已尽量解析长名表）。
+    name: String,
+    /// 成员数据在容器里的文件偏移。
+    offset: u64,
+    /// 成员数据长度。
+    size: u64,
+    /// 成员数据是否超出嗅探窗口。
+    truncated: bool,
+    /// 成员是否**可以**被当作独立对象分析。
+    ///
+    /// 这是给前端的提示：`/ (符号索引)` 这类元数据成员在列表里看得见，
+    /// 但点进去分析只会得到"不是可分析对象"。先在这里说清楚，
+    /// 比让用户点了再吃一个错误好。
+    analyzable: bool,
+}
+
+/// 归档成员列表：`GET /api/members`。
+///
+/// `analyzable` 的判定方式与 `Session::member_session` 完全一致：
+/// **真的去建一次成员会话**。看起来有点重，但这是唯一诚实的做法 ——
+/// 靠名字猜（"以 `/` 开头的就是元数据"）会在别的归档格式上出错，
+/// 而这里的代价只是对每个成员做一次头部嗅探。
+async fn members(State(state): State<AppState>) -> Response {
+    let info = match state.target_info() {
+        Ok(i) => i,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+    let all = match state.members() {
+        Ok(m) => m,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let members: Vec<MemberWire> = all
+        .iter()
+        .map(|m| MemberWire {
+            name: m.name.clone(),
+            offset: m.offset,
+            size: m.size,
+            truncated: m.truncated,
+            analyzable: state.member_session(&m.name).is_ok(),
+        })
+        .collect();
+
+    Json(MembersResponse {
+        format_version: info.format_version,
+        is_archive: info.is_archive(),
+        container: info.container.clone(),
+        truncated: info.members_truncated,
+        members,
+        notes: info.notes.clone(),
+    })
+    .into_response()
+}
+
 /// 函数列表响应。
 #[derive(Serialize)]
 struct FunctionsResponse {
@@ -577,6 +699,91 @@ async fn cfg(
         entry: bitflip_core::hex16(entry),
         cfg,
         function,
+    })
+    .into_response()
+}
+
+/// 归档成员里的函数列表：`GET /api/members/functions?member=<name>`。
+///
+/// 为什么不能复用 `/api/functions?member=`：容器级分析对归档**根本不成立**
+/// （`state.analysis()` 会失败），所以那条路径永远走不到成员。
+/// 单独一个端点能让"这里是成员的函数"这件事在 URL 层面就清楚，
+/// 前端也不会误以为可以拿容器级分页参数来翻成员。
+///
+/// 返回体复用 [`FunctionsResponse`] 的形状（外加 `member` 字段），
+/// 这样前端的函数列表组件不需要为成员写第二套解析。
+#[derive(Serialize)]
+struct MemberFunctionsResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 成员名（原样回显，让前端确认自己看的是哪个成员）。
+    member: String,
+    /// 总数（分页前）。
+    total: usize,
+    /// 本页函数。
+    functions: Vec<bitflip_core::FunctionWire>,
+    /// 分析期的降级说明。
+    notes: Vec<String>,
+}
+
+/// 成员函数列表查询参数。
+#[derive(serde::Deserialize)]
+struct MemberFunctionsQuery {
+    /// 成员名（必填）。
+    member: Option<String>,
+    /// 只看地址 >= 该值的函数。
+    from: Option<String>,
+    /// 请求条数；服务端 clamp。
+    count: Option<usize>,
+}
+
+/// 成员函数列表：`GET /api/members/functions?member=<name>`。
+async fn member_functions(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<MemberFunctionsQuery>,
+) -> Response {
+    let Some(name) = query.member.as_deref().filter(|s| !s.is_empty()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "缺少 member 参数：请先用 /api/members 查看可用的成员名",
+        );
+    };
+
+    let session = match state.member_session(name) {
+        Ok(s) => s,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let job = session.detached_job();
+    let analysis = match session.analysis(&job) {
+        Ok(a) => a,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+
+    let from = match parse_optional_address(query.from.as_deref()) {
+        Ok(v) => v,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let count = query
+        .count
+        .unwrap_or(bitflip_core::DEFAULT_PAGE_SIZE)
+        .min(bitflip_core::DEFAULT_PAGE_SIZE);
+
+    let all = analysis.functions();
+    let total = all.len();
+    let functions: Vec<_> = all
+        .iter()
+        .filter(|f| bitflip_core::parse_address(&f.start).is_some_and(|addr| addr >= from))
+        .take(count)
+        .cloned()
+        .collect();
+
+    Json(MemberFunctionsResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        member: name.to_string(),
+        total,
+        functions,
+        notes: analysis.notes().to_vec(),
     })
     .into_response()
 }

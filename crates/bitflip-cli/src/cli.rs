@@ -70,10 +70,73 @@ pub struct Cli {
 pub enum Command {
     /// 识别目标格式与架构（不启动服务）
     Info(InfoArgs),
+    /// 列出归档成员（静态库 / ar 归档）
+    Members(MembersArgs),
+    /// 列出识别出的函数
+    Functions(FunctionsArgs),
+    /// 在目标里定位一个符号（函数名或地址）
+    Symbol(SymbolArgs),
     /// 启动本地 Web 服务
     Serve(ServeArgs),
     /// 打印版本与 API 版本
     Version,
+}
+
+/// `members` 参数。
+#[derive(Debug, Args)]
+pub struct MembersArgs {
+    /// 目标文件（归档 / 静态库）
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+    /// 打开调试日志
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+/// `functions` 参数。
+#[derive(Debug, Args)]
+pub struct FunctionsArgs {
+    /// 目标文件；归档可用 `--member` 指定成员
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 归档成员名（只分析该成员）
+    #[arg(long, value_name = "NAME")]
+    pub member: Option<String>,
+    /// 只看地址 >= 该值的函数（十六进制，可带 0x）
+    #[arg(long, value_name = "ADDR")]
+    pub from: Option<String>,
+    /// 最多输出多少条
+    #[arg(long, default_value_t = 50, value_name = "N")]
+    pub count: usize,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+    /// 打开调试日志
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+/// `symbol` 参数。
+#[derive(Debug, Args)]
+pub struct SymbolArgs {
+    /// 目标文件；归档可用 `--member` 指定成员
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 要定位的符号：函数名，或十六进制地址
+    #[arg(value_name = "QUERY")]
+    pub query: String,
+    /// 归档成员名（只在该成员里找）
+    #[arg(long, value_name = "NAME")]
+    pub member: Option<String>,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+    /// 打开调试日志
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 /// `info` 参数。
@@ -165,5 +228,60 @@ mod tests {
             }
             other => panic!("期望 serve，得到 {other:?}"),
         }
+    }
+
+    /// M5 的三个成员/符号子命令必须能解析，且默认值不吓人。
+    #[test]
+    fn member_commands_parse() {
+        let cli =
+            Cli::try_parse_from(["bitflip-cli", "members", "libfoo.a"]).expect("解析 members");
+        match cli.command {
+            Command::Members(args) => {
+                assert_eq!(args.target.to_string_lossy(), "libfoo.a");
+                assert!(!args.json);
+            }
+            other => panic!("期望 members，得到 {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "functions",
+            "libfoo.a",
+            "--member",
+            "foo.o",
+            "--count",
+            "5",
+        ])
+        .expect("解析 functions");
+        match cli.command {
+            Command::Functions(args) => {
+                assert_eq!(args.member.as_deref(), Some("foo.o"));
+                assert_eq!(args.count, 5);
+                // 不指定 --from 时不该过滤掉任何地址
+                assert!(args.from.is_none());
+            }
+            other => panic!("期望 functions，得到 {other:?}"),
+        }
+
+        // `symbol` 的查询是位置参数（既可能是名字也可能是地址）
+        let cli = Cli::try_parse_from(["bitflip-cli", "symbol", "libfoo.a", "bf_add"])
+            .expect("解析 symbol");
+        match cli.command {
+            Command::Symbol(args) => {
+                assert_eq!(args.query, "bf_add");
+                assert!(args.member.is_none());
+            }
+            other => panic!("期望 symbol，得到 {other:?}"),
+        }
+    }
+
+    /// 缺少必需参数时必须报错，而不是静默用默认值。
+    #[test]
+    fn symbol_requires_a_query() {
+        let result = Cli::try_parse_from(["bitflip-cli", "symbol", "libfoo.a"]);
+        assert!(
+            result.is_err(),
+            "symbol 缺少 QUERY 应当解析失败，而不是拿空字符串去搜"
+        );
     }
 }

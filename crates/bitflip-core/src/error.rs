@@ -23,6 +23,17 @@ pub enum BitflipError {
     #[error("输入无效: {0}")]
     InvalidInput(String),
 
+    /// 找不到指定的东西（归档成员名、符号名等）。
+    ///
+    /// 与 [`BitflipError::InvalidInput`] 分开是有意的：输入"格式合法但
+    /// 目标里没有"和"输入本身就不合法"对用户是两件事 ——
+    /// 前者要去核对名字，后者要去改写法。混成一类会让提示变得没用。
+    #[error("找不到: {what}")]
+    NotFound {
+        /// 找的是什么（含可用的候选提示）。
+        what: String,
+    },
+
     /// 该目标上做不了这项分析（格式没解析成功、没有可执行段等）。
     ///
     /// 与 [`BitflipError::NotYetImplemented`] 的区别很重要：
@@ -61,5 +72,11 @@ impl BitflipError {
     #[must_use]
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self::AnalysisUnavailable(reason.into())
+    }
+
+    /// 便捷构造"找不到"错误。
+    #[must_use]
+    pub fn not_found(what: impl Into<String>) -> Self {
+        Self::NotFound { what: what.into() }
     }
 }
