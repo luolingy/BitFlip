@@ -24,6 +24,8 @@ use crate::cli::{FunctionsArgs, MembersArgs, SymbolArgs};
 pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
     crate::tracing_setup::init(args.verbose);
 
+    // `members` 不需要架构/基址覆盖：归档自己带着成员格式，
+    // 而"列成员"这一步不涉及解码。多给一组参数只会让人以为它们有用。
     let session = Session::open(&args.target, OpenOptions::default())?;
     let members = session.members();
 
@@ -108,7 +110,7 @@ pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
 pub fn run_functions(args: &FunctionsArgs) -> anyhow::Result<()> {
     crate::tracing_setup::init(args.verbose);
 
-    let opened = Session::open(&args.target, OpenOptions::default())?;
+    let opened = Session::open(&args.target, args.raw.to_open_options()?)?;
 
     // 归档必须指定成员：容器没有函数。这里**不**自动遍历所有成员 ——
     // 那会把几万个函数混在一起，而"这个函数来自哪个成员"这个信息
@@ -222,7 +224,7 @@ pub fn run_functions(args: &FunctionsArgs) -> anyhow::Result<()> {
 pub fn run_symbol(args: &SymbolArgs) -> anyhow::Result<()> {
     crate::tracing_setup::init(args.verbose);
 
-    let opened = Session::open(&args.target, OpenOptions::default())?;
+    let opened = Session::open(&args.target, args.raw.to_open_options()?)?;
 
     // 查询既可能是名字，也可能是地址。地址用 16 进制判定：
     // 纯十六进制字符且能解析成 u64（`parse_address` 已处理 0x 前缀）。

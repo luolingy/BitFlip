@@ -44,6 +44,52 @@ impl Arch {
         }
     }
 
+    /// 该架构最常用的解码模式。
+    ///
+    /// 只在**用户手工指定架构、却没指定模式**时用作兜底：`ArchSpec` 要求
+    /// 模式必填（Thumb 与 ARM 是同一个架构的两套编码，没有模式就选不出
+    /// 解码器）。这里的取值是"该架构最常见的那一种"，不是"唯一正确的"，
+    /// 所以调用方把它用进猜测时应当说明这是默认值。
+    ///
+    /// ARM 取 ARM 状态而不是 Thumb：`Arch::Arm` 这个枚举值字面上就是
+    /// ARM 状态；Thumb 需要用户显式说 `Mode::Thumb`。
+    pub const fn default_mode(self) -> Mode {
+        match self {
+            Self::X86 => Mode::M32,
+            Self::X86_64 | Self::Aarch64 | Self::Riscv64 | Self::Mips64 => Mode::M64,
+            Self::Arm | Self::Riscv32 | Self::Mips | Self::Wasm32 => Mode::M32,
+        }
+    }
+
+    /// 该架构**惯用**的字节序。
+    ///
+    /// 只有同时支持两种端序的架构（MIPS、ARM、RISC-V）才有真正的选择余地；
+    /// 这里给的始终是**该架构最常见的那一种**，不是"唯一正确的"。
+    /// 只在"用户手工指定了架构却没说端序"时用作兜底 ——
+    /// 要按少见的那种解，必须由用户显式说 `--endian`。
+    ///
+    /// 这个函数存在的理由不只是方便：它是 M5 分层闸门
+    /// （`scripts/check-arch-layering.ps1`）要求的那道边界。
+    /// 端序判断属于架构知识，`bitflip-core` 这类架构无关的代码不该自己写
+    /// `Endian::Little` —— 否则"哪个架构是小端"这件事就散落到全仓库了。
+    ///
+    /// 目前所有已支持架构的工具链默认都是小端，所以这里还没有分支；
+    /// 真要区分时（例如把 MIPS 大端固件作为一等场景），改的应该是**这一个**
+    /// 函数，而不是去调用方找散落的 `Endian::Little`。
+    #[must_use]
+    pub const fn preferred_endian(self) -> Endian {
+        Endian::Little
+    }
+
+    /// 用户只给了架构、没给模式与端序时用的完整规格。
+    ///
+    /// 这是"给一个架构就能开始解码"的唯一入口：模式取
+    /// [`Arch::default_mode`]，端序取 [`Arch::preferred_endian`]。
+    #[must_use]
+    pub const fn default_spec(self) -> ArchSpec {
+        ArchSpec::from_arch(self, self.default_mode(), self.preferred_endian())
+    }
+
     /// 该架构在给定模式下的默认指针宽度（字节）。
     pub const fn ptr_size(self, mode: Mode) -> u8 {
         match self {
@@ -266,5 +312,44 @@ mod tests {
         assert!(!spec.is_64bit());
         assert_eq!(ArchSpec::x86_64().to_string(), "x86_64/64/le");
         assert_eq!(ArchSpec::aarch64().to_string(), "aarch64/64/le");
+    }
+
+    /// `default_spec` 是"只给一个架构就能开始解码"的唯一入口。
+    ///
+    /// 它存在的意义是分层：M5 闸门禁止 `bitflip-core` 自己写
+    /// `Endian::Little` 或 `Mode::M64`，那些判断必须落在这里。
+    #[test]
+    fn default_spec_picks_a_usable_mode_and_endian() {
+        assert_eq!(Arch::X86_64.default_spec().to_string(), "x86_64/64/le");
+        assert_eq!(Arch::Aarch64.default_spec().to_string(), "aarch64/64/le");
+        assert_eq!(Arch::X86.default_spec().to_string(), "x86/32/le");
+        assert_eq!(Arch::Riscv32.default_spec().to_string(), "riscv32/32/le");
+        assert_eq!(Arch::Mips64.default_spec().to_string(), "mips64/64/le");
+    }
+
+    /// ARM 的默认模式必须是 **ARM 状态**而不是 Thumb。
+    ///
+    /// 这是一个容易搞错的点：Cortex-M 固件大多是 Thumb，但
+    /// `Arch::Arm` 这个枚举值字面上就是 ARM 状态。替用户"猜到 Thumb"
+    /// 会解出一堆错指令；要 Thumb 必须显式说 `--mode thumb`。
+    #[test]
+    fn arm_defaults_to_arm_state_not_thumb() {
+        assert_eq!(Arch::Arm.default_mode(), Mode::M32);
+        assert_eq!(Arch::Arm.default_spec().to_string(), "arm/32/le");
+    }
+
+    /// 指针宽度跟着模式走：同一个架构在不同模式下宽度不同。
+    #[test]
+    fn default_spec_ptr_size_is_consistent_with_mode() {
+        for arch in [Arch::X86_64, Arch::Aarch64, Arch::Riscv64, Arch::Mips64] {
+            let spec = arch.default_spec();
+            assert_eq!(spec.ptr_size, 8, "{arch} 应是 64 位");
+            assert!(spec.is_64bit());
+        }
+        for arch in [Arch::X86, Arch::Arm, Arch::Riscv32, Arch::Mips] {
+            let spec = arch.default_spec();
+            assert_eq!(spec.ptr_size, 4, "{arch} 应是 32 位");
+            assert!(!spec.is_64bit());
+        }
     }
 }

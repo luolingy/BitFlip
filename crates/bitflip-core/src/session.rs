@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bitflip_analyze::{JobHandle, NullSink, StageId, StringOptions};
-use bitflip_arch::ArchSpec;
+use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
 use bitflip_loader::object::{Object, ObjectId};
 use bitflip_loader::{sniff_file, ContainerKind, Guess, ObjectKind};
 use bitflip_project::ProjectStore;
@@ -253,11 +253,41 @@ impl ObjectInfo {
     }
 }
 
-/// 打开目标时的选项。M0 只有占位字段，M2 起加入 raw 二进制的基址/架构覆写。
+/// 打开目标时的选项。
+///
+/// 这些字段都是**用户显式指定的事实**，用来补上工具自己拿不到的信息。
+/// 原始二进制（固件、裸镜像、脱壳出来的代码段）没有任何头可以嗅探，
+/// 必须由用户告诉工具"这是什么架构、从哪个地址开始" ——
+/// 否则工具只能如实说"未识别"，而那是没有用的答案。
 #[derive(Debug, Clone, Default)]
 pub struct OpenOptions {
-    /// 视作原始二进制（忽略格式嗅探），M2 实现。
+    /// 视作原始二进制（忽略格式嗅探）。
+    ///
+    /// 用于"文件其实有 ELF 头但已经损坏"或"头部是加密的"这类情形：
+    /// 嗅探会失败或给出误导性结论，用户明确说"就按裸字节看"。
     pub force_raw: bool,
+
+    /// 手工指定的架构（`None` = 用嗅探结论）。
+    ///
+    /// 架构决定用哪个反汇编后端。指定错的后果不是崩溃，而是
+    /// **解出一堆看起来成功的垃圾指令** —— 所以它只在用户显式给出时生效。
+    pub arch: Option<Arch>,
+
+    /// 手工指定的模式/位宽（Thumb、16/32/64 位）。
+    ///
+    /// 与 `arch` 配合使用：ARM 的 Thumb 与 ARM 是同一架构的两套编码，
+    /// 光有 `Arch::Arm` 不足以确定用哪个解码器。
+    pub mode: Option<Mode>,
+
+    /// 手工指定的字节序。
+    pub endian: Option<Endian>,
+
+    /// 原始二进制映射的基址（`None` = 从 0 开始）。
+    ///
+    /// 固件里的地址通常是"物理地址"，比如 ARM Cortex-M 的 flash 从
+    /// `0x08000000` 开始。不给基址的话，反汇编出来的地址与用户手上的
+    /// 参考手册对不上，跳转目标也就没法核对。
+    pub base_address: Option<u64>,
 }
 
 /// 归档成员名的基名：去掉目录部分后的文件名。
@@ -456,13 +486,132 @@ impl Session {
     /// 解析失败**不是**打开失败：嗅探结论仍然可用，此时 `parsed()` 返回 `None`
     /// 且原因记录在 `info().notes` 里。这样畸形文件也能被打开并查看"哪里坏了"，
     /// 而不是整个工具被一个坏节挡住（M1 要求"只返回错误，不 panic"）。
-    pub fn open(path: impl AsRef<Path>, _opts: OpenOptions) -> Result<Self, BitflipError> {
+    pub fn open(path: impl AsRef<Path>, opts: OpenOptions) -> Result<Self, BitflipError> {
         let path = path.as_ref().to_path_buf();
-        let guess = sniff_file(&path)?;
+        let mut guess = sniff_file(&path)?;
+
+        // 手工覆盖：用户显式给出的事实优先于嗅探结论。
+        //
+        // 为什么必须允许覆盖：原始二进制（固件、裸镜像）没有任何头，
+        // 嗅探只能如实说"未识别"，而"未识别"对用户是没有用的答案 ——
+        // 他明确知道这是 Cortex-M 的固件。`force_raw` 则用于"头部损坏
+        // 或加密、但代码是好的"这类情形。
+        //
+        // 覆盖**只**在用户显式给出时生效，绝不"猜一个填上"：
+        // 猜错架构的后果不是崩溃，而是解出一堆看起来成功的垃圾指令，
+        // 那比明确说"未识别"危险得多。
+        let mut override_notes = Vec::new();
+        // 注意条件是**对象不是 raw**，不是"容器不是 plain"。
+        //
+        // 单对象文件（ELF/PE/COFF）的容器就是 `Plain`，早先用
+        // `container != Plain` 判定，于是 `--force-raw` 处理一个普通 ELF
+        // 时整段跳过：容器没被重置、说明也没留下，用户下了强制指令
+        // 界面却只字不提。真正的判据是"我们本来认出了什么格式"。
+        if opts.force_raw && guess.object != ObjectKind::Raw {
+            override_notes.push(format!(
+                "用户指定按原始二进制处理（已忽略嗅探出的对象格式：{}）",
+                guess.object.label_zh()
+            ));
+            guess.container = ContainerKind::Plain;
+            guess.object = ObjectKind::Raw;
+            guess.member_kind = None;
+            guess.members.clear();
+            guess.members_truncated = false;
+            // 节表来自被忽略的那个格式，留着会让界面显示"节 9"——
+            // 那是 ELF 的节，不是这个"裸字节"的节。
+            guess.sections = None;
+            guess.entry = None;
+        }
+
+        if let Some(arch) = opts.arch {
+            // 模式与端序的兜底都由 `bitflip-arch` 决定（`default_spec`）：
+            // "哪个架构惯用哪种模式/端序"是架构知识，不该写在这个架构无关的
+            // 文件里（M5 分层闸门會拦下来）。用户显式给的 mode/endian 覆盖兜底。
+            let mut spec = arch.default_spec();
+            if let Some(mode) = opts.mode {
+                spec = ArchSpec::from_arch(arch, mode, spec.endian);
+            }
+            if let Some(endian) = opts.endian {
+                spec = ArchSpec { endian, ..spec };
+            }
+            if guess.arch.map(|a| (a.arch, a.mode)) != Some((spec.arch, spec.mode)) {
+                override_notes.push(match guess.arch {
+                    Some(was) => format!(
+                        "用户指定架构为 {}/{}（嗅探结论是 {}/{}，已按用户指定处理）",
+                        spec.arch, spec.mode, was.arch, was.mode
+                    ),
+                    None => format!(
+                        "用户指定架构为 {}/{}（嗅探未识别出架构）",
+                        spec.arch, spec.mode
+                    ),
+                });
+            }
+            guess.arch = Some(spec);
+        } else if let Some(mode) = opts.mode {
+            // 只覆盖模式（Thumb / 位宽），架构沿用嗅探结论。
+            // 嗅探也没认出来时就说明这一点 —— 没架构只有模式没有意义。
+            match guess.arch {
+                Some(spec) => {
+                    override_notes.push(format!(
+                        "用户指定模式为 {mode}（架构沿用嗅探结论 {}）",
+                        spec.arch
+                    ));
+                    guess.arch = Some(ArchSpec::from_arch(
+                        spec.arch,
+                        mode,
+                        opts.endian.unwrap_or(spec.endian),
+                    ));
+                }
+                None => override_notes.push(format!(
+                    "用户指定了模式 {mode}，但架构未识别 —— 只给模式无法确定解码器，\
+                     请同时指定架构"
+                )),
+            }
+        } else if let Some(endian) = opts.endian {
+            if let Some(spec) = guess.arch {
+                guess.arch = Some(ArchSpec { endian, ..spec });
+            }
+        }
+
+        // `Guess` 里 `bits` / `endian` 是与 `arch` 并列的**独立字段**
+        // （嗅探时逐项填写）。覆盖了 `arch` 却不同步这两个，界面就会显示
+        // "架构 aarch64 / 位宽未识别" 这种自相矛盾的结论。
+        if let Some(spec) = guess.arch {
+            guess.bits = spec.ptr_size * 8;
+            guess.endian = Some(spec.endian);
+        }
+
+        if let Some(base) = opts.base_address {
+            override_notes.push(format!(
+                "用户指定基址 {base:#x}（嗅探结论：{}）",
+                guess
+                    .image_base
+                    .map_or_else(|| "无".to_string(), |b| format!("{b:#x}"))
+            ));
+            guess.image_base = Some(base);
+        }
+
         let file_size = std::fs::metadata(&path).map_or(guess.sniffed_bytes as u64, |m| m.len());
         let mut info = TargetInfo::from_guess(&path, file_size, &guess);
+        // 覆盖说明同时**并入 `guess.notes`**：后续 `parse_target` 与
+        // 分析层看到的是 `guess`，它们也该知道这些结论是用户强制的。
+        guess.notes.extend(override_notes.iter().cloned());
 
-        let (object, object_raw) = match Self::parse_target(&path, file_size, &guess) {
+        // `TargetInfo` 的说明有两个来源，必须**两个都留**：
+        //   1. `override_notes` —— 用户覆盖引起的说明（"已按裸字节处理"等）；
+        //   2. `info.notes` —— 嗅探过程的记录（"ELF 可执行文件"等）。
+        //
+        // 早先这里直接 `info.notes = override_notes`，把嗅探记录整批顶掉了。
+        // 触发它的是一个具体场景：`--force-raw` 处理 ELF 时，"已按原始二进制
+        // 处理"这句话消失，结论看起来像是工具自己识别出来的 ——
+        // 用户明明下了强制指令，界面却只字不提（CLAUDE.md §7 降级要写在界面上）。
+        //
+        // 顺序：覆盖说明在前。那是用户自己做的事，比嗅探的推论更该先看到。
+        let mut notes = override_notes;
+        notes.extend(std::mem::take(&mut info.notes));
+        info.notes = notes;
+
+        let (object, object_raw) = match Self::parse_target(&path, file_size, &guess, &opts) {
             Ok(object) => {
                 let wire = ObjectInfo::from_object(&object);
                 (Some(wire), Some(Arc::new(object)))
@@ -473,6 +622,34 @@ impl Session {
                 (None, None)
             }
         };
+
+        // 入口以**解析结果**为准。
+        //
+        // 嗅探只在少数格式里能看到入口（ELF `e_entry`），而合成出来的原始
+        // 二进制对象一定知道自己从哪开始。早先"给基址就把入口设成基址"的
+        // 写法写在 `base_address` 分支里，于是 `--base 0` 会漏掉入口 ——
+        // 0 是个完全合法的基址（固件常见）。
+        if info.entry.is_none() {
+            if let Some(entry) = object_raw.as_ref().and_then(|o| o.entry) {
+                info.entry = Some(hex16(entry));
+            }
+        }
+
+        // 分析层（函数识别、CFG）用的是 `guess.entry`，不是 `info.entry`。
+        // 两个必须一致，否则界面显示"入口 0000…0000"却一个函数都识别不出来 ——
+        // 正是 M5 原始二进制要避免的那种自相矛盾。
+        if guess.entry.is_none() {
+            if let Some(entry) = object_raw.as_ref().and_then(|o| o.entry) {
+                guess.entry = Some(entry);
+            }
+        }
+
+        // 摘要是在 `from_guess` 里生成的，那时入口还没从解析结果回填，
+        // 于是会出现"摘要说入口为 -，字段里却写着 0000…0000"的自相矛盾。
+        // 回填完入口后用同一个格式化函数重算，避免两处格式串漂移。
+        if info.entry.is_some() {
+            info.summary = guess.summary_zh();
+        }
 
         // 读入完整字节：分析层需要按虚拟地址随机访问。
         //
@@ -554,9 +731,14 @@ impl Session {
 
     /// 按嗅探结论选择解析器。
     ///
-    /// 归档（`.a` / `.lib`）的成员解析属于 M5；M1 只解析单对象文件，
-    /// 对归档明确说明"sections 描述的是容器"而不是假装解析了成员。
-    fn parse_target(path: &Path, file_size: u64, guess: &Guess) -> Result<Object, String> {
+    /// 归档（`.a` / `.lib`）的成员解析属于 M5；对归档明确说明
+    /// "sections 描述的是容器"而不是假装解析了成员。
+    fn parse_target(
+        path: &Path,
+        file_size: u64,
+        guess: &Guess,
+        opts: &OpenOptions,
+    ) -> Result<Object, String> {
         // 嗅探窗口与解析上限是**两件不同的事**，早先版本把它们混成了一个。
         //
         // 嗅探只读文件前缀（8 MiB）是为了便宜：文件头与容器目录都在前面，
@@ -601,14 +783,92 @@ impl Session {
                 .map_err(|error| format!("PE 解析失败：{}", error.summary_zh())),
             ObjectKind::Coff => bitflip_loader::coff::parse(&bytes, 0, ObjectId::Plain)
                 .map_err(|error| format!("COFF 解析失败：{}", error.summary_zh())),
-            ObjectKind::Raw => Err(
-                "未识别出对象格式：原始二进制需要手工指定基址与架构（见 docs/PLAN.md M2）"
-                    .to_string(),
-            ),
+            ObjectKind::Raw => Self::parse_raw(&bytes, guess, opts),
             ObjectKind::MachO => {
                 Err("Mach-O 解析排期在 M10（见 docs/PLAN.md §1.3），当前只做识别".to_string())
             }
         }
+    }
+
+    /// 把原始二进制包装成一个只有一个可执行段的合成对象。
+    ///
+    /// # 为什么必须能"合成"一个对象
+    ///
+    /// 下游（反汇编、字符串、交叉引用）全都建立在"有一个 `Object`"的前提上。
+    /// 原始二进制没有节表也没有头，但**它的内容就是代码** ——
+    /// 如实地说"我拿不到节表"和"我拒绝分析"是两件不同的事：
+    /// 前者是诚实的降级，后者是功能缺失。
+    ///
+    /// 所以这里合成一个单段对象：
+    /// * 段名 `.raw`（明确不是真实的 ELF `.text`）；
+    /// * 地址从 `base_address` 起（默认 0）—— 固件的物理地址就这样进来；
+    /// * 权限给"可读 + 可执行"，因为用户既然说这是代码，它就是代码；
+    /// * **入口 = 基址**：没有别的地方可作入口，且用户给的基址
+    ///   往往正是他想开始看的地方。
+    ///
+    /// 拿不到的东西一律留空：没有节表就是没有节表，不用合成的假节冒充。
+    fn parse_raw(bytes: &[u8], guess: &Guess, opts: &OpenOptions) -> Result<Object, String> {
+        use bitflip_loader::object::{ContentKind, FileRange, Perms};
+
+        // 架构是硬前提：没有架构就没有解码器，反汇编一个字也做不了。
+        // 这里明确要求用户指定，而不是"随便挑一个" ——
+        // 挑错的后果是解出一堆看起来成功的廉价指令。
+        let Some(spec) = guess.arch else {
+            return Err("原始二进制必须手工指定架构：没有头可读，嗅探无从判断。\
+                 请用 `--arch <架构>` 指定（`bitflip-cli info --help` 列出可选值；\
+                 固件通常还要 `--base` 给基址）"
+                .to_string());
+        };
+
+        let base = opts.base_address.or(guess.image_base).unwrap_or(0);
+        let size = bytes.len() as u64;
+
+        // 原始二进制里没有"代码段/数据段"的区分，整块按代码看待 ——
+        // 用户既然说这是代码，它就是代码。权限给 r-x（不可写：
+        // 我们不会往目标里写任何东西）。
+        let perms = Perms {
+            read: true,
+            write: false,
+            execute: true,
+        };
+
+        let mut object = Object::new(ObjectId::Plain, ObjectKind::Raw, spec, spec.endian);
+
+        object.format.type_name = Some("原始二进制（单段）".to_string());
+        object.image_base = base;
+        // 入口 = 基址：没有别的地方可作入口，而用户给的基址
+        // 往往正是他想开始看的地方。
+        object.entry = Some(base);
+        object.header_flags = None;
+
+        object.segments.push(bitflip_loader::object::Segment {
+            name: ".raw".to_string(),
+            vaddr: base,
+            vsize: size,
+            file: Some(FileRange::new(0, size)),
+            perms,
+            kind: ContentKind::Code,
+            align: 1,
+        });
+
+        object.sections.push(bitflip_loader::object::Section {
+            name: ".raw".to_string(),
+            vaddr: base,
+            file: FileRange::new(0, size),
+            perms,
+            kind: ContentKind::Code,
+            loaded: true,
+        });
+
+        // 拿不到的东西一律留空：没有符号表就是没有符号表，
+        // 不用合成的假符号冒充（CLAUDE.md §7）。
+        object.notes.push(
+            "原始二进制：没有节表与符号表。已按单段（基址起、可读可执行、内容按代码看待）\
+             合成供反汇编使用；函数名与边界全部未知"
+                .to_string(),
+        );
+
+        Ok(object)
     }
 
     /// 解析结果；`None` 表示解析失败，原因见 `info().notes`。

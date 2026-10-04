@@ -11,7 +11,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-pub use cli::{Cli, Command, FunctionsArgs, InfoArgs, MembersArgs, OpenCli, ServeArgs, SymbolArgs};
+pub use cli::{
+    Cli, Command, FunctionsArgs, InfoArgs, MembersArgs, OpenCli, RawOverrideArgs, ServeArgs,
+    SymbolArgs,
+};
 pub use info::run_info;
 pub use members::{run_functions, run_members, run_symbol};
 pub use serve::{serve_blocking, ServeRequest};
@@ -21,8 +24,12 @@ pub use serve::{serve_blocking, ServeRequest};
 pub fn gui_main() -> ExitCode {
     let parsed = OpenCli::parse();
     if parsed.info_only {
-        return report(run_info(&parsed.target, false, parsed.verbose));
+        return report(run_info(&parsed.target, false, parsed.verbose, &parsed.raw));
     }
+    let open_options = match parsed.raw.to_open_options() {
+        Ok(o) => o,
+        Err(error) => return report(Err(error)),
+    };
     report(serve_blocking(ServeRequest {
         target: parsed.target,
         host: parsed.host,
@@ -31,6 +38,7 @@ pub fn gui_main() -> ExitCode {
         token: parsed.token,
         allow_origins: parsed.allow_origin,
         verbose: parsed.verbose,
+        open_options,
     }))
 }
 
@@ -38,19 +46,26 @@ pub fn gui_main() -> ExitCode {
 #[must_use]
 pub fn cli_main() -> ExitCode {
     match Cli::parse().command {
-        Command::Info(args) => report(run_info(&args.target, args.json, args.verbose)),
+        Command::Info(args) => report(run_info(&args.target, args.json, args.verbose, &args.raw)),
         Command::Members(args) => report(run_members(&args)),
         Command::Functions(args) => report(run_functions(&args)),
         Command::Symbol(args) => report(run_symbol(&args)),
-        Command::Serve(args) => report(serve_blocking(ServeRequest {
-            target: args.target,
-            host: args.host,
-            port: args.port,
-            open_browser: !args.no_open,
-            token: args.token,
-            allow_origins: args.allow_origin,
-            verbose: args.verbose,
-        })),
+        Command::Serve(args) => {
+            let open_options = match args.raw.to_open_options() {
+                Ok(o) => o,
+                Err(error) => return report(Err(error)),
+            };
+            report(serve_blocking(ServeRequest {
+                target: args.target,
+                host: args.host,
+                port: args.port,
+                open_browser: !args.no_open,
+                token: args.token,
+                allow_origins: args.allow_origin,
+                verbose: args.verbose,
+                open_options,
+            }))
+        }
         Command::Version => {
             print_version();
             ExitCode::SUCCESS

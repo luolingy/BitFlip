@@ -24,6 +24,16 @@ pub enum SymbolSource {
     Export,
     /// 符号表：ELF `.symtab` / COFF 符号表。
     SymbolTable,
+    /// 对象头里的入口点（`e_entry` / `AddressOfEntryPoint`）。
+    ///
+    /// 排在符号表**之后**：入口是"程序从这里开始执行"，是个强证据，
+    /// 但不保证"这里是一个函数边界" —— 手写汇编的 `_start` 之后
+    /// 可能直接就是别的函数。有符号表时以符号表为准。
+    ///
+    /// 独立成一个来源而不是复用 `Discovery`，是因为界面要能如实告诉用户
+    /// "这个函数是因为入口才出现的" —— 那和"因为被调用所以推断出来"
+    /// 是两条完全不同的证据链。
+    EntryPoint,
     /// 异常/展开表：PE `.pdata`、ELF `.eh_frame` FDE。
     Unwind,
     /// 导入 thunk（IAT/PLT 桩）。
@@ -44,6 +54,7 @@ impl SymbolSource {
             Self::DebugInfo => "debug-info",
             Self::Export => "export",
             Self::SymbolTable => "symbol-table",
+            Self::EntryPoint => "entry-point",
             Self::Unwind => "unwind",
             Self::ImportThunk => "import-thunk",
             Self::Discovery => "discovery",
@@ -60,6 +71,7 @@ impl SymbolSource {
             Self::DebugInfo => "调试信息",
             Self::Export => "导出表",
             Self::SymbolTable => "符号表",
+            Self::EntryPoint => "入口点",
             Self::Unwind => "展开表",
             Self::ImportThunk => "导入桩",
             Self::Discovery => "分析推断",
@@ -76,6 +88,9 @@ impl SymbolSource {
             Self::DebugInfo => 20,
             Self::Export => 30,
             Self::SymbolTable => 40,
+            // 入口点比符号表弱、比展开表强：它是确定的事实（头里写着），
+            // 但不确定是不是函数边界。
+            Self::EntryPoint => 45,
             Self::Unwind => 50,
             Self::ImportThunk => 60,
             Self::Discovery => 70,

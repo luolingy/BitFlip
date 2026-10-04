@@ -26,6 +26,8 @@ pub struct ServeRequest {
     pub allow_origins: Vec<String>,
     /// 调试日志。
     pub verbose: bool,
+    /// 打开目标时的选项（原始二进制的架构/基址覆盖等）。
+    pub open_options: OpenOptions,
 }
 
 /// 同步入口：建立 tokio 运行时并阻塞到服务退出。
@@ -40,7 +42,7 @@ pub fn serve_blocking(request: ServeRequest) -> anyhow::Result<()> {
 
 async fn serve_async(request: ServeRequest) -> anyhow::Result<()> {
     // 先打开目标：路径不对要立刻失败，而不是先起服务再报错。
-    let session = Session::open(&request.target, OpenOptions::default())?;
+    let session = Session::open(&request.target, request.open_options.clone())?;
     let info = session.target_info();
     print_target(&info);
 
@@ -149,6 +151,7 @@ mod tests {
             token: Some("t".to_string()),
             allow_origins: Vec::new(),
             verbose: false,
+            open_options: OpenOptions::default(),
         };
         let error = serve_blocking(request).expect_err("目标不存在必须失败");
         assert!(error.to_string().contains("读取目标失败"));

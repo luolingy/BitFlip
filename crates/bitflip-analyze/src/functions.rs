@@ -64,16 +64,32 @@ impl ConflictKind {
 /// 3. 冲突记录在返回值里，不静默丢弃。
 #[must_use]
 pub fn merge_candidates(addr: u64, candidates: Vec<SymbolCandidate>) -> Function {
-    // 过滤空名候选：这是数据错误，不能让一个空名赢下合并
-    let candidates: Vec<SymbolCandidate> = candidates
-        .into_iter()
+    // 先选出名字。名字必须非空（`validate` 拒空名）：一个空名候选不该
+    // 赢下"这个函数叫什么"这个问题。
+    let named: Vec<SymbolCandidate> = candidates
+        .iter()
         .filter(|c| validate(c).is_ok())
+        .cloned()
         .collect();
+    let chosen = preferred(&named).cloned();
 
-    let chosen = preferred(&candidates).cloned();
-    let (mut name, name_source) = chosen
-        .map(|c| (c.name, c.source))
-        .unwrap_or_else(|| (String::new(), SymbolSource::Discovery));
+    let (mut name, name_source) = match chosen {
+        Some(c) => (c.name, c.source),
+        None => {
+            // 没有**带名字**的候选，但可能仍有候选 —— 它们只是诚实地
+            // 没给出名字（入口点、调用目标推断、导入桩都是这样）。
+            //
+            // 这里必须保留最可信的那个候选的**来源**，不能一律写成
+            // `Discovery`：那会把"因为它是程序入口"和"因为它被调用过"
+            // 这两条完全不同的证据链混成一句谎话。
+            let best = preferred(&candidates).map(|c| c.source);
+            (String::new(), best.unwrap_or(SymbolSource::Discovery))
+        }
+    };
+
+    // 边界与冲突判定用**全部**候选（含无名的）：入口点候选虽然没名字，
+    // 它作为"这里有个函数"的证据一样有效。
+    let candidates: Vec<SymbolCandidate> = candidates;
 
     // 展开表候选把边界编码在 name 里（约定 `<name>\t<end>`）。边界在上面解析，
     // 但**标记必须在这里从名字里去掉** —— 否则 UI 会把 "\t140001050" 当成函数名
@@ -230,11 +246,63 @@ mod tests {
         assert_eq!(f.name_source, SymbolSource::User);
     }
 
+    /// 纯空白的名字**不能**被当成一个名字显示出来。
+    ///
+    /// 原来的断言是"空名候选被整个丢弃"（`candidates.is_empty()`）。
+    /// 那个断言在加入入口点来源之后不再成立，而且**本来就不该成立**：
+    /// 一个只有空白名字的候选仍然带着有效信息（来源 + 置信度），
+    /// 把它整个丢掉等于把证据一起丢了。
+    ///
+    /// 真正要守的是"别把空白当名字显示"，所以断言改成盯 `name`。
     #[test]
-    fn blank_names_are_filtered_out() {
+    fn blank_names_are_not_treated_as_names() {
         let f = merge_candidates(0x5000, vec![cand(0x5000, "   ", SymbolSource::Export, 100)]);
-        assert!(f.candidates.is_empty(), "空名候选不能存活");
-        assert_eq!(f.confidence, 0);
+        assert!(
+            f.name.is_empty(),
+            "纯空白名字必须被规范化成空名字（不能显示成三个空格），实际 {:?}",
+            f.name
+        );
+        assert_eq!(
+            f.confidence, 100,
+            "空白名候选仍带着它的置信度（100）—— 覆盖度统计不该因为名字空白就归零"
+        );
+        // 来源仍然保留：这是"这里有个东西"的证据，不该被抹掉
+        assert_eq!(f.name_source, SymbolSource::Export);
+    }
+
+    /// 无名字的候选仍然要贡献它的**来源**。
+    ///
+    /// 这条盯的是一个具体的谎话：入口点候选（`EntryPoint`）诚实地不带名字，
+    /// 但如果合并时把"没有名字"顺手写成 `Discovery`，界面上就会显示
+    /// "分析推断" —— 而真实的证据是"对象头里写着程序从这里进入"。
+    /// 两条证据链的可靠性完全不同，不能互相冒充（CLAUDE.md §7）。
+    #[test]
+    fn unnamed_candidate_keeps_its_own_source() {
+        let f = merge_candidates(0x6000, vec![cand(0x6000, "", SymbolSource::EntryPoint, 75)]);
+        assert!(f.name.is_empty(), "没有名字就该是空的");
+        assert_eq!(
+            f.name_source,
+            SymbolSource::EntryPoint,
+            "来源必须是入口点，不能被写成发现/推断"
+        );
+        assert!(
+            !f.candidates.is_empty(),
+            "无名但有来源的候选不该被丢弃 —— 它是「这里有函数」的有效证据"
+        );
+    }
+
+    /// 有名字的候选赢；无名的只影响来源。
+    #[test]
+    fn named_candidate_wins_over_unnamed_one() {
+        let f = merge_candidates(
+            0x7000,
+            vec![
+                cand(0x7000, "", SymbolSource::EntryPoint, 75),
+                cand(0x7000, "real_name", SymbolSource::SymbolTable, 70),
+            ],
+        );
+        assert_eq!(f.name, "real_name");
+        assert_eq!(f.name_source, SymbolSource::SymbolTable);
     }
 
     #[test]

@@ -179,6 +179,33 @@ impl TargetAnalysis {
             by_addr.entry(c.addr).or_default().push(c);
         }
 
+        // 来源 3.5：入口点。
+        //
+        // 入口是**唯一一个工具无论如何都知道的地址**，而且它一定是一段代码的
+        // 起点。少了这一条，原始二进制（没有符号表、没有导出、没有展开表）
+        // 会得到"0 个函数" —— 而用户明明指定了基址，就是想从那里开始看。
+        //
+        // 置信度给 75：比符号表（70）高、比导出（80）低。入口是个强证据，
+        // 但它是"程序从这里开始执行"，不保证"这里是一个函数边界" ——
+        // 某些手写汇编的 `_start` 之后就直接是别的函数。
+        if let Some(entry) = object.entry {
+            // 只在该地址确实有解出来的指令时才作为候选，
+            // 否则会在数据区造出一个假函数。
+            if disasm
+                .index
+                .range(entry, entry.saturating_add(1))
+                .next()
+                .is_some()
+            {
+                by_addr.entry(entry).or_default().push(SymbolCandidate {
+                    addr: entry,
+                    name: String::new(), // 入口不等于"函数名叫 entry" —— 诚实留空
+                    source: SymbolSource::EntryPoint,
+                    confidence: 75,
+                });
+            }
+        }
+
         // 来源 4：递归下降证明可达的 call 直接目标。
         // 流式：一次解码一条，立刻归约。linear_only 的 call 不算种子 ——
         // 线性扫描会把数据当指令，它的"调用目标"是伪影。

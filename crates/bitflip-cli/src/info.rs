@@ -3,13 +3,20 @@
 use std::path::Path;
 
 use anyhow::Context;
-use bitflip_core::{ObjectInfo, OpenOptions, Session, TargetInfo};
+use bitflip_core::{ObjectInfo, Session, TargetInfo};
+
+use crate::cli::RawOverrideArgs;
 
 /// 打印目标识别结论。`json` 时输出稳定的 wire 契约（供脚本消费）。
-pub fn run_info(target: &Path, json: bool, verbose: bool) -> anyhow::Result<()> {
+pub fn run_info(
+    target: &Path,
+    json: bool,
+    verbose: bool,
+    raw: &RawOverrideArgs,
+) -> anyhow::Result<()> {
     crate::tracing_setup::init(verbose);
 
-    let session = Session::open(target, OpenOptions::default())?;
+    let session = Session::open(target, raw.to_open_options()?)?;
 
     if json {
         // JSON 模式输出完整解析结果（含 format_version），供脚本消费
@@ -25,9 +32,14 @@ pub fn run_info(target: &Path, json: bool, verbose: bool) -> anyhow::Result<()> 
 
     print_human(session.info(), &session);
 
-    if session.info().object == "raw" {
+    // 原始二进制：只有**还不知道**架构时才提示要手工指定。
+    // 已经给了 `--arch` 还提示"需要指定"会让用户以为自己没生效。
+    if session.info().object == "raw" && session.info().arch.is_none() {
         println!();
-        println!("提示  未识别出容器/对象格式。原始二进制的基址与架构需要手工指定（计划：M2）。");
+        println!(
+            "提示  原始二进制没有头可读，必须手工指定架构：`--arch aarch64|x86_64|arm|...`；\
+             固件通常还要 `--base` 给基址。"
+        );
     }
 
     Ok(())
@@ -279,13 +291,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_elf(dir.path());
 
-        run_info(&path, true, false).expect("json 模式");
-        run_info(&path, false, false).expect("人类可读模式");
+        run_info(&path, true, false, &RawOverrideArgs::default()).expect("json 模式");
+        run_info(&path, false, false, &RawOverrideArgs::default()).expect("人类可读模式");
     }
 
     #[test]
     fn info_on_missing_file_reports_load_error() {
-        let error = run_info(Path::new("nope.dll"), false, false).expect_err("应失败");
+        let error = run_info(
+            Path::new("nope.dll"),
+            false,
+            false,
+            &RawOverrideArgs::default(),
+        )
+        .expect_err("应失败");
         assert!(error.to_string().contains("读取目标失败"));
     }
 }

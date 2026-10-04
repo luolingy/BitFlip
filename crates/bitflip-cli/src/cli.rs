@@ -50,6 +50,10 @@ pub struct OpenCli {
     /// 打开调试日志
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
 }
 
 /// `bitflip-cli` 的无头入口参数。
@@ -80,6 +84,113 @@ pub enum Command {
     Serve(ServeArgs),
     /// 打印版本与 API 版本
     Version,
+}
+
+/// 原始二进制的架构/基址覆盖参数。
+///
+/// 单独成一个结构体是因为**每个接受目标文件的命令都需要它**：
+/// 固件里没有头可读，不给架构就没法反汇编。用 `#[command(flatten)]`
+/// 摊平进各个参数结构，命令行上就是每个命令都直接支持 `--arch` / `--base`。
+#[derive(Debug, Args, Clone, Default)]
+pub struct RawOverrideArgs {
+    /// 手工指定架构（原始二进制必须；也用于覆盖嗅探结论）
+    #[arg(long, value_name = "ARCH")]
+    pub arch: Option<String>,
+
+    /// 手工指定解码模式（arm 上的 thumb、x86 的 16/32/64）
+    #[arg(long, value_name = "MODE")]
+    pub mode: Option<String>,
+
+    /// 手工指定字节序（little / big）
+    #[arg(long, value_name = "ENDIAN")]
+    pub endian: Option<String>,
+
+    /// 原始二进制的基址（十六进制，可带 0x）
+    #[arg(long, value_name = "ADDR")]
+    pub base: Option<String>,
+
+    /// 视作原始二进制：忽略嗅探出的容器与对象格式
+    #[arg(long)]
+    pub force_raw: bool,
+}
+
+impl RawOverrideArgs {
+    /// 转成核心层的打开选项。
+    ///
+    /// 解析失败时**报错**而不是忽略：用户明确敲了 `--arch arm6`，
+    /// 悄悄跳过会让工具用错的架构去解码，输出看起来成功但是垃圾。
+    pub fn to_open_options(&self) -> anyhow::Result<bitflip_core::OpenOptions> {
+        let mut opts = bitflip_core::OpenOptions {
+            force_raw: self.force_raw,
+            ..Default::default()
+        };
+
+        if let Some(text) = &self.arch {
+            let arch = parse_arch(text).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "架构无法识别：{text:?}。可用值：x86、x86_64、aarch64、arm、riscv32、\
+                     riscv64、mips、mips64、wasm32"
+                )
+            })?;
+            opts.arch = Some(arch);
+        }
+
+        if let Some(text) = &self.mode {
+            let mode = parse_mode(text).ok_or_else(|| {
+                anyhow::anyhow!("模式无法识别：{text:?}。可用值：16、32、64、thumb")
+            })?;
+            opts.mode = Some(mode);
+        }
+
+        if let Some(text) = &self.endian {
+            let endian = match text.to_ascii_lowercase().as_str() {
+                "little" | "le" | "l" => bitflip_core::Endian::Little,
+                "big" | "be" | "b" => bitflip_core::Endian::Big,
+                other => {
+                    anyhow::bail!("字节序无法识别：{other:?}。可用值：little、big");
+                }
+            };
+            opts.endian = Some(endian);
+        }
+
+        if let Some(text) = &self.base {
+            let base = bitflip_core::parse_address(text).ok_or_else(|| {
+                anyhow::anyhow!("基址无法解析：{text:?}（十六进制，可带 0x 前缀）")
+            })?;
+            opts.base_address = Some(base);
+        }
+
+        Ok(opts)
+    }
+}
+
+/// 架构短名 → `Arch`。与 `Arch::as_str` 一一对应。
+fn parse_arch(text: &str) -> Option<bitflip_core::Arch> {
+    use bitflip_core::Arch;
+    Some(match text.to_ascii_lowercase().as_str() {
+        "x86" | "i386" | "ia32" => Arch::X86,
+        "x86_64" | "x64" | "amd64" => Arch::X86_64,
+        "aarch64" | "arm64" => Arch::Aarch64,
+        "arm" | "arm32" | "aarch32" => Arch::Arm,
+        "riscv32" | "rv32" => Arch::Riscv32,
+        "riscv64" | "rv64" => Arch::Riscv64,
+        "mips" | "mips32" => Arch::Mips,
+        "mips64" => Arch::Mips64,
+        "wasm32" | "wasm" => Arch::Wasm32,
+        _ => return None,
+    })
+}
+
+/// 模式短名 → `Mode`。
+fn parse_mode(text: &str) -> Option<bitflip_core::Mode> {
+    use bitflip_core::Mode;
+    Some(match text.to_ascii_lowercase().as_str() {
+        "16" | "m16" => Mode::M16,
+        "32" | "m32" => Mode::M32,
+        "64" | "m64" => Mode::M64,
+        "thumb" | "t" => Mode::Thumb,
+        _ => return None,
+    })
 }
 
 /// `members` 参数。
@@ -117,6 +228,9 @@ pub struct FunctionsArgs {
     /// 打开调试日志
     #[arg(short, long)]
     pub verbose: bool,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
 }
 
 /// `symbol` 参数。
@@ -137,6 +251,9 @@ pub struct SymbolArgs {
     /// 打开调试日志
     #[arg(short, long)]
     pub verbose: bool,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
 }
 
 /// `info` 参数。
@@ -151,6 +268,9 @@ pub struct InfoArgs {
     /// 打开调试日志
     #[arg(short, long)]
     pub verbose: bool,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
 }
 
 /// `serve` 参数。
@@ -177,6 +297,9 @@ pub struct ServeArgs {
     /// 打开调试日志
     #[arg(short, long)]
     pub verbose: bool,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
 }
 
 #[cfg(test)]

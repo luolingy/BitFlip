@@ -41,7 +41,30 @@ cargo build --release -p bitflip-app
 # 只想看识别结论
 ./target/release/bitflip --info-only path/to/sample.exe
 ./target/release/bitflip-cli info path/to/libfoo.a --json
+
+# 归档（.a / .lib）：列成员、按成员分析
+./target/release/bitflip-cli members path/to/libfoo.a
+./target/release/bitflip-cli functions path/to/libfoo.a --member foo.o
+./target/release/bitflip-cli symbol path/to/libfoo.a bf_add --member foo.o
+
+# 原始二进制（固件/裸镜像）：没有头可读，架构必须手工指定
+./target/release/bitflip-cli info firmware.bin --arch arm --mode thumb --base 0x08000000
+./target/release/bitflip    firmware.bin --arch arm --base 0x08000000
 ```
+
+`--arch` / `--mode` / `--endian` / `--base` 是**公共覆盖参数**，`info`、`functions`、
+`symbol`、`serve` 与 `bitflip <目标>` 都支持：
+
+| 参数 | 取值 | 说明 |
+| --- | --- | --- |
+| `--arch` | `x86` `x86_64` `aarch64` `arm` `riscv32` `riscv64` `mips` `mips64` `wasm32` | 原始二进制**必须**给；有头的目标给了会覆盖嗅探结论 |
+| `--mode` | `16` `32` `64` `thumb` | 不给则按架构取惯用模式；ARM 的两套编码靠它区分 |
+| `--endian` | `little` `big` | 不给则按架构取惯用端序 |
+| `--base` | 十六进制，可带 `0x` | 原始二进制的基址；不给则从 0 起 |
+| `--force-raw` | 开关 | 忽略已识别的容器与格式，整体按裸字节处理（头损坏/加密但代码可用时） |
+
+覆盖会如实写进结论的"说明"里（例如"用户指定按原始二进制处理（已忽略嗅探出的
+对象格式：ELF）"），不会伪装成是工具自己识别出来的。
 
 前端资源是可选的：仓库里保留了 `web/dist/.gitkeep`，所以**没构建过前端也能编译并运行**，
 此时页面是一份说明如何构建前端的占位页。要看到真正的界面：

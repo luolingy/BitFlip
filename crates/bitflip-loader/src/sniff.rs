@@ -143,7 +143,9 @@ fn sniff_inner(bytes: &[u8], depth: u8) -> Guess {
     } else {
         g.object = ObjectKind::Raw;
         g.notes.push(
-            "未匹配已知容器/对象格式，按原始二进制处理（M2 起支持手工指定基址与架构）".to_string(),
+            "未匹配已知容器/对象格式，按原始二进制处理：需要手工指定架构（`--arch`），\
+             基址也通常需要（`--base`）"
+                .to_string(),
         );
     }
 
