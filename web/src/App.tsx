@@ -18,6 +18,7 @@ import {
 import { DisassemblyView } from "./DisassemblyView";
 import { FunctionsView, HexView, StringsView, XrefsView } from "./AnalysisViews";
 import { MembersView } from "./MembersView";
+import { CallGraphView, CodeMapView, JumpTablesView } from "./M6Views";
 
 type LoadState =
   | { kind: "loading" }
@@ -42,7 +43,10 @@ type ViewId =
   | "xrefs"
   | "strings"
   | "hex"
-  | "members";
+  | "members"
+  | "call-graph"
+  | "code-map"
+  | "jump-tables";
 
 const NAV_SECTIONS: readonly {
   /** 只有 `ready: true` 的项才是真实可切换的视图。 */
@@ -61,6 +65,10 @@ const NAV_SECTIONS: readonly {
   { id: "hex", title: "十六进制", milestone: "M3", hint: "原始字节视图", ready: true },
   // M5：归档成员树。静态库/动态库是 M5 的目标，成员列表是进入它们的入口。
   { id: "members", title: "归档成员", milestone: "M5", hint: "静态库/归档的成员与按成员分析", ready: true },
+  // M6：函数间的关系与"这段字节是什么"。
+  { id: "call-graph", title: "调用图", milestone: "M6", hint: "谁调用了谁，含未解析的间接调用", ready: true },
+  { id: "code-map", title: "数据/代码", milestone: "M6", hint: "判定结论、置信度与依据", ready: true },
+  { id: "jump-tables", title: "跳转表", milestone: "M6", hint: "switch 分派表与目标集合", ready: true },
   // 下面这些确实还没做（M8 签名库匹配），保持置灰 —— 不给点了没反应的按钮。
   { id: null, title: "签名匹配", milestone: "M8", hint: "库函数签名识别", ready: false },
 ];
@@ -74,6 +82,9 @@ const VIEW_TITLES: Record<ViewId, string> = {
   strings: "字符串",
   hex: "十六进制",
   members: "归档成员",
+  "call-graph": "调用图",
+  "code-map": "数据/代码判定",
+  "jump-tables": "跳转表",
 };
 
 
@@ -266,6 +277,12 @@ export function App() {
             <HexView token={token} initialAddress={focus} />
           ) : view === "members" ? (
             <MembersView token={token} onNavigate={navigate} />
+          ) : view === "call-graph" ? (
+            <CallGraphView token={token} onNavigate={navigate} />
+          ) : view === "code-map" ? (
+            <CodeMapView token={token} />
+          ) : view === "jump-tables" ? (
+            <JumpTablesView token={token} onNavigate={navigate} />
           ) : parsed ? (
             <StructureView parsed={parsed} target={target} />
           ) : (

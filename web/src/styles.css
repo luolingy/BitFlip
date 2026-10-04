@@ -899,3 +899,161 @@ button:not(:disabled):hover {
   color: #e05a5a;
   font-size: 12px;
 }
+
+/* ── 调用图 / 数据判定 / 跳转表（M6）────────────────────────────
+   这三个视图的重点是"结论 + 依据"。所以样式上：
+
+   - 警告条（.banner-warn）要显眼：图不完整、证据不足这类事必须
+     比结论本身更容易被看到，而不是藏在角落；
+   - 依据列（.reason-cell）允许换行，不截断 —— 理由被截断就等于
+     没有理由。 */
+
+.banner-warn {
+  border-left: 3px solid #d08a2a;
+  background: rgba(208, 138, 42, 0.1);
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.summary-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.summary-label {
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+.summary-value {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.summary-hint {
+  font-size: 11px;
+  opacity: 0.65;
+  line-height: 1.4;
+}
+
+.section-title {
+  margin: 20px 0 8px;
+  font-size: 14px;
+}
+
+.sub-title {
+  margin: 8px 0 6px;
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+/* 可点的行：与 .row-clickable 区分开，用于"当前正在查看" */
+.row-active {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+/* 函数列表可能很长，限制高度并允许滚动，避免把邻域面板推下去 */
+.table-wrap-short {
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  font: inherit;
+}
+
+.link-button:hover {
+  opacity: 0.8;
+}
+
+.neighbourhood {
+  margin-top: 16px;
+}
+
+.neighbour-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.ref-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 依据列：不截断、允许换行。理由被截断等于没有理由。 */
+.reason-cell {
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 520px;
+  white-space: normal;
+  opacity: 0.85;
+}
+
+/* 判定结论用颜色区分，但"未判定"不要显得像错误 —— 它是诚实的空白 */
+.chip-code {
+  background: rgba(80, 160, 100, 0.2);
+}
+
+.chip-data {
+  background: rgba(120, 120, 160, 0.2);
+}
+
+.chip-unknown {
+  background: rgba(140, 140, 140, 0.15);
+  opacity: 0.8;
+}
+
+.jump-table {
+  margin: 14px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.jump-table-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.target-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.target {
+  font-size: 12px;
+}
+
+.input-small {
+  width: auto;
+  padding: 2px 6px;
+}

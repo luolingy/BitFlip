@@ -792,10 +792,17 @@ async fn call_graph(
         }
         nodes.insert(entry_hex.clone());
 
+        // 邻域模式不截断：1 万函数的图里 3 跳邻域最多几百条边，
+        // 远低于上限。所以 returned == edges.len()。
+        let neighbourhood: Vec<bitflip_core::CallEdgeWire> = edges.into_iter().cloned().collect();
+        let returned_edges = neighbourhood.len();
+
         return Json(CallGraphResponse {
             format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
             summary: g.summary,
-            edges: edges.into_iter().cloned().collect(),
+            returned_edges,
+            truncated_edges: 0,
+            edges: neighbourhood,
             unresolved: g
                 .unresolved
                 .iter()
@@ -834,10 +841,14 @@ async fn call_graph(
         nodes.insert(e.callee.clone());
     }
 
+    let returned = g.edges.iter().take(limit).cloned().collect::<Vec<_>>();
+
     Json(CallGraphResponse {
         format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
         summary: g.summary,
-        edges: g.edges.iter().take(limit).cloned().collect(),
+        returned_edges: returned.len(),
+        truncated_edges: truncated,
+        edges: returned,
         unresolved: g.unresolved.clone(),
         nodes: nodes.into_iter().collect(),
         focus: None,
@@ -887,6 +898,15 @@ struct CallGraphResponse {
     focus: Option<String>,
     /// 邻域跳数（全图模式为 0）。
     depth: u32,
+    /// 实际返回的边数（= `edges.len()`）。
+    ///
+    /// 单独给出是为了让界面**不可能**自相矛盾：大目标上
+    /// `summary.edges` 是图上真实的边数，而 `edges` 只装得下前
+    /// [`MAX_CALL_EDGES`] 条。两个数字不一致时，如果没有这个字段，
+    /// UI 会显示"共 23660 条边"却只列出 20000 行，看起来像丢了数据。
+    returned_edges: usize,
+    /// 因上限而未返回的边数（0 表示没截断）。
+    truncated_edges: usize,
     /// 降级说明。
     notes: Vec<String>,
 }

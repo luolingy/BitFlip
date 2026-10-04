@@ -482,8 +482,121 @@ export interface HexResponse {
   bytes_read: number;
 }
 
-/** 一条用户标注。对应 `bitflip-project::Annotation`。 */
-export interface Annotation {
+/** 调用图汇总。对应 `bitflip-core::CallGraphSummaryWire`。 */
+export interface CallGraphSummary {
+  nodes: number;
+  edges: number;
+  /**
+   * 未解析的间接调用数。
+   *
+   * 必须显示给用户：解析它们需要数据流分析（M6 未实现），
+   * 所以这张图**本来就不完整**。藏起来等于假装完整。
+   */
+  unresolved_indirect: number;
+  outside_targets: number;
+  roots: number;
+  components: number;
+  /** >1 表示存在递归环。 */
+  largest_component: number;
+}
+
+/** 一条调用边。 */
+export interface CallEdge {
+  caller: string;
+  callee: string;
+  /** 尾调用：跳过去就不回来了。 */
+  tail: boolean;
+}
+
+/** 一个未解析的调用点。 */
+export interface UnresolvedCall {
+  caller: string;
+  insn: string;
+}
+
+/** `/api/call-graph` 响应。 */
+export interface CallGraphResponse {
+  format_version: number;
+  summary: CallGraphSummary;
+  edges: CallEdge[];
+  unresolved: UnresolvedCall[];
+  /** 本次响应涉及的节点地址集合。 */
+  nodes: string[];
+  /** 邻域模式下的聚焦函数；全图模式为 `null`。 */
+  focus: string | null;
+  /** 邻域跳数；全图模式为 0。 */
+  depth: number;
+  /**
+   * 实际返回的边数（= `edges.length`）。
+   *
+   * 大目标上 `summary.edges` 是图上真实的边数，而 `edges` 只装得下
+   * 前 2 万条。两个数字不一致时**必须**告诉用户，否则界面会显示
+   * "共 23660 条边"却只列出 20000 行，看起来像丢了数据。
+   */
+  returned_edges: number;
+  /** 因上限未返回的边数；0 表示没截断。 */
+  truncated_edges: number;
+  notes: string[];
+}
+
+/** 数据/代码判定统计。对应 `bitflip-core::CodeMapStats`。 */
+export interface CodeMapStats {
+  code: number;
+  data: number;
+  unknown: number;
+  /** 给出明确结论的比例（0–1）。低不是坏事：说明系统没硬凑结论。 */
+  decided_ratio: number;
+}
+
+/** 一条代表性判定。 */
+export interface CodeMapSample {
+  /**
+   * 判定地址（定长 16 位小写十六进制）。
+   *
+   * 字段名是 `addr`，与服务端 `CodeMapSample` 一致 —— 不要"顺手"
+   * 改成 `address`：名字对不上会让这一列静默变成 `undefined`，
+   * 而 TypeScript 不会因此报错（后端 JSON 是 `any`）。
+   */
+  addr: string;
+  kind: string;
+  kind_label: string;
+  confidence: number;
+  well_supported: boolean;
+  reason: string;
+}
+
+/** `/api/code-map` 响应。 */
+export interface CodeMapResponse {
+  format_version: number;
+  stats: CodeMapStats;
+  samples: CodeMapSample[];
+  notes: string[];
+}
+
+/** 一条跳转表。对应服务端的 `JumpTableWire`。 */
+export interface JumpTable {
+  /** 发起间接跳转的指令地址。 */
+  insn_addr: string;
+  /** 表基址。 */
+  base: string;
+  /** 表项字节宽度（1/2/4/8）。 */
+  width: number;
+  kind: string;
+  kind_zh: string;
+  /** 表项数。 */
+  count: number;
+  /** 目标地址列表。 */
+  targets: string[];
+}
+
+/** `/api/jump-tables` 响应。 */
+export interface JumpTablesResponse {
+  format_version: number;
+  tables: JumpTable[];
+  notes: string[];
+}
+
+/** 一条用户标注。对应 `bitflip-project::Annotation`。 */export interface Annotation {
   /** 定长 16 位小写十六进制。 */
   address: string;
   /** 类别短名：`name` / `comment` / `type` / `bookmark` / `patch` / … */
@@ -512,8 +625,7 @@ export const ANNOTATION_KIND_LABELS: Record<string, string> = {
   "code-data": "代码/数据",
 };
 
-/** 取函数列表；无目标或不可分析时返回 `null`（服务端 400 带原因）。 */
-export async function fetchFunctions(
+/** 取函数列表；无目标或不可分析时返回 `null`（服务端 400 带原因）。 */export async function fetchFunctions(
   token: string | null,
   from: string | null,
   count: number,
@@ -546,8 +658,43 @@ export async function fetchMemberFunctions(
   );
 }
 
-/** 取某地址的交叉引用。 */
-export async function fetchXrefs(
+/** 取调用图。
+ *
+ * 不传 `entry` 取全图（大目标会被服务端截断并说明）；传 `entry`
+ * 取该函数的邻域 —— 这是主路径，1 万函数里用户总是先定位一个
+ * 函数再看它的邻居。 */
+export async function fetchCallGraph(
+  token: string | null,
+  entry?: string | null,
+  depth = 1,
+): Promise<CallGraphResponse | null> {
+  const params = new URLSearchParams();
+  if (entry) {
+    params.set("entry", entry);
+    params.set("depth", String(depth));
+  }
+  const qs = params.toString();
+  return requestOrNull<CallGraphResponse>(
+    `/api/call-graph${qs ? `?${qs}` : ""}`,
+    token,
+  );
+}
+
+/** 取数据/代码判定的统计与样本。 */
+export async function fetchCodeMap(
+  token: string | null,
+): Promise<CodeMapResponse | null> {
+  return requestOrNull<CodeMapResponse>("/api/code-map", token);
+}
+
+/** 取识别出的跳转表。 */
+export async function fetchJumpTables(
+  token: string | null,
+): Promise<JumpTablesResponse | null> {
+  return requestOrNull<JumpTablesResponse>("/api/jump-tables", token);
+}
+
+/** 取某地址的交叉引用。 */export async function fetchXrefs(
   token: string | null,
   address: string,
 ): Promise<XrefsResponse | null> {

@@ -973,9 +973,33 @@ fn build_call_graph_wire(
 
     let graph = bitflip_analyze::build_call_graph(&insns, &ranges);
 
+    // 输出**已解析**的边。未解析的边单独放 `unresolved`：它们没有目标，
+    // 混进 `edges` 会让前端拿到空字符串然后画出悬空节点。
+    let edges: Vec<CallEdgeWire> = graph
+        .edges
+        .iter()
+        .filter(|e| e.resolution == bitflip_analyze::CalleeResolution::Resolved)
+        .filter_map(|e| {
+            let callee = e.callee?;
+            Some(CallEdgeWire {
+                caller: hex16(e.caller),
+                callee: hex16(callee),
+                tail: e.tail,
+            })
+        })
+        .collect();
+
     // 全部函数入口（用于统计"没人调用"的数量）
     let all: Vec<u64> = ranges.iter().map(|r| r.start).collect();
-    let summary = graph.summarize(&all, HUB_LIMIT);
+    let mut summary = graph.summarize(&all, HUB_LIMIT);
+
+    // `summarize` 算的是**全部**边（含未解析），而响应里的 `edges`
+    // 只有已解析的。两者不相等会让 UI 显示"图有 N 条边"却只列出
+    // M 条（N ≠ M），看起来像丢了数据 —— 其实是两类边。
+    //
+    // 如实拆分：`edges` 就是响应里那个数组的长度，未解析的走
+    // `unresolved_indirect`。这样两个数字都能对上。
+    summary.edges = edges.len();
 
     for n in &graph.notes {
         notes.push(n.clone());
@@ -997,23 +1021,7 @@ fn build_call_graph_wire(
             components: summary.components,
             largest_component: summary.largest_component,
         },
-        edges: graph
-            .edges
-            .iter()
-            .filter_map(|e| {
-                // 只输出**已解析**的边：未解析的没有目标，放进 edges
-                // 会让前端拿到一个空字符串然后画出个悬空节点。
-                let callee = e.callee?;
-                if e.resolution != bitflip_analyze::CalleeResolution::Resolved {
-                    return None;
-                }
-                Some(CallEdgeWire {
-                    caller: hex16(e.caller),
-                    callee: hex16(callee),
-                    tail: e.tail,
-                })
-            })
-            .collect(),
+        edges,
         unresolved: graph
             .edges
             .iter()
