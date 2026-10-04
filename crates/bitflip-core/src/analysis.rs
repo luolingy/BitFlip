@@ -91,7 +91,76 @@ pub struct TargetAnalysis {
     jump_tables: JumpTableScan,
     /// 数据/代码判定的统计与结论。M6 引入。
     code_map: CodeMap,
+    /// 函数间调用图。M6 引入。
+    call_graph: CallGraphWire,
     notes: Vec<String>,
+}
+
+/// 调用图的 wire 表示（M6）。
+///
+/// # 为什么不在响应里塞全部边
+///
+/// 验收标准 3 要求"1 万函数规模下可交互渲染"。1 万节点的全图边数
+/// 通常在 3–8 万条，序列化出来有几 MB，前端画不动也没意义 ——
+/// 用户看的是**结构**，不是每条边。
+///
+/// 所以这里给：
+///
+/// * `summary`：总体形状（节点/边/未解析数/分量/hub），用来决定画什么；
+/// * `edges`：全部**已解析**的边（只存两端地址对，紧凑）；
+/// * `unresolved`：未解析间接调用的调用点（地址 + 调用方），
+///   让"图不完整"可见且可定位。
+///
+/// 逐函数的邻域查询走 `/api/call-graph?entry=`，按需算。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CallGraphWire {
+    /// 汇总统计。
+    pub summary: CallGraphSummaryWire,
+    /// 已解析的调用边（调用方入口 → 被调用方入口）。
+    pub edges: Vec<CallEdgeWire>,
+    /// 未解析的间接调用点。
+    pub unresolved: Vec<UnresolvedCallWire>,
+    /// 降级说明。
+    pub notes: Vec<String>,
+}
+
+/// 调用图汇总（wire）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CallGraphSummaryWire {
+    /// 节点数（出现在图中的函数数）。
+    pub nodes: usize,
+    /// 边数。
+    pub edges: usize,
+    /// 未解析的间接调用数。
+    pub unresolved_indirect: usize,
+    /// 落在已知函数之外的目标数（去重）。
+    pub outside_targets: usize,
+    /// 入度为 0 的节点数。
+    pub roots: usize,
+    /// 强连通分量数。
+    pub components: usize,
+    /// 最大分量大小；>1 表示存在递归环。
+    pub largest_component: usize,
+}
+
+/// 一条已解析的调用边（wire）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CallEdgeWire {
+    /// 调用方函数入口（定长 16 位十六进制）。
+    pub caller: String,
+    /// 被调用方函数入口。
+    pub callee: String,
+    /// 是否为尾调用（不返回）。
+    pub tail: bool,
+}
+
+/// 一个未解析的调用点（wire）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UnresolvedCallWire {
+    /// 调用方函数入口。
+    pub caller: String,
+    /// 发起调用的指令地址。
+    pub insn: String,
 }
 
 /// 数据/代码判定的 wire 结果（M6）。
@@ -567,6 +636,9 @@ impl TargetAnalysis {
         // 本身还大（CLAUDE.md §4）。
         let code_map = build_code_map(disasm, &functions, &mut notes);
 
+        // 调用图（M6）：CFG 之外的另一张图 —— 函数之间谁调用谁。
+        let call_graph = build_call_graph_wire(disasm, &functions, &mut notes);
+
         Self {
             functions,
             xrefs,
@@ -576,6 +648,7 @@ impl TargetAnalysis {
             cfg_by_function,
             jump_tables,
             code_map,
+            call_graph,
             notes,
         }
     }
@@ -584,6 +657,12 @@ impl TargetAnalysis {
     #[must_use]
     pub fn code_map(&self) -> &CodeMap {
         &self.code_map
+    }
+
+    /// 函数间调用图。
+    #[must_use]
+    pub fn call_graph(&self) -> &CallGraphWire {
+        &self.call_graph
     }
 
     /// 函数列表（按入口地址升序）。
@@ -851,6 +930,101 @@ fn backfill_jump_table_edges(
         ));
     }
     added
+}
+
+/// 构建调用图的 wire 表示（M6）。
+///
+/// # 为什么要在有 `Disasm` 的前提下重扫一遍指令
+///
+/// `AnalysisFacts` 那套抽样是为**统计**服务的；调用图需要**全部** call
+/// 指令。所以这里走一遍指令索引 —— 索引只有 `(地址, 长度)`，指令本身
+/// 要重新解码。这是本项目一贯的取舍：不缓存解码结果，用时间换内存
+/// （CLAUDE.md §4 的 SoA 约束）。
+///
+/// 成本可控：只有 `Flow::Call` 与 `Flow::Branch` 需要看目标，
+/// 但判断 flow 本身就得解码，所以实际是"全部指令解码一次"。
+/// 1 万函数的规模下这是百毫秒级，可以接受。
+fn build_call_graph_wire(
+    disasm: &Disasm,
+    functions: &[FunctionWire],
+    notes: &mut Vec<String>,
+) -> CallGraphWire {
+    const HUB_LIMIT: usize = 20;
+
+    let ranges: Vec<bitflip_analyze::FunctionRange> = functions
+        .iter()
+        .filter_map(|f| {
+            let start = parse_address(&f.start)?;
+            let end = f.end.as_deref().and_then(parse_address);
+            Some(bitflip_analyze::FunctionRange { start, end })
+        })
+        .collect();
+
+    // 解码全部指令。解码失败的地址跳过 —— 它们不是调用点。
+    let mut insns: Vec<bitflip_arch::DecodedInsn> = Vec::with_capacity(disasm.space.index().len());
+    for (addr, len) in disasm.space.index().range(0, u64::MAX) {
+        let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
+            continue;
+        };
+        if let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) {
+            insns.push(insn);
+        }
+    }
+
+    let graph = bitflip_analyze::build_call_graph(&insns, &ranges);
+
+    // 全部函数入口（用于统计"没人调用"的数量）
+    let all: Vec<u64> = ranges.iter().map(|r| r.start).collect();
+    let summary = graph.summarize(&all, HUB_LIMIT);
+
+    for n in &graph.notes {
+        notes.push(n.clone());
+    }
+    if summary.largest_component > 1 {
+        notes.push(format!(
+            "调用图存在大小为 {} 的强连通分量（互相调用，通常是递归或分发器）",
+            summary.largest_component
+        ));
+    }
+
+    CallGraphWire {
+        summary: CallGraphSummaryWire {
+            nodes: summary.nodes,
+            edges: summary.edges,
+            unresolved_indirect: summary.unresolved_indirect,
+            outside_targets: summary.outside_targets,
+            roots: summary.roots,
+            components: summary.components,
+            largest_component: summary.largest_component,
+        },
+        edges: graph
+            .edges
+            .iter()
+            .filter_map(|e| {
+                // 只输出**已解析**的边：未解析的没有目标，放进 edges
+                // 会让前端拿到一个空字符串然后画出个悬空节点。
+                let callee = e.callee?;
+                if e.resolution != bitflip_analyze::CalleeResolution::Resolved {
+                    return None;
+                }
+                Some(CallEdgeWire {
+                    caller: hex16(e.caller),
+                    callee: hex16(callee),
+                    tail: e.tail,
+                })
+            })
+            .collect(),
+        unresolved: graph
+            .edges
+            .iter()
+            .filter(|e| e.resolution == bitflip_analyze::CalleeResolution::IndirectUnresolved)
+            .map(|e| UnresolvedCallWire {
+                caller: hex16(e.caller),
+                insn: hex16(e.from_insn),
+            })
+            .collect(),
+        notes: graph.notes,
+    }
 }
 
 /// 构建数据/代码判定的统计与样本（M6）。
@@ -1502,6 +1676,7 @@ mod tests {
             cfg_by_function: BTreeMap::new(),
             jump_tables: JumpTableScan::default(),
             code_map: CodeMap::default(),
+            call_graph: CallGraphWire::default(),
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());

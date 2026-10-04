@@ -16,8 +16,9 @@ mod error;
 mod session;
 
 pub use analysis::{
-    BlockWire, CfgWire, CodeMap, CodeMapSample, CodeMapStats, FunctionWire, StringWire,
-    TargetAnalysis, XrefWire, ANALYSIS_FORMAT_VERSION,
+    BlockWire, CallEdgeWire, CallGraphSummaryWire, CallGraphWire, CfgWire, CodeMap, CodeMapSample,
+    CodeMapStats, FunctionWire, StringWire, TargetAnalysis, UnresolvedCallWire, XrefWire,
+    ANALYSIS_FORMAT_VERSION,
 };
 pub use disasm::{
     hex16, parse_address, Disasm, DisasmStats, InsnPage, InsnWire, DEFAULT_PAGE_SIZE,

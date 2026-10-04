@@ -12,6 +12,7 @@
 
 mod assets;
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -347,6 +348,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/analyze", get(analyze))
         .route("/api/jump-tables", get(jump_tables))
         .route("/api/code-map", get(code_map))
+        .route("/api/call-graph", get(call_graph))
         .route("/api/cfg", get(cfg))
         .route("/api/members", get(members))
         .route("/api/members/functions", get(member_functions))
@@ -716,6 +718,177 @@ async fn jump_tables(State(state): State<AppState>) -> Response {
         notes: scan.notes.clone(),
     })
     .into_response()
+}
+
+/// 调用图响应：`GET /api/call-graph`。
+///
+/// # 两种模式
+///
+/// * **无 `entry`**：返回全图汇总 + 已解析边 + 未解析调用点。
+///   大目标（1 万函数）时边有几万条，但每条只有两个地址，仍然可交互；
+///   前端据 `summary` 决定是否要进一步抽稀。
+/// * **带 `entry`**：只返回该函数的**邻域**（直接调用者 + 直接被调用者，
+///   深度 1）。这是"看某个函数的调用关系"的主路径 —— 1 万函数里
+///   用户永远是先定位到一个函数再看它的邻域，而不是看全图。
+///
+/// `depth` 参数控制邻域的跳数，上限 3：再深就会拉出大半个图，
+/// 既慢又没意义。
+/// 单独一个端点的理由：调用图与 CFG 是两张不同的图（函数间 vs 函数内），
+/// 混在一个响应里会让两边都难以独立演进。
+async fn call_graph(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<CallGraphQuery>,
+) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+    let g = analysis.call_graph();
+
+    // ── 邻域模式 ──
+    if let Some(entry_str) = params.entry.as_deref() {
+        let Some(entry) = bitflip_core::parse_address(entry_str) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("entry 不是合法地址：{entry_str}"),
+            );
+        };
+        let depth = params.depth.unwrap_or(1).clamp(1, MAX_NEIGHBORHOOD_DEPTH);
+
+        let mut nodes: BTreeSet<String> = BTreeSet::new();
+        let mut edges: Vec<&bitflip_core::CallEdgeWire> = Vec::new();
+        let mut frontier: Vec<u64> = vec![entry];
+        let mut visited: BTreeSet<u64> = BTreeSet::from([entry]);
+        let entry_hex = bitflip_core::hex16(entry);
+
+        for _ in 0..depth {
+            let mut next: Vec<u64> = Vec::new();
+            for &n in &frontier {
+                let n_hex = bitflip_core::hex16(n);
+                for e in g.edges.iter() {
+                    // 出边与入边都要（用户想看"谁调用我"也要看"我调用谁"）
+                    if e.caller == n_hex || e.callee == n_hex {
+                        if !edges.iter().any(|x| std::ptr::eq(*x, e)) {
+                            edges.push(e);
+                        }
+                        let other = if e.caller == n_hex {
+                            e.callee.clone()
+                        } else {
+                            e.caller.clone()
+                        };
+                        nodes.insert(other.clone());
+                        if let Some(a) = bitflip_core::parse_address(&other) {
+                            if visited.insert(a) {
+                                next.push(a);
+                            }
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        nodes.insert(entry_hex.clone());
+
+        return Json(CallGraphResponse {
+            format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+            summary: g.summary,
+            edges: edges.into_iter().cloned().collect(),
+            unresolved: g
+                .unresolved
+                .iter()
+                .filter(|u| u.caller == entry_hex)
+                .cloned()
+                .collect(),
+            nodes: nodes.into_iter().collect(),
+            focus: Some(entry_hex),
+            depth,
+            notes: g.notes.clone(),
+        })
+        .into_response();
+    }
+
+    // ── 全图模式 ──
+    //
+    // `limit` 用于大目标：边数超过上限时截断并**如实说明**截断了多少。
+    // 静默截断会让用户以为"调用图就这么大"。
+    let limit = params
+        .limit
+        .unwrap_or(MAX_CALL_EDGES)
+        .clamp(1, MAX_CALL_EDGES);
+    let truncated = g.edges.len().saturating_sub(limit);
+    let mut notes = g.notes.clone();
+    if truncated > 0 {
+        notes.push(format!(
+            "调用边共 {} 条，已截断为前 {limit} 条（另 {truncated} 条未返回）；\
+             请用 entry 参数查询单个函数的邻域",
+            g.edges.len()
+        ));
+    }
+
+    let mut nodes: BTreeSet<String> = BTreeSet::new();
+    for e in g.edges.iter().take(limit) {
+        nodes.insert(e.caller.clone());
+        nodes.insert(e.callee.clone());
+    }
+
+    Json(CallGraphResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        summary: g.summary,
+        edges: g.edges.iter().take(limit).cloned().collect(),
+        unresolved: g.unresolved.clone(),
+        nodes: nodes.into_iter().collect(),
+        focus: None,
+        depth: 0,
+        notes,
+    })
+    .into_response()
+}
+
+/// `GET /api/call-graph` 的查询参数。
+#[derive(serde::Deserialize)]
+struct CallGraphQuery {
+    /// 聚焦的函数入口（可选）。给了就只返回它的邻域。
+    entry: Option<String>,
+    /// 邻域跳数（默认 1，上限 [`MAX_NEIGHBORHOOD_DEPTH`]）。
+    depth: Option<u32>,
+    /// 全图模式下返回的最大边数。
+    limit: Option<usize>,
+}
+
+/// 邻域查询的最大跳数。
+///
+/// 上限 3：1 万函数的图里，3 跳邻域可能已经是几百个节点，
+/// 再多既慢又超出"看清楚一个函数的关系"这个目标。
+const MAX_NEIGHBORHOOD_DEPTH: u32 = 3;
+
+/// 全图模式默认返回的最大边数。
+///
+/// 取 20000：按每条边两个 16 字符地址算，响应约 1–2 MB，
+/// 浏览器与前端布局都能承受。超过这个量级用户本来就该用邻域查询。
+const MAX_CALL_EDGES: usize = 20_000;
+
+/// 调用图响应体。
+#[derive(Serialize)]
+struct CallGraphResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 汇总统计。
+    summary: bitflip_core::CallGraphSummaryWire,
+    /// 调用边。
+    edges: Vec<bitflip_core::CallEdgeWire>,
+    /// 未解析的间接调用点。
+    unresolved: Vec<bitflip_core::UnresolvedCallWire>,
+    /// 本次响应涉及的节点地址集合（便于前端直接布局）。
+    nodes: Vec<String>,
+    /// 聚焦的函数（邻域模式下有值）。
+    focus: Option<String>,
+    /// 邻域跳数（全图模式为 0）。
+    depth: u32,
+    /// 降级说明。
+    notes: Vec<String>,
 }
 
 /// 数据/代码判定响应：`GET /api/code-map`。
