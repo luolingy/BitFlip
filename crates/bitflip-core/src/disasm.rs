@@ -217,6 +217,20 @@ impl Disasm {
         };
 
         let (index, stats) = bitflip_analyze::combine(linear, recursive);
+        let index = Arc::new(index);
+
+        // 把最终索引**同步回地址空间**。
+        //
+        // 不同步会造成一个很隐蔽的数据丢失：`disasm.index` 是正确的，
+        // 但 `disasm.space.index()` 永远是空表（`Arc` 也不是同一个）。
+        // 任何通过 `space.index()` 取指令的代码都会读到"这里没有指令"，
+        // 于是静默地什么也不做 —— 不报错、不降级，只是结论为空。
+        //
+        // 实测后果：跳转表识别用 `space.index()` 取候选指令，在
+        // switch fixture（87 条指令）上一条都取不到；而同一份 Disasm 的
+        // `index` 里 87 条都在。两者必须指向同一份数据。
+        let mut space = space;
+        space.set_index_arc(Arc::clone(&index));
 
         if stats.truncated > 0 {
             notes.push(format!(
@@ -233,7 +247,7 @@ impl Disasm {
 
         Self {
             space,
-            index: Arc::new(index),
+            index,
             coverage,
             stats,
             decoder,

@@ -345,6 +345,7 @@ pub fn router(state: AppState) -> Router {
         // 合并返回会让"只想看字符串"的请求也付出序列化函数表的代价。
         .route("/api/functions", get(functions))
         .route("/api/analyze", get(analyze))
+        .route("/api/jump-tables", get(jump_tables))
         .route("/api/cfg", get(cfg))
         .route("/api/members", get(members))
         .route("/api/members/functions", get(member_functions))
@@ -612,6 +613,15 @@ struct AnalyzeResponse {
     xrefs: usize,
     /// 有 CFG 的函数数。
     functions_with_cfg: usize,
+    /// 识别出的跳转表数量（`switch` 分支）。
+    ///
+    /// 单独暴露的理由：验证过的规则是"间接跳转要么解析成表，要么在
+    /// notes 里说明为什么没有"。没有这个计数时，用户只能从 CFG 里
+    /// "某个块没有后继"去**推测**表没识别出来 —— 而那条 CFG 看起来
+    /// 和"这个函数真的不返回"完全一样。
+    jump_tables: usize,
+    /// 跳转表覆盖的目标地址总数（已回填进 CFG 的后继边）。
+    jump_table_targets: usize,
     /// 分析期的降级说明。
     notes: Vec<String>,
 }
@@ -634,7 +644,72 @@ async fn analyze(State(state): State<AppState>) -> Response {
         basic_blocks: summary.basic_blocks,
         xrefs: summary.xrefs,
         functions_with_cfg: analysis.cfg_count(),
+        jump_tables: analysis.jump_tables().tables.len(),
+        jump_table_targets: analysis.jump_tables().all_targets().len(),
         notes: analysis.notes().to_vec(),
+    })
+    .into_response()
+}
+
+/// 跳转表列表响应：`GET /api/jump-tables`。
+#[derive(Serialize)]
+struct JumpTablesResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 识别出的跳转表。
+    tables: Vec<JumpTableWire>,
+    /// 降级说明（未解析的间接跳转等）。
+    notes: Vec<String>,
+}
+
+/// 一张跳转表的 wire 形式。
+#[derive(Serialize)]
+struct JumpTableWire {
+    /// 间接跳转指令的地址（定长十六进制）。
+    insn_addr: String,
+    /// 表基址（定长十六进制）。
+    base: String,
+    /// 表项宽度：`u8` / `u16` / `u32` / `u64`。
+    width: &'static str,
+    /// 表项语义：`absolute` / `base-relative` / `insn-relative`。
+    kind: &'static str,
+    /// 表项语义的中文说明。
+    kind_zh: &'static str,
+    /// 表项数。
+    count: usize,
+    /// 目标地址（定长十六进制）。
+    targets: Vec<String>,
+}
+
+/// 跳转表列表：`GET /api/jump-tables`。
+///
+/// 与 `/api/analyze` 的计数分开暴露的理由：用户需要看到**每张表**
+/// 的基址、宽度与语义，才能判断识别得对不对。只给个总数的话，
+/// "识别错了但数量对了"和"识别对了"在界面上无法区分 —— 而这两种
+/// 情况对下游 CFG 的影响完全不同。
+async fn jump_tables(State(state): State<AppState>) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let scan = analysis.jump_tables();
+    Json(JumpTablesResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        tables: scan
+            .tables
+            .iter()
+            .map(|t| JumpTableWire {
+                insn_addr: bitflip_core::hex16(t.insn_addr),
+                base: bitflip_core::hex16(t.base),
+                width: t.width.as_str(),
+                kind: t.kind.as_str(),
+                kind_zh: t.kind.label_zh(),
+                count: t.count,
+                targets: t.targets.iter().map(|a| bitflip_core::hex16(*a)).collect(),
+            })
+            .collect(),
+        notes: scan.notes.clone(),
     })
     .into_response()
 }

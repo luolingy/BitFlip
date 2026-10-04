@@ -13,9 +13,11 @@
 //! 内存纪律（PLAN §2，参照实现的 OOM 教训）：构建过程**流式**处理指令 ——
 //! 一次解码一条、立刻归约成 xref/候选，绝不持有整份 `Vec<DecodedInsn>`。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use bitflip_analyze::{merge_candidates, unwind_candidates, Cfg, StringOptions};
+use bitflip_analyze::{
+    merge_candidates, scan_jump_tables, unwind_candidates, Cfg, JumpTableScan, StringOptions,
+};
 use bitflip_arch::Flow;
 use bitflip_loader::object::RelocKind;
 use bitflip_symbols::{SymbolCandidate, SymbolSource};
@@ -85,6 +87,8 @@ pub struct TargetAnalysis {
     strings: Vec<StringWire>,
     /// 每个函数的基本块（按函数入口索引）。M5 引入。
     cfg_by_function: BTreeMap<u64, CfgWire>,
+    /// 跳转表识别结论。M6 引入。
+    jump_tables: JumpTableScan,
     notes: Vec<String>,
 }
 
@@ -134,6 +138,12 @@ const SCAN_CHUNK: usize = 4 * 1024 * 1024;
 const MAX_RUN: usize = 4096;
 
 impl TargetAnalysis {
+    /// 跳转表识别结论（M6）。
+    #[must_use]
+    pub fn jump_tables(&self) -> &JumpTableScan {
+        &self.jump_tables
+    }
+
     /// 从反汇编结果 + 目标对象构建目标级分析。
     ///
     /// `disasm` 提供地址空间、指令索引、覆盖标记与解码器；
@@ -457,7 +467,48 @@ impl TargetAnalysis {
         //
         // 逐函数建图。函数的 `end` 可能未知（只有入口）：此时**不猜边界**，
         // 只取该入口到下一个已知识别入口之前的指令，并把 truncated 置真。
+        //
+        // 注意顺序：CFG 在跳转表**之前**建。跳转表识别的产物是"某条间接
+        // 跳转的后继有哪些"，它要回填进 CFG —— 所以先有图，再有边。
         let cfg_by_function = build_cfgs(disasm, &functions, &mut notes);
+
+        // ── 跳转表 / switch（M6）──
+        //
+        // 只在**已索引**的指令上找间接跳转。验证"目标处能解出指令"用
+        // 同一个解码器 —— 换一个判定标准会让"能解出"与"被索引"不一致，
+        // 于是表目标落在索引之外，回填边时又会丢掉它们。
+        let jump_tables =
+            scan_jump_tables(&disasm.space, &indirect_jump_candidates(disasm), |addr| {
+                // 目标必须是一条**已索引指令的起点**，而不是"临时解码
+                // 试试看能不能解出点什么"。
+                //
+                // 这个区别是实测出来的：从任意字节开始解码几乎总能解出
+                // 某条指令，于是验证形同虚设。在 MRT.exe 上，同一个表
+                // 基址会被 u8 与 u16 两张"表"同时认领，u8 那张报出 416
+                // 个项 —— 任何单字节值加上基址都"能解码"。
+                //
+                // 换成索引查询后，目标的个数上限被"真实代码里有多少条
+                // 指令起点"约束住，假表的项数会立刻掉下来。
+                disasm
+                    .space
+                    .index()
+                    .containing(addr)
+                    .is_some_and(|(start, _)| start == addr)
+            });
+        notes.extend(jump_tables.notes.iter().cloned());
+
+        // 把跳转表目标**回填进 CFG**。
+        //
+        // 这一步才是跳转表识别的意义所在：识别出表却不让它改变控制流图，
+        // 那张图仍然是"间接跳转没有后继"的残缺图 —— 用户看到 `switch`
+        // 分支凭空断掉。回填之后每个 case 的目标都成为该块的后继。
+        let mut cfg_by_function = cfg_by_function;
+        let backfilled = backfill_jump_table_edges(&mut cfg_by_function, &jump_tables, &mut notes);
+        if backfilled > 0 {
+            notes.push(format!(
+                "已把 {backfilled} 条跳转表目标边加入 CFG（间接跳转的后继）"
+            ));
+        }
 
         Self {
             functions,
@@ -466,6 +517,7 @@ impl TargetAnalysis {
             xref_by_to,
             strings,
             cfg_by_function,
+            jump_tables,
             notes,
         }
     }
@@ -588,6 +640,155 @@ fn parse_hex(s: &str) -> Option<u64> {
 ///
 /// # 边界处理（这是本函数唯一需要判断的事情）
 ///
+/// 收集用于跳转表识别的指令候选。
+///
+/// 只取**间接跳转**（`Flow::Branch` 且 `target == None`）以及它前面
+/// 一个小窗口内的指令 —— 窗口是给"表基址从哪来"的回溯用的。
+///
+/// 为什么不在整个索引上扫：跳转表识别对每条间接跳转都要向前回溯并
+/// 试读表格，全量扫描在大样本（几十万条间接跳转）上开销可观。先做一次
+/// O(n) 的过滤拿到候选，只对候选附近取指令，代价就与表数成正比。
+fn indirect_jump_candidates(disasm: &Disasm) -> Vec<bitflip_arch::DecodedInsn> {
+    let space = &disasm.space;
+    let index = &disasm.index;
+
+    // 先把所有间接跳转的地址找出来。
+    let mut jumps: Vec<u64> = Vec::new();
+    for (addr, len) in index.range(0, u64::MAX) {
+        let Some(bytes) = space.read(addr, usize::from(len)) else {
+            continue;
+        };
+        let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
+            continue;
+        };
+        if matches!(insn.flow, bitflip_arch::Flow::Branch { .. }) && insn.target.is_none() {
+            jumps.push(addr);
+        }
+    }
+    if jumps.is_empty() {
+        return Vec::new();
+    }
+
+    // 取候选附近的指令窗口（含跳转本身），按地址排序后交给识别器。
+    //
+    // 窗口前置量用 `LOOKBACK_WINDOW + 1`：识别器从跳转处向前回溯
+    // 该长度。多给一条是为了让"回溯起点"本身也在切片里，避免因为
+    // 切片边界而少看一条 —— 那种错误只在"表基址恰好在窗口边缘"时
+    // 才出现，极难复现。
+    let window = (JUMP_LOOKBACK_WINDOW + 1) as u64;
+    let mut wanted: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for &jump in &jumps {
+        let start = jump.saturating_sub(window);
+        for (addr, _len) in index.range(start, jump.saturating_add(1)) {
+            wanted.insert(addr);
+        }
+    }
+
+    let mut out = Vec::with_capacity(wanted.len());
+    for addr in wanted {
+        let Some((_, len)) = index.containing(addr) else {
+            continue;
+        };
+        let Some(bytes) = space.read(addr, usize::from(len)) else {
+            continue;
+        };
+        let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
+            continue;
+        };
+        out.push(insn);
+    }
+    out
+}
+
+/// `build_cfgs` 用的回溯窗口（与 `bitflip-analyze` 的识别器保持一致）。
+const JUMP_LOOKBACK_WINDOW: usize = bitflip_analyze::LOOKBACK_WINDOW;
+
+/// 把跳转表的目标边回填进各函数的 CFG。
+///
+/// 返回实际加入的边数。
+///
+/// # 只加边，不造块
+///
+/// 这里**只把已有的块连起来**：如果表的目标地址处已经有一个块（因为
+/// 该地址在扫描时被当作指令起点索引过），就加一条后继边；如果那里
+/// 没有块，就**跳过并计数**，而不是凭空插入一个块。
+///
+/// 为什么不插入：CFG 的块划分来自"跳转目标 + 跳转的下一条"这两个
+/// 已知来源。为一个只出现在**数据表**里的地址造块，等于让数据决定
+/// 控制流 —— 表项语义判断错误时，会在图上长出一堆不存在的块，
+/// 而它们看起来和真块没有区别。少画边会在 `notes` 里说明；
+/// 多画块则完全不可见。§7 要求选前者。
+fn backfill_jump_table_edges(
+    cfg_by_function: &mut BTreeMap<u64, CfgWire>,
+    scan: &JumpTableScan,
+    notes: &mut Vec<String>,
+) -> usize {
+    if scan.tables.is_empty() {
+        return 0;
+    }
+    // 跳转指令地址 → 该跳转解析出的目标集合
+    let by_insn: BTreeMap<u64, &[u64]> = scan
+        .tables
+        .iter()
+        .map(|t| (t.insn_addr, t.targets.as_slice()))
+        .collect();
+
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+
+    for cfg in cfg_by_function.values_mut() {
+        // 该函数里有没有属于本函数的表目标？先收齐本函数的块首集合。
+        let block_starts: BTreeSet<u64> = cfg
+            .blocks
+            .iter()
+            .map(|b| u64::from_str_radix(&b.start, 16).unwrap_or(0))
+            .collect();
+
+        // 找出本函数内**含间接跳转**的块：它们的后继里应当出现表目标。
+        for jump_addr in by_insn.keys().copied() {
+            let Some(targets) = by_insn.get(&jump_addr) else {
+                continue;
+            };
+            // 哪一块含这条跳转指令？
+            let Some(block) = cfg.blocks.iter_mut().find(|b| {
+                let start = u64::from_str_radix(&b.start, 16).unwrap_or(0);
+                let end = u64::from_str_radix(&b.end, 16).unwrap_or(0);
+                jump_addr >= start && jump_addr < end
+            }) else {
+                continue;
+            };
+
+            for &t in *targets {
+                if !block_starts.contains(&t) {
+                    // 目标处没有块：不造块，如实计数。
+                    skipped += 1;
+                    continue;
+                }
+                let hex = hex16(t);
+                if !block.successors.contains(&hex) {
+                    block.successors.push(hex);
+                    added += 1;
+                }
+            }
+            if !block.successors.is_empty() {
+                block.successors.sort();
+                block.successors.dedup();
+                // 有后继了就不再是"不返回"的终结块。
+                block.terminal = false;
+            }
+        }
+    }
+
+    if skipped > 0 {
+        // 降级必须可见：目标没有对应块意味着 CFG 少了边。
+        notes.push(format!(
+            "有 {skipped} 个跳转表目标在 CFG 里没有对应的基本块（该地址未被扫描为指令起点），\
+             这些边没有加入 —— 图可能少画分支"
+        ));
+    }
+    added
+}
+
 /// `FunctionWire::end` 可能是 `None` —— 只知道入口，不知道到哪结束。
 /// 此时**不猜**边界，而是取从入口起、到**下一个已知识别入口**之前的指令。
 ///
@@ -1079,6 +1280,7 @@ mod tests {
             strings: Vec::new(),
             // 本测试只关心 function_containing，不建 CFG。
             cfg_by_function: BTreeMap::new(),
+            jump_tables: JumpTableScan::default(),
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());

@@ -9,6 +9,7 @@ mod addrspace;
 mod cfg;
 mod functions;
 mod job;
+mod jumptable;
 mod scan;
 mod strings;
 mod xref;
@@ -22,6 +23,10 @@ pub use functions::{merge_candidates, unwind_candidates, ConflictKind, Function}
 pub use job::{
     run_guarded, CancelToken, EventSink, JobError, JobEvent, JobHandle, JobId, JobState, NullSink,
     Progress, StageId,
+};
+pub use jumptable::{
+    preferred_width, scan_jump_tables, EntryKind, EntryWidth, JumpTable, JumpTableScan,
+    LOOKBACK_WINDOW, MAX_ENTRIES,
 };
 pub use scan::{
     combine, control_flow_targets, scan_linear, scan_recursive, ScanCoverage, ScanOptions,

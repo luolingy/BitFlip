@@ -503,6 +503,17 @@ impl AddrSpace {
         self.index = Arc::new(index);
     }
 
+    /// 用共享句柄替换索引，让地址空间与调用方**指向同一份数据**。
+    ///
+    /// 与 [`Self::set_index`] 的区别：后者把 `InsnIndex` 包成一个**新的**
+    /// `Arc`，于是两份索引内容相同但不是同一个对象。当上层持有自己的
+    /// 索引并希望"地址空间里的就是这一份"时，必须用这个版本 ——
+    /// 否则两处会静默分叉（一份有数据、一份是空的），而 `Arc::ptr_eq`
+    /// 是唯一能立刻看出分叉的判据。
+    pub fn set_index_arc(&mut self, index: Arc<InsnIndex>) {
+        self.index = index;
+    }
+
     /// 找到包含该地址的段。
     ///
     /// 段之间可能重叠，这是**正常输入而不是畸形输入**：ELF 里 `PT_LOAD`
