@@ -23,7 +23,7 @@ use bitflip_loader::object::RelocKind;
 use bitflip_symbols::{SymbolCandidate, SymbolSource};
 use serde::{Deserialize, Serialize};
 
-use crate::disasm::{hex16, Disasm};
+use crate::disasm::{hex16, parse_address, Disasm};
 
 /// wire 格式版本。
 pub const ANALYSIS_FORMAT_VERSION: u32 = 1;
@@ -89,7 +89,57 @@ pub struct TargetAnalysis {
     cfg_by_function: BTreeMap<u64, CfgWire>,
     /// 跳转表识别结论。M6 引入。
     jump_tables: JumpTableScan,
+    /// 数据/代码判定的统计与结论。M6 引入。
+    code_map: CodeMap,
     notes: Vec<String>,
+}
+
+/// 数据/代码判定的 wire 结果（M6）。
+///
+/// 为什么存**统计 + 样本**而不是全部地址：一个 200MB 的 PE 有几十万条
+/// 指令，把每个地址的判定都物化出来会让这份结构比目标本身还大
+/// （CLAUDE.md §4 禁止全量物化）。UI 需要的是"分布如何"与"几个代表
+/// 性的例子"，逐地址判定按需用 `/api/code-map` 查询。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct CodeMap {
+    /// 判定统计。
+    pub stats: CodeMapStats,
+    /// 抽样得出的代表性判定（含证据），供 UI 展示"凭什么这么判"。
+    pub samples: Vec<CodeMapSample>,
+    /// 量化误判率所需的说明（本目标没有黄金标准，故只记方法）。
+    pub notes: Vec<String>,
+}
+
+/// 判定统计的 wire 形式。
+///
+/// 没有 `Eq`：`decided_ratio` 是 `f64`，浮点不满足 `Eq`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct CodeMapStats {
+    /// 判为代码的地址数。
+    pub code: usize,
+    /// 判为数据的地址数。
+    pub data: usize,
+    /// 未判定的地址数。
+    pub unknown: usize,
+    /// 给出明确结论的比例（0.0–1.0）。
+    pub decided_ratio: f64,
+}
+
+/// 一条代表性判定。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CodeMapSample {
+    /// 地址（定长 16 位小写十六进制）。
+    pub addr: String,
+    /// 结论短名：`code` / `data` / `unknown`。
+    pub kind: &'static str,
+    /// 结论中文名。
+    pub kind_label: &'static str,
+    /// 置信度（0–100）。
+    pub confidence: u8,
+    /// 是否有高可信证据支撑。
+    pub well_supported: bool,
+    /// 结论的理由（中文，一句话）。
+    pub reason: String,
 }
 
 /// 一个函数的基本块摘要（wire 用）。
@@ -510,6 +560,13 @@ impl TargetAnalysis {
             ));
         }
 
+        // 数据/代码判定（M6）。
+        //
+        // 对**代表性地址**做判定而不是全部：统计分布用抽样，逐地址
+        // 判定交给 `/api/code-map` 按需算。全量物化会让这份结构比目标
+        // 本身还大（CLAUDE.md §4）。
+        let code_map = build_code_map(disasm, &functions, &mut notes);
+
         Self {
             functions,
             xrefs,
@@ -518,8 +575,15 @@ impl TargetAnalysis {
             strings,
             cfg_by_function,
             jump_tables,
+            code_map,
             notes,
         }
+    }
+
+    /// 数据/代码判定结果。
+    #[must_use]
+    pub fn code_map(&self) -> &CodeMap {
+        &self.code_map
     }
 
     /// 函数列表（按入口地址升序）。
@@ -787,6 +851,162 @@ fn backfill_jump_table_edges(
         ));
     }
     added
+}
+
+/// 构建数据/代码判定的统计与样本（M6）。
+///
+/// # 抽样策略
+///
+/// 对**每个可执行段的头部 + 每个函数的入口**做判定，而不是遍历所有
+/// 字节。理由：统计"代码 vs 数据"的分布需要覆盖代码区与数据区，
+/// 而这两处的代表地址就是段头与函数入口。遍历全部字节会把大文件的
+/// 分析时间成倍拉长，换来的统计精度提升很小。
+///
+/// `notes` 里如实写明这是抽样 —— 用户看到的是"抽样得到的分布"，
+/// 不是"全量统计"。
+fn build_code_map(disasm: &Disasm, functions: &[FunctionWire], notes: &mut Vec<String>) -> CodeMap {
+    // 收集代表性地址：**可执行段与非可执行段分开配额**。
+    //
+    // 一开始给函数入口留了 512 的上限、段只取 4 个，结果在 ntdll.dll
+    // 上得到 512/512 全是代码 —— 统计完全被函数入口主导，"数据"一个
+    // 都进不来。这样算出来的分布没有任何意义，还会让用户以为
+    // "这个目标里没有数据"。
+    //
+    // 现在两侧各占一半配额，保证数据区一定被采样到。
+    const SAMPLE_LIMIT: usize = 512;
+    let per_side = SAMPLE_LIMIT / 2;
+
+    let mut code_addrs: Vec<u64> = Vec::new();
+    let mut data_addrs: Vec<u64> = Vec::new();
+    for seg in disasm.space.segments() {
+        let target = if seg.perms.execute {
+            &mut code_addrs
+        } else {
+            &mut data_addrs
+        };
+        // 段头、段中、段尾各取几个，避免只看到开头
+        let span = seg.vsize;
+        for off in [0u64, 1, 16, 64, span / 2, span.saturating_sub(8)] {
+            let a = seg.vaddr.saturating_add(off);
+            if a >= seg.vaddr && a < seg.vaddr.saturating_add(seg.vsize) {
+                target.push(a);
+            }
+        }
+    }
+    // 函数入口是代码侧的最强代表，但**只能占代码侧的配额**
+    for f in functions.iter() {
+        if let Some(a) = parse_address(&f.start) {
+            code_addrs.push(a);
+        }
+    }
+
+    code_addrs.sort_unstable();
+    code_addrs.dedup();
+    data_addrs.sort_unstable();
+    data_addrs.dedup();
+
+    // 两侧各自均匀抽样，避免"前 N 个"把后面的段全漏掉
+    let thin = |v: &[u64], n: usize| -> Vec<u64> {
+        if v.len() <= n {
+            return v.to_vec();
+        }
+        let step = v.len() as f64 / n as f64;
+        (0..n).map(|i| v[(i as f64 * step) as usize]).collect()
+    };
+
+    let mut addrs = thin(&code_addrs, per_side);
+    addrs.extend(thin(&data_addrs, per_side));
+    addrs.sort_unstable();
+    addrs.dedup();
+
+    if addrs.is_empty() {
+        return CodeMap::default();
+    }
+
+    // 构造事实源
+    let reachable: std::collections::HashSet<u64> = disasm
+        .space
+        .index()
+        .range(0, u64::MAX)
+        .map(|(a, _)| a)
+        .collect();
+    let mut branch_targets: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for (a, len) in disasm.space.index().range(0, u64::MAX) {
+        let Some(bytes) = disasm.space.read(a, usize::from(len)) else {
+            continue;
+        };
+        if let Ok(insn) = disasm.decoder.decode_one(&bytes, a) {
+            if let Some(t) = insn.target {
+                branch_targets.insert(t);
+            }
+        }
+    }
+
+    let fn_ranges: Vec<(u64, Option<u64>)> = functions
+        .iter()
+        .filter_map(|f| {
+            let start = parse_address(&f.start)?;
+            let end = f.end.as_deref().and_then(parse_address);
+            Some((start, end))
+        })
+        .collect();
+
+    let decode_run = |addr: u64| -> u32 {
+        let mut a = addr;
+        let mut n = 0u32;
+        while n < 32 {
+            let Some((start, len)) = disasm.space.index().containing(a) else {
+                break;
+            };
+            if start != a {
+                break;
+            }
+            a = a.saturating_add(u64::from(len));
+            n += 1;
+        }
+        n
+    };
+
+    let facts = bitflip_analyze::AnalysisFacts {
+        space: &disasm.space,
+        functions: &fn_ranges,
+        reachable: &reachable,
+        branch_targets: &branch_targets,
+        decode_run: &decode_run,
+    };
+
+    let judgements = bitflip_analyze::judge_code_many(&facts, &addrs);
+    let stats = bitflip_analyze::JudgementStats::from_judgements(&judgements);
+
+    notes.push(format!(
+        "数据/代码判定基于 {} 个抽样地址（段头 + 函数入口），不是全量统计；\
+         代码 {} / 数据 {} / 未判定 {}",
+        stats.total(),
+        stats.code,
+        stats.data,
+        stats.unknown
+    ));
+
+    CodeMap {
+        stats: CodeMapStats {
+            code: stats.code,
+            data: stats.data,
+            unknown: stats.unknown,
+            decided_ratio: stats.decided_ratio(),
+        },
+        samples: judgements
+            .iter()
+            .map(|j| CodeMapSample {
+                addr: hex16(j.addr),
+                kind: j.kind.as_str(),
+                kind_label: j.kind.label_zh(),
+                confidence: j.confidence,
+                well_supported: j.is_well_supported(),
+                reason: j.reason_zh(),
+            })
+            .collect(),
+        notes: Vec::new(),
+    }
 }
 
 /// `FunctionWire::end` 可能是 `None` —— 只知道入口，不知道到哪结束。
@@ -1281,6 +1501,7 @@ mod tests {
             // 本测试只关心 function_containing，不建 CFG。
             cfg_by_function: BTreeMap::new(),
             jump_tables: JumpTableScan::default(),
+            code_map: CodeMap::default(),
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());

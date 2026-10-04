@@ -7,6 +7,7 @@
 
 mod addrspace;
 mod cfg;
+mod codemap;
 mod functions;
 mod job;
 mod jumptable;
@@ -19,6 +20,10 @@ pub use addrspace::{
     PAGE_SIZE, SYNTHETIC_BASE,
 };
 pub use cfg::{build_functions, BasicBlock, Cfg};
+pub use codemap::{
+    compare_with_truth, judge_code, judge_code_many, AnalysisFacts, CodeEvidence, CodeFacts,
+    CodeJudgement, ErrorRate, EvidenceKind, JudgementStats, RegionKind, MIN_DECODE_RUN,
+};
 pub use functions::{merge_candidates, unwind_candidates, ConflictKind, Function};
 pub use job::{
     run_guarded, CancelToken, EventSink, JobError, JobEvent, JobHandle, JobId, JobState, NullSink,

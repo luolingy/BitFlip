@@ -874,12 +874,22 @@ fn parse_exports(
             None
         };
 
+        // 转发导出**不是代码**：`address` 指向的是导出目录里的一个
+        // 字符串（形如 `NTDLL.RtlAllocateHeap`），是一个"去哪找"的
+        // 指路牌。把它当代码会让上层在字符串字节上建函数。
+        //
+        // 非转发导出也不一定就是代码（数据也可以被导出），但 PE 的
+        // 导出表**不记录类型** —— 拿不到就说拿不到：这里只否定
+        // **确定不是代码**的转发项，其余保留 `true` 并在上层用
+        // "能否解码 / 是否可达"复核。
+        let is_code = forwarder.is_none();
+
         out.push(Export {
             name,
             ordinal: Some(ordinal),
             address: rva_to_va(object, *rva),
             forwarder,
-            is_code: true,
+            is_code,
         });
     }
 
@@ -1368,6 +1378,128 @@ mod tests {
         bytes[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXEC|READ
 
         bytes
+    }
+
+    /// 构造一个**带导出表**的最小 PE32+。
+    ///
+    /// `forwarder` 为 `Some` 时，序号 1 的导出 RVA 指向导出目录内部的
+    /// 一个字符串（转发导出的标准编码）；为 `None` 时指向 `.text` 里的
+    /// 真实代码。
+    fn pe64_with_export(forwarder: Option<&str>) -> Vec<u8> {
+        let mut bytes = minimal_pe64();
+        // 把 .text 撑大一点，容下导出目录
+        let opt = 0x84 + 20;
+        let sec = opt + 0xf0;
+
+        // 导出目录放在 .text 内部偏移 0x40 → RVA 0x1040。
+        // PE 导出目录固定 40 字节，各字段偏移：
+        const DIR_RVA: u32 = 0x1040;
+        const NAME_RVA: u32 = DIR_RVA + 0x40; // "dllname" 字符串
+        const FUNCS_RVA: u32 = DIR_RVA + 0x60; // 地址表（1 项）
+        const NAMES_RVA: u32 = DIR_RVA + 0x70; // 名字 RVA 表（1 项）
+        const ORDS_RVA: u32 = DIR_RVA + 0x78; // 序号表（1 项，u16）
+        const EXPORT_NAME_RVA: u32 = DIR_RVA + 0x80; // "exported" 字符串
+        const FWD_RVA: u32 = DIR_RVA + 0x90; // 转发字符串
+
+        let text_off = |rva: u32| -> usize { (0x200 + (rva - 0x1000)) as usize };
+
+        // 导出目录
+        let d = text_off(DIR_RVA);
+        bytes[d + 12..d + 16].copy_from_slice(&NAME_RVA.to_le_bytes());
+        bytes[d + 16..d + 20].copy_from_slice(&1u32.to_le_bytes()); // Base
+        bytes[d + 20..d + 24].copy_from_slice(&1u32.to_le_bytes()); // NumberOfFunctions
+        bytes[d + 24..d + 28].copy_from_slice(&1u32.to_le_bytes()); // NumberOfNames
+        bytes[d + 28..d + 32].copy_from_slice(&FUNCS_RVA.to_le_bytes());
+        bytes[d + 32..d + 36].copy_from_slice(&NAMES_RVA.to_le_bytes());
+        bytes[d + 36..d + 40].copy_from_slice(&ORDS_RVA.to_le_bytes());
+
+        // DLL 名
+        let mut off = text_off(NAME_RVA);
+        bytes[off..off + 8].copy_from_slice(b"test.dll");
+        off = text_off(EXPORT_NAME_RVA);
+        bytes[off..off + 9].copy_from_slice(b"exported\0");
+
+        // 地址表：转发时指向目录内的字符串，否则指向 .text 里的代码
+        let func_rva: u32 = match forwarder {
+            Some(_) => FWD_RVA,
+            None => 0x1000,
+        };
+        off = text_off(FUNCS_RVA);
+        bytes[off..off + 4].copy_from_slice(&func_rva.to_le_bytes());
+
+        // 名字表 → "exported"
+        off = text_off(NAMES_RVA);
+        bytes[off..off + 4].copy_from_slice(&EXPORT_NAME_RVA.to_le_bytes());
+        // 序号表 → 0
+        off = text_off(ORDS_RVA);
+        bytes[off..off + 2].copy_from_slice(&0u16.to_le_bytes());
+
+        if let Some(target) = forwarder {
+            off = text_off(FWD_RVA);
+            let s = format!("{target}\0");
+            bytes[off..off + s.len()].copy_from_slice(s.as_bytes());
+        }
+
+        // 可选头里填数据目录 [0] = 导出表。
+        //
+        // `size` 必须**覆盖到转发字符串**（DIR_RVA + 0x90 附近）：
+        // 解析器判断"这个 RVA 指向的是字符串而不是代码"的依据就是
+        // "RVA 落在导出目录范围内"。填 40（只是目录结构本身的大小）
+        // 会让转发字符串落到范围外，于是被当成普通导出。
+        let opt = 0x84 + 20;
+        bytes[opt + 112..opt + 116].copy_from_slice(&DIR_RVA.to_le_bytes());
+        bytes[opt + 116..opt + 120].copy_from_slice(&0x100u32.to_le_bytes());
+
+        let _ = sec;
+        bytes
+    }
+
+    /// **转发导出不是代码。**
+    ///
+    /// 转发导出的"地址"其实指向导出目录里的一个字符串
+    /// （形如 `NTDLL.RtlAllocateHeap`）。早先这里硬编码
+    /// `is_code: true`，会让上层跑到字符串字节上去建函数 ——
+    /// 一个凭空出现的"函数"，正是 M6 要量化的误判来源。
+    #[test]
+    fn forwarded_export_is_not_claimed_to_be_code() {
+        let obj = parse(
+            &pe64_with_export(Some("NTDLL.RtlAllocateHeap")),
+            0,
+            ObjectId::Plain,
+        )
+        .expect("解析带转发导出的 PE");
+        let e = obj
+            .exports
+            .iter()
+            .find(|e| e.name == "exported")
+            .expect("应当解析出 exported 这个导出");
+
+        assert_eq!(
+            e.forwarder.as_deref(),
+            Some("NTDLL.RtlAllocateHeap"),
+            "转发目标字符串应当被读出来"
+        );
+        assert!(
+            !e.is_code,
+            "转发导出指向的是字符串，不是代码 —— 不能声称它是函数"
+        );
+    }
+
+    /// 普通导出仍然是代码（这条守住不要修过头）。
+    #[test]
+    fn ordinary_export_is_still_code() {
+        let obj = parse(&pe64_with_export(None), 0, ObjectId::Plain).expect("解析 PE");
+        let e = obj
+            .exports
+            .iter()
+            .find(|e| e.name == "exported")
+            .expect("应当解析出 exported 这个导出");
+
+        assert!(e.forwarder.is_none());
+        assert!(
+            e.is_code,
+            "PE 导出表不记录类型，非转发导出默认按代码处理（上层再复核）"
+        );
     }
 
     #[test]

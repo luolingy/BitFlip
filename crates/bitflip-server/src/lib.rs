@@ -346,6 +346,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/functions", get(functions))
         .route("/api/analyze", get(analyze))
         .route("/api/jump-tables", get(jump_tables))
+        .route("/api/code-map", get(code_map))
         .route("/api/cfg", get(cfg))
         .route("/api/members", get(members))
         .route("/api/members/functions", get(member_functions))
@@ -622,6 +623,8 @@ struct AnalyzeResponse {
     jump_tables: usize,
     /// 跳转表覆盖的目标地址总数（已回填进 CFG 的后继边）。
     jump_table_targets: usize,
+    /// 数据/代码判定的抽样统计。明细见 `/api/code-map`。
+    code_map: bitflip_core::CodeMapStats,
     /// 分析期的降级说明。
     notes: Vec<String>,
 }
@@ -646,6 +649,7 @@ async fn analyze(State(state): State<AppState>) -> Response {
         functions_with_cfg: analysis.cfg_count(),
         jump_tables: analysis.jump_tables().tables.len(),
         jump_table_targets: analysis.jump_tables().all_targets().len(),
+        code_map: analysis.code_map().stats,
         notes: analysis.notes().to_vec(),
     })
     .into_response()
@@ -710,6 +714,41 @@ async fn jump_tables(State(state): State<AppState>) -> Response {
             })
             .collect(),
         notes: scan.notes.clone(),
+    })
+    .into_response()
+}
+
+/// 数据/代码判定响应：`GET /api/code-map`。
+#[derive(Serialize)]
+struct CodeMapResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 判定统计（基于抽样）。
+    stats: bitflip_core::CodeMapStats,
+    /// 代表性判定（含证据），供 UI 展示"凭什么这么判"。
+    samples: Vec<bitflip_core::CodeMapSample>,
+    /// 说明（抽样范围、降级等）。
+    notes: Vec<String>,
+}
+
+/// 数据/代码判定：`GET /api/code-map`。
+///
+/// 单独一个端点的理由：判定结论的**依据**（哪条证据、强度多少）是
+/// 用户判断"该不该信"的关键，而 `/api/analyze` 是个汇总，塞不下
+/// 这些细节。CLAUDE.md §7 要求降级与不确定性可见 —— 只给个比例
+/// 数字不算可见。
+async fn code_map(State(state): State<AppState>) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let m = analysis.code_map();
+    Json(CodeMapResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        stats: m.stats,
+        samples: m.samples.clone(),
+        notes: m.notes.clone(),
     })
     .into_response()
 }
