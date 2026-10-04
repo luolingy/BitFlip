@@ -512,22 +512,18 @@ fn load_address_into_reg(insn: &DecodedInsn) -> Option<(u64, RegId)> {
     //
     // 基准是**下一条指令**的地址（RIP 在指令执行时已指向下一条），
     // 不是当前指令地址。差一个指令长度在新样本上就会整体偏移。
-    if let Some(rip) = rip_register(insn.arch) {
-        for op in &insn.operands {
-            if let Operand::Mem(MemRef {
-                base: Some(b),
-                index: None,
-                disp,
-                write: false,
-                ..
-            }) = op
-            {
-                if *b == rip {
-                    let next = insn.addr.wrapping_add(u64::from(insn.len));
-                    let addr = next.wrapping_add(*disp as u64);
-                    return Some((addr, dest));
-                }
-            }
+    //
+    // 操作数已经是解码层判定过的 `PcRelative`（`bitflip-arch` 在
+    // 识别出 RIP 基址时产出它），这里**不再自己比对 RIP 寄存器**。
+    // 早先这里手写了一遍"base == RIP"的判断，与解码层各有一份口径；
+    // 解码层补上 `PcRelative` 之后，两份口径必然漂移 —— 一处认、
+    // 一处不认，跳转表就会整体识别不出来（实测正是如此）。
+    // 判定只留一处：谁产出操作数，谁负责判定。
+    for op in &insn.operands {
+        if let Operand::PcRelative(disp) = op {
+            let next = insn.addr.wrapping_add(u64::from(insn.len));
+            let addr = next.wrapping_add(*disp as u64);
+            return Some((addr, dest));
         }
     }
 
@@ -545,26 +541,6 @@ fn load_address_into_reg(insn: &DecodedInsn) -> Option<(u64, RegId)> {
         }
     }
     imm.map(|v| (v, dest))
-}
-
-/// 该架构里"指令指针"作为**基址寄存器**时的 [`RegId`]。
-///
-/// 只有 x86/x86_64 会把 RIP 建模成可参与寻址的基址寄存器
-/// （capstone 的 `X86_REG_RIP = 41`）。其他架构要么没有这种寻址方式
-/// （AArch64 用 `adrp`+`add`，目标由解码器给出），要么没有指令指针
-/// 寄存器（RISC-V 的 `pc` 不可直接寻址）。
-///
-/// 返回 `None` 表示"这个架构没有 RIP 相对寻址"，调用方据此跳过这条
-/// 分支 —— 而不是拿一个猜的数字去比。
-#[must_use]
-pub const fn rip_register(arch: Arch) -> Option<RegId> {
-    match arch {
-        // capstone 里 X86_REG_RIP = 41、X86_REG_EIP = 40。
-        // 这里只处理 64 位模式——32 位下 RIP 相对寻址不是编译器的常规
-        // 输出（PIC 32 位用 GOT 间接），把它一起认了反而增加误判面。
-        Arch::X86_64 => Some(RegId(41)),
-        _ => None,
-    }
 }
 
 /// 指令写入的第一个寄存器（按操作数顺序）。
@@ -925,14 +901,32 @@ mod tests {
         }
     }
 
+    /// RIP 相对寻址由**解码层**判定并产出 `Operand::PcRelative`。
+    ///
+    /// 这里曾经有一份 `rip_register()` 做同样的判断，与解码层各持一份
+    /// 口径。解码层补上 `PcRelative` 之后两份口径立刻漂移：解码层不再
+    /// 产出带 RIP 基址的 `Mem`，而这里仍在找它 —— 跳转表整体识别失败
+    /// （6 个测试里挂了 3 个）。判定只留一处，所以这个函数被删掉了。
+    ///
+    /// 留下这条测试记录"判定归属解码层"这个决定，防止有人再补一份。
     #[test]
-    fn only_x86_64_has_a_rip_register() {
-        // RIP 相对寻址是 x86_64 特有的；别的架构返回 None，调用方据此
-        // 跳过该分支，而不是拿一个猜的编号去比较。
-        assert!(rip_register(Arch::X86_64).is_some());
-        assert!(rip_register(Arch::Aarch64).is_none());
-        assert!(rip_register(Arch::Arm).is_none());
-        assert!(rip_register(Arch::Riscv64).is_none());
+    fn rip_relative_judgement_belongs_to_the_decoder() {
+        // 真实的 `lea rcx, [rip+disp]` 应当产出 PcRelative 而不是带基址的 Mem
+        let dec = bitflip_arch::decoder_for(bitflip_arch::ArchSpec::from_arch(
+            Arch::X86_64,
+            bitflip_arch::Mode::M64,
+            bitflip_arch::Endian::Little,
+        ));
+        let insn = dec
+            .decode_one(&[0x48, 0x8d, 0x0d, 0x34, 0x12, 0x00, 0x00], 0x1000)
+            .expect("解码 lea");
+        assert!(
+            insn.operands
+                .iter()
+                .any(|op| matches!(op, Operand::PcRelative(_))),
+            "解码层必须把 RIP 相对识别成 PcRelative：{:?}",
+            insn.operands
+        );
     }
 
     /// 构造一条解码指令，只为测试纯逻辑判定（不依赖 capstone）。
@@ -1004,20 +998,17 @@ mod tests {
         //
         // disp 要按 RIP 相对算：地址 = 指令地址 + 指令长度 + disp。
         // `insn` 里 len 固定 4，所以 disp = 0x2000 - (0x1000 + 4)。
+        //
+        // 操作数形态用 `PcRelative`，与**真实解码器**的产出一致。
+        // 早先这里手写成"带 RIP 基址的 Mem"，那种形态解码器现在已经
+        // 不再产出了 —— 用不存在的形态做测试，测的就不是真实路径。
         let load_base = insn(
             0x1000,
             Flow::Fallthrough,
             None,
             vec![
                 Operand::Reg(RegId(0)),
-                Operand::Mem(MemRef {
-                    base: Some(rip_register(Arch::X86_64).unwrap()),
-                    index: None,
-                    scale: 1,
-                    disp: 0x2000 - (0x1000 + 4),
-                    size: 8,
-                    write: false,
-                }),
+                Operand::PcRelative(0x2000 - (0x1000 + 4)),
             ],
             &[],
             &[0],

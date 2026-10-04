@@ -348,6 +348,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/analyze", get(analyze))
         .route("/api/jump-tables", get(jump_tables))
         .route("/api/code-map", get(code_map))
+        .route("/api/const-scan", get(const_scan))
         .route("/api/call-graph", get(call_graph))
         .route("/api/cfg", get(cfg))
         .route("/api/members", get(members))
@@ -627,8 +628,26 @@ struct AnalyzeResponse {
     jump_table_targets: usize,
     /// 数据/代码判定的抽样统计。明细见 `/api/code-map`。
     code_map: bitflip_core::CodeMapStats,
+    /// 常量/结构体初步推断的计数。明细见 `/api/const-scan`。
+    const_summary: ConstSummaryWire,
     /// 分析期的降级说明。
     notes: Vec<String>,
+}
+
+/// 常量推断的**计数**（明细走 `/api/const-scan`）。
+///
+/// 只放计数是因为明细很大（字符串引用可达上万条、立即数画像 40 条），
+/// 塞进汇总会让每次打开目标都多传几百 KB。
+#[derive(Serialize)]
+struct ConstSummaryWire {
+    /// 被指令引用的字符串条数。
+    referenced_strings: usize,
+    /// 有步长结论的基址寄存器组数。
+    strides_with_value: usize,
+    /// 观测到的基址寄存器组总数（含推不出步长的）。
+    stride_groups: usize,
+    /// 观测到的立即数总数（含重复）。
+    immediate_total: usize,
 }
 
 /// 分析摘要：`GET /api/analyze`。
@@ -642,6 +661,8 @@ async fn analyze(State(state): State<AppState>) -> Response {
         Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
     };
 
+    let consts = analysis.const_scan();
+
     Json(AnalyzeResponse {
         format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
         instructions: summary.instructions,
@@ -652,6 +673,12 @@ async fn analyze(State(state): State<AppState>) -> Response {
         jump_tables: analysis.jump_tables().tables.len(),
         jump_table_targets: analysis.jump_tables().all_targets().len(),
         code_map: analysis.code_map().stats,
+        const_summary: ConstSummaryWire {
+            referenced_strings: consts.strings.len(),
+            strides_with_value: consts.strides.iter().filter(|s| s.stride.is_some()).count(),
+            stride_groups: consts.strides.len(),
+            immediate_total: consts.immediate_total,
+        },
         notes: analysis.notes().to_vec(),
     })
     .into_response()
@@ -921,6 +948,57 @@ struct CodeMapResponse {
     /// 代表性判定（含证据），供 UI 展示"凭什么这么判"。
     samples: Vec<bitflip_core::CodeMapSample>,
     /// 说明（抽样范围、降级等）。
+    notes: Vec<String>,
+}
+
+/// 常量/结构体初步推断：`GET /api/const-scan`。
+///
+/// # 为什么不并进 `/api/analyze`
+///
+/// 立即数画像有 40 条、字符串引用可能有上万条，塞进汇总响应会让
+/// 每次打开目标都多传几百 KB。汇总里只放计数（见 `AnalyzeResponse`
+/// 的 `const_summary`），明细按需取。
+///
+/// # 返回的是"观测事实"不是"结构体定义"
+///
+/// `strides` 给的是"这个基址上看到过哪些位移、步长多少"，`strings`
+/// 给的是"谁引用了哪条字符串"。响应里**没有字段名也没有字段类型** ——
+/// 没有调试信息就没有名字，编一个 `struct_1` 是 CLAUDE.md §7 禁止的。
+async fn const_scan(State(state): State<AppState>) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let scan = analysis.const_scan();
+    Json(ConstScanResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        strings: scan.strings.clone(),
+        strides: scan.strides.clone(),
+        immediates: scan.immediates.clone(),
+        immediate_total: scan.immediate_total,
+        immediate_distinct: scan.immediate_distinct,
+        notes: scan.notes.clone(),
+    })
+    .into_response()
+}
+
+/// `/api/const-scan` 的响应。
+#[derive(Serialize)]
+struct ConstScanResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 被引用的字符串汇总。
+    strings: Vec<bitflip_core::StringUsageWire>,
+    /// 内存访问步长。
+    strides: Vec<bitflip_core::StrideWire>,
+    /// 高频立即数。
+    immediates: Vec<bitflip_core::ImmediateWire>,
+    /// 观测到的立即数总数。
+    immediate_total: usize,
+    /// 去重后的立即数个数。
+    immediate_distinct: usize,
+    /// 降级说明。
     notes: Vec<String>,
 }
 

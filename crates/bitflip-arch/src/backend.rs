@@ -466,6 +466,13 @@ fn opt_reg(reg: capstone::RegId) -> Option<RegId> {
     }
 }
 
+/// x86 上 RIP 在 capstone 里的寄存器编号。
+///
+/// 这是个外部约定值，不是我们编的：capstone 的 `X86_REG_RIP = 41`。
+/// 单独起个名字是为了让引用点能说清"这个 41 是什么"，否则读代码的人
+/// 只会看到一个魔法数字。
+const RIP_REG_ID: u16 = 41;
+
 /// x86 操作数。
 fn convert_x86_operand(
     op: &capstone::arch::x86::X86Operand,
@@ -489,8 +496,29 @@ fn convert_x86_operand(
             }
         }
         X86OperandType::Mem(mem) => {
+            let base = opt_reg(mem.base());
+
+            // RIP 相对操作数（`mov rax, [rip+0x10]`、`lea rcx, [rip+...]`）
+            // 必须转成 `PcRelative` 而不是普通 `Mem`。
+            //
+            // 这个分支长期缺失，后果是一整条链路静默失效：x86 上
+            // `Operand::PcRelative` 从来没被产出过，于是
+            // `xrefs_of` 的数据引用分支永远命中不了 —— 交叉引用里
+            // 看不到任何全局变量访问，字符串引用聚合也一条都匹配不到
+            // （ntdll 上有 6487 条字符串，却"没有一条被引用"）。
+            //
+            // 它不报错、不 panic，只是安静地少给数据，
+            // 所以只能靠"用真实目标验证结论是否合理"来发现。
+            //
+            // RIP 在 capstone 里的编号是 41；`disp` 是**相对位移**
+            // （不是解析后的地址），与 `PcRelative` 的语义一致。
+            if base == Some(crate::insn::RegId(RIP_REG_ID)) {
+                operands.push(crate::insn::Operand::PcRelative(mem.disp()));
+                return;
+            }
+
             operands.push(crate::insn::Operand::Mem(crate::insn::MemRef {
-                base: opt_reg(mem.base()),
+                base,
                 index: opt_reg(mem.index()),
                 scale: mem.scale() as u8,
                 disp: mem.disp(),
@@ -627,6 +655,7 @@ fn is_conditional_jump(mnemonic: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::insn::Operand;
     use crate::types::Endian;
 
     fn x64() -> ArchSpec {
@@ -635,6 +664,39 @@ mod tests {
 
     fn decoder() -> CapstoneDecoder {
         CapstoneDecoder::new(x64()).expect("x86_64 解码器")
+    }
+
+    #[test]
+    fn rip_relative_memory_becomes_pc_relative_operand() {
+        // lea rcx, [rip+0x1234] = 48 8d 0d 34 12 00 00，指令在 0x1000
+        //
+        // 这条路径曾经缺失：RIP 相对被当成普通 `Mem`，于是
+        // x86 上 `Operand::PcRelative` 从未被产出，`xrefs_of` 的数据
+        // 引用分支永远命中不了。xref 面板看不到任何全局变量访问，
+        // 字符串引用聚合一条都匹配不到 —— 全部静默为空，不报错。
+        let dec = decoder();
+        let insn = dec
+            .decode_one(&[0x48, 0x8d, 0x0d, 0x34, 0x12, 0x00, 0x00], 0x1000)
+            .expect("解码 lea");
+        let Some(Operand::PcRelative(disp)) = insn.operands.last() else {
+            panic!("rip 相对应当产出 PcRelative，实际 {:?}", insn.operands);
+        };
+        assert_eq!(*disp, 0x1234, "PcRelative 存的是相对位移，不是绝对地址");
+    }
+
+    /// 普通内存操作数**不能**被误判成 PC 相对。
+    #[test]
+    fn ordinary_memory_stays_a_plain_mem_operand() {
+        let dec = decoder();
+        // 48 8B 43 10 = mov rax, [rbx+0x10]
+        let insn = dec
+            .decode_one(&[0x48, 0x8b, 0x43, 0x10], 0x1000)
+            .expect("解码 mov");
+        let Some(Operand::Mem(m)) = insn.operands.last() else {
+            panic!("普通内存操作数应当仍是 Mem，实际 {:?}", insn.operands);
+        };
+        assert_eq!(m.disp, 0x10);
+        assert_ne!(m.base.map(|r| r.0), Some(RIP_REG_ID), "rbx 不是 rip");
     }
 
     #[test]

@@ -109,9 +109,18 @@ fn format_operand(cs: &Capstone, op: &Operand) -> String {
                 format!("{value:#x}")
             }
         }
-        // PC 相对：显示成"相对偏移"，因为绝对地址要等加上指令地址才知道，
-        // 而这里是纯渲染层，不该做地址计算。
-        Operand::PcRelative(offset) => format!("{offset:+#x}"),
+        // PC 相对：渲染成 `rip+0x10` 形式。
+        //
+        // 不在这里算绝对地址 —— 那要加上**下一条指令**的地址，是分析层
+        // 的事（见 `bitflip_analyze::xref`）。渲染层只如实呈现指令里
+        // 写着的位移。
+        //
+        // 用 `rip` 这个名字是因为 x86 上这几乎总是 RIP 相对；AArch64
+        // 的 PC 相对寻址也归到这里，显示成 `pc+...` 更准，但那需要在
+        // 这里拿到架构信息，而 `format_operand` 只看得到操作数。
+        // 折中：统一用 `rip`，与外部反汇编器（LLVM/GNU as）在 x86 上的
+        // 输出一致，便于逐条对拍。
+        Operand::PcRelative(offset) => format!("[rip{offset:+#x}]"),
         Operand::Mem(mem) => format_mem(cs, mem),
         // `reg, lsl #n` / `reg, uxtw #n`。
         //

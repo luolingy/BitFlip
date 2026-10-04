@@ -434,13 +434,80 @@ async fn jump_tables_response_matches_the_frontend_contract() {
     }
 }
 
-/// 三个端点在没有目标时都必须给出明确的 400，而不是 500 或空数组。
+/// 常量/结构体初步推断的字段形状。
+///
+/// # 为什么这个端点尤其要测字段名
+///
+/// 它的三个结论（字符串引用 / 步长 / 立即数）都可能**静默为空**：
+/// 不报错，只是列表是空的。字段名一旦写错，前端那几块会一起变成
+/// 空白，而 typecheck 抓不到 —— 和 `CodeMapSample.addr` 是同一类坑。
+#[tokio::test]
+async fn const_scan_response_matches_the_frontend_contract() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+    let (status, body) = get(state, "/api/const-scan").await;
+    assert_eq!(status, StatusCode::OK, "响应：{body}");
+
+    assert_keys(
+        &body,
+        &[
+            "format_version",
+            "strings",
+            "strides",
+            "immediates",
+            "immediate_total",
+            "immediate_distinct",
+            "notes",
+        ],
+        "const-scan 响应",
+    );
+
+    for s in body["strings"].as_array().expect("strings 是数组") {
+        assert_keys(
+            s,
+            &["address", "functions", "sites"],
+            "const-scan.strings 条目",
+        );
+        assert_eq!(s["address"].as_str().unwrap().len(), 16);
+        assert!(
+            !s["sites"].as_array().unwrap().is_empty(),
+            "有记录就必须有引用点"
+        );
+    }
+
+    for s in body["strides"].as_array().expect("strides 是数组") {
+        assert_keys(
+            s,
+            &["base", "width", "stride", "offsets"],
+            "const-scan.strides 条目",
+        );
+        // 推不出步长时必须是 null，**不能是 0** —— 0 是编的
+        assert_ne!(
+            s["stride"],
+            serde_json::json!(0),
+            "步长 0 不合法：推不出来应当是 null"
+        );
+    }
+
+    for i in body["immediates"].as_array().expect("immediates 是数组") {
+        assert_keys(i, &["value", "count"], "const-scan.immediates 条目");
+        // 值是十进制字符串（避免 JSON 精度问题），必须是可解析的整数
+        let v = i["value"].as_str().expect("立即数值是字符串");
+        assert!(v.parse::<i64>().is_ok(), "立即数值应为十进制，实际 {v:?}");
+    }
+}
+
+/// 四个端点在没有目标时都必须给出明确的 400，而不是 500 或空数组。
 #[tokio::test]
 async fn m6_endpoints_require_a_target() {
     let state = AppState::new(TOKEN, None)
         .with_allowed_origins(bitflip_server::default_allowed_origins(PORT, &[]));
 
-    for uri in ["/api/call-graph", "/api/code-map", "/api/jump-tables"] {
+    for uri in [
+        "/api/call-graph",
+        "/api/code-map",
+        "/api/const-scan",
+        "/api/jump-tables",
+    ] {
         let (status, _) = get(state.clone(), uri).await;
         assert_eq!(
             status,

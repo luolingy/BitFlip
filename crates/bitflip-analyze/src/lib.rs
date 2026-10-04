@@ -9,6 +9,7 @@ mod addrspace;
 mod callgraph;
 mod cfg;
 mod codemap;
+mod consts;
 mod functions;
 mod job;
 mod jumptable;
@@ -28,6 +29,10 @@ pub use cfg::{build_functions, BasicBlock, Cfg};
 pub use codemap::{
     compare_with_truth, judge_code, judge_code_many, AnalysisFacts, CodeEvidence, CodeFacts,
     CodeJudgement, ErrorRate, EvidenceKind, JudgementStats, RegionKind, MIN_DECODE_RUN,
+};
+pub use consts::{
+    aggregate_string_refs, infer_strides, profile_immediates, scan_constants, Access, AccessStride,
+    ConstScan, ImmediateProfile, StringUsage,
 };
 pub use functions::{merge_candidates, unwind_candidates, ConflictKind, Function};
 pub use job::{

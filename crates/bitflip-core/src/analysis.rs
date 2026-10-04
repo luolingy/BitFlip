@@ -49,6 +49,66 @@ pub struct FunctionWire {
     pub size: Option<u64>,
 }
 
+/// 常量/结构体初步推断的 wire 表示（M6）。
+///
+/// # 为什么叫"初步"
+///
+/// 这里给的是**观测事实**（哪些位移被访问过、步长是多少、哪些立即数
+/// 出现得多），不是结构体定义。没有调试信息就没有字段名和字段类型，
+/// 硬给会变成编故事 —— 见 `bitflip_analyze::consts` 的模块文档。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstScanWire {
+    /// 被指令引用的字符串（按字符串地址升序）。
+    pub strings: Vec<StringUsageWire>,
+    /// 内存访问步长（按基址寄存器、再按宽度排序）。
+    pub strides: Vec<StrideWire>,
+    /// 出现频率最高的立即数（`值` 为十进制字符串，避免 JSON 精度问题）。
+    pub immediates: Vec<ImmediateWire>,
+    /// 观测到的立即数总数（含重复）。
+    pub immediate_total: usize,
+    /// 去重后的不同立即数个数。
+    pub immediate_distinct: usize,
+    /// 降级说明（中文）。
+    pub notes: Vec<String>,
+}
+
+/// 一条被引用的字符串及其引用者。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StringUsageWire {
+    /// 字符串起始地址。
+    pub address: String,
+    /// 引用它的函数入口（升序去重）。**空数组有意义**：被引用了但引用点
+    /// 不在任何已知函数里 —— 不编造归属。
+    pub functions: Vec<String>,
+    /// 引用点（指令地址，升序去重）。
+    pub sites: Vec<String>,
+}
+
+/// 某个基址寄存器上观测到的访问位移与步长。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrideWire {
+    /// 基址寄存器编号。
+    pub base: u16,
+    /// 访问宽度（字节）。
+    pub width: u8,
+    /// 推断出的步长；推不出时为 `null`（**不填 0** —— 0 是编的）。
+    pub stride: Option<u64>,
+    /// 参与推断的位移（升序去重，取绝对值）。
+    pub offsets: Vec<u64>,
+}
+
+/// 一个高频立即数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImmediateWire {
+    /// 立即数（十进制字符串，负数带 `-`）。
+    ///
+    /// 用字符串而不是数字：`i64` 超过 JavaScript 的安全整数范围时
+    /// 会被静默截断，而 x64 上的地址常量经常就在那个量级。
+    pub value: String,
+    /// 出现次数。
+    pub count: usize,
+}
+
 /// xref 的 wire 表示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XrefWire {
@@ -93,6 +153,8 @@ pub struct TargetAnalysis {
     code_map: CodeMap,
     /// 函数间调用图。M6 引入。
     call_graph: CallGraphWire,
+    /// 常量/结构体初步推断。M6 引入。
+    const_scan: ConstScanWire,
     notes: Vec<String>,
 }
 
@@ -639,6 +701,9 @@ impl TargetAnalysis {
         // 调用图（M6）：CFG 之外的另一张图 —— 函数之间谁调用谁。
         let call_graph = build_call_graph_wire(disasm, &functions, &mut notes);
 
+        // 常量/结构体初步（M6）：字符串引用聚合、内存访问步长、立即数画像。
+        let const_scan = build_const_scan(disasm, &strings, &functions, &mut notes);
+
         Self {
             functions,
             xrefs,
@@ -649,8 +714,15 @@ impl TargetAnalysis {
             jump_tables,
             code_map,
             call_graph,
+            const_scan,
             notes,
         }
+    }
+
+    /// 常量/结构体初步推断结果。
+    #[must_use]
+    pub fn const_scan(&self) -> &ConstScanWire {
+        &self.const_scan
     }
 
     /// 数据/代码判定结果。
@@ -944,6 +1016,37 @@ fn backfill_jump_table_edges(
 /// 成本可控：只有 `Flow::Call` 与 `Flow::Branch` 需要看目标，
 /// 但判断 flow 本身就得解码，所以实际是"全部指令解码一次"。
 /// 1 万函数的规模下这是百毫秒级，可以接受。
+/// 解码指令索引里的**全部**指令。
+///
+/// # 为什么要抽成一处
+///
+/// 调用图与常量/结构体推断都需要逐条指令的 `operands`/`flow`。两处
+/// 各写一遍"遍历索引 + 读字节 + decode_one"很容易漂移（比如一处改了
+/// 读不到字节时的处理），而那种漂移不会报错，只会让两个功能看到
+/// 不同的指令集合。抽出来就只有一个版本。
+///
+/// 解码失败的地址**跳过**：它们在索引里但不构成一条完整指令
+/// （最后一个字节被截断之类），不是有效分析输入。
+fn decode_indexed_insns(disasm: &Disasm) -> Vec<bitflip_arch::DecodedInsn> {
+    let mut insns: Vec<bitflip_arch::DecodedInsn> = Vec::with_capacity(disasm.space.index().len());
+    for (addr, len) in disasm.space.index().range(0, u64::MAX) {
+        let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
+            continue;
+        };
+        if let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) {
+            insns.push(insn);
+        }
+    }
+    insns
+}
+
+/// 构建调用图并转成 wire 形式（M6）。
+///
+/// # 只输出已解析的边
+///
+/// 未解析的间接调用没有目标，混进 `edges` 会让前端拿到 `null`
+/// 然后画出悬空节点。它们走 `unresolved` 字段，并计入
+/// `summary.unresolved_indirect` —— 图不完整这件事必须能被量化。
 fn build_call_graph_wire(
     disasm: &Disasm,
     functions: &[FunctionWire],
@@ -961,15 +1064,7 @@ fn build_call_graph_wire(
         .collect();
 
     // 解码全部指令。解码失败的地址跳过 —— 它们不是调用点。
-    let mut insns: Vec<bitflip_arch::DecodedInsn> = Vec::with_capacity(disasm.space.index().len());
-    for (addr, len) in disasm.space.index().range(0, u64::MAX) {
-        let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
-            continue;
-        };
-        if let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) {
-            insns.push(insn);
-        }
-    }
+    let insns = decode_indexed_insns(disasm);
 
     let graph = bitflip_analyze::build_call_graph(&insns, &ranges);
 
@@ -1034,6 +1129,93 @@ fn build_call_graph_wire(
         notes: graph.notes,
     }
 }
+
+/// 构建常量/结构体初步推断（M6）。
+///
+/// # 输入从哪来
+///
+/// 需要逐条指令的 `operands`：字符串引用看 `PcRelative` / `Imm`，
+/// 步长看 `Mem` 的 `base/index/disp/size`。所以这里必须再遍历一次
+/// 指令索引 —— 与调用图一样，代价是 O(指令数)，实测在 ntdll 上
+/// 是调用图同量级（几百毫秒），不是新的瓶颈。
+///
+/// # 函数范围
+///
+/// 把 `FunctionWire` 的定长 hex 地址转回 `u64` 再交给
+/// `bitflip_analyze::consts`。转换失败（理论上不可能）时**跳过该函数**
+/// 而不是当成 0 —— 把解析失败折成 0 会让所有引用都归到一个假函数上。
+fn build_const_scan(
+    disasm: &Disasm,
+    strings: &[StringWire],
+    functions: &[FunctionWire],
+    notes: &mut Vec<String>,
+) -> ConstScanWire {
+    // 解码全部指令（与调用图共用同一个助手，避免两处逻辑漂移）
+    let insns = decode_indexed_insns(disasm);
+
+    // 字符串区间：`(起始地址, 字节长度)`。地址解析失败就跳过该条 ——
+    // 编一个 0 会制造一条指向文件开头的假引用。
+    let ranges: Vec<(u64, u64)> = strings
+        .iter()
+        .filter_map(|s| parse_address(&s.address).map(|a| (a, s.size)))
+        .collect();
+
+    // 函数范围
+    let fn_ranges: Vec<(u64, Option<u64>)> = functions
+        .iter()
+        .filter_map(|f| {
+            let start = parse_address(&f.start)?;
+            let end = f.end.as_deref().and_then(parse_address);
+            Some((start, end))
+        })
+        .collect();
+
+    // 立即数画像取前 40 条：再多对"识别魔数/标志位"没有帮助，
+    // 反而把响应撑大。
+    let scan = bitflip_analyze::scan_constants(&insns, &ranges, &fn_ranges, IMMEDIATE_TOP_N);
+
+    for n in &scan.notes {
+        notes.push(n.clone());
+    }
+
+    ConstScanWire {
+        strings: scan
+            .strings
+            .iter()
+            .map(|u| StringUsageWire {
+                address: hex16(u.string),
+                functions: u.functions.iter().map(|&f| hex16(f)).collect(),
+                sites: u.sites.iter().map(|&s| hex16(s)).collect(),
+            })
+            .collect(),
+        strides: scan
+            .strides
+            .iter()
+            .map(|s| StrideWire {
+                base: s.base.0,
+                width: s.width,
+                stride: s.dominant(),
+                offsets: s.offsets.clone(),
+            })
+            .collect(),
+        immediates: scan
+            .immediates
+            .top
+            .iter()
+            .map(|&(v, count)| ImmediateWire {
+                // 十进制字符串：JSON 数字超过 2^53 会在前端被静默截断
+                value: v.to_string(),
+                count,
+            })
+            .collect(),
+        immediate_total: scan.immediates.total,
+        immediate_distinct: scan.immediates.distinct,
+        notes: scan.notes,
+    }
+}
+
+/// 立即数画像保留的条数。
+const IMMEDIATE_TOP_N: usize = 40;
 
 /// 构建数据/代码判定的统计与样本（M6）。
 ///
@@ -1685,6 +1867,7 @@ mod tests {
             jump_tables: JumpTableScan::default(),
             code_map: CodeMap::default(),
             call_graph: CallGraphWire::default(),
+            const_scan: ConstScanWire::default(),
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());
