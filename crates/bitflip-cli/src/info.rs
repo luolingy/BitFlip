@@ -65,6 +65,29 @@ fn print_human(info: &TargetInfo, session: &Session) {
         }
     );
     println!("端序      {}", info.endian.as_deref().unwrap_or("未识别"));
+    // 调用约定只在识别出架构时才有意义。没有就说没有，不填默认值。
+    match &info.abi {
+        Some(abi) => {
+            let args = if abi.arg_regs.is_empty() {
+                "经栈传递".to_string()
+            } else {
+                abi.arg_regs.join(", ")
+            };
+            println!("调用约定  {}（参数：{args}）", abi.name);
+            println!(
+                "         返回 {} · 栈 {} · 对齐 {} 字节 · {}",
+                abi.return_reg, abi.stack_pointer, abi.stack_align, abi.return_address
+            );
+        }
+        None => println!(
+            "调用约定  {}",
+            if info.arch.is_none() {
+                "未识别（架构未知）"
+            } else {
+                "该架构没有寄存器级调用约定"
+            }
+        ),
+    }
     println!("入口      {}", info.entry.as_deref().unwrap_or("-"));
     println!("镜像基址  {}", info.image_base.as_deref().unwrap_or("-"));
     println!(

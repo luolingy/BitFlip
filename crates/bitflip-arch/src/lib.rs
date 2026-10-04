@@ -10,12 +10,14 @@
 //! - 解码后端是 capstone（M2 接入）；换后端不应影响上层 —— 上层只依赖
 //!   [`Decoder`] trait 与 [`DecodedInsn`]。
 
+mod abi;
 mod backend;
 mod decode;
 mod insn;
 mod render;
 mod types;
 
+pub use abi::{abi_for_spec, AbiSpec, ReturnAddress};
 pub use backend::{BackendError, CapstoneDecoder, DecoderBackend};
 pub use decode::{decoder_for, Abi, DecodeError, Decoder, UnsupportedDecoder};
 pub use insn::{

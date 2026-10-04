@@ -504,11 +504,24 @@ impl AddrSpace {
     }
 
     /// 找到包含该地址的段。
+    ///
+    /// 段之间可能重叠，这是**正常输入而不是畸形输入**：ELF 里 `PT_LOAD`
+    /// 描述加载布局、节表描述逻辑内容，两者 vaddr 常常相同而大小略有出入
+    /// （实测 `libnvwgf2umx.so` 的 `.data`：段 0x131bee8、节 0x1371859）。
+    ///
+    /// 重叠时取**覆盖范围最大**的那个，而不是排序后第一个。原因：
+    /// 调用方（字符串扫描、解码器）要的是"这个地址上能读到多少连续字节"，
+    /// 较小的那个交不出数据就会让读取整体失败。早先取第一个匹配，
+    /// 于是在上面那个样本上挑中了较小的段，字符串扫描在 `.init_array`
+    /// 处整个中断 —— 数据是**丢了**的，只是没崩。
     #[must_use]
     pub fn segment_at(&self, addr: u64) -> Option<&MappedSegment> {
-        // 段可能有重叠（恶意/畸形输入），取第一个匹配 —— 段已按 vaddr 排序，
-        // 因此这是地址最低的那个，行为是确定的。
-        self.segments.iter().find(|s| s.contains(addr))
+        self.segments
+            .iter()
+            .filter(|s| s.contains(addr))
+            // vaddr 相同的情况下比 vsize；仍相同则保持原有顺序，
+            // 让行为对给定输入完全确定（不依赖排序的不稳定性）。
+            .max_by_key(|s| s.vsize)
     }
 
     /// 地址是否落在任何段内。
@@ -1009,18 +1022,74 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_segments_resolve_deterministically() {
-        // 畸形输入可能给出重叠段：必须确定性地选一个，而不是随机
+    fn overlapping_segments_resolve_to_the_larger_one() {
+        // 段重叠是**正常输入**：ELF 的 PT_LOAD 与节表覆盖同一片虚拟地址，
+        // vaddr 相同而大小不同。此时必须选覆盖范围大的那个 ——
+        // 调用方要的是"这个地址上能读到多少连续字节"，选小的会让读取
+        // 整体失败（实测 libnvwgf2umx.so 上字符串扫描整个中断）。
+        //
+        // 注意这两个段 vaddr 不同（0x1000 / 0x1080）、大小相同，
+        // 所以这里测的是"两者都含该地址时选哪个"，不是"选哪个 vaddr"。
         let segments = vec![
-            segment(".a", 0x1000, 0x100, None, perms(true, false, false)),
-            segment(".b", 0x1080, 0x100, None, perms(true, true, false)),
+            segment(".small", 0x1000, 0x100, None, perms(true, false, false)),
+            segment(".large", 0x1000, 0x1000, None, perms(true, false, false)),
         ];
         let space = AddrSpace::new("t", Arc::from(Vec::new()), &segments).expect("构造");
-        // 排序后取地址最低的
         assert_eq!(
-            space.segment_at(0x1090).map(|s| s.name.as_str()),
-            Some(".a")
+            space.segment_at(0x1100).map(|s| s.name.as_str()),
+            Some(".large"),
+            "重叠时必须选覆盖范围更大的段"
         );
+    }
+
+    #[test]
+    fn overlapping_segments_resolve_deterministically() {
+        // 畸形输入可能给出完全重叠、大小相同的段：必须确定性地选一个，
+        // 而不是随排序或哈希顺序变化。
+        let segments = vec![
+            segment(".a", 0x1000, 0x100, None, perms(true, false, false)),
+            segment(".b", 0x1000, 0x100, None, perms(true, true, false)),
+        ];
+        let space = AddrSpace::new("t", Arc::from(Vec::new()), &segments).expect("构造");
+        // 同一段实例反复查询结果必须一致
+        let first = space.segment_at(0x1090).map(|s| s.name.clone());
+        assert!(first.is_some(), "重叠段内的地址必须能解析");
+        for _ in 0..8 {
+            assert_eq!(
+                space.segment_at(0x1090).map(|s| s.name.clone()),
+                first,
+                "同样的查询必须给出同样的答案"
+            );
+        }
+    }
+
+    #[test]
+    fn read_across_overlapping_segments_picks_the_one_that_covers() {
+        // 这是那个数据丢失 bug 的最小复现：两个段同起点，一个短一个长。
+        // 请求长度超过短段时必须仍然成功 —— 早先取"排序后第一个"，
+        // 挑中短段就让读取返回 None，调用方只能截断。
+        let segments = vec![
+            segment(
+                ".short",
+                0x2000,
+                0x40,
+                Some((0, 0x40)),
+                perms(true, false, false),
+            ),
+            segment(
+                ".long",
+                0x2000,
+                0x1000,
+                Some((0, 0x1000)),
+                perms(true, false, false),
+            ),
+        ];
+        let file: Arc<[u8]> = Arc::from(vec![0xAAu8; 0x1000]);
+        let space = AddrSpace::new("t", file, &segments).expect("构造");
+
+        let data = space.read(0x2000, 0x200).expect("必须读得到");
+        assert_eq!(data.len(), 0x200);
+        assert!(data.iter().all(|b| *b == 0xAA));
     }
 
     #[test]

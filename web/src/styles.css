@@ -881,6 +881,20 @@ button:not(:disabled):hover {
   padding: 1px 6px;
 }
 
+/* ── 归档成员（M5）──────────────────────────────────────────────
+   成员列表选中态 + 详情区。可点的行复用 .row-clickable，
+   这里只补"当前选中的是哪一个"和详情区的分隔。 */
+
+.member-active {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.member-detail {
+  margin-top: 20px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
 .error-inline {
   color: #e05a5a;
   font-size: 12px;

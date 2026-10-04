@@ -1243,29 +1243,32 @@ fn classify_reloc(machine: u16, raw_kind: u32) -> RelocKind {
     const EM_RISCV: u16 = 243;
 
     match machine {
-        // x86_64: R_X86_64_64=1, GLOB_DAT=6, JUMP_SLOT=7, RELATIVE=8,
-        //         PC32=2, PLT32=4, GOTPCREL=9
+        // x86_64: 64=1, PC32=2, PLT32=4, GLOB_DAT=6, JUMP_SLOT=7,
+        //         RELATIVE=8, GOTPCREL=9, RELATIVE64=38, PC64=42
         EM_X86_64 => match raw_kind {
             1 => RelocKind::Absolute,
             2 | 4 | 9 | 42 => RelocKind::Relative,
             6 | 7 => RelocKind::ImportLookup,
-            8 => RelocKind::Relative,
+            // RELATIVE / RELATIVE64 是**数据槽位**指针（加载器写"基址+加数"），
+            // 与指令里的 PC 相对重定位是两回事。分开归类，指针表识别才能
+            // 只挑出它们而不误取指令重定位。
+            8 | 38 => RelocKind::RelocPointer,
             _ => RelocKind::Other,
         },
-        // i386: R_386_32=1, PC32=2, GLOB_DAT=6, JMP_SLOT=7, RELATIVE=8
+        // i386: 32=1, PC32=2, GLOB_DAT=6, JMP_SLOT=7, RELATIVE=8
         EM_386 => match raw_kind {
             1 => RelocKind::Absolute,
             2 => RelocKind::Relative,
             6 | 7 => RelocKind::ImportLookup,
-            8 => RelocKind::Relative,
+            8 => RelocKind::RelocPointer,
             _ => RelocKind::Other,
         },
-        // aarch64: ABS64=257, GLOB_DAT=1025, JUMP_SLOT=1026, RELATIVE=1027, PREL32=261
+        // aarch64: ABS64=257, PREL32=261, GLOB_DAT=1025, JUMP_SLOT=1026, RELATIVE=1027
         EM_AARCH64 => match raw_kind {
             257 => RelocKind::Absolute,
             261 => RelocKind::Relative,
             1025 | 1026 => RelocKind::ImportLookup,
-            1027 => RelocKind::Relative,
+            1027 => RelocKind::RelocPointer,
             _ => RelocKind::Other,
         },
         // arm: ABS32=2, REL32=3, GLOB_DAT=21, JUMP_SLOT=22, RELATIVE=23
@@ -1273,13 +1276,13 @@ fn classify_reloc(machine: u16, raw_kind: u32) -> RelocKind {
             2 => RelocKind::Absolute,
             3 => RelocKind::Relative,
             21 | 22 => RelocKind::ImportLookup,
-            23 => RelocKind::Relative,
+            23 => RelocKind::RelocPointer,
             _ => RelocKind::Other,
         },
         // riscv: 64/32=2, RELATIVE=3, JUMP_SLOT=5
         EM_RISCV => match raw_kind {
             2 => RelocKind::Absolute,
-            3 => RelocKind::Relative,
+            3 => RelocKind::RelocPointer,
             5 => RelocKind::ImportLookup,
             _ => RelocKind::Other,
         },
@@ -1930,13 +1933,43 @@ mod tests {
         assert_eq!(classify_reloc(62, 1), RelocKind::Absolute);
         assert_eq!(classify_reloc(62, 6), RelocKind::ImportLookup);
         assert_eq!(classify_reloc(62, 7), RelocKind::ImportLookup);
-        assert_eq!(classify_reloc(62, 8), RelocKind::Relative);
+        // RELATIVE / RELATIVE64 是**数据槽位**指针，与指令里的
+        // PC 相对重定位（PC32=2、PLT32=4、GOTPCREL=9）必须分开：
+        // 指针表识别只能从前者得到"这里存了个地址"的结论。
+        assert_eq!(classify_reloc(62, 8), RelocKind::RelocPointer);
+        assert_eq!(classify_reloc(62, 38), RelocKind::RelocPointer);
+        assert_eq!(classify_reloc(62, 2), RelocKind::Relative);
+        assert_eq!(classify_reloc(62, 4), RelocKind::Relative);
         // 未知编号归 Other，不猜
         assert_eq!(classify_reloc(62, 999), RelocKind::Other);
         assert_eq!(classify_reloc(0xffff, 1), RelocKind::Other);
         // aarch64
         assert_eq!(classify_reloc(183, 257), RelocKind::Absolute);
         assert_eq!(classify_reloc(183, 1026), RelocKind::ImportLookup);
+        assert_eq!(classify_reloc(183, 1027), RelocKind::RelocPointer);
+        assert_eq!(classify_reloc(183, 261), RelocKind::Relative);
+        // arm / i386 / riscv 的 RELATIVE 同样归数据槽位
+        assert_eq!(classify_reloc(40, 23), RelocKind::RelocPointer);
+        assert_eq!(classify_reloc(3, 8), RelocKind::RelocPointer);
+        assert_eq!(classify_reloc(243, 3), RelocKind::RelocPointer);
+    }
+
+    #[test]
+    fn relative_and_reloc_pointer_are_distinguishable() {
+        // 这条测试守住的是一个具体的回归：早先 `R_*_RELATIVE` 与
+        // PC 相对重定位共用 `RelocKind::Relative`，导致"只挑数据槽位"
+        // 这件事做不到 —— 实测 libsample.so 的 sample_table[2] 就是这样
+        // 被漏掉的，而单看"有重定位数据"完全看不出问题。
+        assert_ne!(
+            RelocKind::Relative,
+            RelocKind::RelocPointer,
+            "两类重定位必须是不同的枚举值，否则无法区分数据指针与指令内偏移"
+        );
+        assert_ne!(
+            RelocKind::Relative.as_str(),
+            RelocKind::RelocPointer.as_str(),
+            "短名也必须不同，否则 wire 上仍然分不开"
+        );
     }
 
     #[test]

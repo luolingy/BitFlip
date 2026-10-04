@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use bitflip_analyze::{merge_candidates, unwind_candidates, Cfg, StringOptions};
 use bitflip_arch::Flow;
+use bitflip_loader::object::RelocKind;
 use bitflip_symbols::{SymbolCandidate, SymbolSource};
 use serde::{Deserialize, Serialize};
 
@@ -160,9 +161,20 @@ impl TargetAnalysis {
             }
         }
         // 来源 2：导出表
+        //
+        // 只把**代码**导出当函数候选。共享库会导出数据符号
+        // （`sample_table`、`stdout`、`errno` 之类），把它们列成"函数"
+        // 是纯噪声，用户点进去只会看到一堆无法解码的字节 ——
+        // §7 要求不制造这种看得见但没意义的结论。
+        //
+        // `is_code` 由 loader 判定（ELF 看 STT_FUNC、PE 看是否在可执行节）。
+        // 拿不到判定的场合（例如节权限缺失）保守地跳过：宁可漏报也不误报。
         for exp in &object.exports {
             if exp.forwarder.is_some() {
                 continue; // 转发导出没有本地代码，不是函数
+            }
+            if !exp.is_code {
+                continue; // 数据导出不是函数
             }
             by_addr
                 .entry(exp.address)
@@ -209,7 +221,12 @@ impl TargetAnalysis {
         // 来源 4：递归下降证明可达的 call 直接目标。
         // 流式：一次解码一条，立刻归约。linear_only 的 call 不算种子 ——
         // 线性扫描会把数据当指令，它的"调用目标"是伪影。
-        let mut call_target_count = 0usize;
+        //
+        // 计数按**去重后的地址**算，不是按调用点算：同一个函数被调用 100 次
+        // 也只是一个函数。早先累加在调用点上，于是样本上出现
+        // "函数 300340 个" 但 "521869 个函数仅来自调用目标推断" 这种
+        // 自相矛盾的结论 —— 数字比总数还大，只会让用户不再相信任何数字。
+        let mut call_targets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         for (addr, len) in disasm.index.range(0, u64::MAX) {
             let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
                 continue;
@@ -227,9 +244,10 @@ impl TargetAnalysis {
                     source: SymbolSource::Discovery,
                     confidence: 40,
                 });
-                call_target_count += 1;
+                call_targets.insert(target);
             }
         }
+        let call_target_count = call_targets.len();
 
         // 来源 5：导入桩（import thunk）。
         //
@@ -273,6 +291,71 @@ impl TargetAnalysis {
         if thunk_count > 0 {
             notes.push(format!(
                 "识别出 {thunk_count} 个导入桩（`jmp *__imp_xxx` 形式的间接跳转桩）"
+            ));
+        }
+
+        // 来源 6：重定位驱动的指针表。
+        //
+        // 共享库把函数地址放进表里（虚表、`__init_array`、跳转表），
+        // 这些槽位在文件里往往还是 0 或占位值 —— 真正的地址要等加载器
+        // 按重定位表填。因此**重定位表本身**就是"这里有一个函数指针"的
+        // 最强证据：它比"这块数据看起来像地址"可靠得多。
+        //
+        // 只认两类**数据槽位**重定位：
+        //   * `Absolute`：把绝对地址写进某个槽位；
+        //   * `RelocPointer`：ELF `R_*_RELATIVE` / PE `IMAGE_REL_BASED_*`，
+        //     加载器写"基址 + 加数"，加数即模块内目标地址。
+        //
+        // 不认 `Relative`（PC 相对，出现在指令里）与 `ImportLookup`
+        // （指向外部符号）：两者都不直接给出本模块内的代码地址。
+        //
+        // 指向的地址必须**已经**有解出来的指令才当候选，否则会在数据区
+        // 造出假函数（§7：宁可漏，不要误报）。
+        let mut reloc_pointer_count = 0usize;
+        for rel in &object.relocations {
+            let is_pointer_slot = matches!(rel.kind, RelocKind::Absolute | RelocKind::RelocPointer);
+            if !is_pointer_slot {
+                continue;
+            }
+            // 重定位的目标地址 = 原值 + 加数。ELF 的 RELA 把加数放在表里，
+            // REL 则把加数写在槽位本身（此时 addend 是 0，下面读槽位补上）。
+            let mut target = rel.addend as u64;
+            if rel.addend == 0 {
+                // REL 情形：从槽位读原值。读不到就跳过，不猜。
+                let ptr_len = object.arch.ptr_size as usize;
+                let Some(bytes) = disasm.space.read(rel.address, ptr_len) else {
+                    continue;
+                };
+                target = match bytes.len() {
+                    8 => u64::from_le_bytes(bytes[..8].try_into().expect("8 字节")),
+                    4 => u64::from(u32::from_le_bytes(bytes[..4].try_into().expect("4 字节"))),
+                    _ => continue,
+                };
+            }
+            // 已经认出来的不用再动（重定位只是佐证，不该覆盖更强的来源）
+            if by_addr.contains_key(&target) {
+                continue;
+            }
+            // 目标处必须真的有指令，否则这是数据指针而不是函数指针
+            if disasm
+                .index
+                .range(target, target.saturating_add(1))
+                .next()
+                .is_none()
+            {
+                continue;
+            }
+            by_addr.entry(target).or_default().push(SymbolCandidate {
+                addr: target,
+                name: String::new(), // 指针表里的目标没有名字 —— 不许编
+                source: SymbolSource::RelocPointer,
+                confidence: 55,
+            });
+            reloc_pointer_count += 1;
+        }
+        if reloc_pointer_count > 0 {
+            notes.push(format!(
+                "有 {reloc_pointer_count} 个函数地址来自重定位驱动的指针表（虚表 / `__init_array` 之类）"
             ));
         }
 

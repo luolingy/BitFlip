@@ -227,6 +227,41 @@ loader     arch      analyze    symbols    project
 
 风险：`.lib` 的格式变体（MSVC 版本差异）与 ARM/Thumb 的指令集切换是已知难点；fixture 覆盖要够。
 
+**M5 完成情况（据实记录）**
+
+三条验收标准均已满足，`scripts/check-arch-layering.ps1` 门禁通过（扫描 15 个文件）。
+交付物的落地情况：
+
+| 交付物 | 状态 | 说明 |
+| --- | --- | --- |
+| MLib `.lib` / `ar` `.a` 解析 | 完成 | 类型 1/2 成员链、长名表 `//`、符号索引 `/` |
+| 按成员独立分析（后端 + CLI） | 完成 | `/api/members`、`/api/members/functions`、`--member` |
+| 归档成员树 UI | 完成 | `web/src/MembersView.tsx`；`analyzable` 由后端实建会话判定，不按名字猜 |
+| PLT/GOT 解析 | **部分** | 重定位表（`.rela.dyn`/`.rela.plt`）已解析并暴露；**PLT 桩的语义命名留给 M6** |
+| 重定位驱动的指针表识别 | 完成 | `SymbolSource::RelocPointer`，见下方说明 |
+| AArch64 + ARM/Thumb 解码 | 完成 | 由 M2 的 capstone 后端覆盖 |
+| ARM/Thumb ABI | 完成 | `bitflip-arch/src/abi.rs`；实现了一直空着的 `Abi` trait |
+| 架构自动识别 + 手动覆盖 | 完成 | `--arch`/`--mode`/`--endian`/`--base` |
+| 跨成员 xref | **未做** | 见下方说明，依赖 M6 的调用图 |
+
+三条需要说明的取舍：
+
+1. **PLT/GOT**：ELF 的 `R_X86_64_JUMP_SLOT` / PE 的 IAT 已作为
+   `RelocKind::ImportLookup` 解析出来，"哪些槽位是导入"是确定的事实。但把
+   `.plt` 里的桩**命名**成 `foo@plt` 需要先有符号归属推断，那是 M6 的
+   "调用约定与参数推断"的一部分。当前如实显示为"导入桩"，不编名字。
+
+2. **重定位驱动的指针表**：这是 M5 唯一新增的**函数发现来源**。它修掉了一个
+   真实缺陷 —— ELF 的 `R_*_RELATIVE` 原先被归进 `RelocKind::Relative`
+   （PC 相对），与指令里的重定位混在一起，于是"数据槽位指针"根本无法单独
+   识别。现拆出 `RelocKind::RelocPointer`。fixture 里
+   `sample_via_pointer` **只**靠这条证据被发现（无导出、无符号表、无 `call`
+   指向），验证方式是先临时关掉该来源、看测试变红。
+
+3. **跨成员 xref**：归档成员各自是独立地址空间（每个 `.o` 都从 0 开始），
+   跨成员引用要靠符号名而不是地址来连接。这在有调用图之后才有意义，M5
+   不做。当前归档视图明确只做"按成员进入分析"，不假装有跨成员关系图。
+
 ### M6 · 数据/代码判定与高级分析
 
 **目标**：把"看起来对"变成"分析得对"。

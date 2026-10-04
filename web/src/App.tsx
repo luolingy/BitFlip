@@ -17,6 +17,7 @@ import {
 } from "./api";
 import { DisassemblyView } from "./DisassemblyView";
 import { FunctionsView, HexView, StringsView, XrefsView } from "./AnalysisViews";
+import { MembersView } from "./MembersView";
 
 type LoadState =
   | { kind: "loading" }
@@ -34,7 +35,14 @@ type LoadState =
  * `ready: true` 的项在本里程碑真实可用；其余一律标注里程碑并置灰。
  * 不做"点了没反应"的假入口（CLAUDE.md §7）。
  */
-type ViewId = "structure" | "disasm" | "functions" | "xrefs" | "strings" | "hex";
+type ViewId =
+  | "structure"
+  | "disasm"
+  | "functions"
+  | "xrefs"
+  | "strings"
+  | "hex"
+  | "members";
 
 const NAV_SECTIONS: readonly {
   /** 只有 `ready: true` 的项才是真实可切换的视图。 */
@@ -51,6 +59,8 @@ const NAV_SECTIONS: readonly {
   { id: "xrefs", title: "交叉引用", milestone: "M3", hint: "谁引用了我 / 我引用了谁", ready: true },
   { id: "strings", title: "字符串", milestone: "M3", hint: "字符串提取与地址定位", ready: true },
   { id: "hex", title: "十六进制", milestone: "M3", hint: "原始字节视图", ready: true },
+  // M5：归档成员树。静态库/动态库是 M5 的目标，成员列表是进入它们的入口。
+  { id: "members", title: "归档成员", milestone: "M5", hint: "静态库/归档的成员与按成员分析", ready: true },
   // 下面这些确实还没做（M8 签名库匹配），保持置灰 —— 不给点了没反应的按钮。
   { id: null, title: "签名匹配", milestone: "M8", hint: "库函数签名识别", ready: false },
 ];
@@ -63,6 +73,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   xrefs: "交叉引用",
   strings: "字符串",
   hex: "十六进制",
+  members: "归档成员",
 };
 
 
@@ -253,6 +264,8 @@ export function App() {
             <StringsView token={token} onNavigate={navigate} />
           ) : view === "hex" ? (
             <HexView token={token} initialAddress={focus} />
+          ) : view === "members" ? (
+            <MembersView token={token} onNavigate={navigate} />
           ) : parsed ? (
             <StructureView parsed={parsed} target={target} />
           ) : (

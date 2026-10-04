@@ -368,9 +368,44 @@ export interface FunctionWire {
   size: number | null;
 }
 
+/** 归档里的一个成员。对应 `bitflip-server` 的 `MemberWire`。 */
+export interface MemberWire {
+  /** 成员名（已尽量解析长名表）。 */
+  name: string;
+  /** 成员数据在容器里的文件偏移。 */
+  offset: number;
+  /** 成员数据长度。 */
+  size: number;
+  /** 成员数据是否超出嗅探窗口。 */
+  truncated: boolean;
+  /**
+   * 成员是否**可以**被当作独立对象分析。
+   *
+   * 这是后端真的建过一次成员会话得出的结论，不是按名字猜的 ——
+   * 所以可以直接拿来决定按钮是否可点，不需要前端再判一次。
+   */
+  analyzable: boolean;
+}
+
+/** 归档成员列表。对应 `GET /api/members`。 */
+export interface MembersResponse {
+  format_version: number;
+  /**
+   * 目标是不是归档。
+   *
+   * **"不是归档"与"归档没有成员"是两件事**，文案完全不同，
+   * 所以后端显式给出这一位而不是靠数组为空判断。
+   */
+  is_archive: boolean;
+  /** 容器类别（`ar` / `msvc-lib` / 其他）。 */
+  container: string;
+  /** 成员列表是否被截断。 */
+  truncated: boolean;
+  members: MemberWire[];
+}
+
 /** 一条交叉引用。对应 `bitflip-core::XrefWire`。 */
-export interface XrefWire {
-  /** 引用发出的地址。 */
+export interface XrefWire {  /** 引用发出的地址。 */
   from: string;
   /** 被引用的地址。 */
   to: string;
@@ -489,6 +524,26 @@ export async function fetchFunctions(
   }
   params.set("count", String(count));
   return requestOrNull<FunctionsResponse>(`/api/functions?${params.toString()}`, token);
+}
+
+/** 取归档成员列表。 */
+export async function fetchMembers(
+  token: string | null,
+): Promise<MembersResponse | null> {
+  return requestOrNull<MembersResponse>("/api/members", token);
+}
+
+/** 取某个归档成员里的函数列表。 */
+export async function fetchMemberFunctions(
+  token: string | null,
+  member: string,
+  count: number,
+): Promise<FunctionsResponse | null> {
+  const params = new URLSearchParams({ member, count: String(count) });
+  return requestOrNull<FunctionsResponse>(
+    `/api/members/functions?${params.toString()}`,
+    token,
+  );
 }
 
 /** 取某地址的交叉引用。 */

@@ -335,6 +335,29 @@ fn member_name_key(name: &str) -> String {
     }
 }
 
+/// 调用约定（ABI）的 wire 表示。
+///
+/// 只描述**寄存器级**的约定 —— "第 N 个参数走哪个寄存器"这类可以从架构
+/// 直接确定的事实。"这个函数实际有几个参数"是另一回事，那要看调用点或
+/// 调试信息，本结构不做推断。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AbiInfo {
+    /// 约定名（如 `System V AMD64` / `AAPCS64`）。
+    pub name: String,
+    /// 参数寄存器名，按参数顺序。空表 = 参数经栈传递。
+    pub arg_regs: Vec<String>,
+    /// 返回值寄存器名。
+    pub return_reg: String,
+    /// 栈指针寄存器名。
+    pub stack_pointer: String,
+    /// 帧指针寄存器名（`None` = 该 ABI 允许省略）。
+    pub frame_pointer: Option<String>,
+    /// 返回地址存放方式的中文说明。
+    pub return_address: String,
+    /// 栈对齐要求（字节）。
+    pub stack_align: u32,
+}
+
 /// 目标识别结论的对外表示（JSON wire 契约）。
 ///
 /// 所有"未知"都显式表达为 `null` + `notes` 里的原因，不用 0 / 空串冒充。
@@ -352,6 +375,7 @@ pub struct TargetInfo {
     pub container_label: String,
     /// 对象格式短名（`pe` / `coff` / `elf` / `macho` / `raw`）。
     pub object: String,
+
     /// 对象格式中文名。
     pub object_label: String,
     /// 归档成员格式（短名）。
@@ -364,6 +388,12 @@ pub struct TargetInfo {
     pub bits: u8,
     /// 端序（`le` / `be`）。
     pub endian: Option<String>,
+    /// 调用约定（ABI）摘要。
+    ///
+    /// `None` = 该架构没有寄存器级调用约定（如 WebAssembly），
+    /// 或架构未知。**不填默认值**：拿一套看起来合理的寄存器名糊过去
+    /// 正是 §7 禁止的假象。
+    pub abi: Option<AbiInfo>,
     /// 入口点（定长 hex）。
     pub entry: Option<String>,
     /// 镜像基址（定长 hex，PE 有）。
@@ -409,6 +439,20 @@ impl TargetInfo {
             arch_family: guess.arch.map(|a: ArchSpec| a.arch.as_str().to_string()),
             bits: guess.bits,
             endian: guess.endian.map(|e| e.as_str().to_string()),
+            abi: guess.arch.and_then(|spec| {
+                // PE 目标走 Microsoft x64 约定，其余走 System V /
+                // AAPCS 等。用对象格式判定，不按文件扩展名猜。
+                let windows = guess.object == ObjectKind::Pe;
+                bitflip_arch::abi_for_spec(spec, windows).map(|abi| AbiInfo {
+                    name: abi.name_zh.to_string(),
+                    arg_regs: abi.arg_reg_names.iter().map(|s| (*s).to_string()).collect(),
+                    return_reg: abi.ret_reg_name.to_string(),
+                    stack_pointer: abi.stack_pointer_name.to_string(),
+                    frame_pointer: abi.frame_pointer_name.map(str::to_string),
+                    return_address: abi.return_address.label_zh().to_string(),
+                    stack_align: abi.stack_align,
+                })
+            }),
             entry: guess.entry.map(hex16),
             image_base: guess.image_base.map(hex16),
             sections: guess.sections,

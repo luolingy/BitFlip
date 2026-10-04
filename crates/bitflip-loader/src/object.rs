@@ -273,6 +273,16 @@ pub enum RelocKind {
     Absolute,
     /// 相对地址（PC 相对）。
     Relative,
+    /// 相对基址的指针槽位（ELF `R_*_RELATIVE`、PE `IMAGE_REL_BASED_DIR64`）。
+    ///
+    /// 与 [`Self::Relative`] 分开是必要的：PC 相对重定位出现在**指令**里
+    /// （`call`/`lea` 的目标），而这一种出现在**数据**里 —— 加载器会往
+    /// 该槽位写"基址 + 加数"，也就是一个函数/对象指针。
+    ///
+    /// 早先两者都归到 `Relative`，导致指针表识别没法只挑出数据指针：
+    /// 实测 `libsample.so` 的 `sample_table[2]` 就是一条
+    /// `R_X86_64_RELATIVE`（加数即目标地址），归错类就完全看不见它。
+    RelocPointer,
     /// 需要导入符号解析。
     ImportLookup,
     /// 其他/未知类型。
@@ -286,6 +296,7 @@ impl RelocKind {
         match self {
             Self::Absolute => "abs",
             Self::Relative => "rel",
+            Self::RelocPointer => "relptr",
             Self::ImportLookup => "import",
             Self::Other => "other",
         }

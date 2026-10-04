@@ -38,6 +38,12 @@ pub enum SymbolSource {
     Unwind,
     /// 导入 thunk（IAT/PLT 桩）。
     ImportThunk,
+    /// 重定位驱动的指针表：虚表、`__init_array`、跳转表等。
+    ///
+    /// 与 [`Self::Discovery`] 的区别在于证据强度：重定位表明确写着
+    /// "加载器会往这个槽位写一个地址"，比"这个数据看起来像地址"可靠；
+    /// 但槽位里也可能是指向数据的指针，所以仍弱于展开表。
+    RelocPointer,
     /// 分析推断出来的函数入口（调用目标 / prologue 模式）。
     Discovery,
     /// 兜底启发式（对齐填充里发现的代码等），置信度最低。
@@ -57,6 +63,7 @@ impl SymbolSource {
             Self::EntryPoint => "entry-point",
             Self::Unwind => "unwind",
             Self::ImportThunk => "import-thunk",
+            Self::RelocPointer => "reloc-pointer",
             Self::Discovery => "discovery",
             Self::Heuristic => "heuristic",
         }
@@ -74,6 +81,7 @@ impl SymbolSource {
             Self::EntryPoint => "入口点",
             Self::Unwind => "展开表",
             Self::ImportThunk => "导入桩",
+            Self::RelocPointer => "重定位指针表",
             Self::Discovery => "分析推断",
             Self::Heuristic => "启发式",
         }
@@ -93,6 +101,10 @@ impl SymbolSource {
             Self::EntryPoint => 45,
             Self::Unwind => 50,
             Self::ImportThunk => 60,
+            // 重定位指针表：加载器必须往这个槽位写一个地址，所以"这里是
+            // 指针"是确定的；但"这个指针指向函数"仍是推断（也可能是数据
+            // 指针），因此排在导入桩之后、分析推断之前。
+            Self::RelocPointer => 65,
             Self::Discovery => 70,
             Self::Heuristic => 90,
         }
