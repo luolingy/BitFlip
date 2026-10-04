@@ -692,6 +692,15 @@ struct StringScanner {
     base: u64,
     opts: StringOptions,
     out: Vec<bitflip_analyze::StringEntry>,
+    /// 已经喂进来的字节数（**段内**偏移，不含段基址）。
+    ///
+    /// `feed` 是按 [`SCAN_CHUNK`] 分块调用的，每块在段内的起始偏移都不同，
+    /// 因此必须累计。早先直接用块内下标 `i` 当偏移，于是每一块的地址都从
+    /// `base` 重新开始，超出第一块的地址全部错位。
+    ///
+    /// 100 MiB 的 `.rdata`（25 个分块）上实测：384 个可识别字符串里有
+    /// 368 个地址与别人重复，去重后只剩 16 个。
+    consumed: u64,
     /// 进行中的 ASCII 运行（字节 + 起始地址）。
     ascii_run: Option<(Vec<u8>, u64)>,
     /// 进行中的 UTF-16LE 运行（低位字节 + 起始地址）。
@@ -710,6 +719,7 @@ impl StringScanner {
                 max_entries: opts.max_entries,
             },
             out: Vec::new(),
+            consumed: 0,
             ascii_run: None,
             utf16_run: None,
             utf16_pending_lo: None,
@@ -718,12 +728,14 @@ impl StringScanner {
     }
 
     fn feed(&mut self, data: &[u8]) {
-        // 已收集够数就不再扫描：上限存在的意义就是防止畸形输入撑爆内存
+        // 已收集够数就不再扫描：上限存在的意义就是防止畸形输入撑爆内存。
+        // 注意这里**也要**累加偏移，否则后续分块的地址会错位。
         if self.out.len() >= self.opts.max_entries {
+            self.consumed += data.len() as u64;
             return;
         }
         for (i, &b) in data.iter().enumerate() {
-            let addr = self.base + i as u64;
+            let addr = self.base + self.consumed + i as u64;
             // ── ASCII 状态机 ──
             if printable_local(b) {
                 let run = self.ascii_run.get_or_insert_with(|| (Vec::new(), addr));
@@ -773,6 +785,7 @@ impl StringScanner {
                 }
             }
         }
+        self.consumed += data.len() as u64;
     }
 
     /// 结束扫描。段尾未终止的运行一律丢弃 —— 没有 NUL 终止符就不算字符串。
@@ -892,6 +905,61 @@ mod tests {
             analysis.strings()
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 跨分块的字符串扫描必须给出**绝对地址**。
+    ///
+    /// 这条盯的是一个真实发生过的 bug：`feed` 用块内下标当偏移，于是每个
+    /// 分块的地址都从段基址重新开始。在 100 MiB 的 `.rdata` 上，
+    /// 384 个可识别字符串里有 368 个地址与别人重复 ——
+    /// `tests/big_file.rs` 是那条端到端的回归。
+    ///
+    /// 这里手工构造两次 `feed`，直接验证第二块的地址是第一块之后的偏移。
+    #[test]
+    fn streaming_string_scan_uses_absolute_addresses_across_chunks() {
+        const BASE: u64 = 0x1000;
+        let opts = bitflip_analyze::StringOptions {
+            min_length: 4,
+            max_entries: 1000,
+        };
+
+        let mut scanner = StringScanner::new(BASE, &opts);
+        // 第一块：一个字符串，长度 8，占 9 字节（含 NUL）
+        let chunk1 = b"aaaaaaa\0";
+        // 第二块：同样内容的另一个字符串
+        let chunk2 = b"bbbbbbb\0";
+        scanner.feed(chunk1);
+        scanner.feed(chunk2);
+        let (entries, _) = scanner.finish();
+
+        assert_eq!(entries.len(), 2, "两块各应产出一条，实际 {entries:?}");
+        let addrs: Vec<u64> = entries.iter().map(|e| e.address).collect();
+        assert_eq!(
+            addrs,
+            vec![BASE, BASE + chunk1.len() as u64],
+            "第二块的地址必须接在第一块之后；\
+             若两块地址相同，说明分块偏移没有累加（地址会互相覆盖后丢失）"
+        );
+        assert_eq!(entries[0].text, "aaaaaaa");
+        assert_eq!(entries[1].text, "bbbbbbb");
+    }
+
+    /// 跨分块的可打印运行不能被截断。
+    #[test]
+    fn a_string_split_across_chunks_survives() {
+        const BASE: u64 = 0x2000;
+        let opts = bitflip_analyze::StringOptions {
+            min_length: 4,
+            max_entries: 1000,
+        };
+        let mut scanner = StringScanner::new(BASE, &opts);
+        scanner.feed(b"hello wor");
+        scanner.feed(b"ld\0");
+        let (entries, _) = scanner.finish();
+
+        assert_eq!(entries.len(), 1, "跨块拼接应得到一条，实际 {entries:?}");
+        assert_eq!(entries[0].text, "hello world");
+        assert_eq!(entries[0].address, BASE);
     }
 
     #[test]

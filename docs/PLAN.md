@@ -161,6 +161,9 @@ loader     arch      analyze    symbols    project
 3. 分页边界（跨段、段末尾、非法地址）有测试；
 4. 解码器 fuzz 10 分钟无 panic。
 
+> 大文件的测试方法、fixture 生成与实测数据见 `docs/BIG-FILE-TESTING.md`。
+> 现状：96 MiB fixture 完整分析 2.1 s（release），100MB 级目标达标。
+
 风险：指令表示一旦定型很难改 —— 本阶段必须完成结构化设计评审（见 ARCHITECTURE §4）。
 `capstone` 的 `disasm_count` 式分块解码要注意退化路径（adi 曾在此踩到二次复杂度）。
 
