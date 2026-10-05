@@ -296,6 +296,45 @@ impl CapstoneDecoder {
         })
     }
 
+    /// 取一条指令的助记符**名字**（`"push"`、`"sub"`、`"stp"`…）。
+    ///
+    /// # 为什么分析层需要名字而不是编号
+    ///
+    /// `DecodedInsn::mnemonic` 是 capstone 的 `MnemonicId`，它的数值
+    /// 跨 capstone 版本会变，且不构成稳定契约。分析层要判断"这条指令
+    /// 是不是 `sub`"时，只能靠名字。
+    ///
+    /// 反过来，把 `MnemonicId` 硬编码成常量表是**更糟**的做法：版本一升，
+    /// 判断会静默错位 —— 帧大小算错却不报错。所以这里向真实后端要名字，
+    /// 由分析层做字符串比较。名字查不到返回 `None`，调用方据此停下并
+    /// 记一条降级说明，而不是猜。
+    ///
+    /// 一次调用是 O(1) 的哈希查找，但涉及 FFI；前导扫描只在函数开头
+    /// 的少数几条指令上调用，开销可忽略。
+    #[must_use]
+    pub fn mnemonic_name(&self, insn: &DecodedInsn) -> Option<String> {
+        self.with_engine(|cs| cs.insn_name(capstone::InsnId(insn.mnemonic.0)))
+    }
+
+    /// 取一个寄存器编号的**名字**（`RegId(37)` → `"rbx"`）。
+    ///
+    /// # 为什么不能只靠 ABI 表
+    ///
+    /// [`crate::AbiSpec`] 里只有参数寄存器、返回寄存器、栈指针、帧指针和
+    /// 被调用者保存寄存器这几组**名字**，而且它是"给人看的契约"。
+    /// 但前导扫描会遇到表外的寄存器 —— 典型例子是 AArch64 的
+    /// `stp x29, x30, [sp, #-16]!`：`x30` 是链接寄存器，不在
+    /// `callee_saved_names` 里（按 AAPCS64，x19–x28 才是被调用者保存）。
+    ///
+    /// 遇到表外寄存器时，要么报一个 `reg#30` 这样的假名（CLAUDE.md §7
+    /// 禁止），要么向真实后端问。这里选后者。
+    ///
+    /// 查不到返回 `None`，调用方如实显示"未识别寄存器"。
+    #[must_use]
+    pub fn register_name(&self, reg: RegId) -> Option<String> {
+        self.with_engine(|cs| cs.reg_name(capstone::RegId(reg.0)))
+    }
+
     /// 在该解码器**本线程**的 capstone 引擎上执行一段操作。
     ///
     /// 暴露这个是为了渲染层（`render` 模块）能查助记符与寄存器名 ——

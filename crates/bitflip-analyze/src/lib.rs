@@ -11,6 +11,7 @@ mod callgraph;
 mod cfg;
 mod codemap;
 mod consts;
+mod frames;
 mod functions;
 mod job;
 mod jumptable;
@@ -37,6 +38,10 @@ pub use codemap::{
 pub use consts::{
     aggregate_string_refs, infer_strides, profile_immediates, scan_constants, Access, AccessStride,
     ConstScan, ImmediateProfile, StringUsage,
+};
+pub use frames::{
+    scan_frames, summarize_frames, FrameInference, FrameScan, FrameSource, MAX_PROLOGUE_BYTES,
+    MAX_PROLOGUE_INSNS,
 };
 pub use functions::{merge_candidates, unwind_candidates, ConflictKind, Function};
 pub use job::{

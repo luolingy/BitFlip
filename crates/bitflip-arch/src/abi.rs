@@ -103,6 +103,80 @@ impl AbiSpec {
     pub fn is_arg_register(&self, name: &str) -> bool {
         self.arg_reg_names.contains(&name)
     }
+
+    /// 把寄存器名解析成 capstone 的 [`RegId`]。
+    ///
+    /// # 为什么必须查真实后端而不是写死编号
+    ///
+    /// `RegId` 是 capstone 的编号，跨架构没有统一规律；写死一张
+    /// "rdi = 39" 的表在换后端（或 capstone 版本变更）时会**静默错位** ——
+    /// 参数标注整体偏一到两个寄存器，而没有任何报错。
+    ///
+    /// 所以走 `CapstoneDecoder::register_id` 向真实后端要编号。
+    /// 查不到就返回 `None`，调用方据此跳过该寄存器 —— 不猜。
+    ///
+    /// # 别名兜底（AArch64 的 x29/x30）
+    ///
+    /// ABI 表里存的是**约定名**，capstone 有它自己的一套名字，两者对
+    /// 同一个寄存器可能不同：AArch64 的 `x29` 在 capstone 里叫 `fp`，
+    /// `x30` 叫 `lr`（`x19`–`x28` 则与约定名一致）。
+    ///
+    /// 这个差异是**静默**的：`reg_id("x29")` 返回 `None` 而不报错，
+    /// 于是"帧指针 = x29"这条规则永远匹配不上 —— AArch64 的帧指针识别
+    /// 整体失效，前导扫描还会在第二条指令就停下。只有真实目标能暴露。
+    ///
+    /// 处理方式是查完原名再查已知别名，见 [`aliases_of`]。
+    /// 别名表**小而明确**：只在两个名字确实指同一寄存器时登记，
+    /// 不做模糊匹配 —— 拼错的名字应当解析失败，而不是碰巧命中别人。
+    #[must_use]
+    pub fn reg_id(&self, name: &str) -> Option<RegId> {
+        if let Some(id) = crate::backend::CapstoneDecoder::register_id(self.spec, name) {
+            return Some(id);
+        }
+        for alias in aliases_of(name) {
+            if let Some(id) = crate::backend::CapstoneDecoder::register_id(self.spec, alias) {
+                return Some(id);
+            }
+        }
+        None
+    }
+}
+
+/// 寄存器名的**等价名**表：ABI 约定名 ↔ capstone 的名字。
+///
+/// # 为什么需要这张表
+///
+/// 大部分寄存器在两边同名（`rax`、`rcx`、`x0`、`x19`…），所以直接查名
+/// 就够了。但 AArch64 的两个寄存器是例外：capstone 用 ABI 别名而不是
+/// 编号名 —— `x29` 叫 `fp`、`x30` 叫 `lr`。
+///
+/// 这个差异不会报错，只会让 `reg_id` 返回 `None`，于是依赖它的规则
+/// （帧指针识别、被调用者保存寄存器核对）**静默失效**。所以必须显式
+/// 登记，不能指望"名字总是对得上"。
+///
+/// # 维护约定
+///
+/// * 只登记**确实指同一个寄存器**的名字，两个方向都要写（查 `x29` 和
+///   查 `fp` 都应当命中）。
+/// * 不登记"长得像"的名字 —— 拼错的名字应当解析失败，而不是碰巧命中。
+/// * 新增架构时，如果 ABI 表里的名字查不到，先确认是不是这类别名差异，
+///   是就补进来，不是就修名字本身。
+///
+/// 返回该名字的全部等价名。
+fn aliases_of(name: &str) -> &'static [&'static str] {
+    const ALIASES: &[(&str, &[&str])] = &[
+        // AArch64：x29 = 帧指针，capstone 叫 fp
+        ("x29", &["fp"]),
+        ("fp", &["x29"]),
+        // AArch64：x30 = 链接寄存器，capstone 叫 lr
+        ("x30", &["lr"]),
+        ("lr", &["x30"]),
+    ];
+    ALIASES
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, list)| *list)
+        .unwrap_or(&[])
 }
 
 /// 参数寄存器序列。
@@ -243,21 +317,6 @@ pub fn abi_for_spec(spec: ArchSpec, windows: bool) -> Option<AbiSpec> {
 }
 
 impl AbiSpec {
-    /// 把寄存器名解析成 capstone 的 [`RegId`]。
-    ///
-    /// # 为什么必须查真实后端而不是写死编号
-    ///
-    /// `RegId` 是 capstone 的编号，跨架构没有统一规律；写死一张
-    /// "rdi = 39" 的表在换后端（或 capstone 版本变更）时会**静默错位** ——
-    /// 参数标注整体偏一到两个寄存器，而没有任何报错。
-    ///
-    /// 所以走 `CapstoneDecoder::register_id` 向真实后端要编号。
-    /// 查不到就返回 `None`，调用方据此跳过该寄存器 —— 不猜。
-    #[must_use]
-    pub fn reg_id(&self, name: &str) -> Option<RegId> {
-        crate::backend::CapstoneDecoder::register_id(self.spec, name)
-    }
-
     /// 参数寄存器的 [`RegId`] 列表（按调用顺序）。
     ///
     /// 任何一个名字解析失败就**整体返回 `None`**：宁可说"这个架构的
@@ -354,6 +413,45 @@ mod tests {
     /// 解析不出来时 `arg_reg_ids()` 返回 `None`，上层据此说"该架构不支持
     /// 参数推断" —— 可接受的降级。但**本可以支持却查不到**会让用户白白
     /// 失去这项能力，所以在这里把每个架构都试一遍。
+    /// AArch64 的 `x29`/`x30` 在 capstone 里叫 `fp`/`lr`，靠别名表兜底。
+    ///
+    /// 这条测试是**真实目标暴露出来的**：没有别名时 `reg_id("x29")`
+    /// 返回 `None` 而不报错，于是"帧指针 = x29"永远匹配不上 ——
+    /// AArch64 的帧指针识别整体失效，前导扫描在第二条指令就停下。
+    #[test]
+    fn aarch64_frame_pointer_and_link_register_resolve_via_aliases() {
+        let abi = abi_for_spec(spec(Arch::Aarch64, Mode::M64), false).expect("AAPCS64");
+        assert_eq!(abi.frame_pointer_name, Some("x29"));
+
+        // 约定名必须能查到编号 —— 这是帧指针识别的前提
+        let fp = abi
+            .reg_id("x29")
+            .expect("x29 必须能解析（capstone 里叫 fp，靠别名兜底）");
+        // 别名另一方向也要能查到同一个编号
+        assert_eq!(abi.reg_id("fp"), Some(fp), "fp 与 x29 必须指向同一编号");
+
+        let lr = abi
+            .reg_id("x30")
+            .expect("x30 必须能解析（capstone 里叫 lr，靠别名兜底）");
+        assert_eq!(abi.reg_id("lr"), Some(lr), "lr 与 x30 必须指向同一编号");
+
+        // 帧指针和链接寄存器不能是同一个寄存器
+        assert_ne!(fp, lr, "x29 与 x30 必须是不同的寄存器");
+    }
+
+    /// 别名表不能变成"什么都查得到"：拼错的名字必须解析失败。
+    #[test]
+    fn unknown_register_names_still_fail_to_resolve() {
+        let abi = abi_for_spec(spec(Arch::Aarch64, Mode::M64), false).expect("AAPCS64");
+        for bogus in ["x29x", "xx29", "fpp", "", "r29", "rax"] {
+            assert_eq!(
+                abi.reg_id(bogus),
+                None,
+                "{bogus:?} 不该解析成功（别名表不能做模糊匹配）"
+            );
+        }
+    }
+
     #[test]
     fn every_supported_arch_can_resolve_its_argument_registers() {
         for arch in [
