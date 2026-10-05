@@ -1162,13 +1162,13 @@ fn parse_unwind_info(
                     .u32(next_slot, Endianness::Little, "SAVE_NONVOL_FAR 偏移")
                     .ok();
             }
-            // SAVE_XMM128：下 1 槽 = 缩放偏移（×16）
+            // SAVE_XMM128：下 1 槽 = 缩放偏移（×16，128 位对齐）
             6 => {
                 slots = 2;
                 extra = reader
                     .u16(next_slot, Endianness::Little, "SAVE_XMM128 偏移")
                     .ok()
-                    .map(u32::from);
+                    .map(|scaled| u32::from(scaled) * 16);
             }
             // SAVE_XMM128_FAR：下 2 槽 = 32 位偏移
             7 => {
@@ -1291,9 +1291,12 @@ fn parse_unwind_info(
             }
             6 | 7 => {
                 // SAVE_XMM128[_FAR]：记录但不计入帧大小
-                let reg = x64_reg_name(r.info)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("xmm{}", r.info));
+                //
+                // 这里的编号是 **XMM** 寄存器编号，不是 GP 寄存器编号。
+                // 拿 GP 表（rax..r15）翻译会把 xmm0 写成 "rax"、xmm6 写成
+                // "rsi" —— 真实 ntdll 上一次能列出十几个 "rax" 保存，
+                // 看起来像严重错误，其实是名字表用错了。
+                let reg = format!("xmm{}", r.info);
                 let offset = r.extra.unwrap_or(0);
                 ops.push(PeUnwindOp::SaveXmm { reg, offset });
             }
@@ -2361,6 +2364,43 @@ mod tests {
             }
             other => panic!("应找到 SAVE_NONVOL，实际 {other:?}"),
         }
+    }
+
+    /// SAVE_XMM128 的编号是 XMM 编号，必须翻译成 `xmmN`。
+    ///
+    /// 这是真实目标上暴露的：ntdll 里带 XMM 保存的函数列出了十几个
+    /// "rax"，因为 GP 寄存器表（0=rax…）被拿来翻译 XMM 编号 ——
+    /// xmm0 变成 "rax"、xmm6 变成 "rsi"。不报错，只是名字全错。
+    #[test]
+    fn unwind_xmm_save_is_named_by_xmm_number_not_gp_table() {
+        // version 1；CountOfCodes=2
+        // code0: SAVE_XMM128，op=6，info=0（xmm0），scaled offset=2 → 0x20
+        //
+        // 字节序又要注意：低 4 位是 UnwindOp、高 4 位是 OpInfo，
+        // 所以是 (0<<4)|6 = 0x06。写成 0x60 就是 push rsi（op=0、info=6）。
+        let blob = [
+            0x01, 0x01, 0x02, 0x00, // 头
+            0x00, 0x06, // SAVE_XMM128：op=6, info=0
+            0x02, 0x00, // scaled offset = 2（×16 = 0x20）
+        ];
+        let (obj, bytes) = object_with_rdata(&blob);
+        let reader = Reader::with_base(&bytes, 0);
+        let info = parse_unwind_info(&reader, &obj, 0x1_4000_2000).expect("解码");
+
+        match info.ops.as_slice() {
+            [PeUnwindOp::SaveXmm { reg, offset }] => {
+                assert_eq!(reg, "xmm0", "必须是 xmm 编号，不能走 GP 表");
+                assert_eq!(*offset, 0x20, "缩放单位是 16（128 位对齐）");
+            }
+            other => panic!("应为 SAVE_XMM128，实际 {other:?}"),
+        }
+        // XMM 保存不计入帧大小
+        assert_eq!(info.frame_size(), Some(0));
+        assert!(
+            info.notes.iter().any(|n| n.contains("XMM 保存")),
+            "XMM 不计入帧大小要说明：{:?}",
+            info.notes
+        );
     }
 
     /// ALLOC_LARGE（info=0）读取的是 8 字节单位，不是原始字节数。
