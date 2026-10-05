@@ -591,7 +591,7 @@ AAPCS），以及**栈帧/局部变量视图**（PE 展开信息解码 + 前导�
   可达 717 个函数、最深 29 层。
 
 M6 交付物至此**全部完成**。
-### M7 · 脚本层与插件（决策门 D1 后启动）
+### M7 · 脚本层与插件（D1 已决：rquickjs）
 
 **目标**：可自动化、可扩展，等价 IDA 的 IDC/IDAPython 位置。
 
@@ -732,7 +732,7 @@ M6 交付物至此**全部完成**。
 
 | ID | 决策 | 影响 | 状态 |
 |----|------|------|------|
-| D1 | 脚本层：rquickjs（JS） / mlua（Lua） / wasmtime（WASM 插件） | M7 起全部脚本能力与插件生态 | **分析已完成，等待选择**（[D1-SCRIPT-ENGINE-ANALYSIS.md](./D1-SCRIPT-ENGINE-ANALYSIS.md)） |
+| ~~D1~~ | ~~脚本层引擎~~ | — | **已决：见 ADR-0013（rquickjs；wasmtime 推迟到有真实插件分发需求时）** |
 | ~~D2~~ | ~~工程库：SQLite / 自研日志~~ | M4 起所有持久化 | **已决：主数据 SQLite + 派生物独立文件（ADR-0012，分析见 `D2-STORAGE-ANALYSIS.md`）** |
 | ~~D3~~ | ~~解码后端：capstone / + iced-x86~~ | 指令文本质量与属性精度 | **已决：capstone 单后端，接口保持后端抽象（ADR-0011）** |
 | D4 | PDB/DWARF 依赖范围 | M8 工作量与体积 | 待定（M8 前） |
