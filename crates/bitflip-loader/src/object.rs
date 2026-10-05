@@ -393,6 +393,138 @@ pub struct UnwindEntry {
     pub end: u64,
     /// 展开信息地址。
     pub unwind_info: u64,
+    /// 解码出的展开细节（PE 的 `UNWIND_INFO`）。
+    ///
+    /// `None` 表示该条目没有解码（ELF 的 `.eh_frame` 目前只给出函数
+    /// 边界，没有 CFI 指令解码；PE 的 `.pdata` 若能解出就填上）。
+    /// **不拿一个默认值冒充**：没有解码就是没有。
+    pub decoded: Option<PeUnwindInfo>,
+}
+
+/// PE `UNWIND_INFO` 解码结果（x64 展开信息）。
+///
+/// # 它是"帧大小 + 保存寄存器"的权威来源
+///
+/// 编译器生成的展开表描述"如何撤销这个函数的栈操作"，其中前导段
+/// （prologue）的指令序列直接决定栈帧大小与保存了哪些寄存器。
+/// 栈帧视图（M6）拿它做**交叉核对**：与前导扫描对照，两边一致才敢
+/// 说是帧大小。
+///
+/// # 边界：只解码能确定的
+///
+/// 版本号、标志位、前导大小、帧寄存器、保存/分配操作都直接取自
+/// `UNWIND_INFO`。XMM 保存记录在案但**不计入帧大小**（它们也占栈，
+/// 但字节数取决于浮点寄存器宽度，先不猜）；看不懂的操作原样记下，
+/// 让上层如实显示"有未识别的展开操作"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeUnwindInfo {
+    /// 展开信息版本（0 = 仅 x64 语义，1 = 含 ARM64）。
+    pub version: u8,
+    /// 标志位（低 3 位：EHANDLER / UHANDLER / CHAININFO）。
+    pub flags: u8,
+    /// 前导长度（字节）。
+    pub prologue_size: u8,
+    /// 帧寄存器（`SET_FPREG` 或 `FrameRegister` 字段）；`None` = 无帧指针。
+    pub frame_register: Option<String>,
+    /// 帧寄存器相对前导结束时 RSP 的偏移（`FrameOffset << 4`，单位字节）。
+    pub frame_offset: u32,
+    /// 展开操作序列（按前导顺序）。
+    pub ops: Vec<PeUnwindOp>,
+    /// 解码过程中的说明（无法定位、未知操作等）。
+    pub notes: Vec<String>,
+}
+
+/// 一条 `UNWIND_CODE` 展开操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeUnwindOp {
+    /// `push reg`：保存非易失寄存器，占 8 字节栈。
+    PushNonVolatile {
+        /// 寄存器名。
+        reg: String,
+        /// 该 push 在**最终** RSP 之上的偏移（即相对帧顶的槽位）。
+        slot_from_top: u64,
+    },
+    /// `sub rsp, size`：栈分配。
+    Alloc {
+        /// 分配字节数。
+        size: u32,
+    },
+    /// `mov <frame_reg>, rsp`：建立帧指针。
+    SetFramePointer {
+        /// 帧寄存器名。
+        reg: String,
+    },
+    /// `mov [rsp+off*8], reg`：把寄存器保存到栈槽。
+    SaveNonVolatile {
+        /// 寄存器名。
+        reg: String,
+        /// 缩放前的偏移（实际偏移 = `scaled * 8`）。
+        scaled_offset: u32,
+    },
+    /// `mov [rsp+off], reg`：32 位偏移版本。
+    SaveNonVolatileFar {
+        /// 寄存器名。
+        reg: String,
+        /// 实际偏移（字节）。
+        offset: u32,
+    },
+    /// XMM 寄存器保存（128 位）。**不计入帧大小**（见 [`PeUnwindInfo`]）。
+    SaveXmm {
+        /// 寄存器名。
+        reg: String,
+        /// 实际偏移（字节）。
+        offset: u32,
+    },
+    /// `push machineframe`：异常帧（中断/异常处理用）。
+    PushMachineFrame {
+        /// 机器帧宽度（字节）。
+        size: u32,
+    },
+    /// 未识别的操作码。原样保留，让上层如实显示。
+    Unknown {
+        /// 未识别操作码值。
+        opcode: u8,
+        /// 操作数信息。
+        info: u8,
+        /// 在前导中的偏移。
+        prolog_offset: u8,
+    },
+}
+
+impl PeUnwindInfo {
+    /// 从展开操作累计出的栈帧大小（字节）。
+    ///
+    /// 只累计"确定占栈"的操作：push 与 alloc。XMM 保存、未知操作
+    /// **不计入** —— 宁可低估并在 notes 里说明，也不要猜一个数。
+    #[must_use]
+    pub fn frame_size(&self) -> Option<u64> {
+        let mut total: u64 = 0;
+        for op in &self.ops {
+            match op {
+                PeUnwindOp::PushNonVolatile { .. } => total += 8,
+                PeUnwindOp::Alloc { size } => total += u64::from(*size),
+                PeUnwindOp::PushMachineFrame { size } => total += u64::from(*size),
+                // 保存不分配栈；未知/XMM 不猜
+                _ => {}
+            }
+        }
+        Some(total)
+    }
+
+    /// 保存了哪些非易失寄存器（push 或 save）。
+    #[must_use]
+    pub fn saved_registers(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for op in &self.ops {
+            match op {
+                PeUnwindOp::PushNonVolatile { reg, .. } => out.push(reg.as_str()),
+                PeUnwindOp::SaveNonVolatile { reg, .. } => out.push(reg.as_str()),
+                PeUnwindOp::SaveNonVolatileFar { reg, .. } => out.push(reg.as_str()),
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 /// 对象的格式细节（各格式共有的头字段归一化）。

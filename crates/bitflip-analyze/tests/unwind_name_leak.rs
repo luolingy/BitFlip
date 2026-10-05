@@ -14,6 +14,7 @@ fn unwind_marker_must_not_leak_into_the_name() {
         begin: 0x140001000,
         end: 0x140001050,
         unwind_info: 0,
+        decoded: None,
     }];
 
     let cands = unwind_candidates(&entries);

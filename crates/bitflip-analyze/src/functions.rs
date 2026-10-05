@@ -311,6 +311,7 @@ mod tests {
             begin: 0x1400,
             end: 0x1440,
             unwind_info: 0,
+            decoded: None,
         }];
         let cands = unwind_candidates(&entries);
         assert_eq!(cands.len(), 1);

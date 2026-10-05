@@ -1345,6 +1345,10 @@ fn parse_eh_frame_entries(
             begin: entry.begin,
             end: entry.end(),
             unwind_info: 0, // FDE 自身的展开信息地址；M3 不做栈回溯，不填假值
+            // ELF 的 .eh_frame 目前只解出函数边界，没有 CFI 指令解码。
+            // 因此 decoded 一律 None —— 与 PE 的 UNWIND_INFO 解码保持一致，
+            // 让上层能区分"这个函数没有展开信息"和"有展开信息但没解码"。
+            decoded: None,
         });
     }
 
