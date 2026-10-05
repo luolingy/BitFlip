@@ -917,6 +917,17 @@ button:not(:disabled):hover {
   line-height: 1.6;
 }
 
+/* 说明条：比警告弱一档，用于"界面上的数字是下界/观测事实"这类
+   必须让用户知道、但不算风险提示的话。 */
+.banner-note {
+  border-left: 3px solid var(--accent, #4a7fb5);
+  background: rgba(74, 127, 181, 0.08);
+  padding: 8px 12px;
+  margin: 8px 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

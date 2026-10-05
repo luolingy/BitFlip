@@ -18,7 +18,13 @@ import {
 import { DisassemblyView } from "./DisassemblyView";
 import { FunctionsView, HexView, StringsView, XrefsView } from "./AnalysisViews";
 import { MembersView } from "./MembersView";
-import { CallGraphView, CodeMapView, JumpTablesView } from "./M6Views";
+import {
+  ArgScanView,
+  CallGraphView,
+  CodeMapView,
+  ConstScanView,
+  JumpTablesView,
+} from "./M6Views";
 
 type LoadState =
   | { kind: "loading" }
@@ -46,7 +52,9 @@ type ViewId =
   | "members"
   | "call-graph"
   | "code-map"
-  | "jump-tables";
+  | "jump-tables"
+  | "const-scan"
+  | "arg-scan";
 
 const NAV_SECTIONS: readonly {
   /** 只有 `ready: true` 的项才是真实可切换的视图。 */
@@ -69,6 +77,8 @@ const NAV_SECTIONS: readonly {
   { id: "call-graph", title: "调用图", milestone: "M6", hint: "谁调用了谁，含未解析的间接调用", ready: true },
   { id: "code-map", title: "数据/代码", milestone: "M6", hint: "判定结论、置信度与依据", ready: true },
   { id: "jump-tables", title: "跳转表", milestone: "M6", hint: "switch 分派表与目标集合", ready: true },
+  { id: "const-scan", title: "常量/结构体", milestone: "M6", hint: "字符串引用、访问位移、高频立即数", ready: true },
+  { id: "arg-scan", title: "参数推断", milestone: "M6", hint: "调用约定与参数下界", ready: true },
   // 下面这些确实还没做（M8 签名库匹配），保持置灰 —— 不给点了没反应的按钮。
   { id: null, title: "签名匹配", milestone: "M8", hint: "库函数签名识别", ready: false },
 ];
@@ -85,6 +95,8 @@ const VIEW_TITLES: Record<ViewId, string> = {
   "call-graph": "调用图",
   "code-map": "数据/代码判定",
   "jump-tables": "跳转表",
+  "const-scan": "常量 / 结构体初步",
+  "arg-scan": "调用约定与参数推断",
 };
 
 
@@ -283,6 +295,10 @@ export function App() {
             <CodeMapView token={token} />
           ) : view === "jump-tables" ? (
             <JumpTablesView token={token} onNavigate={navigate} />
+          ) : view === "const-scan" ? (
+            <ConstScanView token={token} />
+          ) : view === "arg-scan" ? (
+            <ArgScanView token={token} />
           ) : parsed ? (
             <StructureView parsed={parsed} target={target} />
           ) : (

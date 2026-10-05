@@ -17,14 +17,18 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  fetchArgScan,
   fetchCallGraph,
   fetchCodeMap,
+  fetchConstScan,
   fetchFunctions,
   fetchJumpTables,
   formatAddress,
   normalizeAddress,
+  type ArgScanResponse,
   type CallGraphResponse,
   type CodeMapResponse,
+  type ConstScanResponse,
   type FunctionWire,
   type JumpTablesResponse,
 } from "./api";
@@ -538,8 +542,7 @@ export function JumpTablesView({
   );
 }
 
-/** 地址跳转框（与 M3 视图同形，供调用图里快速回跳用）。 */
-export function AddressJump({ onJump }: { onJump: (address: string) => void }) {
+/** 地址跳转框（与 M3 视图同形，供调用图里快速回跳用）。 */export function AddressJump({ onJump }: { onJump: (address: string) => void }) {
   const [text, setText] = useState("");
   const [invalid, setInvalid] = useState(false);
 
@@ -570,5 +573,366 @@ export function AddressJump({ onJump }: { onJump: (address: string) => void }) {
       <button onClick={submit}>跳转</button>
       {invalid && <span className="unknown"> 地址格式不认识</span>}
     </div>
+  );
+}
+
+/**
+ * 常量 / 结构体初步推断。
+ *
+ * # 界面上必须让人看出"这是观测事实，不是结构体定义"
+ *
+ * 后端只给三样东西：哪些字符串被谁引用、某个基址上看到过哪些位移、
+ * 哪些立即数出现得多。**没有字段名，也没有字段类型** —— 没有调试信息
+ * 就没有名字，编一个 `struct_1` 是禁止的。这里照实呈现，并在显眼处
+ * 说明这一点，免得用户以为没显示名字是因为界面太窄。
+ */
+export function ConstScanView({ token }: { token: string | null }) {
+  const loaded = useLoaded<ConstScanResponse>(
+    () => fetchConstScan(token),
+    [token],
+  );
+
+  if (loaded.kind === "loading") {
+    return <p className="hint">正在加载常量分析…</p>;
+  }
+  if (loaded.kind === "error") {
+    return <p className="error">加载失败：{loaded.message}</p>;
+  }
+  if (loaded.data === null) {
+    return <p className="hint">尚未打开目标。</p>;
+  }
+
+  const scan = loaded.data;
+
+  return (
+    <div className="m6-view">
+      <p className="banner-note">
+        以下是**从指令里观测到的事实**：哪些字符串被引用、某个基址上
+        出现过哪些位移、哪些立即数出现得多。这里**没有字段名和字段类型**
+        —— 没有调试信息就没有名字，编一个 <code>struct_1</code> 属于造假，
+        所以不编。
+      </p>
+
+      <section>
+        <h3 className="section-title">
+          字符串引用（{scan.strings.length} 条）
+        </h3>
+        {scan.strings.length === 0 ? (
+          <p className="hint">
+            没有观测到指令直接引用字符串。可能是间接传递（经寄存器、
+            经跳转表），本版不做数据流分析。
+          </p>
+        ) : (
+          <div className="table-wrap-short">
+            <table>
+              <thead>
+                <tr>
+                  <th>字符串地址</th>
+                  <th>引用函数</th>
+                  <th>引用点</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scan.strings.map((s) => (
+                  <tr key={s.address}>
+                    <td className="mono">{s.address}</td>
+                    <td>
+                      {s.functions.length === 0 ? (
+                        // 引用点可能落在所有已知函数之外 —— 如实说，
+                        // 不要归到某个"最近的函数"上
+                        <span className="unknown">不在已知函数内</span>
+                      ) : (
+                        <span className="ref-list">
+                          {s.functions.map((f) => (
+                            <button
+                              key={f}
+                              className="link-button mono"
+                              title={f}
+                            >
+                              {f.slice(-6)}
+                            </button>
+                          ))}
+                        </span>
+                      )}
+                    </td>
+                    <td className="mono num">{s.sites.length}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section>
+        <h3 className="section-title">内存访问位移（{scan.strides.length} 组）</h3>
+        {scan.strides.length === 0 ? (
+          <p className="hint">没有观测到带固定基址寄存器的内存访问。</p>
+        ) : (
+          <div className="table-wrap-short">
+            <table>
+              <thead>
+                <tr>
+                  <th>基址寄存器</th>
+                  <th>宽度</th>
+                  <th>步长</th>
+                  <th>观测到的位移</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scan.strides.map((s) => (
+                  <tr key={`${s.base}-${s.width}`}>
+                    <td className="mono">reg#{s.base}</td>
+                    <td className="num">{s.width}</td>
+                    <td className="num">
+                      {s.stride === null ? (
+                        // 推不出来时显示"不确定"，**不显示 0** ——
+                        // 0 是个看起来合理的值，会让人以为步长就是 0
+                        <span className="unknown" title="位移间隔不一致，推不出步长">
+                          不确定
+                        </span>
+                      ) : (
+                        s.stride
+                      )}
+                    </td>
+                    <td className="mono">
+                      {s.offsets
+                        .slice(0, 12)
+                        .map((o) => `+${o.toString(16)}`)
+                        .join(" ")}
+                      {s.offsets.length > 12 && ` …共 ${s.offsets.length} 个`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section>
+        <h3 className="section-title">
+          高频立即数（{scan.immediates.length} / {scan.immediate_distinct} 种）
+        </h3>
+        <p className="hint">
+          合计观测到 {scan.immediate_total} 个立即数，去重后{" "}
+          {scan.immediate_distinct} 种。
+        </p>
+        {scan.immediates.length === 0 ? (
+          <p className="hint">没有观测到立即数。</p>
+        ) : (
+          <div className="table-wrap-short">
+            <table>
+              <thead>
+                <tr>
+                  <th>值（十进制 / 十六进制）</th>
+                  <th>出现次数</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scan.immediates.map((i) => (
+                  <tr key={i.value}>
+                    <td className="mono">
+                      {i.value}
+                      <span className="unknown"> / {immediateHex(i.value)}</span>
+                    </td>
+                    <td className="num">{i.count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <Notes notes={scan.notes} />
+    </div>
+  );
+}
+
+/**
+ * 把十进制的立即数显示成十六进制。
+ *
+ * 后端给的是**十进制字符串**（避免 JSON 大整数在 JS 侧被截断），
+ * 而反汇编里的人习惯看十六进制 —— 两种都给。用 `BigInt` 而不是
+ * `Number`：目标里的立即数可能超过 2^53，`Number` 会静默变形。
+ */
+function immediateHex(value: string): string {
+  try {
+    const n = BigInt(value);
+    return n < 0n ? `-0x${(-n).toString(16)}` : `0x${n.toString(16)}`;
+  } catch {
+    // 解析不了就如实说，不要硬凑一个数
+    return "无法解析";
+  }
+}
+
+/**
+ * 调用约定与参数推断。
+ *
+ * # 「下界」这个词必须出现在界面上
+ *
+ * 后端给的是"至少有几个参数"，不是"有几个参数"。没有调试信息时，
+ * 参数寄存器没被读到**不等于**没有这个参数（可能只被透传、或者一进
+ * 函数就存到栈上）。所以这里一律显示成"≥ N"，并在表头写明理由 ——
+ * 直接显示 N 会让人当成确切个数。
+ */
+export function ArgScanView({ token }: { token: string | null }) {
+  const loaded = useLoaded<ArgScanResponse>(() => fetchArgScan(token), [token]);
+  const [filter, setFilter] = useState("");
+
+  if (loaded.kind === "loading") {
+    return <p className="hint">正在加载参数推断…</p>;
+  }
+  if (loaded.kind === "error") {
+    return <p className="error">加载失败：{loaded.message}</p>;
+  }
+  if (loaded.data === null) {
+    return <p className="hint">尚未打开目标。</p>;
+  }
+
+  const scan = loaded.data;
+
+  if (scan.abi_name === null) {
+    // 该架构没有寄存器级约定（如 wasm32）。说清是"不适用"，
+    // 而不是让用户以为"这些函数都没有参数"。
+    return (
+      <div className="m6-view">
+        <p className="banner-warn">
+          该架构没有寄存器级调用约定（例如 WebAssembly 用栈式传参），
+          因此不提供参数推断 —— 这是**这项能力不适用**，不是
+          "这些函数没有参数"。
+        </p>
+        <Notes notes={scan.notes} />
+      </div>
+    );
+  }
+
+  const functions = scan.functions.filter((f) =>
+    filter.length === 0 ? true : f.entry.includes(filter.toLowerCase()),
+  );
+
+  // 下界分布：一眼看出整体是否合理（全都 0 或全都满都说明判据有问题）
+  const histogram = new Map<number, number>();
+  for (const f of scan.functions) {
+    histogram.set(f.lower_bound, (histogram.get(f.lower_bound) ?? 0) + 1);
+  }
+  const buckets = [...histogram.entries()].sort((a, b) => a[0] - b[0]);
+
+  return (
+    <div className="m6-view">
+      <div className="summary-grid">
+        <div className="summary-card">
+          <div className="summary-label">调用约定</div>
+          <div className="summary-value">{scan.abi_name}</div>
+          <div className="summary-hint">
+            参数寄存器：{scan.arg_reg_names.join("、")}
+          </div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">函数</div>
+          <div className="summary-value">{scan.functions.length}</div>
+          <div className="summary-hint">
+            从栈取参：
+            {scan.functions.filter((f) => f.reads_stack_args).length} 个
+          </div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">参数下界分布</div>
+          <div className="summary-value">{buckets.length} 种</div>
+          <div className="summary-hint">
+            {buckets.map(([k, v]) => `${k}:${v}`).join("  ")}
+          </div>
+        </div>
+      </div>
+
+      <p className="banner-note">
+        表中的数字是**参数个数的下界**（至少这么多），不是确切个数。
+        没有调试信息时，参数寄存器没被读到不等于没有这个参数 ——
+        它可能只被透传给别的调用，或者一进函数就存到栈上后再也没读。
+      </p>
+
+      <input
+        className="input input-small"
+        placeholder="按函数入口地址筛选"
+        value={filter}
+        onChange={(event) => setFilter(event.target.value)}
+      />
+
+      <div className="table-wrap-short">
+        <table>
+          <thead>
+            <tr>
+              <th>入口</th>
+              <th>至少</th>
+              <th>用到的参数寄存器</th>
+              <th>指令数</th>
+              <th>栈参数</th>
+            </tr>
+          </thead>
+          <tbody>
+            {functions.map((f) => (
+              <tr key={f.entry}>
+                <td className="mono">{f.entry}</td>
+                <td className="num">≥ {f.lower_bound}</td>
+                <td>
+                  {f.used_names.length === 0 ? (
+                    <span className="unknown">未观测到</span>
+                  ) : (
+                    <span className="ref-list">
+                      {f.used.map((slot, i) => (
+                        <span
+                          key={slot}
+                          className="chip-code"
+                          title={`第 ${slot + 1} 个参数`}
+                        >
+                          {f.used_names[i]}
+                        </span>
+                      ))}
+                    </span>
+                  )}
+                  {f.unobserved_from !== null && (
+                    <span className="unknown">
+                      {" "}
+                      第 {f.unobserved_from + 1} 个起未观测到
+                    </span>
+                  )}
+                </td>
+                <td className="num">{f.insn_count}</td>
+                <td className="num">
+                  {f.reads_stack_args ? (
+                    <span title="寄存器传参不够用，参数也走了栈">是</span>
+                  ) : (
+                    <span className="unknown">无</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {functions.length === 0 && (
+        <p className="hint">没有匹配的函数。</p>
+      )}
+
+      <Notes notes={scan.notes} />
+    </div>
+  );
+}
+
+/** 降级/说明列表。没有说明时什么都不渲染，不留空标题。 */
+function Notes({ notes }: { notes: string[] }) {
+  if (notes.length === 0) {
+    return null;
+  }
+  return (
+    <section>
+      <h3 className="section-title">说明</h3>
+      <ul className="notes">
+        {notes.map((n) => (
+          <li key={n}>{n}</li>
+        ))}
+      </ul>
+    </section>
   );
 }

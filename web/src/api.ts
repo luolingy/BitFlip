@@ -596,6 +596,88 @@ export interface JumpTablesResponse {
   notes: string[];
 }
 
+/** `/api/const-scan` 响应。 */
+export interface ConstScanResponse {
+  format_version: number;
+  strings: StringUsage[];
+  strides: StringStride[];
+  immediates: Immediate[];
+  immediate_total: number;
+  immediate_distinct: number;
+  notes: string[];
+}
+
+/** 一条被指令引用的字符串。 */
+export interface StringUsage {
+  /** 定长 16 位小写十六进制。 */
+  address: string;
+  /** 引用它的函数入口（可能为空：引用点落在已知函数之外）。 */
+  functions: string[];
+  /** 引用点（指令地址）。 */
+  sites: string[];
+}
+
+/** 一个基址寄存器上的访问位移观测。 */
+export interface StringStride {
+  /** 基址寄存器编号（capstone 的 `RegId`）。 */
+  base: number;
+  /** 访问宽度（字节）。 */
+  width: number;
+  /** 推断出的步长；`null` 表示推不出来 —— **不是 0**。 */
+  stride: number | null;
+  /** 观测到的位移（升序）。 */
+  offsets: number[];
+}
+
+/** 一个高频立即数。 */
+export interface Immediate {
+  /**
+   * 立即数值，**十进制字符串**。
+   *
+   * 用字符串而不是 `number`：JSON 里超过 2^53 的整数会在 JS 侧被
+   * 静默截断，而目标里完全可能出现这样的立即数。
+   */
+  value: string;
+  count: number;
+}
+
+/** `/api/arg-scan` 响应。 */
+export interface ArgScanResponse {
+  format_version: number;
+  /** 调用约定中文名；`null` 表示该架构没有寄存器级约定（如 wasm32）。 */
+  abi_name: string | null;
+  /** 参数寄存器名（按调用顺序）。 */
+  arg_reg_names: string[];
+  functions: ArgInference[];
+  notes: string[];
+}
+
+/** 单个函数的参数推断结果。 */
+export interface ArgInference {
+  /** 函数入口，定长 16 位小写十六进制。 */
+  entry: string;
+  /** 推断所依据的指令条数。 */
+  insn_count: number;
+  /** 确定用到的参数寄存器序号（ABI 序号，不重编号）。 */
+  used: number[];
+  /** 上述序号对应的寄存器名，便于直接显示。 */
+  used_names: string[];
+  /**
+   * 参数个数的**下界**（最大已用序号 + 1）。
+   *
+   * 不是参数个数：没有调试信息时，参数寄存器没被读到不等于没有这个
+   * 参数（可能只被透传，或者一进函数就存到栈上）。UI 上必须显示成
+   * "至少 N 个"，不能显示成"有 N 个"。
+   */
+  lower_bound: number;
+  /** 第一个未观测到读取的参数寄存器序号；`null` 表示全都用到了。 */
+  unobserved_from: number | null;
+  /** ABI 规定的寄存器参数容量。 */
+  register_slots: number;
+  /** 是否观测到从栈上读参数。 */
+  reads_stack_args: boolean;
+}
+
 /** 一条用户标注。对应 `bitflip-project::Annotation`。 */export interface Annotation {
   /** 定长 16 位小写十六进制。 */
   address: string;
@@ -692,6 +774,20 @@ export async function fetchJumpTables(
   token: string | null,
 ): Promise<JumpTablesResponse | null> {
   return requestOrNull<JumpTablesResponse>("/api/jump-tables", token);
+}
+
+/** 取常量/结构体初步推断。 */
+export async function fetchConstScan(
+  token: string | null,
+): Promise<ConstScanResponse | null> {
+  return requestOrNull<ConstScanResponse>("/api/const-scan", token);
+}
+
+/** 取调用约定与参数推断。 */
+export async function fetchArgScan(
+  token: string | null,
+): Promise<ArgScanResponse | null> {
+  return requestOrNull<ArgScanResponse>("/api/arg-scan", token);
 }
 
 /** 取某地址的交叉引用。 */export async function fetchXrefs(
