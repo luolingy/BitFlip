@@ -100,7 +100,7 @@ impl Annotation {
     #[must_use]
     pub fn patch_bytes(&self) -> Option<Vec<u8>> {
         let hex = self.patch_hex.as_deref()?;
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return None;
         }
         let mut out = Vec::with_capacity(hex.len() / 2);

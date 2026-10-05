@@ -5,7 +5,9 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.85"
+# 1.87 是 `rquickjs` 的 MSRV（ADR-0013 选定的脚本引擎）。继续声明更低的版本
+# 会变成一句谎话：装到 1.85 的机器上根本编不过。
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitflip/bitflip"
 homepage = "https://github.com/bitflip/bitflip"
@@ -20,6 +22,7 @@ bitflip-analyze = { path = "crates/bitflip-analyze", version = "0.0.1" }
 bitflip-symbols = { path = "crates/bitflip-symbols", version = "0.0.1" }
 bitflip-project = { path = "crates/bitflip-project", version = "0.0.1" }
 bitflip-core = { path = "crates/bitflip-core", version = "0.0.1" }
+bitflip-script = { path = "crates/bitflip-script", version = "0.0.1" }
 bitflip-server = { path = "crates/bitflip-server", version = "0.0.1" }
 bitflip-cli = { path = "crates/bitflip-cli", version = "0.0.1" }
 
@@ -31,6 +34,11 @@ clap = { version = "4", features = ["derive", "env"] }
 mime_guess = "2"
 rand = "0.8"
 rayon = "1"
+# 脚本引擎（ADR-0013）。刻意不写 `default-features = false`：
+# rquickjs 的 default 就是 `std`，先只开它。`full` 会额外拉进
+# chrono / loader / dyn-load / either / indexmap / phf —— 这些在 M7
+# 的宿主 API 里用不上，不该为了"以后可能要"先付编译时间。
+rquickjs = "0.14"
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

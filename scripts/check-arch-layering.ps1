@@ -13,6 +13,10 @@
 #      (production code, #[cfg(test)] mod tests excluded) must not mention
 #      architecture variants, endianness variants or mode variants.
 #   2. crates/bitflip-server/src/*.rs likewise.
+#   3. crates/bitflip-script/src/*.rs likewise. The script layer sits between
+#      core and server; if it ever branches on architecture, guest scripts
+#      silently stop being portable across targets, which is exactly the
+#      cumulative failure this gate exists to prevent.
 #
 # Why tests are excluded: a unit test must be able to build a decoder for a
 # specific architecture to verify it. Banning that would push fixtures out of
@@ -40,7 +44,8 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $guarded = @(
     'crates/bitflip-analyze/src',
     'crates/bitflip-core/src',
-    'crates/bitflip-server/src'
+    'crates/bitflip-server/src',
+    'crates/bitflip-script/src'
 )
 
 # Architecture-specific tokens. Deliberately broad: a false positive costs a

@@ -96,7 +96,7 @@ fn build_large_elf(total: usize) -> Vec<u8> {
         }
         // 每 4 个周期插入一次 call rel32（指向下一个周期的入口），
         // 让递归下降有真实的工作量可做
-        if cycle % 4 == 0 {
+        if cycle.is_multiple_of(4) {
             body[10] = 0xE8;
             let rel = 32i32 - 5; // 从 call 结束处跳到下一个周期的入口
             body[11..15].copy_from_slice(&rel.to_le_bytes());

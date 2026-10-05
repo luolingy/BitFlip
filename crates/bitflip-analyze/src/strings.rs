@@ -138,7 +138,7 @@ fn scan_utf16le(data: &[u8], base: u64, opts: &StringOptions, out: &mut Vec<Stri
                 continue;
             }
             // 不构成合格串：从下一个对齐点重试
-            i = if s % 2 == 0 { s + 2 } else { s + 1 };
+            i = if s.is_multiple_of(2) { s + 2 } else { s + 1 };
         } else {
             i += 2; // 非对齐步进：只在偶数偏移找对
         }

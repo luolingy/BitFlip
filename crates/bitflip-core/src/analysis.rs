@@ -2298,7 +2298,9 @@ impl StringScanner {
                 }
             }
             // ── UTF-16LE 状态机（按绝对地址偶对齐配对）──
-            if addr % 2 == 0 {
+            // 用 `is_multiple_of` 而不是 `% 2 == 0`：MSRV 提到 1.87 后 clippy 会
+            // 要求这么写，而且它把"偶对齐"这个意图直接写出来了。
+            if addr.is_multiple_of(2) {
                 self.utf16_pending_lo = Some((b, addr));
             } else if let Some((lo, run_addr)) = self.utf16_pending_lo.take() {
                 // (lo, b) 构成一对，lo 在偶地址 run_addr

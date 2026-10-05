@@ -71,7 +71,7 @@ fn synthetic_graph(n: usize) -> (Vec<bitflip_arch::DecodedInsn>, Vec<FunctionRan
             }
         }
         // 环：每 50 个函数里前两个互相调用
-        if i % 50 == 0 && i + 2 <= n {
+        if i.is_multiple_of(50) && i + 2 <= n {
             insns.push(mk_call(here + 12, BASE + (i + 1) as u64 * STRIDE));
         }
     }

@@ -992,7 +992,7 @@ mod tests {
         }
         let space = space_with(&bytes, 0x2000, true);
         // 最坏情况：段内每个 4 字节边界都"是指令起点"
-        let any_start = |a: u64| (0x2000..0x2200).contains(&a) && (a - 0x2000) % 4 == 0;
+        let any_start = |a: u64| (0x2000..0x2200).contains(&a) && (a - 0x2000).is_multiple_of(4);
 
         // movq 0x…(%rip), %rax —— 从数据槽取函数指针（没有索引！）
         //

@@ -1,0 +1,22 @@
+[package]
+name = "bitflip-script"
+description = "BitFlip 脚本层：嵌入式 JavaScript 引擎、沙箱与宿主 API（ADR-0013）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bitflip-core = { workspace = true }
+rquickjs = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

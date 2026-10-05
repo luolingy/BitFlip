@@ -577,7 +577,7 @@ mod tests {
         cie_body.push(1); // augmentation data length
         cie_body.push(0x1b); // 'R' 编码：pcrel | sdata4
                              // 对齐到 4 字节（记录体以 4 字节对齐）
-        while (cie_body.len() + 4) % 4 != 0 {
+        while !(cie_body.len() + 4).is_multiple_of(4) {
             cie_body.push(0);
         }
         let cie_len = 4 + cie_body.len(); // length 字段之后的字节数
@@ -596,7 +596,7 @@ mod tests {
             // pc_range：同编码的数值部分（sdata4）
             fde_body.extend_from_slice(&(length as i32).to_le_bytes());
             fde_body.push(0); // augmentation data length
-            while (fde_body.len() + 4) % 4 != 0 {
+            while !(fde_body.len() + 4).is_multiple_of(4) {
                 fde_body.push(0);
             }
             let fde_len = 4 + fde_body.len();
