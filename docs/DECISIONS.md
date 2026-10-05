@@ -158,7 +158,7 @@ vite 在加载配置时会 `execFile` 解析真实路径，而沙箱禁止 Node 
 
 | ID | 决策 | 期限 | 候选与倾向 |
 |----|------|------|-----------|
-| D1 | 脚本层引擎 | M6 末 | rquickjs（JS 生态、C 依赖编译）/ mlua（易嵌入、Lua 生态弱）/ wasmtime（隔离最好、API 笨重）。倾向：先 rquickjs，若构建负担过重退 mlua |
+| D1 | 脚本层引擎 | **已到期限（M6 已完成），等待选择** | rquickjs（JS 生态 + 与前端同语言）/ mlua（绑定最成熟、体积最小）/ wasmtime（隔离最好、ABI 税最重）。**分析已完成，见 [`docs/D1-SCRIPT-ENGINE-ANALYSIS.md`](./D1-SCRIPT-ENGINE-ANALYSIS.md)**（含本机实测的构建时间/体积/中断行为）。推荐 A（rquickjs）并把 WASM 推迟到 M8+，但 A 与 B 的取舍是"脚本语言选型"，由人决定 |
 | ~~D2~~ | ~~工程库存储~~ | — | **已决：见 ADR-0012（主数据 SQLite + 派生物独立文件，分层）** |
 | ~~D3~~ | ~~解码后端~~ | — | **已决：见 ADR-0011（capstone 单后端，接口保持后端抽象）** |
 

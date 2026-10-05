@@ -597,6 +597,8 @@ M6 交付物至此**全部完成**。
 
 交付物：
 - 嵌入脚本引擎（rquickjs / mlua / wasmtime 三选一，见 DECISIONS D1）+ 沙箱与超时。
+  决策依据（含本机实测的构建时间/体积/中断行为）见
+  [`docs/D1-SCRIPT-ENGINE-ANALYSIS.md`](./D1-SCRIPT-ENGINE-ANALYSIS.md)。
 - 脚本 API：读地址空间/指令/函数/xref/符号、写注释与名字、注册分析 pass、生成补丁、
   自定义视图数据源；错误与日志回传到 UI。
 - UI：脚本控制台（REPL + 结果表格）、脚本库（保存/复用）、脚本触发的批处理进度。
@@ -730,7 +732,7 @@ M6 交付物至此**全部完成**。
 
 | ID | 决策 | 影响 | 状态 |
 |----|------|------|------|
-| D1 | 脚本层：rquickjs（JS） / mlua（Lua） / wasmtime（WASM 插件） | M7 起全部脚本能力与插件生态 | 待定（M6 末） |
+| D1 | 脚本层：rquickjs（JS） / mlua（Lua） / wasmtime（WASM 插件） | M7 起全部脚本能力与插件生态 | **分析已完成，等待选择**（[D1-SCRIPT-ENGINE-ANALYSIS.md](./D1-SCRIPT-ENGINE-ANALYSIS.md)） |
 | ~~D2~~ | ~~工程库：SQLite / 自研日志~~ | M4 起所有持久化 | **已决：主数据 SQLite + 派生物独立文件（ADR-0012，分析见 `D2-STORAGE-ANALYSIS.md`）** |
 | ~~D3~~ | ~~解码后端：capstone / + iced-x86~~ | 指令文本质量与属性精度 | **已决：capstone 单后端，接口保持后端抽象（ADR-0011）** |
 | D4 | PDB/DWARF 依赖范围 | M8 工作量与体积 | 待定（M8 前） |
