@@ -22,6 +22,7 @@ import {
   fetchCodeMap,
   fetchConstScan,
   fetchFunctions,
+  fetchFrames,
   fetchJumpTables,
   formatAddress,
   normalizeAddress,
@@ -30,6 +31,7 @@ import {
   type CodeMapResponse,
   type ConstScanResponse,
   type FunctionWire,
+  type FrameScanResponse,
   type JumpTablesResponse,
 } from "./api";
 
@@ -767,10 +769,110 @@ function immediateHex(value: string): string {
   }
 }
 
+export function FrameScanView({ token }: { token: string | null }) {
+  const loaded = useLoaded<FrameScanResponse>(() => fetchFrames(token), [token]);
+  const [filter, setFilter] = useState("");
+
+  if (loaded.kind === "loading") return <p className="hint">正在加载栈帧视图…</p>;
+  if (loaded.kind === "error") return <p className="error">加载失败：{loaded.message}</p>;
+  if (loaded.data === null) return <p className="hint">尚未打开目标。</p>;
+
+  const scan = loaded.data;
+  if (scan.abi_name === null) {
+    return (
+      <div className="m6-view">
+        <p className="banner-warn">该架构没有可用的调用约定，因此栈帧视图不适用。</p>
+        <Notes notes={scan.notes} />
+      </div>
+    );
+  }
+
+  const functions = scan.functions.filter((f) =>
+    filter.length === 0 ? true : f.entry.includes(filter.toLowerCase()),
+  );
+  const withFrame = scan.functions.filter((f) => f.frame_size !== null).length;
+  const withUnwind = scan.functions.filter((f) => f.unwind_frame_size !== null).length;
+  const agreed = scan.functions.filter((f) => f.source.includes("一致") && !f.source.includes("不一致")).length;
+
+  return (
+    <div className="m6-view">
+      <div className="summary-grid">
+        <div className="summary-card">
+          <div className="summary-label">调用约定</div>
+          <div className="summary-value">{scan.abi_name}</div>
+          <div className="summary-hint">帧大小来自展开信息与前导扫描</div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">帧大小</div>
+          <div className="summary-value">{withFrame} / {scan.functions.length}</div>
+          <div className="summary-hint">有确定结论的函数</div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">交叉核对</div>
+          <div className="summary-value">{agreed}</div>
+          <div className="summary-hint">两个来源一致</div>
+        </div>
+      </div>
+
+      <p className="banner-note">
+        展开信息是编译器生成的权威数据；前导扫描用于补充与核对。两个来源不一致时，
+        表中同时保留两个值，不能把分歧隐藏成一个数字。
+      </p>
+      <p className="summary-hint">有展开信息细节：{withUnwind} 个函数</p>
+      <input
+        className="input input-small"
+        placeholder="按函数入口地址筛选"
+        value={filter}
+        onChange={(event) => setFilter(event.target.value)}
+      />
+
+      <div className="table-wrap-short">
+        <table>
+          <thead>
+            <tr>
+              <th>入口</th>
+              <th>帧大小</th>
+              <th>来源</th>
+              <th>保存寄存器</th>
+              <th>帧指针</th>
+              <th>前导长度</th>
+            </tr>
+          </thead>
+          <tbody>
+            {functions.map((f) => (
+              <tr key={f.entry}>
+                <td className="mono">{f.entry}</td>
+                <td className="num">
+                  {f.frame_size === null ? <span className="unknown">未知</span> : `${f.frame_size} B`}
+                  {(f.unwind_frame_size !== f.prologue_frame_size) && (
+                    <div className="subvalue">展开 {f.unwind_frame_size ?? "未知"} / 前导 {f.prologue_frame_size ?? "未知"}</div>
+                  )}
+                </td>
+                <td>{f.source}</td>
+                <td>
+                  {f.saved_registers.length === 0 ? (
+                    <span className="unknown">无</span>
+                  ) : (
+                    <span className="ref-list">
+                      {f.saved_registers.map((reg) => <span className="chip-code" key={reg}>{reg}</span>)}
+                    </span>
+                  )}
+                </td>
+                <td>{f.frame_pointer ?? <span className="unknown">无</span>}</td>
+                <td className="num">{f.prologue_len === null ? <span className="unknown">未知</span> : `${f.prologue_len} B`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {functions.length === 0 && <p className="hint">没有匹配的函数。</p>}
+      <Notes notes={scan.notes} />
+    </div>
+  );
+}
+
 /**
  * 调用约定与参数推断。
- *
- * # 「下界」这个词必须出现在界面上
  *
  * 后端给的是"至少有几个参数"，不是"有几个参数"。没有调试信息时，
  * 参数寄存器没被读到**不等于**没有这个参数（可能只被透传、或者一进

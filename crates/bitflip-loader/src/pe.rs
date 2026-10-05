@@ -1126,15 +1126,18 @@ fn parse_unwind_info(
         // 附加数据读取：从后续槽位读（2 字节 / 4 字节）。
         let next_slot = base + 2;
         match opcode {
-            // ALLOC_LARGE：OpInfo=0 → 下 1 槽 4 字节大小；OpInfo=1 → 下 2 槽 8 字节
+            // ALLOC_LARGE：OpInfo=0 → 下 1 槽、以 8 字节为单位的大小；
+            // OpInfo=1 → 下 2 槽、未缩放的 32 位字节数。
             1 => {
                 slots = if info == 1 { 3 } else { 2 };
                 let size = if info == 1 {
+                    // OpInfo=1：后两个槽组成未缩放的 32 位字节数。
                     reader.u32(next_slot, Endianness::Little, "ALLOC_LARGE 大小")
                 } else {
+                    // OpInfo=0：下一个槽是以 8 字节为单位的缩放值。
                     reader
                         .u16(next_slot, Endianness::Little, "ALLOC_LARGE 大小")
-                        .map(u32::from)
+                        .map(|scaled| u32::from(scaled) * 8)
                 };
                 match size {
                     Ok(s) => extra = Some(s),
@@ -2360,7 +2363,26 @@ mod tests {
         }
     }
 
-    /// ALLOC_LARGE（info=1，8 字节大小，占 3 槽）。
+    /// ALLOC_LARGE（info=0）读取的是 8 字节单位，不是原始字节数。
+    #[test]
+    fn unwind_alloc_large_scaled_form_multiplies_by_eight() {
+        // version 1；CountOfCodes=2；op=1/info=0；scaled size=0x12 -> 0x90 bytes
+        let blob = [
+            0x01, 0x01, 0x02, 0x00, // 头
+            0x00, 0x01, // ALLOC_LARGE info=0
+            0x12, 0x00, // scaled size
+        ];
+        let (obj, bytes) = object_with_rdata(&blob);
+        let reader = Reader::with_base(&bytes, 0);
+        let info = parse_unwind_info(&reader, &obj, 0x1_4000_2000).expect("解码");
+        assert_eq!(info.frame_size(), Some(0x90));
+        assert!(matches!(
+            info.ops.as_slice(),
+            [PeUnwindOp::Alloc { size: 0x90 }]
+        ));
+    }
+
+    /// ALLOC_LARGE（info=1，未缩放的 32 位字节大小，占 3 槽）。
     #[test]
     fn unwind_alloc_large_reads_full_width() {
         // version 0；SizeOfProlog=1；CountOfCodes=3

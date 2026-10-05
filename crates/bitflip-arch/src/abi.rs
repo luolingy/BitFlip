@@ -104,6 +104,26 @@ impl AbiSpec {
         self.arg_reg_names.contains(&name)
     }
 
+    /// 一个寄存器压栈占几个字节（前导扫描用它累计帧大小）。
+    ///
+    /// # 为什么这个数属于 ABI 而不是调用方
+    ///
+    /// 32 位架构（x86、ARM）的 `push` 占 4 字节，64 位占 8 字节 ——
+    /// 这是**架构的事实**，不是调用方该自己分支的。放在 `bitflip-analyze`
+    /// 里的每一处 `match arch` 都违反分层（架构差异必须收敛在
+    /// `bitflip-arch`），而且换一个新架构时调用方会漏改。
+    ///
+    /// 按字宽取数而不是逐架构枚举：字宽由解码器规格给出，新架构只改
+    /// `bitflip-arch` 这一处。
+    #[must_use]
+    pub fn stack_slot_size(&self) -> u64 {
+        if self.spec.is_64bit() {
+            8
+        } else {
+            4
+        }
+    }
+
     /// 把寄存器名解析成 capstone 的 [`RegId`]。
     ///
     /// # 为什么必须查真实后端而不是写死编号

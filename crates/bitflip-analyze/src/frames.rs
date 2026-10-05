@@ -42,7 +42,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use bitflip_arch::{AbiSpec, Arch, CapstoneDecoder, DecodedInsn, Flow, Operand, RegId};
+use bitflip_arch::{AbiSpec, CapstoneDecoder, DecodedInsn, Flow, Operand, RegId};
 use bitflip_loader::object::{PeUnwindInfo, UnwindEntry};
 
 use crate::args::InsnRange;
@@ -238,11 +238,13 @@ fn lookup_unwind<'a>(index: &[(u64, &'a PeUnwindInfo)], entry: u64) -> Option<&'
 struct NameResolver<'a> {
     abi: &'a AbiSpec,
     decoder: Option<CapstoneDecoder>,
-    /// `MnemonicId`（按架构分开）→ 名字。
+    /// `MnemonicId` → 名字。
     ///
     /// 前导扫描每条指令都要判助记符，而函数有几千个。逐个走 FFI 会
-    /// 明显变慢；编号在同一个架构内稳定，所以按编号缓存。
-    mnemonic_cache: RefCell<BTreeMap<(u32, u8), Option<String>>>,
+    /// 明显变慢；编号在同一个解码器（= 同一个架构规格）内稳定，所以
+    /// 按编号缓存。键里**不需要**再混架构：一个 `NameResolver` 只服务
+    /// 一个 `AbiSpec`，缓存的生命周期与它一致。
+    mnemonic_cache: RefCell<BTreeMap<u32, Option<String>>>,
 }
 
 impl<'a> NameResolver<'a> {
@@ -256,7 +258,7 @@ impl<'a> NameResolver<'a> {
 
     /// 助记符名（带缓存）。
     fn mnemonic(&self, insn: &DecodedInsn) -> Option<String> {
-        let key = (insn.mnemonic.0, arch_tag(insn.arch));
+        let key = insn.mnemonic.0;
         if let Some(hit) = self.mnemonic_cache.borrow().get(&key) {
             return hit.clone();
         }
@@ -293,21 +295,6 @@ impl<'a> NameResolver<'a> {
         }
         // 表外寄存器：向真实后端问（例如 AArch64 的 x30 链接寄存器）。
         self.decoder.as_ref().and_then(|d| d.register_name(reg))
-    }
-}
-
-fn arch_tag(arch: Arch) -> u8 {
-    match arch {
-        Arch::X86 => 0,
-        Arch::X86_64 => 1,
-        Arch::Aarch64 => 2,
-        Arch::Arm => 3,
-        Arch::Riscv32 => 4,
-        Arch::Riscv64 => 5,
-        Arch::Mips => 6,
-        Arch::Mips64 => 7,
-        Arch::Wasm32 => 8,
-        _ => 255,
     }
 }
 
@@ -435,11 +422,10 @@ fn scan_prologue(body: &[DecodedInsn], resolver: &NameResolver<'_>) -> PrologueS
         .frame_pointer_name
         .and_then(|n| resolver.abi.reg_id(n));
 
-    // 一个寄存器占几个字节：32 位架构（x86 / ARM）是 4，其余 8。
-    let slot = match body.first().map(|i| i.arch) {
-        Some(Arch::X86 | Arch::Arm) => 4u64,
-        _ => 8,
-    };
+    // 一个寄存器压栈占几个字节。这是架构的事实，属于 ABI 层 ——
+    // 在这里按 `arch` 分支会违反分层（架构差异必须收敛在 bitflip-arch），
+    // 新架构出现时这里也会漏改。
+    let slot = resolver.abi.stack_slot_size();
 
     for (n, insn) in body.iter().enumerate() {
         if n >= MAX_PROLOGUE_INSNS || scan.len >= MAX_PROLOGUE_BYTES {
@@ -697,7 +683,7 @@ pub fn summarize_frames(inferences: &[FrameInference], abi: Option<&AbiSpec>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitflip_arch::{abi_for_spec, decoder_for, ArchSpec, Endian, Mode};
+    use bitflip_arch::{abi_for_spec, decoder_for, Arch, ArchSpec, Endian, Mode};
     use bitflip_loader::object::PeUnwindOp;
 
     fn x64() -> ArchSpec {

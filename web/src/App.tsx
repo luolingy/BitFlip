@@ -23,6 +23,7 @@ import {
   CallGraphView,
   CodeMapView,
   ConstScanView,
+  FrameScanView,
   JumpTablesView,
 } from "./M6Views";
 
@@ -54,7 +55,8 @@ type ViewId =
   | "code-map"
   | "jump-tables"
   | "const-scan"
-  | "arg-scan";
+  | "arg-scan"
+  | "frames";
 
 const NAV_SECTIONS: readonly {
   /** 只有 `ready: true` 的项才是真实可切换的视图。 */
@@ -79,6 +81,7 @@ const NAV_SECTIONS: readonly {
   { id: "jump-tables", title: "跳转表", milestone: "M6", hint: "switch 分派表与目标集合", ready: true },
   { id: "const-scan", title: "常量/结构体", milestone: "M6", hint: "字符串引用、访问位移、高频立即数", ready: true },
   { id: "arg-scan", title: "参数推断", milestone: "M6", hint: "调用约定与参数下界", ready: true },
+  { id: "frames", title: "栈帧 / 局部变量", milestone: "M6", hint: "展开信息与前导扫描", ready: true },
   // 下面这些确实还没做（M8 签名库匹配），保持置灰 —— 不给点了没反应的按钮。
   { id: null, title: "签名匹配", milestone: "M8", hint: "库函数签名识别", ready: false },
 ];
@@ -97,6 +100,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   "jump-tables": "跳转表",
   "const-scan": "常量 / 结构体初步",
   "arg-scan": "调用约定与参数推断",
+  frames: "栈帧 / 局部变量",
 };
 
 
@@ -299,6 +303,8 @@ export function App() {
             <ConstScanView token={token} />
           ) : view === "arg-scan" ? (
             <ArgScanView token={token} />
+          ) : view === "frames" ? (
+            <FrameScanView token={token} />
           ) : parsed ? (
             <StructureView parsed={parsed} target={target} />
           ) : (

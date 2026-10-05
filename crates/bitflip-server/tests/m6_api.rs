@@ -576,7 +576,64 @@ async fn arg_scan_response_matches_the_frontend_contract() {
     }
 }
 
-/// 五个端点在没有目标时都必须给出明确的 400，而不是 500 或空数组。
+/// 栈帧视图的字段形状。
+///
+/// 重点在**两个帧大小字段都在**：帧大小有两个来源（展开信息 / 前导
+/// 扫描），不一致时两个值都必须给出来。把它们合成一个 `frame_size`
+/// 会让人看不到分歧，等于替用户做了决定。
+#[tokio::test]
+async fn frames_response_matches_the_frontend_contract() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+    let (status, body) = get(state, "/api/frames").await;
+    assert_eq!(status, StatusCode::OK, "响应：{body}");
+
+    assert_keys(
+        &body,
+        &["format_version", "abi_name", "functions", "notes"],
+        "frames 响应",
+    );
+
+    for f in body["functions"].as_array().expect("functions 是数组") {
+        assert_keys(
+            f,
+            &[
+                "entry",
+                "frame_size",
+                "source",
+                "unwind_frame_size",
+                "prologue_frame_size",
+                "prologue_len",
+                "saved_registers",
+                "frame_pointer",
+                "stopped_at",
+                "notes",
+            ],
+            "frames.functions 条目",
+        );
+
+        assert_eq!(f["entry"].as_str().unwrap().len(), 16, "地址定长 16 位");
+
+        // `frame_size` 拿不到时必须是 null，不能用 0 冒充
+        // （0 是"确实没有栈帧"这个有意义的结论，两者不能混）。
+        if f["frame_size"].is_null() {
+            assert!(
+                f["unwind_frame_size"].is_null() && f["prologue_frame_size"].is_null(),
+                "frame_size 为 null 时两个来源也必须都是 null：{f}"
+            );
+        }
+
+        // stopped_at 是地址，必须是定长 16 位或 null
+        if let Some(at) = f["stopped_at"].as_str() {
+            assert_eq!(at.len(), 16, "stopped_at 必须定长 16 位，实际 {at:?}");
+        }
+
+        // source 必须是人能读的中文说明，不能是空串
+        let source = f["source"].as_str().expect("source 是字符串");
+        assert!(!source.trim().is_empty(), "source 不能为空：{f}");
+    }
+}
+
+/// 六个端点在没有目标时都必须给出明确的 400，而不是 500 或空数组。
 #[tokio::test]
 async fn m6_endpoints_require_a_target() {
     let state = AppState::new(TOKEN, None)
@@ -587,6 +644,7 @@ async fn m6_endpoints_require_a_target() {
         "/api/code-map",
         "/api/const-scan",
         "/api/arg-scan",
+        "/api/frames",
         "/api/jump-tables",
     ] {
         let (status, _) = get(state.clone(), uri).await;

@@ -17,9 +17,9 @@ mod session;
 
 pub use analysis::{
     ArgInferenceWire, ArgScanWire, BlockWire, CallEdgeWire, CallGraphSummaryWire, CallGraphWire,
-    CfgWire, CodeMap, CodeMapSample, CodeMapStats, ConstScanWire, FunctionWire, ImmediateWire,
-    StrideWire, StringUsageWire, StringWire, TargetAnalysis, UnresolvedCallWire, XrefWire,
-    ANALYSIS_FORMAT_VERSION,
+    CfgWire, CodeMap, CodeMapSample, CodeMapStats, ConstScanWire, FrameInferenceWire,
+    FrameScanWire, FunctionWire, ImmediateWire, StrideWire, StringUsageWire, StringWire,
+    TargetAnalysis, UnresolvedCallWire, XrefWire, ANALYSIS_FORMAT_VERSION,
 };
 pub use disasm::{
     hex16, parse_address, Disasm, DisasmStats, InsnPage, InsnWire, DEFAULT_PAGE_SIZE,

@@ -790,6 +790,36 @@ export async function fetchArgScan(
   return requestOrNull<ArgScanResponse>("/api/arg-scan", token);
 }
 
+/** `/api/frames` 响应。 */
+export interface FrameScanResponse {
+  format_version: number;
+  abi_name: string | null;
+  functions: FrameInference[];
+  notes: string[];
+}
+
+/** 单个函数的栈帧与局部变量视图。 */
+export interface FrameInference {
+  entry: string;
+  frame_size: number | null;
+  source: string;
+  unwind_frame_size: number | null;
+  prologue_frame_size: number | null;
+  prologue_len: number | null;
+  saved_registers: string[];
+  frame_pointer: string | null;
+  stopped_at: string | null;
+  notes: string[];
+}
+
+/** 取栈帧与局部变量视图。 */
+export async function fetchFrames(
+  token: string | null,
+): Promise<FrameScanResponse | null> {
+  return requestOrNull<FrameScanResponse>("/api/frames", token);
+}
+
+
 /** 取某地址的交叉引用。 */export async function fetchXrefs(
   token: string | null,
   address: string,

@@ -157,7 +157,52 @@ pub struct TargetAnalysis {
     const_scan: ConstScanWire,
     /// 调用约定与参数推断。M6 引入。
     arg_scan: ArgScanWire,
+    /// 栈帧与局部变量视图。M6 引入。
+    frame_scan: FrameScanWire,
     notes: Vec<String>,
+}
+
+/// 栈帧扫描的 wire 表示（M6）。
+///
+/// # 为什么两个帧大小字段都要给
+///
+/// 帧大小有两个来源：PE 的展开信息（编译器生成的权威数据）和前导扫描
+/// （顺着指令累加）。两者可能不一致 —— 那正是**要让人看见**的信息，
+/// 而不是挑一个藏起来。所以 `unwind_frame_size` 与
+/// `prologue_frame_size` 都出现在响应里，`source` 说明采纳了谁。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameScanWire {
+    /// 调用约定的中文名；`None` 表示该架构没有可用的调用约定。
+    pub abi_name: Option<String>,
+    /// 每个函数的帧推断（按入口升序）。
+    pub functions: Vec<FrameInferenceWire>,
+    /// 降级说明（中文）。
+    pub notes: Vec<String>,
+}
+
+/// 单个函数的栈帧推断（M6）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameInferenceWire {
+    /// 函数入口。
+    pub entry: String,
+    /// **采纳**的帧大小（字节）；`None` = 没拿到，不用 0 冒充。
+    pub frame_size: Option<u64>,
+    /// 帧大小的来源与两个来源是否一致。
+    pub source: String,
+    /// 展开信息给出的帧大小。
+    pub unwind_frame_size: Option<u64>,
+    /// 前导扫描算出的帧大小。
+    pub prologue_frame_size: Option<u64>,
+    /// 前导扫描覆盖的字节数。
+    pub prologue_len: Option<u64>,
+    /// 保存的非易失寄存器（按前导顺序）。
+    pub saved_registers: Vec<String>,
+    /// 帧指针寄存器名。
+    pub frame_pointer: Option<String>,
+    /// 前导扫描停在哪个地址。
+    pub stopped_at: Option<String>,
+    /// 这个函数的降级说明。
+    pub notes: Vec<String>,
 }
 
 /// 调用约定与参数推断的 wire 表示（M6）。
@@ -757,6 +802,15 @@ impl TargetAnalysis {
             object.kind == bitflip_loader::ObjectKind::Pe,
         );
 
+        // 栈帧与局部变量视图（M6）：展开信息 + 前导扫描，两边交叉核对。
+        let frame_scan = build_frame_scan(
+            disasm,
+            &functions,
+            &object.unwind,
+            &mut notes,
+            object.kind == bitflip_loader::ObjectKind::Pe,
+        );
+
         Self {
             functions,
             xrefs,
@@ -769,6 +823,7 @@ impl TargetAnalysis {
             call_graph,
             const_scan,
             arg_scan,
+            frame_scan,
             notes,
         }
     }
@@ -783,6 +838,12 @@ impl TargetAnalysis {
     #[must_use]
     pub fn arg_scan(&self) -> &ArgScanWire {
         &self.arg_scan
+    }
+
+    /// 栈帧与局部变量视图。
+    #[must_use]
+    pub fn frame_scan(&self) -> &FrameScanWire {
+        &self.frame_scan
     }
 
     /// 数据/代码判定结果。
@@ -1362,6 +1423,81 @@ fn build_arg_scan(
             })
             .collect(),
         notes: scan.notes,
+    }
+}
+
+/// 栈帧与局部变量视图（M6）：展开信息 + 前导扫描。
+///
+/// # 展开信息从哪来
+///
+/// PE 的 `.pdata` 里每条 `RUNTIME_FUNCTION` 指向一份 `UNWIND_INFO`，
+/// 加载器已经解码成"帧大小 + 保存寄存器 + 帧指针"。ELF 的 `.eh_frame`
+/// 目前只解出函数边界、没有 CFI 指令解码，所以那部分 `decoded` 是
+/// `None` —— 扫描层会如实说明"帧大小只能靠前导扫描"，而不是假装有。
+fn build_frame_scan(
+    disasm: &Disasm,
+    functions: &[FunctionWire],
+    unwind: &[bitflip_loader::object::UnwindEntry],
+    notes: &mut Vec<String>,
+    windows: bool,
+) -> FrameScanWire {
+    let spec = disasm.decoder.spec();
+
+    let Some(abi) = bitflip_arch::abi_for_spec(spec, windows) else {
+        return FrameScanWire {
+            abi_name: None,
+            functions: Vec::new(),
+            notes: vec![bitflip_analyze::summarize_frames(&[], None)
+                .notes
+                .join("；")],
+        };
+    };
+
+    let insns = decode_indexed_insns(disasm);
+
+    let ranges: Vec<bitflip_analyze::ArgInsnRange> = functions
+        .iter()
+        .filter_map(|f| {
+            let start = parse_address(&f.start)?;
+            let end = f.end.as_deref().and_then(parse_address);
+            Some(bitflip_analyze::ArgInsnRange { start, end })
+        })
+        .collect();
+
+    let scan = bitflip_analyze::scan_frames(&insns, &ranges, unwind, &abi);
+    let summary = bitflip_analyze::summarize_frames(&scan.functions, Some(&abi));
+
+    for n in &scan.notes {
+        notes.push(n.clone());
+    }
+    for n in &summary.notes {
+        notes.push(n.clone());
+    }
+
+    FrameScanWire {
+        abi_name: summary.abi_name,
+        functions: scan
+            .functions
+            .iter()
+            .map(|f| FrameInferenceWire {
+                entry: hex16(f.entry),
+                frame_size: f.frame_size,
+                source: f.source.label_zh().to_string(),
+                unwind_frame_size: f.unwind_frame_size,
+                prologue_frame_size: f.prologue_frame_size,
+                prologue_len: f.prologue_len,
+                saved_registers: f.saved_registers.clone(),
+                frame_pointer: f.frame_pointer.clone(),
+                stopped_at: f.stopped_at.map(hex16),
+                notes: f.notes.clone(),
+            })
+            .collect(),
+        notes: scan
+            .notes
+            .iter()
+            .chain(summary.notes.iter())
+            .cloned()
+            .collect(),
     }
 }
 
@@ -2017,6 +2153,7 @@ mod tests {
             call_graph: CallGraphWire::default(),
             const_scan: ConstScanWire::default(),
             arg_scan: ArgScanWire::default(),
+            frame_scan: FrameScanWire::default(),
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());

@@ -350,6 +350,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/code-map", get(code_map))
         .route("/api/const-scan", get(const_scan))
         .route("/api/arg-scan", get(arg_scan))
+        .route("/api/frames", get(frames))
         .route("/api/call-graph", get(call_graph))
         .route("/api/cfg", get(cfg))
         .route("/api/members", get(members))
@@ -1044,6 +1045,40 @@ struct ArgScanResponse {
     arg_reg_names: Vec<String>,
     /// 每个函数的推断结果。
     functions: Vec<bitflip_core::ArgInferenceWire>,
+    /// 降级说明。
+    notes: Vec<String>,
+}
+
+/// 栈帧与局部变量视图：`GET /api/frames`。
+///
+/// 帧大小有两个来源（PE 的展开信息 / 前导扫描），响应里**两个值都给**，
+/// 并用 `source` 说明采纳了谁、两边是否一致 —— 不一致正是要让人看见的
+/// 信息，不能悄悄挑一个（CLAUDE.md §7）。
+async fn frames(State(state): State<AppState>) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let scan = analysis.frame_scan();
+    Json(FrameScanResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        abi_name: scan.abi_name.clone(),
+        functions: scan.functions.clone(),
+        notes: scan.notes.clone(),
+    })
+    .into_response()
+}
+
+/// `/api/frames` 的响应。
+#[derive(Serialize)]
+struct FrameScanResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 调用约定的中文名；`null` 表示该架构没有可用的调用约定。
+    abi_name: Option<String>,
+    /// 每个函数的帧推断结果。
+    functions: Vec<bitflip_core::FrameInferenceWire>,
     /// 降级说明。
     notes: Vec<String>,
 }
