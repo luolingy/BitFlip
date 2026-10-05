@@ -250,6 +250,52 @@ impl CapstoneDecoder {
         })
     }
 
+    /// 把架构规定的寄存器**名**解析成 capstone 的 [`RegId`]。
+    ///
+    /// # 为什么需要它
+    ///
+    /// ABI 表里存的是名字（`"rdi"`、`"rcx"`、`"x0"`）—— 那是给人看的
+    /// 契约，界面要显示它。而 `DecodedInsn::reads`/`writes` 里放的是
+    /// `RegId`，也就是 capstone 的编号。两套表示之间需要一个映射，
+    /// 否则"这个函数读了第 1 个参数寄存器吗"这个问题根本无从问起
+    /// （`AbiSpec::arg_regs()` 因此长期返回空表）。
+    ///
+    /// # 为什么不写死一张编号表
+    ///
+    /// `RegId` 由 capstone 决定，跨架构没有统一规律。写死编号在换
+    /// 后端或 capstone 版本变更时会**静默错位**：参数标注整体偏一两个
+    /// 寄存器，不报错，只是结论全错。
+    ///
+    /// 所以这里向真实后端要：遍历该架构的全部寄存器名，找同名的那一个。
+    /// 找不到返回 `None` —— 调用方据此说"这个架构不支持参数推断"，
+    /// 而不是拿一个猜的编号去比。
+    ///
+    /// 一次调用是 O(寄存器数)；参数推断按函数做，但每个架构的 ABI 表
+    /// 很小（几个到十几个名字），且调用方会在分析开始时解析一次。
+    #[must_use]
+    pub fn register_id(spec: ArchSpec, name: &str) -> Option<RegId> {
+        let decoder = CapstoneDecoder::new(spec).ok()?;
+        decoder.with_engine(|cs| {
+            // capstone 的寄存器编号不保证连续，按下标逐个问名字，
+            // 直到越界返回 None。
+            let mut index = 1u16;
+            loop {
+                let reg = capstone::RegId(index);
+                match cs.reg_name(reg) {
+                    Some(found) => {
+                        if found.eq_ignore_ascii_case(name) {
+                            return Some(RegId(index));
+                        }
+                        index = index.saturating_add(1);
+                    }
+                    // 编号超出该架构的寄存器表：到头了。
+                    // 这里**不是**"出错"，只是枚举结束。
+                    None => return None,
+                }
+            }
+        })
+    }
+
     /// 在该解码器**本线程**的 capstone 引擎上执行一段操作。
     ///
     /// 暴露这个是为了渲染层（`render` 模块）能查助记符与寄存器名 ——

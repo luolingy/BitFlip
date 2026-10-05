@@ -6,6 +6,7 @@
 //! 阶段划分（`docs/ARCHITECTURE.md` §5）在 M2 起逐个落地；M0 先固定契约与边界语义。
 
 mod addrspace;
+mod args;
 mod callgraph;
 mod cfg;
 mod codemap;
@@ -20,6 +21,9 @@ mod xref;
 pub use addrspace::{
     index_insn, AddrSpace, AddrSpaceError, ByteSource, InsnIndex, MappedSegment, PAGE_MASK,
     PAGE_SIZE, SYNTHETIC_BASE,
+};
+pub use args::{
+    infer_args, infer_args_all, summarize_args, ArgInference, ArgScan, InsnRange as ArgInsnRange,
 };
 pub use callgraph::{
     build_call_graph, find_function, CallEdge, CallGraph, CalleeResolution, FunctionRange,

@@ -349,6 +349,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/jump-tables", get(jump_tables))
         .route("/api/code-map", get(code_map))
         .route("/api/const-scan", get(const_scan))
+        .route("/api/arg-scan", get(arg_scan))
         .route("/api/call-graph", get(call_graph))
         .route("/api/cfg", get(cfg))
         .route("/api/members", get(members))
@@ -998,6 +999,51 @@ struct ConstScanResponse {
     immediate_total: usize,
     /// 去重后的立即数个数。
     immediate_distinct: usize,
+    /// 降级说明。
+    notes: Vec<String>,
+}
+
+/// 调用约定与参数推断：`GET /api/arg-scan`。
+///
+/// # 为什么单独一个端点
+///
+/// 每个函数一条记录，1 万函数的目标上这个数组很大；塞进 `/api/analyze`
+/// 会让每次打开目标都多传几百 KB，而多数时候用户并不看参数。所以按需取。
+///
+/// # 返回的数字是**下界**，响应里也要能看出来
+///
+/// 字段名用 `lower_bound` 而不是 `arg_count`：没有调试信息时，
+/// 参数寄存器没被读到**不等于**没有这个参数（可能只被透传、或者一进
+/// 函数就存到栈上）。字段名本身就是提示，免得看 JSON 的人误读成
+/// "参数个数"（CLAUDE.md §7 —— 拿不到就说拿不到）。
+async fn arg_scan(State(state): State<AppState>) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let scan = analysis.arg_scan();
+    Json(ArgScanResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        abi_name: scan.abi_name.clone(),
+        arg_reg_names: scan.arg_reg_names.clone(),
+        functions: scan.functions.clone(),
+        notes: scan.notes.clone(),
+    })
+    .into_response()
+}
+
+/// `/api/arg-scan` 的响应。
+#[derive(Serialize)]
+struct ArgScanResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 调用约定的中文名；`null` 表示该架构没有寄存器级约定。
+    abi_name: Option<String>,
+    /// 参数寄存器名（按序）。
+    arg_reg_names: Vec<String>,
+    /// 每个函数的推断结果。
+    functions: Vec<bitflip_core::ArgInferenceWire>,
     /// 降级说明。
     notes: Vec<String>,
 }

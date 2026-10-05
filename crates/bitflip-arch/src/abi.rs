@@ -242,17 +242,49 @@ pub fn abi_for_spec(spec: ArchSpec, windows: bool) -> Option<AbiSpec> {
     Some(abi)
 }
 
+impl AbiSpec {
+    /// 把寄存器名解析成 capstone 的 [`RegId`]。
+    ///
+    /// # 为什么必须查真实后端而不是写死编号
+    ///
+    /// `RegId` 是 capstone 的编号，跨架构没有统一规律；写死一张
+    /// "rdi = 39" 的表在换后端（或 capstone 版本变更）时会**静默错位** ——
+    /// 参数标注整体偏一到两个寄存器，而没有任何报错。
+    ///
+    /// 所以走 `CapstoneDecoder::register_id` 向真实后端要编号。
+    /// 查不到就返回 `None`，调用方据此跳过该寄存器 —— 不猜。
+    #[must_use]
+    pub fn reg_id(&self, name: &str) -> Option<RegId> {
+        crate::backend::CapstoneDecoder::register_id(self.spec, name)
+    }
+
+    /// 参数寄存器的 [`RegId`] 列表（按调用顺序）。
+    ///
+    /// 任何一个名字解析失败就**整体返回 `None`**：宁可说"这个架构的
+    /// 参数推断不支持"，也不要给出一个少了一个寄存器的序列 ——
+    /// 那会让后面所有参数的位置都错一位。
+    #[must_use]
+    pub fn arg_reg_ids(&self) -> Option<Vec<RegId>> {
+        let mut out = Vec::with_capacity(self.arg_reg_names.len());
+        for name in self.arg_reg_names {
+            out.push(self.reg_id(name)?);
+        }
+        Some(out)
+    }
+}
+
 impl Abi for AbiSpec {
     fn spec(&self) -> ArchSpec {
         self.spec
     }
 
     fn arg_regs(&self) -> &'static [RegId] {
-        // 尚未建立名字→编号映射，因此如实返回空表。
-        // 需要寄存器名时用 [`AbiSpec::arg_reg_names`]。
+        // 名字→编号的映射是运行期查 capstone 得到的，不是编译期常量，
+        // 因此这里无法返回 `&'static [RegId]`。
         //
-        // 这里返回空而不是"猜一组编号"：RegId 由 capstone 决定，
-        // 跨架构没有统一规律，公式化的猜测在换后端时会静默错位。
+        // 需要编号请用 [`AbiSpec::arg_reg_ids`]（失败时返回 `None`，
+        // 语义比"空表"明确）；需要名字请用
+        // [`AbiSpec::arg_reg_names`]。
         &[]
     }
 
@@ -281,6 +313,86 @@ mod tests {
 
     fn spec(arch: Arch, mode: Mode) -> ArchSpec {
         ArchSpec::from_arch(arch, mode, arch.preferred_endian())
+    }
+
+    /// 名字到编号的映射必须真的能查到，且两套约定不混淆。
+    ///
+    /// 这条测试存在的理由：`arg_regs()` 长期返回空表（编号映射没建），
+    /// 于是"参数推断"根本无从下手 —— `bitflip-analyze` 只能对所有函数
+    /// 报"没有参数"。补齐映射后要有人盯着它别悄悄退化：一旦查不到，
+    /// 参数推断会**静默**返回空结论，不报错。
+    #[test]
+    fn register_names_resolve_to_ids() {
+        let sysv = abi_for_spec(spec(Arch::X86_64, Mode::M64), false).expect("sysv");
+        let win = abi_for_spec(spec(Arch::X86_64, Mode::M64), true).expect("win");
+
+        // SysV 第 1 个参数是 rdi，Windows 是 rcx —— 必须都能查到且不同
+        let rdi = sysv.reg_id("rdi").expect("rdi 应当能解析");
+        let rcx = win.reg_id("rcx").expect("rcx 应当能解析");
+        assert_ne!(rdi, rcx, "rdi 与 rcx 是不同的寄存器");
+
+        let ids = sysv.arg_reg_ids().expect("SysV 参数寄存器应当全部可解析");
+        assert_eq!(ids.len(), sysv.arg_reg_names.len());
+        assert_eq!(ids[0], rdi, "第 1 个是 rdi");
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                sysv.reg_id(sysv.arg_reg_names[i]),
+                Some(*id),
+                "第 {i} 个名字与编号必须一致"
+            );
+        }
+
+        // 返回值寄存器（rax）也要能查到 —— 变参检测要用
+        assert!(sysv.reg_id("rax").is_some(), "rax 应当能解析");
+
+        // 不存在的名字应当返回 None，而不是撞上某个寄存器
+        assert_eq!(sysv.reg_id("not_a_register"), None);
+    }
+
+    /// 每个有 ABI 的架构，参数寄存器都必须能全部解析出来。
+    ///
+    /// 解析不出来时 `arg_reg_ids()` 返回 `None`，上层据此说"该架构不支持
+    /// 参数推断" —— 可接受的降级。但**本可以支持却查不到**会让用户白白
+    /// 失去这项能力，所以在这里把每个架构都试一遍。
+    #[test]
+    fn every_supported_arch_can_resolve_its_argument_registers() {
+        for arch in [
+            Arch::X86_64,
+            Arch::X86,
+            Arch::Aarch64,
+            Arch::Arm,
+            Arch::Riscv64,
+            Arch::Riscv32,
+            Arch::Mips,
+            Arch::Mips64,
+        ] {
+            for windows in [false, true] {
+                let mode = match arch {
+                    Arch::X86_64 | Arch::Aarch64 | Arch::Riscv64 | Arch::Mips64 => Mode::M64,
+                    _ => Mode::M32,
+                };
+                let Some(abi) = abi_for_spec(spec(arch, mode), windows) else {
+                    continue;
+                };
+                let ids = abi.arg_reg_ids().unwrap_or_else(|| {
+                    panic!(
+                        "{arch:?}（windows={windows}）的参数寄存器解析失败：{:?}",
+                        abi.arg_reg_names
+                    )
+                });
+                assert_eq!(
+                    ids.len(),
+                    abi.arg_reg_names.len(),
+                    "{arch:?} 解析出的数量与名字表不一致"
+                );
+                let unique: std::collections::BTreeSet<u16> = ids.iter().map(|r| r.0).collect();
+                assert_eq!(
+                    unique.len(),
+                    ids.len(),
+                    "{arch:?} 的参数寄存器编号有重复：{ids:?}"
+                );
+            }
+        }
     }
 
     #[test]

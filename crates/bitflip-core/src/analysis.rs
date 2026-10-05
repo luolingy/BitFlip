@@ -155,7 +155,50 @@ pub struct TargetAnalysis {
     call_graph: CallGraphWire,
     /// 常量/结构体初步推断。M6 引入。
     const_scan: ConstScanWire,
+    /// 调用约定与参数推断。M6 引入。
+    arg_scan: ArgScanWire,
     notes: Vec<String>,
+}
+
+/// 调用约定与参数推断的 wire 表示（M6）。
+///
+/// # 这里的数字是**下界**，字段名要让人看得出这一点
+///
+/// `lower_bound` 不是"参数个数"。debug 信息缺失时，参数寄存器没被读到
+/// **不等于**没有这个参数（可能只被透传、或一进函数就存到栈上）。
+/// 所以字段名用 `lower_bound` 而不是 `arg_count`，让看 JSON 的人也不会
+/// 误读；`unobserved_from` 说明"从第几个起不确定"。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgScanWire {
+    /// 调用约定的中文名；`None` 表示该架构没有寄存器级约定（如 wasm32）。
+    pub abi_name: Option<String>,
+    /// 参数寄存器名（按调用顺序），供界面显示"参数在哪些寄存器里"。
+    pub arg_reg_names: Vec<String>,
+    /// 每个函数的推断结果（按入口升序）。
+    pub functions: Vec<ArgInferenceWire>,
+    /// 降级说明（中文）。
+    pub notes: Vec<String>,
+}
+
+/// 单个函数的参数推断（M6）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgInferenceWire {
+    /// 函数入口。
+    pub entry: String,
+    /// 推断所依据的指令条数。
+    pub insn_count: usize,
+    /// 确定用到的参数寄存器序号（ABI 序号，**不重编号**）。
+    pub used: Vec<usize>,
+    /// 这些序号的寄存器名，便于直接显示。
+    pub used_names: Vec<String>,
+    /// 参数个数的**下界**（确定用到的最大序号 + 1）。
+    pub lower_bound: usize,
+    /// 第一个未观测到读取的参数寄存器序号；`None` 表示全都用到了。
+    pub unobserved_from: Option<usize>,
+    /// ABI 规定的寄存器参数容量。
+    pub register_slots: usize,
+    /// 是否观测到从栈上读参数。
+    pub reads_stack_args: bool,
 }
 
 /// 调用图的 wire 表示（M6）。
@@ -704,6 +747,16 @@ impl TargetAnalysis {
         // 常量/结构体初步（M6）：字符串引用聚合、内存访问步长、立即数画像。
         let const_scan = build_const_scan(disasm, &strings, &functions, &mut notes);
 
+        // 调用约定与参数推断（M6）。需要知道目标是 PE 还是 ELF 才能选对
+        // x86_64 的两套约定（前四个参数寄存器完全不同），所以按对象
+        // 格式判定，不按文件扩展名猜。
+        let arg_scan = build_arg_scan(
+            disasm,
+            &functions,
+            &mut notes,
+            object.kind == bitflip_loader::ObjectKind::Pe,
+        );
+
         Self {
             functions,
             xrefs,
@@ -715,6 +768,7 @@ impl TargetAnalysis {
             code_map,
             call_graph,
             const_scan,
+            arg_scan,
             notes,
         }
     }
@@ -723,6 +777,12 @@ impl TargetAnalysis {
     #[must_use]
     pub fn const_scan(&self) -> &ConstScanWire {
         &self.const_scan
+    }
+
+    /// 调用约定与参数推断结果。
+    #[must_use]
+    pub fn arg_scan(&self) -> &ArgScanWire {
+        &self.arg_scan
     }
 
     /// 数据/代码判定结果。
@@ -1216,6 +1276,94 @@ fn build_const_scan(
 
 /// 立即数画像保留的条数。
 const IMMEDIATE_TOP_N: usize = 40;
+
+/// 构建调用约定与参数推断（M6）。
+///
+/// # 为什么 `windows` 这个标志必须认真取
+///
+/// x86_64 有两套互不兼容的约定：System V 前四个参数走 `rdi/rsi/rdx/rcx`，
+/// Microsoft x64 走 `rcx/rdx/r8/r9`。用错了不会报错，只会让**所有**参数
+/// 标注整体错位（同一个 `rcx` 在一边是第 1 个参数、另一边是第 4 个）。
+///
+/// 所以按**对象格式**判定（PE ⇒ Windows），不按文件扩展名猜：
+/// 扩展名是用户随便改的，对象格式是文件头里的事实。
+fn build_arg_scan(
+    disasm: &Disasm,
+    functions: &[FunctionWire],
+    notes: &mut Vec<String>,
+    windows: bool,
+) -> ArgScanWire {
+    let spec = disasm.decoder.spec();
+
+    let Some(abi) = bitflip_arch::abi_for_spec(spec, windows) else {
+        // 该架构没有寄存器级约定（wasm32）。如实说明"不适用"，
+        // 而不是给一个空的函数列表让界面显示"这些函数都没有参数"。
+        return ArgScanWire {
+            abi_name: None,
+            arg_reg_names: Vec::new(),
+            functions: Vec::new(),
+            notes: vec![bitflip_analyze::summarize_args(&[], None, functions.len())
+                .notes
+                .join("；")],
+        };
+    };
+
+    // 名字 → 编号。解析失败就如实降级：这一项能力对这个目标不可用。
+    //
+    // **不退回"猜一组编号"**：编号错位会让参数标注整体偏移，而且
+    // 看起来一切正常 —— 那是比"不提供"更坏的失败。
+    let Some(arg_regs) = abi.arg_reg_ids() else {
+        notes.push(format!(
+            "无法解析 {} 的参数寄存器编号，因此不提供参数推断 —— \
+             不猜编号，因为错位后会静默给出错误的参数位置",
+            abi.name_zh
+        ));
+        return ArgScanWire {
+            abi_name: Some(abi.name_zh.to_string()),
+            arg_reg_names: abi.arg_reg_names.iter().map(|s| (*s).to_string()).collect(),
+            functions: Vec::new(),
+            notes: vec!["该架构的参数寄存器名无法映射到解码器编号，已跳过参数推断".to_string()],
+        };
+    };
+
+    let insns = decode_indexed_insns(disasm);
+
+    let ranges: Vec<bitflip_analyze::ArgInsnRange> = functions
+        .iter()
+        .filter_map(|f| {
+            let start = parse_address(&f.start)?;
+            let end = f.end.as_deref().and_then(parse_address);
+            Some(bitflip_analyze::ArgInsnRange { start, end })
+        })
+        .collect();
+
+    let inferred = bitflip_analyze::infer_args_all(&insns, &ranges, &arg_regs, &abi);
+    let scan = bitflip_analyze::summarize_args(&inferred, Some(&abi), functions.len());
+
+    for n in &scan.notes {
+        notes.push(n.clone());
+    }
+
+    ArgScanWire {
+        abi_name: scan.abi_name,
+        arg_reg_names: scan.arg_reg_names,
+        functions: scan
+            .functions
+            .iter()
+            .map(|a| ArgInferenceWire {
+                entry: hex16(a.entry),
+                insn_count: a.insn_count,
+                used: a.used.clone(),
+                used_names: a.used_names(&abi).into_iter().map(str::to_string).collect(),
+                lower_bound: a.lower_bound(),
+                unobserved_from: a.first_unused,
+                register_slots: a.register_slots,
+                reads_stack_args: a.reads_stack_args,
+            })
+            .collect(),
+        notes: scan.notes,
+    }
+}
 
 /// 构建数据/代码判定的统计与样本（M6）。
 ///
@@ -1868,6 +2016,7 @@ mod tests {
             code_map: CodeMap::default(),
             call_graph: CallGraphWire::default(),
             const_scan: ConstScanWire::default(),
+            arg_scan: ArgScanWire::default(),
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());

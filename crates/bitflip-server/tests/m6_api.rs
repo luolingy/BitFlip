@@ -496,7 +496,87 @@ async fn const_scan_response_matches_the_frontend_contract() {
     }
 }
 
-/// 四个端点在没有目标时都必须给出明确的 400，而不是 500 或空数组。
+/// 调用约定与参数推断的字段形状。
+///
+/// 重点在 **`lower_bound` 这个名字**：它是下界不是个数。字段名一旦
+/// 被改成 `arg_count`，前端和用户都会把它读成"参数个数"，而那是
+/// 没有调试信息时**推不出来**的东西。
+#[tokio::test]
+async fn arg_scan_response_matches_the_frontend_contract() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+    let (status, body) = get(state, "/api/arg-scan").await;
+    assert_eq!(status, StatusCode::OK, "响应：{body}");
+
+    assert_keys(
+        &body,
+        &[
+            "format_version",
+            "abi_name",
+            "arg_reg_names",
+            "functions",
+            "notes",
+        ],
+        "arg-scan 响应",
+    );
+
+    let regs = body["arg_reg_names"]
+        .as_array()
+        .expect("arg_reg_names 是数组");
+
+    for f in body["functions"].as_array().expect("functions 是数组") {
+        assert_keys(
+            f,
+            &[
+                "entry",
+                "insn_count",
+                "used",
+                "used_names",
+                "lower_bound",
+                "unobserved_from",
+                "register_slots",
+                "reads_stack_args",
+            ],
+            "arg-scan.functions 条目",
+        );
+
+        // **不能有 arg_count 字段** —— 那是没有证据的声称
+        assert!(
+            f.get("arg_count").is_none(),
+            "不允许出现 arg_count：没有调试信息时参数个数推不出来，只能给下界"
+        );
+
+        assert_eq!(f["entry"].as_str().unwrap().len(), 16, "地址定长 16 位");
+
+        let used: Vec<usize> = f["used"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let expected = used.last().map_or(0, |&i| i + 1);
+        assert_eq!(
+            f["lower_bound"].as_u64().unwrap() as usize,
+            expected,
+            "下界必须等于最大已用序号 + 1"
+        );
+
+        // 参数名与序号必须一一对应（前端按下标取名字）
+        assert_eq!(
+            f["used_names"].as_array().unwrap().len(),
+            used.len(),
+            "used_names 与 used 数量不一致"
+        );
+        for (name, &idx) in f["used_names"].as_array().unwrap().iter().zip(used.iter()) {
+            assert_eq!(
+                name.as_str().unwrap(),
+                regs[idx].as_str().unwrap(),
+                "第 {idx} 个参数名对不上"
+            );
+        }
+    }
+}
+
+/// 五个端点在没有目标时都必须给出明确的 400，而不是 500 或空数组。
 #[tokio::test]
 async fn m6_endpoints_require_a_target() {
     let state = AppState::new(TOKEN, None)
@@ -506,6 +586,7 @@ async fn m6_endpoints_require_a_target() {
         "/api/call-graph",
         "/api/code-map",
         "/api/const-scan",
+        "/api/arg-scan",
         "/api/jump-tables",
     ] {
         let (status, _) = get(state.clone(), uri).await;
