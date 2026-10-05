@@ -16,6 +16,7 @@ import {
   ANNOTATION_KIND_LABELS,
   STRING_ENCODING_LABELS,
   XREF_KIND_LABELS,
+  XREF_SOURCE_LABELS,
   deleteAnnotation,
   fetchAnnotations,
   fetchFunctions,
@@ -245,6 +246,14 @@ export function XrefsView({
   const [address, setAddress] = useState<string | null>(initialAddress);
   const [state, setState] = useState<Loaded<XrefsResponse>>({ kind: "loading" });
   const [annotation, setAnnotation] = useState<Annotation | null>(null);
+  /**
+   * 类型与来源过滤（M6 交付物 7）。
+   *
+   * 空数组 = 不过滤。过滤在服务端做，"谁引用了我 / 我引用了谁"的
+   * 计数天然反映过滤后的结果。
+   */
+  const [kindFilter, setKindFilter] = useState<string[]>([]);
+  const [sourceFilter, setSourceFilter] = useState<string[]>([]);
 
   useEffect(() => {
     setAddress(initialAddress);
@@ -257,7 +266,7 @@ export function XrefsView({
     }
     let cancelled = false;
     setState({ kind: "loading" });
-    void fetchXrefs(token, address).then(
+    void fetchXrefs(token, address, { kind: kindFilter, source: sourceFilter }).then(
       (data) => {
         if (!cancelled) {
           setState({ kind: "ready", data });
@@ -275,7 +284,7 @@ export function XrefsView({
     return () => {
       cancelled = true;
     };
-  }, [token, address]);
+  }, [token, address, kindFilter, sourceFilter]);
 
   // 顺带取该地址的名称标注：用户改名后回到这里应当看到自己的名字。
   useEffect(() => {
@@ -310,6 +319,59 @@ export function XrefsView({
         <AddressJumpBox label="输入地址（16 进制）" onJump={setAddress} />
         {address && <span className="mono current-address">{formatAddress(address)}</span>}
       </div>
+
+      {address && (
+        <div className="view-toolbar xref-filters">
+          <span className="hint">类型：</span>
+          {(["call", "jump", "data"] as const).map((k) => {
+            const on = kindFilter.includes(k);
+            return (
+              <label key={k} className="filter-chip">
+                <input
+                  type="checkbox"
+                  checked={on}
+                  onChange={() =>
+                    setKindFilter((cur) =>
+                      on ? cur.filter((v) => v !== k) : [...cur, k],
+                    )
+                  }
+                />
+                {XREF_KIND_LABELS[k] ?? k}
+              </label>
+            );
+          })}
+          <span className="hint">来源：</span>
+          {(["direct", "jump-table"] as const).map((s) => {
+            const on = sourceFilter.includes(s);
+            return (
+              <label key={s} className="filter-chip">
+                <input
+                  type="checkbox"
+                  checked={on}
+                  onChange={() =>
+                    setSourceFilter((cur) =>
+                      on ? cur.filter((v) => v !== s) : [...cur, s],
+                    )
+                  }
+                />
+                {XREF_SOURCE_LABELS[s] ?? s}
+              </label>
+            );
+          })}
+          {(kindFilter.length > 0 || sourceFilter.length > 0) && (
+            <button
+              type="button"
+              className="button-small"
+              onClick={() => {
+                setKindFilter([]);
+                setSourceFilter([]);
+              }}
+            >
+              清除过滤
+            </button>
+          )}
+        </div>
+      )}
 
       {!address ? (
         <p className="hint">输入一个地址查看它的交叉引用。</p>
@@ -367,7 +429,7 @@ function XrefList({
         {title} <span className="count">{rows.length}</span>
       </h3>
       {rows.length === 0 ? (
-        <p className="hint">无。间接引用不在这里 —— 跳转表要等 M6。</p>
+        <p className="hint">无（若设置了过滤，可能只是被过滤掉了 —— 清除过滤再看）。</p>
       ) : (
         <div className="table-wrap">
           <table className="data-table">
@@ -376,11 +438,13 @@ function XrefList({
                 <th>来源</th>
                 <th>目标</th>
                 <th>类型</th>
+                <th>引用途径</th>
+                <th>可信度</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((xref) => (
-                <tr key={`${xref.from}-${xref.to}-${xref.kind}`}>
+                <tr key={`${xref.from}-${xref.to}-${xref.kind}-${xref.source}`}>
                   <td
                     className="mono row-clickable"
                     onClick={() => onNavigate(xref.from)}
@@ -396,6 +460,30 @@ function XrefList({
                     {formatAddress(xref.to)}
                   </td>
                   <td>{XREF_KIND_LABELS[xref.kind] ?? xref.kind}</td>
+                  <td>
+                    {xref.source === "direct" ? (
+                      <span>直接</span>
+                    ) : (
+                      <span
+                        className="chip chip-small"
+                        title="间接跳转经跳转表识别推导出的目标 —— 分析器读表算出来的，不是指令里写明的"
+                      >
+                        跳转表推导
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {xref.reachable ? (
+                      <span>可达</span>
+                    ) : (
+                      <span
+                        className="unknown"
+                        title="发起指令未被递归下降证明可达：它可能只是线性扫描把数据误认成了指令，这条引用可能是伪影"
+                      >
+                        低（发起指令不可达）
+                      </span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

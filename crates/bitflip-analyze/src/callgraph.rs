@@ -167,6 +167,36 @@ impl CallGraph {
         seen
     }
 
+    /// 从若干入口做 BFS，返回每个可达函数到**最近入口**的跳数。
+    ///
+    /// 与 [`Self::reachable_from`] 的区别是带深度：可达性回答"能不能到"，
+    /// 深度回答"隔着几层调用"。界面要按层展开，就得有这个数。
+    ///
+    /// 与 `reachable_from` 一样只走已解析的边，所以结果是**下界**。
+    #[must_use]
+    pub fn reachable_with_depth(&self, roots: &[u64]) -> BTreeMap<u64, u32> {
+        let mut depth: BTreeMap<u64, u32> = BTreeMap::new();
+        let mut queue: VecDeque<(u64, u32)> = VecDeque::new();
+        for &r in roots {
+            if depth.insert(r, 0).is_none() {
+                queue.push_back((r, 0));
+            }
+        }
+        while let Some((f, d)) = queue.pop_front() {
+            for e in self.callees_of(f) {
+                let Some(c) = e.callee else {
+                    continue;
+                };
+                // 只记录首次到达：BFS 保证首次即最短
+                if let std::collections::btree_map::Entry::Vacant(slot) = depth.entry(c) {
+                    slot.insert(d.saturating_add(1));
+                    queue.push_back((c, d.saturating_add(1)));
+                }
+            }
+        }
+        depth
+    }
+
     /// 没有被任何函数调用的函数（"根"的候选）。
     ///
     /// **不是**"死代码"：间接调用解析不了，被间接调用的函数在这里
@@ -839,5 +869,76 @@ mod tests {
         for r in all {
             assert!(!r.label_zh().is_empty());
         }
+    }
+
+    // ── 可达性（M6 交付物 7）──
+
+    #[test]
+    fn reachable_depth_is_the_shortest_call_distance() {
+        // 链：0x1000 → 0x2000 → 0x3000，外加一条 0x1000 → 0x3000 的近路。
+        // 0x3000 的深度必须是 1（最短），不是 2（先走链）。
+        let f = funcs(&[
+            (0x1000, Some(0x1100)),
+            (0x2000, Some(0x2100)),
+            (0x3000, Some(0x3100)),
+        ]);
+        let insns = vec![
+            call(0x1020, Some(0x2000)),
+            call(0x1030, Some(0x3000)),
+            call(0x2020, Some(0x3000)),
+        ];
+        let g = build_call_graph(&insns, &f);
+        let d = g.reachable_with_depth(&[0x1000]);
+
+        assert_eq!(d.get(&0x1000), Some(&0), "入口自己深度 0");
+        assert_eq!(d.get(&0x2000), Some(&1));
+        assert_eq!(d.get(&0x3000), Some(&1), "BFS 首次到达即最短");
+    }
+
+    #[test]
+    fn reachable_depth_handles_recursion_without_looping_forever() {
+        // 互递归：A → B → A。朴素 DFS 会死循环；BFS + 首次记录必须收敛。
+        let f = funcs(&[(0x1000, Some(0x1100)), (0x2000, Some(0x2100))]);
+        let insns = vec![call(0x1020, Some(0x2000)), call(0x2020, Some(0x1000))];
+        let g = build_call_graph(&insns, &f);
+        let d = g.reachable_with_depth(&[0x1000]);
+
+        assert_eq!(d.len(), 2, "两个函数都可达，且各自只记一次");
+        assert_eq!(d.get(&0x1000), Some(&0));
+        assert_eq!(d.get(&0x2000), Some(&1));
+    }
+
+    #[test]
+    fn unreachable_functions_are_absent_from_the_depth_map() {
+        // 孤立函数（没人调用、也不调用别人）必须**不在**可达集里 ——
+        // 这正是"可达性"要回答的问题。
+        let f = funcs(&[
+            (0x1000, Some(0x1100)),
+            (0x2000, Some(0x2100)),
+            (0x9000, Some(0x9100)),
+        ]);
+        let insns = vec![call(0x1020, Some(0x2000))];
+        let g = build_call_graph(&insns, &f);
+        let d = g.reachable_with_depth(&[0x1000]);
+
+        assert!(d.contains_key(&0x2000));
+        assert!(
+            !d.contains_key(&0x9000),
+            "孤立函数不该出现在从 0x1000 出发的可达集里"
+        );
+    }
+
+    #[test]
+    fn indirect_calls_do_not_extend_reachability() {
+        // 未解析的间接调用没有目标可走，所以可达集是**下界**。
+        // 这条钉住"下界"这个语义：不许因为存在未解析调用就猜测可达。
+        let f = funcs(&[(0x1000, Some(0x1100)), (0x2000, Some(0x2100))]);
+        let insns = vec![call(0x1020, None)];
+        let g = build_call_graph(&insns, &f);
+        let d = g.reachable_with_depth(&[0x1000]);
+
+        assert_eq!(d.len(), 1, "只有入口自己");
+        assert!(!d.contains_key(&0x2000));
+        assert_eq!(g.unresolved_indirect, 1);
     }
 }

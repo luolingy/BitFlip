@@ -731,11 +731,57 @@ button:not(:disabled):hover {
   overflow: auto;
 }
 
+/* M6 各视图的容器。与 .analysis-view 同样的纵向排布 —— 这两组视图
+   在同一个面板里切换，间距不一致会看起来像两个不同的界面。 */
+.m6-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* 主值下面的一行次要信息（例如"展开 152 / 前导 152"）。
+   用小字号 + 暗色，避免与主值抢注意力。 */
+.subvalue {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
 .view-toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+/* xref 过滤条：与普通工具栏区分开（它是查询条件，不是导航）。 */
+.xref-filters {
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-raised);
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+
+.filter-chip input {
+  cursor: pointer;
+}
+
+.button-small {
+  font-size: 12px;
+  padding: 2px 8px;
 }
 
 .jump-box {

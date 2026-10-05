@@ -24,8 +24,12 @@ import {
   fetchFunctions,
   fetchFrames,
   fetchJumpTables,
+  fetchReachability,
+  fetchXrefSearch,
   formatAddress,
   normalizeAddress,
+  XREF_KIND_LABELS,
+  XREF_SOURCE_LABELS,
   type ArgScanResponse,
   type CallGraphResponse,
   type CodeMapResponse,
@@ -33,6 +37,8 @@ import {
   type FunctionWire,
   type FrameScanResponse,
   type JumpTablesResponse,
+  type ReachabilityResponse,
+  type XrefSearchResponse,
 } from "./api";
 
 /** 一页的加载状态。 */
@@ -1036,5 +1042,405 @@ function Notes({ notes }: { notes: string[] }) {
         ))}
       </ul>
     </section>
+  );
+}
+
+/**
+ * 交叉引用搜索（M6 交付物 7）。
+ *
+ * # 为什么要有"全表过滤"这个入口
+ *
+ * 单地址的 `/api/xrefs` 回答"谁引用了我"，但它要求用户**先知道地址**。
+ * 逆向时更常见的问题是"这一片区域里的数据被谁访问过"、"哪些调用指向
+ * 这个范围" —— 那需要在全表上按类型/来源/范围过滤。没有这个入口，
+ * 用户只能逐地址查，那不叫过滤。
+ *
+ * # 为什么来源要单独一列
+ *
+ * `direct` 是指令里写明的目标；`jump-table` 是分析器读表推导出来的。
+ * 两者可信度不同、失效模式也不同，混在一起显示等于让用户无法判断
+ * 该信谁。同理，发起指令不可达的行单独标注 —— 那可能只是线性扫描把
+ * 数据误认成了指令。
+ */
+export function XrefSearchView({
+  token,
+  onNavigate,
+}: {
+  token: string | null;
+  onNavigate: (address: string) => void;
+}) {
+  const [kinds, setKinds] = useState<string[]>([]);
+  const [sources, setSources] = useState<string[]>([]);
+  const [toStart, setToStart] = useState("");
+  const [toEnd, setToEnd] = useState("");
+  const [offset, setOffset] = useState(0);
+  const pageSize = 200;
+
+  const loaded = useLoaded<XrefSearchResponse>(
+    () =>
+      fetchXrefSearch(token, {
+        kind: kinds,
+        source: sources,
+        toStart: toStart || undefined,
+        toEnd: toEnd || undefined,
+        count: pageSize,
+        offset,
+      }),
+    [token, kinds.join(","), sources.join(","), toStart, toEnd, offset],
+  );
+
+  if (loaded.kind === "loading") {
+    return <p className="hint">正在搜索交叉引用…</p>;
+  }
+  if (loaded.kind === "error") {
+    return <p className="error">加载失败：{loaded.message}</p>;
+  }
+  if (loaded.data === null) {
+    return <p className="hint">尚未打开目标。</p>;
+  }
+
+  const page = loaded.data;
+  const hasFilter = kinds.length > 0 || sources.length > 0 || toStart || toEnd;
+
+  return (
+    <div className="m6-view">
+      <div className="view-toolbar xref-filters">
+        <span className="hint">类型：</span>
+        {(["call", "jump", "data"] as const).map((k) => {
+          const on = kinds.includes(k);
+          return (
+            <label key={k} className="filter-chip">
+              <input
+                type="checkbox"
+                checked={on}
+                onChange={() =>
+                  setKinds((cur) => (on ? cur.filter((v) => v !== k) : [...cur, k]))
+                }
+              />
+              {XREF_KIND_LABELS[k] ?? k}
+            </label>
+          );
+        })}
+        <span className="hint">来源：</span>
+        {(["direct", "jump-table"] as const).map((s) => {
+          const on = sources.includes(s);
+          return (
+            <label key={s} className="filter-chip">
+              <input
+                type="checkbox"
+                checked={on}
+                onChange={() =>
+                  setSources((cur) => (on ? cur.filter((v) => v !== s) : [...cur, s]))
+                }
+              />
+              {XREF_SOURCE_LABELS[s] ?? s}
+            </label>
+          );
+        })}
+        <span className="hint">目标范围：</span>
+        <input
+          className="input input-small"
+          placeholder="起点（16 进制）"
+          value={toStart}
+          onChange={(event) => {
+            setOffset(0);
+            setToStart(event.target.value);
+          }}
+        />
+        <input
+          className="input input-small"
+          placeholder="终点（不含）"
+          value={toEnd}
+          onChange={(event) => {
+            setOffset(0);
+            setToEnd(event.target.value);
+          }}
+        />
+        {hasFilter && (
+          <button
+            type="button"
+            className="button-small"
+            onClick={() => {
+              setKinds([]);
+              setSources([]);
+              setToStart("");
+              setToEnd("");
+              setOffset(0);
+            }}
+          >
+            清除过滤
+          </button>
+        )}
+      </div>
+
+      <div className="summary-grid">
+        <div className="summary-card">
+          <div className="summary-label">匹配总数</div>
+          <div className="summary-value">{page.total}</div>
+          <div className="summary-hint">
+            {hasFilter ? "已按条件过滤" : "全量（未过滤）"}
+          </div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">本页</div>
+          <div className="summary-value">
+            {page.skipped + 1}–{page.skipped + page.returned}
+          </div>
+          <div className="summary-hint">每页 {pageSize} 条</div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">未显示</div>
+          <div className="summary-value">{page.truncated}</div>
+          <div className="summary-hint">用翻页查看</div>
+        </div>
+      </div>
+
+      <div className="view-toolbar">
+        <button
+          type="button"
+          className="button-small"
+          disabled={offset === 0}
+          onClick={() => setOffset(Math.max(0, offset - pageSize))}
+        >
+          上一页
+        </button>
+        <button
+          type="button"
+          className="button-small"
+          disabled={offset + page.returned >= page.total}
+          onClick={() => setOffset(offset + pageSize)}
+        >
+          下一页
+        </button>
+      </div>
+
+      <div className="table-wrap-short">
+        <table>
+          <thead>
+            <tr>
+              <th>来源</th>
+              <th>目标</th>
+              <th>类型</th>
+              <th>途径</th>
+              <th>可信度</th>
+            </tr>
+          </thead>
+          <tbody>
+            {page.xrefs.map((x) => (
+              <tr key={`${x.from}-${x.to}-${x.kind}-${x.source}`}>
+                <td className="mono row-clickable" onClick={() => onNavigate(x.from)}>
+                  {formatAddress(x.from)}
+                </td>
+                <td className="mono row-clickable" onClick={() => onNavigate(x.to)}>
+                  {formatAddress(x.to)}
+                </td>
+                <td>{XREF_KIND_LABELS[x.kind] ?? x.kind}</td>
+                <td>
+                  {x.source === "direct" ? (
+                    "直接"
+                  ) : (
+                    <span
+                      className="chip chip-small"
+                      title="间接跳转经跳转表识别推导出的目标 —— 分析器读表算出来的，不是指令里写明的"
+                    >
+                      跳转表推导
+                    </span>
+                  )}
+                </td>
+                <td>
+                  {x.reachable ? (
+                    "可达"
+                  ) : (
+                    <span
+                      className="unknown"
+                      title="发起指令未被递归下降证明可达：可能只是线性扫描把数据误认成了指令"
+                    >
+                      低
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {page.xrefs.length === 0 && (
+        <p className="hint">
+          没有匹配的引用。若设置了过滤，可能只是被过滤掉了 —— 清除过滤再看。
+        </p>
+      )}
+
+      <Notes notes={page.notes} />
+    </div>
+  );
+}
+
+/**
+ * 可达性视图（M6 交付物 7）。
+ *
+ * # 这个视图最重要的一句话是"不可达不等于死代码"
+ *
+ * BFS 只走**已解析**的调用边。未解析的间接调用（`call rax`）没有目标，
+ * 走不过去，所以只被间接调用的函数在这里会显示成"不可达"。把
+ * `unresolved_indirect` 和不可达数**并排显示**，用户才不会拿这个数字
+ * 去删代码。
+ */
+export function ReachabilityView({
+  token,
+  onNavigate,
+}: {
+  token: string | null;
+  onNavigate: (address: string) => void;
+}) {
+  const [entry, setEntry] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+
+  const loaded = useLoaded<ReachabilityResponse>(
+    () => fetchReachability(token, entry, 2000),
+    [token, entry],
+  );
+
+  if (loaded.kind === "loading") {
+    return <p className="hint">正在计算可达性…</p>;
+  }
+  if (loaded.kind === "error") {
+    return <p className="error">加载失败：{loaded.message}</p>;
+  }
+  if (loaded.data === null) {
+    return <p className="hint">尚未打开目标。</p>;
+  }
+
+  const r = loaded.data.result;
+
+  return (
+    <div className="m6-view">
+      <div className="view-toolbar">
+        <input
+          className="input input-small"
+          placeholder="起点函数入口（留空 = 全局）"
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+        />
+        <button
+          type="button"
+          className="button-small"
+          onClick={() => setEntry(draft.trim() === "" ? null : draft.trim())}
+        >
+          计算
+        </button>
+        {entry && (
+          <button
+            type="button"
+            className="button-small"
+            onClick={() => {
+              setDraft("");
+              setEntry(null);
+            }}
+          >
+            回到全局
+          </button>
+        )}
+        {entry && <span className="mono current-address">{formatAddress(entry)}</span>}
+      </div>
+
+      <p className="banner-note">
+        {entry
+          ? "从该函数出发，沿已解析的调用边做 BFS（首次到达即最短距离）。"
+          : "全局模式：从所有\"没有任何已解析入边\"的函数出发。这些不全是程序入口 —— 只被间接调用的函数也会落在这里。"}
+        {r.unresolved_indirect > 0 && (
+          <>
+            {" "}
+            有 <b>{r.unresolved_indirect}</b> 处间接调用未解析出目标，
+            因此可达集是<b>下界</b>：<b>不可达不等于死代码</b>。
+          </>
+        )}
+      </p>
+
+      <div className="summary-grid">
+        <div className="summary-card">
+          <div className="summary-label">可达</div>
+          <div className="summary-value">
+            {r.reachable} / {r.total_functions}
+          </div>
+          <div className="summary-hint">占已知函数的比例</div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">不可达</div>
+          <div className="summary-value">{r.unreachable}</div>
+          <div className="summary-hint">含未解析间接调用的目标，需谨慎解读</div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">最大跳数</div>
+          <div className="summary-value">{r.max_depth}</div>
+          <div className="summary-hint">调用链最深层数</div>
+        </div>
+        <div className="summary-card">
+          <div className="summary-label">未解析间接调用</div>
+          <div className="summary-value">{r.unresolved_indirect}</div>
+          <div className="summary-hint">这些边在图上断开</div>
+        </div>
+      </div>
+
+      {r.depth_histogram.length > 0 && (
+        <div className="table-wrap-short">
+          <table>
+            <thead>
+              <tr>
+                <th>跳数</th>
+                <th>函数数</th>
+                <th>占比</th>
+              </tr>
+            </thead>
+            <tbody>
+              {r.depth_histogram.map((count, depth) => (
+                <tr key={depth}>
+                  <td className="num">{depth}</td>
+                  <td className="num">{count}</td>
+                  <td className="num">
+                    {r.reachable === 0
+                      ? "—"
+                      : `${((count / r.reachable) * 100).toFixed(1)}%`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <h3 className="section-heading">
+        可达函数 <span className="count">{r.functions.length}</span>
+        {r.truncated > 0 && (
+          <span className="unknown"> （另有 {r.truncated} 个未列出）</span>
+        )}
+      </h3>
+      <div className="table-wrap-short">
+        <table>
+          <thead>
+            <tr>
+              <th>跳数</th>
+              <th>入口</th>
+              <th>名称</th>
+            </tr>
+          </thead>
+          <tbody>
+            {r.functions.map((f) => (
+              <tr key={f.entry}>
+                <td className="num">{f.depth}</td>
+                <td className="mono row-clickable" onClick={() => onNavigate(f.entry)}>
+                  {formatAddress(f.entry)}
+                </td>
+                <td>
+                  {f.name ?? <span className="unknown">未命名</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {r.functions.length === 0 && <p className="hint">没有可达函数。</p>}
+
+      <Notes notes={r.notes} />
+    </div>
   );
 }

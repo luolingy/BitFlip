@@ -118,6 +118,115 @@ pub struct XrefWire {
     pub to: String,
     /// 类型（`call` / `jump` / `data`）。
     pub kind: String,
+    /// 引用来源（M6 交付物 7）：`direct` = 直接从指令流提取；
+    /// `jump-table` = 间接跳转经跳转表识别回填出的目标。
+    ///
+    /// # 为什么来源必须是字段而不是隐含约定
+    ///
+    /// 间接跳转的表目标来自**推导**（读表 + 验证），与指令里写明的
+    /// 直接目标可信度不同。不给这个字段，用户看到的两类引用长一个样，
+    /// 无法区分"编译器写死的"与"分析器推出来的" —— 而后者的错误
+    /// 传导方式完全不同。
+    pub source: String,
+    /// 发起指令是否被递归下降证明可达（M6 交付物 7）。
+    ///
+    /// `false` 不代表这条引用是错的：线性扫描把数据误认成指令时，
+    /// 那条"指令"解出的引用目标可能是伪影。这是**可信度**信号，
+    /// UI 必须把它显出来，而不是当作同等事实展示。
+    pub reachable: bool,
+}
+
+/// xref 来源短名。
+pub mod xref_source {
+    /// 直接从指令流提取（指令编码里写明的目标）。
+    pub const DIRECT: &str = "direct";
+    /// 跳转表识别回填的目标（分析器推导）。
+    pub const JUMP_TABLE: &str = "jump-table";
+}
+
+/// 交叉引用过滤条件（M6 交付物 7：按类型 / 来源 / 范围）。
+///
+/// 每个维度都是可选的，`None` 表示不过滤。**空集合与 `None` 不同**：
+/// 空集合意味着"用户勾掉了所有选项"，此时应当匹配 0 条 —— 把空集合
+/// 当成"不过滤"会让界面出现"全部取消勾选反而显示全部"的荒谬行为。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XrefFilter {
+    /// 类型白名单（`call` / `jump` / `data`）。
+    pub kinds: Option<std::collections::BTreeSet<String>>,
+    /// 来源白名单（`direct` / `jump-table`）。
+    pub sources: Option<std::collections::BTreeSet<String>>,
+    /// 发起地址范围 `[start, end)`。
+    pub from_range: Option<(u64, u64)>,
+    /// 目标地址范围 `[start, end)`。
+    pub to_range: Option<(u64, u64)>,
+}
+
+impl XrefFilter {
+    /// 是否没有任何条件。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_none()
+            && self.sources.is_none()
+            && self.from_range.is_none()
+            && self.to_range.is_none()
+    }
+
+    /// 一条引用是否满足全部条件。
+    #[must_use]
+    pub fn matches(&self, x: &XrefWire) -> bool {
+        if let Some(kinds) = &self.kinds {
+            if !kinds.contains(&x.kind) {
+                return false;
+            }
+        }
+        if let Some(sources) = &self.sources {
+            if !sources.contains(&x.source) {
+                return false;
+            }
+        }
+        if let Some((start, end)) = self.from_range {
+            match parse_hex(&x.from) {
+                Some(a) if a >= start && a < end => {}
+                _ => return false,
+            }
+        }
+        if let Some((start, end)) = self.to_range {
+            match parse_hex(&x.to) {
+                Some(a) if a >= start && a < end => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// 一次 xref 搜索的结果页。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrefPage {
+    /// 满足条件的总条数（不受分页影响）。
+    pub total: usize,
+    /// 本页之前跳过的条数（回显，便于界面算进度）。
+    pub skipped: usize,
+    /// 本页条目。
+    pub items: Vec<XrefWire>,
+}
+
+impl XrefPage {
+    /// 本页条数。
+    #[must_use]
+    pub fn returned(&self) -> usize {
+        self.items.len()
+    }
+
+    /// 因分页而未返回的条数。
+    ///
+    /// 这个数字必须能算出来并显示：只给"共 N 条"和"本页 M 条"，
+    /// 用户得自己做减法，而漏做时就会以为数据丢了（调用图那边
+    /// 已经因为同样的问题返工过一次）。
+    #[must_use]
+    pub fn truncated(&self) -> usize {
+        self.total.saturating_sub(self.skipped + self.items.len())
+    }
 }
 
 /// 字符串条目的 wire 表示。
@@ -153,6 +262,8 @@ pub struct TargetAnalysis {
     code_map: CodeMap,
     /// 函数间调用图。M6 引入。
     call_graph: CallGraphWire,
+    /// 调用图的原始形态（带邻接表）。M6 交付物 7：可达性 BFS 要用。
+    call_graph_raw: bitflip_analyze::CallGraph,
     /// 常量/结构体初步推断。M6 引入。
     const_scan: ConstScanWire,
     /// 调用约定与参数推断。M6 引入。
@@ -272,6 +383,52 @@ pub struct CallGraphWire {
     pub unresolved: Vec<UnresolvedCallWire>,
     /// 降级说明。
     pub notes: Vec<String>,
+}
+
+/// 可达性查询结果（M6 交付物 7）。
+///
+/// # 为什么"可达"必须标成下界
+///
+/// 未解析的间接调用没有目标可走，所以从入口出发的 BFS 只能沿已解析
+/// 的边走。真实可达集**只会更大**：一个只被 `call rax` 调用的函数
+/// 在这里会显示成"不可达"，而它其实是活的。所以这份结论必须带
+/// `unresolved_indirect` 一起看 —— 只看"不可达"会把大量活代码当成死代码。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ReachabilityWire {
+    /// 起点（`null` 表示从全部根出发的全局可达性）。
+    pub entry: Option<String>,
+    /// 本次结论覆盖的函数总数。
+    pub total_functions: usize,
+    /// 可达函数数（含起点本身）。
+    pub reachable: usize,
+    /// 不可达函数数。
+    pub unreachable: usize,
+    /// 最大跳数（层数）。全图模式或起点孤立时为 0。
+    pub max_depth: u32,
+    /// 按跳数分层的直方图：`depth_histogram[i]` = 距起点 i 跳的函数数。
+    pub depth_histogram: Vec<usize>,
+    /// 可达函数明细（按跳数、再按地址升序），已按 `limit` 截断。
+    pub functions: Vec<ReachableFunctionWire>,
+    /// 明细被截断的条数。
+    ///
+    /// 与调用图同样的理由：只给"可达 3000 个"却只列 500 行，界面看起来
+    /// 像丢了数据。截断多少必须是个能算出来的数字。
+    pub truncated: usize,
+    /// 本次 BFS 没有走通的间接调用数 —— 也就是"可达集是下界"的程度。
+    pub unresolved_indirect: usize,
+    /// 口径与降级说明。
+    pub notes: Vec<String>,
+}
+
+/// 一个可达函数。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReachableFunctionWire {
+    /// 函数入口地址。
+    pub entry: String,
+    /// 距起点的跳数。
+    pub depth: u32,
+    /// 函数名；`null` 表示未命名（**不是**编出来的占位名）。
+    pub name: Option<String>,
 }
 
 /// 调用图汇总（wire）。
@@ -639,6 +796,13 @@ impl TargetAnalysis {
         }
 
         // ── xref 提取（与候选收集同一遍流式解码）──
+        //
+        // 每条引用带两个元数据字段（M6 交付物 7）：
+        // - `reachable`：发起指令是否被递归下降证明可达。线性扫描会把
+        //   数据误认成指令，那条"指令"解出的引用可能是伪影 —— 这是
+        //   可信度信号，不是对错判定。
+        // - `source`：此处先全部记为 direct（指令编码里写明的目标）；
+        //   跳转表回填的目标在扫描完成后另行追加（见下文）。
         let mut xrefs: Vec<XrefWire> = Vec::new();
         let mut xref_by_from: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut xref_by_to: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -657,6 +821,8 @@ impl TargetAnalysis {
                     from: hex16(x.from),
                     to: hex16(x.to),
                     kind: x.kind.as_str().to_string(),
+                    source: xref_source::DIRECT.to_string(),
+                    reachable: disasm.coverage.is_reachable(x.from),
                 });
             }
         }
@@ -779,6 +945,50 @@ impl TargetAnalysis {
             ));
         }
 
+        // 把跳转表目标**回填进 xref 表**（M6 交付物 7：来源可区分）。
+        //
+        // 间接跳转的目标是推导出来的，不是指令编码里写明的。不让它们
+        // 进 xref 表，"谁引用了我"就漏掉 switch 的所有分支 —— 对表的
+        // 使用方（虚表成员、处理函数）这是主要入口。但必须带
+        // `source = jump-table` 标记，与直接目标区分开。
+        //
+        // 跳过"直接引用里已有同一 (from, to, jump)"的项：同一目标
+        // 既被直接跳转又被表推导覆盖时，保留 direct 那条（证据更强）。
+        let mut jump_table_xrefs = 0usize;
+        for t in &jump_tables.tables {
+            for &target in &t.targets {
+                let key_from = t.insn_addr;
+                let direct_exists = xref_by_from.get(&key_from).is_some_and(|idxs| {
+                    idxs.iter().any(|&i| {
+                        parse_hex(&xrefs[i].to) == Some(target)
+                            && xrefs[i].kind == "jump"
+                            && xrefs[i].source == xref_source::DIRECT
+                    })
+                });
+                if direct_exists {
+                    continue;
+                }
+                let idx = xrefs.len();
+                xref_by_from.entry(key_from).or_default().push(idx);
+                xref_by_to.entry(target).or_default().push(idx);
+                xrefs.push(XrefWire {
+                    from: hex16(key_from),
+                    to: hex16(target),
+                    kind: "jump".to_string(),
+                    source: xref_source::JUMP_TABLE.to_string(),
+                    // 间接跳转本身在指令流里，它的可达性按发起指令算
+                    reachable: disasm.coverage.is_reachable(key_from),
+                });
+                jump_table_xrefs += 1;
+            }
+        }
+        if jump_table_xrefs > 0 {
+            notes.push(format!(
+                "有 {jump_table_xrefs} 条 xref 来自跳转表推导（source=jump-table），\
+                 与指令里写明的直接目标可信度不同"
+            ));
+        }
+
         // 数据/代码判定（M6）。
         //
         // 对**代表性地址**做判定而不是全部：统计分布用抽样，逐地址
@@ -787,7 +997,7 @@ impl TargetAnalysis {
         let code_map = build_code_map(disasm, &functions, &mut notes);
 
         // 调用图（M6）：CFG 之外的另一张图 —— 函数之间谁调用谁。
-        let call_graph = build_call_graph_wire(disasm, &functions, &mut notes);
+        let (call_graph, call_graph_raw) = build_call_graph_wire(disasm, &functions, &mut notes);
 
         // 常量/结构体初步（M6）：字符串引用聚合、内存访问步长、立即数画像。
         let const_scan = build_const_scan(disasm, &strings, &functions, &mut notes);
@@ -821,6 +1031,7 @@ impl TargetAnalysis {
             jump_tables,
             code_map,
             call_graph,
+            call_graph_raw,
             const_scan,
             arg_scan,
             frame_scan,
@@ -856,6 +1067,149 @@ impl TargetAnalysis {
     #[must_use]
     pub fn call_graph(&self) -> &CallGraphWire {
         &self.call_graph
+    }
+
+    /// 可达性（M6 交付物 7）。
+    ///
+    /// `entry` 给出时从该函数出发；为 `None` 时从**全部根**（入度为 0
+    /// 的函数）出发，回答"整个目标里有多少函数从某个入口可达"。
+    ///
+    /// `limit` 限制明细条数，`total/reachable/unreachable/truncated`
+    /// 不受它影响 —— 统计是全量的，只有明细被截断。
+    #[must_use]
+    pub fn reachability(&self, entry: Option<u64>, limit: usize) -> ReachabilityWire {
+        let all: Vec<u64> = self
+            .functions
+            .iter()
+            .filter_map(|f| parse_hex(&f.start))
+            .collect();
+
+        let roots: Vec<u64> = match entry {
+            Some(e) => vec![e],
+            // 全图模式：从"没人调用"的函数出发。这不是"入口点"——
+            // 间接调用解析不了，被间接调用的函数也会落在这里，
+            // 所以 note 里必须写清楚。
+            None => self.call_graph_raw.entries_candidates(&all),
+        };
+
+        let depth_map = self.call_graph_raw.reachable_with_depth(&roots);
+
+        // 只把**已知函数入口**算作"可达函数"。
+        //
+        // 调用图的 `callee` 存的是**原始目标地址**，不一定是函数入口：
+        // 调用指令可以指向函数中间的某个标签（thunk、编译器辅助块），
+        // 而边界未知的函数还有 1 MiB 的防误纳窗口。这些地址在图上是有
+        // 意义的中间节点（BFS 要经过它们才能走到更远），但它们不是
+        // 函数，计进"可达函数数"会让分母对不上（实测 157 vs 155）。
+        let known: std::collections::HashSet<u64> = all.iter().copied().collect();
+        let reached_entries: Vec<(u32, u64)> = depth_map
+            .iter()
+            .filter(|(addr, _)| known.contains(addr))
+            .map(|(&a, &d)| (d, a))
+            .collect();
+        // 非入口的中间节点数。起点本身如果是未知地址，由下面那条专门的
+        // 说明负责，不在这里重复计数（否则同一个地址会被说两遍）。
+        let unknown_roots = roots.iter().filter(|r| !known.contains(r)).count();
+        let non_entry_nodes = depth_map
+            .len()
+            .saturating_sub(reached_entries.len())
+            .saturating_sub(unknown_roots);
+
+        // 分层直方图
+        let mut max_depth = 0u32;
+        let mut histogram: Vec<usize> = Vec::new();
+        for &(d, _) in &reached_entries {
+            max_depth = max_depth.max(d);
+            let idx = d as usize;
+            if histogram.len() <= idx {
+                histogram.resize(idx + 1, 0);
+            }
+            histogram[idx] += 1;
+        }
+
+        // 明细：按 (跳数, 地址) 升序 —— 界面按层展开时直接顺序读。
+        let name_of = |addr: u64| -> Option<String> {
+            self.functions
+                .iter()
+                .find(|f| parse_hex(&f.start) == Some(addr))
+                .and_then(|f| f.named.then(|| f.name.clone()))
+                .filter(|n| !n.is_empty())
+        };
+        let mut ordered = reached_entries;
+        ordered.sort_unstable();
+        let total_reachable = ordered.len();
+        let truncated = total_reachable.saturating_sub(limit);
+        let functions: Vec<ReachableFunctionWire> = ordered
+            .into_iter()
+            .take(limit)
+            .map(|(depth, addr)| ReachableFunctionWire {
+                entry: hex16(addr),
+                depth,
+                name: name_of(addr),
+            })
+            .collect();
+
+        // 不可达 = 已知函数里没进可达集的那些。用已知函数总数做分母，
+        // 而不是用图的节点数 —— 两者不同（只有调用关系的函数才在图里）。
+        let total_functions = all.len();
+        let reachable = total_reachable;
+        let unreachable = total_functions.saturating_sub(reachable);
+
+        let mut notes = Vec::new();
+        match entry {
+            Some(e) => notes.push(format!(
+                "从 {} 出发的可达集（沿已解析的调用边，BFS 到首次到达为止）",
+                hex16(e)
+            )),
+            None => notes.push(format!(
+                "全局可达性：从 {} 个\"没有任何已解析入边\"的函数出发。\
+                 这些不全是程序入口 —— 只被间接调用的函数也会落在这里",
+                roots.len()
+            )),
+        }
+        if non_entry_nodes > 0 {
+            notes.push(format!(
+                "另有 {non_entry_nodes} 个被调用到的地址并非函数入口\
+                 （函数中间的标签 / thunk），未计入可达函数数，但 BFS 会经过它们"
+            ));
+        }
+        // 起点本身不是已知函数入口时必须明说：否则界面显示"可达 0 个"，
+        // 用户会以为"这个函数既不调用别人也没人调用它"，而真实原因是
+        // 这个地址根本不是函数入口（打错了，或者是一段还没识别的代码）。
+        if let Some(e) = entry {
+            if !known.contains(&e) {
+                notes.push(format!(
+                    "起点 {} 不是已知函数入口，因此它本身不计入可达函数数；\
+                     结论只包含从它出发能走到的函数",
+                    hex16(e)
+                ));
+            }
+        }
+        if self.call_graph_raw.unresolved_indirect > 0 {
+            notes.push(format!(
+                "有 {} 处间接调用没有解析出目标，它们指向的函数走不到：\
+                 可达集是**下界**，\"不可达\"不等于死代码",
+                self.call_graph_raw.unresolved_indirect
+            ));
+        }
+        if truncated > 0 {
+            notes.push(format!(
+                "可达函数共 {total_reachable} 个，明细只列了 {limit} 个，还有 {truncated} 个未列出"
+            ));
+        }
+
+        ReachabilityWire {
+            entry: entry.map(hex16),
+            total_functions,
+            reachable,
+            unreachable,
+            max_depth,
+            depth_histogram: histogram,
+            functions,
+            truncated,
+            unresolved_indirect: self.call_graph_raw.unresolved_indirect,
+            notes,
+        }
     }
 
     /// 函数列表（按入口地址升序）。
@@ -953,6 +1307,39 @@ impl TargetAnalysis {
             .get(&addr)
             .map(|idxs| idxs.iter().map(|&i| &self.xrefs[i]).collect())
             .unwrap_or_default()
+    }
+
+    /// 全部引用（按提取顺序：发起地址升序，同址内按类型）。
+    ///
+    /// 为什么要有"取全部"的入口：过滤（按类型/来源/范围）与统计都
+    /// 需要在全表上跑，只靠 `xrefs_from`/`xrefs_to` 做不到。
+    #[must_use]
+    pub fn xrefs(&self) -> &[XrefWire] {
+        &self.xrefs
+    }
+
+    /// 按条件搜索引用（M6 交付物 7）。
+    ///
+    /// 返回 `(匹配总数, 本页条目)`：总数与分页**分开给**，否则界面
+    /// 只能显示"本页有几条"，用户无法判断"是被过滤掉了还是本来就没有"。
+    #[must_use]
+    pub fn search_xrefs(&self, filter: &XrefFilter, offset: usize, count: usize) -> XrefPage {
+        let mut total = 0usize;
+        let mut items = Vec::new();
+        for x in &self.xrefs {
+            if !filter.matches(x) {
+                continue;
+            }
+            if total >= offset && items.len() < count {
+                items.push(x.clone());
+            }
+            total += 1;
+        }
+        XrefPage {
+            total,
+            skipped: offset.min(total),
+            items,
+        }
     }
 
     /// 字符串列表（按地址升序）。
@@ -1172,7 +1559,7 @@ fn build_call_graph_wire(
     disasm: &Disasm,
     functions: &[FunctionWire],
     notes: &mut Vec<String>,
-) -> CallGraphWire {
+) -> (CallGraphWire, bitflip_analyze::CallGraph) {
     const HUB_LIMIT: usize = 20;
 
     let ranges: Vec<bitflip_analyze::FunctionRange> = functions
@@ -1227,7 +1614,7 @@ fn build_call_graph_wire(
         ));
     }
 
-    CallGraphWire {
+    let wire = CallGraphWire {
         summary: CallGraphSummaryWire {
             nodes: summary.nodes,
             edges: summary.edges,
@@ -1247,8 +1634,11 @@ fn build_call_graph_wire(
                 insn: hex16(e.from_insn),
             })
             .collect(),
-        notes: graph.notes,
-    }
+        notes: graph.notes.clone(),
+    };
+    // 原图一并返回：可达性查询要按邻接表做 BFS，而 wire 形态的边
+    // 每次查询都要重建邻接表。构建期留一份，查询期就只是遍历。
+    (wire, graph)
 }
 
 /// 构建常量/结构体初步推断（M6）。
@@ -2151,6 +2541,7 @@ mod tests {
             jump_tables: JumpTableScan::default(),
             code_map: CodeMap::default(),
             call_graph: CallGraphWire::default(),
+            call_graph_raw: bitflip_analyze::CallGraph::default(),
             const_scan: ConstScanWire::default(),
             arg_scan: ArgScanWire::default(),
             frame_scan: FrameScanWire::default(),
@@ -2218,5 +2609,124 @@ mod tests {
         scanner.feed(b"no-terminator-here");
         let (entries, _) = scanner.finish();
         assert!(entries.is_empty(), "未终止运行不许计入，实际 {entries:?}");
+    }
+
+    // ── M6 交付物 7：xref 过滤（按类型 / 来源 / 范围）──
+
+    fn xref(from: u64, to: u64, kind: &str, source: &str) -> XrefWire {
+        XrefWire {
+            from: hex16(from),
+            to: hex16(to),
+            kind: kind.to_string(),
+            source: source.to_string(),
+            reachable: true,
+        }
+    }
+
+    fn kinds(items: &[&str]) -> Option<std::collections::BTreeSet<String>> {
+        Some(items.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    #[test]
+    fn empty_filter_matches_everything() {
+        let f = XrefFilter::default();
+        assert!(f.is_empty());
+        assert!(f.matches(&xref(0x1000, 0x2000, "call", "direct")));
+        assert!(f.matches(&xref(0x1000, 0x2000, "data", "jump-table")));
+    }
+
+    #[test]
+    fn kind_filter_selects_only_that_kind() {
+        let f = XrefFilter {
+            kinds: kinds(&["call"]),
+            ..Default::default()
+        };
+        assert!(f.matches(&xref(0x1000, 0x2000, "call", "direct")));
+        assert!(!f.matches(&xref(0x1000, 0x2000, "jump", "direct")));
+        assert!(!f.matches(&xref(0x1000, 0x2000, "data", "direct")));
+    }
+
+    #[test]
+    fn source_filter_separates_derived_from_direct() {
+        // 这条守的是"推导出来的目标不许混进直接目标"：跳转表目标是
+        // 分析器读表算出来的，可信度与指令里写明的不同。
+        let f = XrefFilter {
+            sources: kinds(&[xref_source::DIRECT]),
+            ..Default::default()
+        };
+        assert!(f.matches(&xref(0x1000, 0x2000, "jump", "direct")));
+        assert!(
+            !f.matches(&xref(0x1000, 0x2000, "jump", "jump-table")),
+            "来源过滤必须能把跳转表推导的目标排除掉"
+        );
+    }
+
+    #[test]
+    fn empty_kind_set_matches_nothing_not_everything() {
+        // 空集合 ≠ 不过滤：界面把所有勾选取消后应当显示 0 条，
+        // 而不是"反而显示全部"。
+        let f = XrefFilter {
+            kinds: Some(std::collections::BTreeSet::new()),
+            ..Default::default()
+        };
+        assert!(!f.is_empty(), "空集合是一个显式条件，不是无条件");
+        assert!(!f.matches(&xref(0x1000, 0x2000, "call", "direct")));
+    }
+
+    #[test]
+    fn scope_range_is_half_open() {
+        let f = XrefFilter {
+            to_range: Some((0x2000, 0x3000)),
+            ..Default::default()
+        };
+        assert!(f.matches(&xref(0x1000, 0x2000, "call", "direct")), "左闭");
+        assert!(f.matches(&xref(0x1000, 0x2fff, "call", "direct")));
+        assert!(!f.matches(&xref(0x1000, 0x3000, "call", "direct")), "右开");
+        assert!(!f.matches(&xref(0x1000, 0x1fff, "call", "direct")));
+    }
+
+    #[test]
+    fn from_and_to_scopes_are_independent() {
+        let f = XrefFilter {
+            from_range: Some((0x1000, 0x2000)),
+            to_range: Some((0x9000, 0xa000)),
+            ..Default::default()
+        };
+        assert!(f.matches(&xref(0x1500, 0x9500, "call", "direct")));
+        assert!(!f.matches(&xref(0x1500, 0x8500, "call", "direct")));
+        assert!(!f.matches(&xref(0x2500, 0x9500, "call", "direct")));
+    }
+
+    #[test]
+    fn page_reports_total_and_truncation_separately() {
+        // 分页后的三个数字必须自洽：skipped + returned + truncated == total。
+        // 调用图那边曾经只给"共 N 条"，界面显示的总数与列出的行数对不上，
+        // 看起来像丢数据 —— 这里一开始就把三个数分开给。
+        let all: Vec<XrefWire> = (0..10)
+            .map(|i| xref(0x1000 + i * 4, 0x2000, "call", "direct"))
+            .collect();
+        let filter = XrefFilter::default();
+
+        let page = XrefPage {
+            total: all.len(),
+            skipped: 0,
+            items: all.clone(),
+        };
+        assert_eq!(page.returned(), 10);
+        assert_eq!(page.truncated(), 0);
+
+        // 手工按 filter 分页模拟（search_xrefs 需要 TargetAnalysis，
+        // 这里验证 XrefPage 自身的算术契约）
+        let page = XrefPage {
+            total: all.len(),
+            skipped: 4,
+            items: all[4..7].to_vec(),
+        };
+        assert_eq!(
+            page.skipped + page.returned() + page.truncated(),
+            page.total
+        );
+        assert_eq!(page.truncated(), 3);
+        assert!(!filter.is_empty() || filter.matches(&all[0]));
     }
 }

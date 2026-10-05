@@ -356,6 +356,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/members", get(members))
         .route("/api/members/functions", get(member_functions))
         .route("/api/xrefs", get(xrefs))
+        .route("/api/xref-search", get(xref_search))
+        .route("/api/reachability", get(reachability))
         .route("/api/strings", get(strings))
         .route("/api/hex", get(hex))
         // 标注是**主数据**，可读可写可删；写路径不触发重新分析。
@@ -1324,19 +1326,31 @@ struct XrefsResponse {
     function: Option<bitflip_core::FunctionWire>,
 }
 
-/// 交叉引用查询参数。
+/// 交叉引用查询参数：地址 + 可选的类型/来源过滤。
 #[derive(serde::Deserialize)]
-struct AddressQuery {
+struct XrefsQuery {
     /// 目标地址（`0x` 前缀可省）。
     address: Option<String>,
-    /// `address` 的别名，便于前端直接复用反汇编页的跳转参数名。
+    /// `address` 的别名。
     at: Option<String>,
+    /// 逗号分隔的类型过滤（`call` / `jump` / `data`）。
+    kind: Option<String>,
+    /// 逗号分隔的来源过滤（`direct` / `jump-table`）。
+    source: Option<String>,
 }
 
 /// 交叉引用：`GET /api/xrefs?address=<hex>`。
+///
+/// 可选过滤（M6 交付物 7）：
+/// - `kind`：逗号分隔的类型列表（`call` / `jump` / `data`）；
+/// - `source`：逗号分隔的来源列表（`direct` / `jump-table`）。
+///
+/// 过滤在**服务端**做而不是前端做：`from`/`to` 各自过滤后，"谁引用了
+/// 我"与"我引用了谁"的计数才能如实反映过滤后的结果，UI 不必自己
+/// 再实现一遍（前端实现意味着每个调用方都要复制过滤语义）。
 async fn xrefs(
     State(state): State<AppState>,
-    axum::extract::Query(query): axum::extract::Query<AddressQuery>,
+    axum::extract::Query(query): axum::extract::Query<XrefsQuery>,
 ) -> Response {
     let analysis = match state.analysis() {
         Ok(a) => a,
@@ -1354,14 +1368,296 @@ async fn xrefs(
         );
     };
 
+    // 过滤集合解析：显式给出的名字必须是已知的 —— 拼错的过滤条件
+    // 静默匹配 0 条，看起来就像"没有引用"，这是要避免的假象。
+    let kind_filter = match parse_name_set(&query.kind, &["call", "jump", "data"], "类型") {
+        Ok(set) => set,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let source_filter = match parse_name_set(
+        &query.source,
+        &[
+            bitflip_core::xref_source::DIRECT,
+            bitflip_core::xref_source::JUMP_TABLE,
+        ],
+        "来源",
+    ) {
+        Ok(set) => set,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    let keep = |x: &bitflip_core::XrefWire| {
+        kind_filter.as_ref().is_none_or(|set| set.contains(&x.kind))
+            && source_filter
+                .as_ref()
+                .is_none_or(|set| set.contains(&x.source))
+    };
+
     Json(XrefsResponse {
         format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
         address: bitflip_core::hex16(address),
-        from: analysis.xrefs_from(address).into_iter().cloned().collect(),
-        to: analysis.xrefs_to(address).into_iter().cloned().collect(),
+        from: analysis
+            .xrefs_from(address)
+            .into_iter()
+            .filter(|x| keep(x))
+            .cloned()
+            .collect(),
+        to: analysis
+            .xrefs_to(address)
+            .into_iter()
+            .filter(|x| keep(x))
+            .cloned()
+            .collect(),
         function: analysis.function_containing(address).cloned(),
     })
     .into_response()
+}
+
+/// xref 搜索响应（M6 交付物 7）。
+#[derive(Serialize)]
+struct XrefSearchResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 满足条件的总条数（不受分页影响）。
+    total: usize,
+    /// 本页返回条数。
+    returned: usize,
+    /// 因分页跳过的条数。
+    skipped: usize,
+    /// 因分页未返回的条数。
+    ///
+    /// `skipped + returned + truncated == total` 恒成立 —— 界面上的
+    /// 三个数字必须能对上，否则用户会以为数据丢了（调用图那边因为
+    /// 只给"共 N 条"返工过一次）。
+    truncated: usize,
+    /// 本页引用。
+    xrefs: Vec<bitflip_core::XrefWire>,
+    /// 降级/口径说明。
+    notes: Vec<String>,
+}
+
+/// xref 搜索参数（按类型 / 来源 / 范围过滤）。
+#[derive(serde::Deserialize)]
+struct XrefSearchQuery {
+    /// 逗号分隔的类型（`call` / `jump` / `data`）。
+    kind: Option<String>,
+    /// 逗号分隔的来源（`direct` / `jump-table`）。
+    source: Option<String>,
+    /// 发起地址范围起点（含）。
+    from_start: Option<String>,
+    /// 发起地址范围终点（不含）。
+    from_end: Option<String>,
+    /// 目标地址范围起点（含）。
+    to_start: Option<String>,
+    /// 目标地址范围终点（不含）。
+    to_end: Option<String>,
+    /// 请求条数。
+    count: Option<usize>,
+    /// 跳过条数。
+    offset: Option<usize>,
+}
+
+/// 解析地址范围：两端都可选，只给一端就是半开区间。
+///
+/// 返回 `Err(说明)` 用于"给了但解析不了" —— 静默忽略一个写错的地址会把
+/// "过滤后为空"伪装成"这个目标没有引用"。
+///
+/// 错误用 `String` 而不是直接返回 `Response`：`Response` 有 128 字节，
+/// 用它当 `Err` 变体会让每个调用点都被 clippy 的 `result_large_err`
+/// 拦下，而这里只需要一句能拼进 400 响应的话。
+fn parse_range(
+    start: Option<&String>,
+    end: Option<&String>,
+    what: &str,
+) -> Result<Option<(u64, u64)>, String> {
+    if start.is_none() && end.is_none() {
+        return Ok(None);
+    }
+    let lo = match start {
+        Some(raw) => bitflip_core::parse_address(raw)
+            .ok_or_else(|| format!("{what}起点无法解析：{raw:?}（需要 16 进制，可带 0x 前缀）"))?,
+        None => 0,
+    };
+    let hi = match end {
+        Some(raw) => bitflip_core::parse_address(raw)
+            .ok_or_else(|| format!("{what}终点无法解析：{raw:?}（需要 16 进制，可带 0x 前缀）"))?,
+        None => u64::MAX,
+    };
+    if lo >= hi {
+        return Err(format!("{what}范围为空：起点 {lo:#x} 不小于终点 {hi:#x}"));
+    }
+    Ok(Some((lo, hi)))
+}
+
+/// 解析逗号分隔的白名单；未知值报错而不是静默匹配 0 条。
+///
+/// 空串（例如 `kind=`）视为**未给过滤**：界面清空输入框时会发出这种
+/// 请求，把它当成"空集合"会返回 0 条。
+fn parse_name_set(
+    spec: &Option<String>,
+    known: &[&str],
+    what: &str,
+) -> Result<Option<std::collections::BTreeSet<String>>, String> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let items: std::collections::BTreeSet<String> = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for item in &items {
+        if !known.contains(&item.as_str()) {
+            return Err(format!(
+                "未知的{what}过滤值：{item:?}（可用：{}）",
+                known.join(" / ")
+            ));
+        }
+    }
+    Ok(Some(items))
+}
+
+/// 交叉引用搜索：`GET /api/xref-search?kind=&source=&from_start=&from_end=&to_start=&to_end=`。
+///
+/// 与 `/api/xrefs` 的分工：后者是"某个地址的引用"（点开一个地址看），
+/// 前者是"符合条件的引用有哪些"（全表过滤 + 分页）。没有这个入口，
+/// 按范围过滤就只能逐地址查 —— 那不叫过滤。
+async fn xref_search(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<XrefSearchQuery>,
+) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let kinds = match parse_name_set(&query.kind, &["call", "jump", "data"], "类型") {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let sources = match parse_name_set(
+        &query.source,
+        &[
+            bitflip_core::xref_source::DIRECT,
+            bitflip_core::xref_source::JUMP_TABLE,
+        ],
+        "来源",
+    ) {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let from_range = match parse_range(
+        query.from_start.as_ref(),
+        query.from_end.as_ref(),
+        "发起地址",
+    ) {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let to_range = match parse_range(query.to_start.as_ref(), query.to_end.as_ref(), "目标地址")
+    {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    let filter = bitflip_core::XrefFilter {
+        kinds,
+        sources,
+        from_range,
+        to_range,
+    };
+
+    let offset = query.offset.unwrap_or(0);
+    let count = query
+        .count
+        .unwrap_or(bitflip_core::DEFAULT_PAGE_SIZE)
+        .min(bitflip_core::MAX_PAGE_SIZE);
+
+    let page = analysis.search_xrefs(&filter, offset, count);
+
+    // 口径说明：这些数字是怎么来的必须写清楚，否则"总数 12 万"会被
+    // 当成"目标里有 12 万条引用"。
+    let mut notes = Vec::new();
+    if !filter.is_empty() {
+        notes.push("以上结果已按类型/来源/地址范围过滤".to_string());
+    }
+    if page.truncated() > 0 {
+        notes.push(format!(
+            "满足条件的共 {} 条，本页返回 {} 条，还有 {} 条未返回（用 offset 翻页）",
+            page.total,
+            page.returned(),
+            page.truncated()
+        ));
+    }
+
+    Json(XrefSearchResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        total: page.total,
+        returned: page.returned(),
+        skipped: page.skipped,
+        truncated: page.truncated(),
+        xrefs: page.items,
+        notes,
+    })
+    .into_response()
+}
+
+/// 可达性查询参数（M6 交付物 7）。
+#[derive(serde::Deserialize)]
+struct ReachabilityQuery {
+    /// 起点函数入口；省略时为全局可达性（从全部根出发）。
+    entry: Option<String>,
+    /// 明细条数上限。
+    limit: Option<usize>,
+}
+
+/// 可达性：`GET /api/reachability?entry=<hex>&limit=<n>`。
+///
+/// 不带 `entry` 时给**全局**可达性：从"没有任何已解析入边"的函数出发，
+/// 有多少函数可达、多少不可达。这是"这堆代码里哪一块是活的"的第一
+/// 近似 —— 但必须与"间接调用未解析"一起读，否则会把活代码判成死代码。
+async fn reachability(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ReachabilityQuery>,
+) -> Response {
+    let analysis = match state.analysis() {
+        Ok(a) => a,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let entry = match query.entry.as_ref() {
+        Some(raw) => match bitflip_core::parse_address(raw) {
+            Some(a) => Some(a),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("起点地址无法解析：{raw:?}（需要 16 进制，可带 0x 前缀）"),
+                )
+            }
+        },
+        None => None,
+    };
+
+    let limit = query
+        .limit
+        .unwrap_or(bitflip_core::DEFAULT_PAGE_SIZE)
+        .min(bitflip_core::MAX_PAGE_SIZE);
+
+    Json(ReachabilityResponse {
+        format_version: bitflip_core::ANALYSIS_FORMAT_VERSION,
+        result: analysis.reachability(entry, limit),
+    })
+    .into_response()
+}
+
+/// 可达性响应。
+#[derive(Serialize)]
+struct ReachabilityResponse {
+    /// wire 格式版本。
+    format_version: u32,
+    /// 结论。
+    result: bitflip_core::ReachabilityWire,
 }
 
 /// 字符串列表响应。

@@ -25,6 +25,8 @@ import {
   ConstScanView,
   FrameScanView,
   JumpTablesView,
+  ReachabilityView,
+  XrefSearchView,
 } from "./M6Views";
 
 type LoadState =
@@ -56,7 +58,9 @@ type ViewId =
   | "jump-tables"
   | "const-scan"
   | "arg-scan"
-  | "frames";
+  | "frames"
+  | "xref-search"
+  | "reachability";
 
 const NAV_SECTIONS: readonly {
   /** 只有 `ready: true` 的项才是真实可切换的视图。 */
@@ -82,6 +86,10 @@ const NAV_SECTIONS: readonly {
   { id: "const-scan", title: "常量/结构体", milestone: "M6", hint: "字符串引用、访问位移、高频立即数", ready: true },
   { id: "arg-scan", title: "参数推断", milestone: "M6", hint: "调用约定与参数下界", ready: true },
   { id: "frames", title: "栈帧 / 局部变量", milestone: "M6", hint: "展开信息与前导扫描", ready: true },
+  // 交付物 7：过滤与可达性。搜索是"先知道范围再找引用"的入口，
+  // 可达性回答"这一片代码是不是活的"（但必须连着未解析数一起读）。
+  { id: "xref-search", title: "交叉引用搜索", milestone: "M6", hint: "按类型/来源/范围过滤全表", ready: true },
+  { id: "reachability", title: "可达性", milestone: "M6", hint: "从入口沿调用边的可达集（下界）", ready: true },
   // 下面这些确实还没做（M8 签名库匹配），保持置灰 —— 不给点了没反应的按钮。
   { id: null, title: "签名匹配", milestone: "M8", hint: "库函数签名识别", ready: false },
 ];
@@ -101,6 +109,8 @@ const VIEW_TITLES: Record<ViewId, string> = {
   "const-scan": "常量 / 结构体初步",
   "arg-scan": "调用约定与参数推断",
   frames: "栈帧 / 局部变量",
+  "xref-search": "交叉引用搜索",
+  reachability: "可达性",
 };
 
 
@@ -305,6 +315,10 @@ export function App() {
             <ArgScanView token={token} />
           ) : view === "frames" ? (
             <FrameScanView token={token} />
+          ) : view === "xref-search" ? (
+            <XrefSearchView token={token} onNavigate={navigate} />
+          ) : view === "reachability" ? (
+            <ReachabilityView token={token} onNavigate={navigate} />
           ) : parsed ? (
             <StructureView parsed={parsed} target={target} />
           ) : (

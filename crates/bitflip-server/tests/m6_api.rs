@@ -646,6 +646,8 @@ async fn m6_endpoints_require_a_target() {
         "/api/arg-scan",
         "/api/frames",
         "/api/jump-tables",
+        "/api/xref-search",
+        "/api/reachability",
     ] {
         let (status, _) = get(state.clone(), uri).await;
         assert_eq!(
@@ -654,4 +656,242 @@ async fn m6_endpoints_require_a_target() {
             "{uri} 在没有目标时应当明确拒绝，而不是返回空数据"
         );
     }
+}
+
+// ── M6 交付物 7：xref 过滤与可达性 ──
+
+/// xref 搜索的字段形状与三个计数自洽。
+///
+/// 这条守的还是"界面上的数字必须能对上"：`skipped + returned + truncated
+/// == total`。调用图那边因为只给"共 N 条"而返工过一次。
+#[tokio::test]
+async fn xref_search_response_matches_the_frontend_contract() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+    let (status, body) = get(state, "/api/xref-search").await;
+    assert_eq!(status, StatusCode::OK, "响应：{body}");
+
+    assert_keys(
+        &body,
+        &[
+            "format_version",
+            "total",
+            "returned",
+            "skipped",
+            "truncated",
+            "xrefs",
+            "notes",
+        ],
+        "xref-search 响应",
+    );
+
+    let total = body["total"].as_u64().unwrap();
+    let returned = body["returned"].as_u64().unwrap();
+    let skipped = body["skipped"].as_u64().unwrap();
+    let truncated = body["truncated"].as_u64().unwrap();
+    assert_eq!(
+        returned,
+        body["xrefs"].as_array().unwrap().len() as u64,
+        "returned 必须等于数组长度"
+    );
+    assert_eq!(
+        skipped + returned + truncated,
+        total,
+        "跳过 + 返回 + 截断 必须等于总数"
+    );
+
+    // 每条引用都要带来源与可达性两个字段（前端据此分列显示）
+    let first = &body["xrefs"].as_array().unwrap()[0];
+    assert_keys(
+        first,
+        &["from", "to", "kind", "source", "reachable"],
+        "xref 条目",
+    );
+    assert!(
+        first["reachable"].is_boolean(),
+        "reachable 必须是布尔而不是字符串"
+    );
+}
+
+/// 按类型过滤必须真的减少结果，而不是被静默忽略。
+///
+/// fixture 里 `entry` 有 call、间接调用没有目标（不产生 xref），
+/// 所以只按 `call` 过滤时应当只剩 call 型。
+#[tokio::test]
+async fn xref_search_filters_by_kind_and_rejects_unknown_kinds() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+
+    let (status, all) = get(state.clone(), "/api/xref-search").await;
+    assert_eq!(status, StatusCode::OK);
+    let total = all["total"].as_u64().unwrap();
+    assert!(total > 0, "fixture 应当产出引用，实际 {total}");
+
+    let (status, calls) = get(state.clone(), "/api/xref-search?kind=call").await;
+    assert_eq!(status, StatusCode::OK, "响应：{calls}");
+    let kinds: Vec<&str> = calls["xrefs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        kinds.iter().all(|k| *k == "call"),
+        "只按 call 过滤却出现了其它类型：{kinds:?}"
+    );
+
+    // 拼错的过滤值必须报错：静默返回 0 条会伪装成"这个目标没有引用"
+    let (status, body) = get(state, "/api/xref-search?kind=calll").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "响应：{body}");
+}
+
+/// 按来源过滤：`jump-table` 是推导出来的，必须能与 `direct` 分开。
+#[tokio::test]
+async fn xref_search_filters_by_source() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+
+    let (status, direct) = get(state.clone(), "/api/xref-search?source=direct").await;
+    assert_eq!(status, StatusCode::OK, "响应：{direct}");
+    for x in direct["xrefs"].as_array().unwrap() {
+        assert_eq!(x["source"], "direct");
+    }
+
+    let (status, derived) = get(state, "/api/xref-search?source=jump-table").await;
+    assert_eq!(status, StatusCode::OK, "响应：{derived}");
+    for x in derived["xrefs"].as_array().unwrap() {
+        assert_eq!(x["source"], "jump-table");
+    }
+}
+
+/// 按范围过滤，并且范围写反 / 写错必须报错。
+#[tokio::test]
+async fn xref_search_filters_by_address_range_and_validates_it() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+
+    // 覆盖整个地址空间：应当等于不过滤
+    let (status, full) = get(state.clone(), "/api/xref-search").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, ranged) = get(
+        state.clone(),
+        "/api/xref-search?to_start=0&to_end=ffffffffffffffff",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "响应：{ranged}");
+    assert_eq!(
+        ranged["total"], full["total"],
+        "覆盖全空间的过滤不应改变结果"
+    );
+
+    // 空区间必须报错，而不是返回 0 条
+    let (status, body) = get(state.clone(), "/api/xref-search?to_start=2000&to_end=1000").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "响应：{body}");
+
+    // 写错的地址必须报错
+    let (status, body) = get(state, "/api/xref-search?from_start=zzzz").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "响应：{body}");
+}
+
+/// 可达性的字段形状与"下界"语义。
+#[tokio::test]
+async fn reachability_response_matches_the_frontend_contract() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+    let (status, body) = get(state, "/api/reachability").await;
+    assert_eq!(status, StatusCode::OK, "响应：{body}");
+
+    assert_keys(&body, &["format_version", "result"], "reachability 响应");
+    let result = &body["result"];
+    assert_keys(
+        result,
+        &[
+            "entry",
+            "total_functions",
+            "reachable",
+            "unreachable",
+            "max_depth",
+            "depth_histogram",
+            "functions",
+            "truncated",
+            "unresolved_indirect",
+            "notes",
+        ],
+        "reachability.result",
+    );
+
+    // 全图模式没有起点
+    assert!(result["entry"].is_null(), "全局可达性的 entry 应为 null");
+
+    // 可达 + 不可达 == 函数总数（三个数字必须自洽）
+    let total = result["total_functions"].as_u64().unwrap();
+    let reachable = result["reachable"].as_u64().unwrap();
+    let unreachable = result["unreachable"].as_u64().unwrap();
+    assert_eq!(
+        reachable + unreachable,
+        total,
+        "可达 + 不可达 必须等于函数总数"
+    );
+
+    // 分层直方图之和 == 可达数
+    let hist_sum: u64 = result["depth_histogram"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .sum();
+    assert_eq!(hist_sum, reachable, "直方图之和必须等于可达函数数");
+
+    // "可达是下界"这件事必须出现在 notes 里
+    let notes = result["notes"].as_array().unwrap();
+    assert!(
+        notes.iter().any(|n| n.as_str().unwrap().contains("下界")),
+        "可达集是下界这件事必须明说：{notes:?}"
+    );
+}
+
+/// 指定起点时，起点自己深度为 0，深度 1 的集合**必须**等于调用图里
+/// 它的直接被调用方。
+///
+/// 这条是两个端点之间的交叉核对，而不是把 fixture 的地址抄一遍：
+/// 硬编码地址会在 fixture 字节微调时静默失效（这个 fixture 的注释
+/// 本身就把 `call` 的地址算错了两字节 —— 两个 `nop` 之后才是指令），
+/// 而对不上调用图才是真的实现错误。
+#[tokio::test]
+async fn reachability_from_a_given_entry_starts_at_depth_zero() {
+    let (state, _t) = state_with_target(&build_elf_with_call_graph());
+
+    // 0x401000 是 fixture 的入口
+    let (status, body) = get(state.clone(), "/api/reachability?entry=0000000000401000").await;
+    assert_eq!(status, StatusCode::OK, "响应：{body}");
+    let result = &body["result"];
+
+    assert_eq!(result["entry"], "0000000000401000");
+    let fns = result["functions"].as_array().unwrap();
+    assert!(!fns.is_empty(), "至少起点自己应当可达");
+
+    let start = &fns[0];
+    assert_eq!(start["entry"], "0000000000401000");
+    assert_eq!(start["depth"], 0, "起点自己深度必须是 0");
+
+    // 从调用图取起点的直接被调用方
+    let (status, graph) = get(state.clone(), "/api/call-graph").await;
+    assert_eq!(status, StatusCode::OK);
+    let callees: Vec<String> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["caller"] == "0000000000401000")
+        .map(|e| e["callee"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!callees.is_empty(), "fixture 的入口应当有直接调用边");
+
+    let depth1: Vec<String> = fns
+        .iter()
+        .filter(|f| f["depth"] == 1)
+        .map(|f| f["entry"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        depth1, callees,
+        "深度 1 的可达集必须正好是调用图里入口的直接被调用方"
+    );
+
+    // 起点写错要报错，不能悄悄退化成全局模式
+    let (status, body) = get(state, "/api/reachability?entry=zzzz").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "响应：{body}");
 }

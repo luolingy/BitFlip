@@ -405,13 +405,35 @@ export interface MembersResponse {
 }
 
 /** 一条交叉引用。对应 `bitflip-core::XrefWire`。 */
-export interface XrefWire {  /** 引用发出的地址。 */
+export interface XrefWire {
+  /** 引用发出的地址。 */
   from: string;
   /** 被引用的地址。 */
   to: string;
   /** 类型短名：`call` / `jump` / `data`。 */
   kind: string;
+  /**
+   * 引用来源短名：`direct`（指令编码里写明的目标）或
+   * `jump-table`（间接跳转经跳转表识别推导出的目标）。
+   *
+   * 两者的可信度不同：后者是分析器读表推导的，验证失败的模式
+   * 也不同 —— UI 必须能区分，不能当成同一种事实展示。
+   */
+  source: string;
+  /**
+   * 发起指令是否被递归下降证明可达。
+   *
+   * `false` 不代表引用是错的，而是"发起指令本身可能只是线性扫描
+   * 把数据误认成了指令"。低可信度的行要显著区分显示。
+   */
+  reachable: boolean;
 }
+
+/** 引用来源短名 → 中文标签。 */
+export const XREF_SOURCE_LABELS: Record<string, string> = {
+  direct: "直接",
+  "jump-table": "跳转表推导",
+};
 
 /** 引用类型短名 → 中文标签。 */
 export const XREF_KIND_LABELS: Record<string, string> = {
@@ -459,6 +481,73 @@ export interface StringsResponse {
   format_version: number;
   total: number;
   strings: StringWire[];
+}
+
+/** `/api/xref-search` 响应（M6 交付物 7）。 */
+export interface XrefSearchResponse {
+  format_version: number;
+  /** 满足条件的总条数（不受分页影响）。 */
+  total: number;
+  /** 本页返回条数。 */
+  returned: number;
+  /** 因分页跳过的条数。 */
+  skipped: number;
+  /** 因分页未返回的条数。`skipped + returned + truncated == total`。 */
+  truncated: number;
+  xrefs: XrefWire[];
+  notes: string[];
+}
+
+/** xref 搜索的过滤条件。 */
+export interface XrefSearchFilters {
+  kind?: string[];
+  source?: string[];
+  // 显式写出 `| undefined`：项目开了 exactOptionalPropertyTypes，
+  // 只写 `fromStart?: string` 时不允许显式传 undefined。
+  fromStart?: string | undefined;
+  fromEnd?: string | undefined;
+  toStart?: string | undefined;
+  toEnd?: string | undefined;
+  count?: number | undefined;
+  offset?: number | undefined;
+}
+
+/** 一个可达函数。对应 `bitflip-core::ReachableFunctionWire`。 */
+export interface ReachableFunctionWire {
+  entry: string;
+  /** 距起点的跳数。 */
+  depth: number;
+  /** 函数名；`null` 表示未命名（不是编出来的占位名）。 */
+  name: string | null;
+}
+
+/** 可达性结论。对应 `bitflip-core::ReachabilityWire`。 */
+export interface ReachabilityWire {
+  /** 起点；`null` 表示从全部根出发的全局可达性。 */
+  entry: string | null;
+  total_functions: number;
+  reachable: number;
+  unreachable: number;
+  max_depth: number;
+  /** `depth_histogram[i]` = 距起点 i 跳的函数数。 */
+  depth_histogram: number[];
+  functions: ReachableFunctionWire[];
+  /** 明细被截断的条数。 */
+  truncated: number;
+  /**
+   * 本次 BFS 没有走通的间接调用数。
+   *
+   * 这个数 > 0 时"不可达"**不等于**死代码：只被 `call rax` 调用的
+   * 函数在这里也会显示成不可达。界面必须把它和不可达数一起显示。
+   */
+  unresolved_indirect: number;
+  notes: string[];
+}
+
+/** `/api/reachability` 响应。 */
+export interface ReachabilityResponse {
+  format_version: number;
+  result: ReachabilityWire;
 }
 
 /** 十六进制视图的一行。 */
@@ -820,12 +909,75 @@ export async function fetchFrames(
 }
 
 
-/** 取某地址的交叉引用。 */export async function fetchXrefs(
+/** 取某地址的交叉引用，可按类型与来源过滤。 */export async function fetchXrefs(
   token: string | null,
   address: string,
+  filters?: { kind?: string[]; source?: string[] },
 ): Promise<XrefsResponse | null> {
   const params = new URLSearchParams({ address });
+  if (filters?.kind?.length) {
+    params.set("kind", filters.kind.join(","));
+  }
+  if (filters?.source?.length) {
+    params.set("source", filters.source.join(","));
+  }
   return requestOrNull<XrefsResponse>(`/api/xrefs?${params.toString()}`, token);
+}
+
+/** 按条件搜索交叉引用（全表过滤 + 分页）。 */
+export async function fetchXrefSearch(
+  token: string | null,
+  filters: XrefSearchFilters,
+): Promise<XrefSearchResponse | null> {
+  const params = new URLSearchParams();
+  if (filters.kind?.length) {
+    params.set("kind", filters.kind.join(","));
+  }
+  if (filters.source?.length) {
+    params.set("source", filters.source.join(","));
+  }
+  if (filters.fromStart) {
+    params.set("from_start", filters.fromStart);
+  }
+  if (filters.fromEnd) {
+    params.set("from_end", filters.fromEnd);
+  }
+  if (filters.toStart) {
+    params.set("to_start", filters.toStart);
+  }
+  if (filters.toEnd) {
+    params.set("to_end", filters.toEnd);
+  }
+  if (filters.count !== undefined) {
+    params.set("count", String(filters.count));
+  }
+  if (filters.offset !== undefined) {
+    params.set("offset", String(filters.offset));
+  }
+  return requestOrNull<XrefSearchResponse>(
+    `/api/xref-search?${params.toString()}`,
+    token,
+  );
+}
+
+/** 取可达性结论。`entry` 省略时为全局可达性。 */
+export async function fetchReachability(
+  token: string | null,
+  entry?: string | null,
+  limit?: number,
+): Promise<ReachabilityResponse | null> {
+  const params = new URLSearchParams();
+  if (entry) {
+    params.set("entry", entry);
+  }
+  if (limit !== undefined) {
+    params.set("limit", String(limit));
+  }
+  const qs = params.toString();
+  return requestOrNull<ReachabilityResponse>(
+    `/api/reachability${qs ? `?${qs}` : ""}`,
+    token,
+  );
 }
 
 /** 取字符串列表（可按子串过滤）。 */
