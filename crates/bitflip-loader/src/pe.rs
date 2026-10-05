@@ -1163,7 +1163,20 @@ fn parse_unwind_info(
                     .ok();
             }
             // SAVE_XMM128：下 1 槽 = 缩放偏移（×16，128 位对齐）
-            6 => {
+            //
+            // # 操作码编号为什么是 8 而不是 6
+            //
+            // 微软 PE/COFF 规范的真实定义：0=PUSH_NONVOL、1=ALLOC_LARGE、
+            // 2=ALLOC_SMALL、3=SET_FPREG、4=SAVE_NONVOL、5=SAVE_NONVOL_FAR、
+            // **6/7 = 保留（x64 上非法）**、8=SAVE_XMM128、9=SAVE_XMM128_FAR、
+            // 0xA=PUSH_MACHFRAME。
+            //
+            // 第一版把 6/7 当 XMM、8 当 MACHFRAME —— 表错了一位，单独的
+            // MinGW fixture 上 push/alloc 仍然全对（它们只用 0–5），测试
+            // 全绿；上 ntdll 一跑，几十个函数的 XMM 保存被解成 MACHFRAME
+            // 或"未识别 0xa"，帧大小与保存列表整体失真。教训：操作码表
+            // 的冷门分支必须有一个真实系统二进制当参照。
+            8 => {
                 slots = 2;
                 extra = reader
                     .u16(next_slot, Endianness::Little, "SAVE_XMM128 偏移")
@@ -1171,7 +1184,7 @@ fn parse_unwind_info(
                     .map(|scaled| u32::from(scaled) * 16);
             }
             // SAVE_XMM128_FAR：下 2 槽 = 32 位偏移
-            7 => {
+            9 => {
                 slots = 3;
                 extra = reader
                     .u32(next_slot, Endianness::Little, "SAVE_XMM128_FAR 偏移")
@@ -1289,22 +1302,35 @@ fn parse_unwind_info(
                     ops.push(PeUnwindOp::SaveNonVolatileFar { reg, offset });
                 }
             }
-            6 | 7 => {
+            8 | 9 => {
                 // SAVE_XMM128[_FAR]：记录但不计入帧大小
                 //
                 // 这里的编号是 **XMM** 寄存器编号，不是 GP 寄存器编号。
                 // 拿 GP 表（rax..r15）翻译会把 xmm0 写成 "rax"、xmm6 写成
-                // "rsi" —— 真实 ntdll 上一次能列出十几个 "rax" 保存，
-                // 看起来像严重错误，其实是名字表用错了。
+                // "rsi"。操作码编号见上面槽位循环里的说明（8/9，不是 6/7）。
                 let reg = format!("xmm{}", r.info);
                 let offset = r.extra.unwrap_or(0);
                 ops.push(PeUnwindOp::SaveXmm { reg, offset });
             }
-            8 => {
-                // PUSH_MACHFRAME
+            0xA => {
+                // PUSH_MACHFRAME：info=0 → 0x28（机器帧），info=1 → 再加
+                // 8 字节错误码。规范里 info 只有这两种取值。
                 let size = u32::from(r.info) + 1;
                 ops.push(PeUnwindOp::PushMachineFrame { size: size * 0x28 });
                 accum += u64::from(size) * 0x28;
+            }
+            6 | 7 => {
+                // x64 上保留的操作码：按规范不该出现。如实记为未识别，
+                // 不猜语义 —— 见 CLAUDE.md §7。
+                ops.push(PeUnwindOp::Unknown {
+                    opcode: r.opcode,
+                    info: r.info,
+                    prolog_offset: r.prolog_off,
+                });
+                notes.push(format!(
+                    "展开码 {}（保留值，x64 上非法；info={:#x}，前导偏移 {:#x}）未识别",
+                    r.opcode, r.info, r.prolog_off
+                ));
             }
             other => {
                 ops.push(PeUnwindOp::Unknown {
@@ -2366,21 +2392,23 @@ mod tests {
         }
     }
 
-    /// SAVE_XMM128 的编号是 XMM 编号，必须翻译成 `xmmN`。
+    /// SAVE_XMM128 的操作码是 8，寄存器编号翻译成 `xmmN`。
     ///
-    /// 这是真实目标上暴露的：ntdll 里带 XMM 保存的函数列出了十几个
-    /// "rax"，因为 GP 寄存器表（0=rax…）被拿来翻译 XMM 编号 ——
-    /// xmm0 变成 "rax"、xmm6 变成 "rsi"。不报错，只是名字全错。
+    /// 两个坑都是真实目标暴露的：
+    /// - 编号表错位：第一版把 6/7 当 XMM、8 当 MACHFRAME（MinGW 样本
+    ///   只用 0–5，测试全绿也发现不了）；ntdll 上几十个函数的 XMM 保存
+    ///   被解成 MACHFRAME 或"未识别 0xa"。
+    /// - 名字表用错：XMM 编号拿 GP 表（0=rax…）翻译，xmm0 变成 "rax"。
     #[test]
     fn unwind_xmm_save_is_named_by_xmm_number_not_gp_table() {
         // version 1；CountOfCodes=2
-        // code0: SAVE_XMM128，op=6，info=0（xmm0），scaled offset=2 → 0x20
+        // code0: SAVE_XMM128，op=8，info=0（xmm0），scaled offset=2 → 0x20
         //
-        // 字节序又要注意：低 4 位是 UnwindOp、高 4 位是 OpInfo，
-        // 所以是 (0<<4)|6 = 0x06。写成 0x60 就是 push rsi（op=0、info=6）。
+        // 字节序要注意：低 4 位是 UnwindOp、高 4 位是 OpInfo，
+        // 所以 opbyte = (0<<4)|8 = 0x08。写成 0x80 就是 MACHFRAME。
         let blob = [
             0x01, 0x01, 0x02, 0x00, // 头
-            0x00, 0x06, // SAVE_XMM128：op=6, info=0
+            0x00, 0x08, // SAVE_XMM128：op=8, info=0
             0x02, 0x00, // scaled offset = 2（×16 = 0x20）
         ];
         let (obj, bytes) = object_with_rdata(&blob);
@@ -2401,6 +2429,57 @@ mod tests {
             "XMM 不计入帧大小要说明：{:?}",
             info.notes
         );
+    }
+
+    /// PUSH_MACHFRAME 的操作码是 0xA，info=0/1 对应 0x28/0x50 字节。
+    #[test]
+    fn unwind_machine_frame_is_opcode_a_with_0x28_units() {
+        // version 1；CountOfCodes=1；opbyte = (0<<4)|0xA = 0x0A
+        let blob = [
+            0x01, 0x01, 0x01, 0x00, // 头
+            0x00, 0x0A, // PUSH_MACHFRAME info=0
+        ];
+        let (obj, bytes) = object_with_rdata(&blob);
+        let reader = Reader::with_base(&bytes, 0);
+        let info = parse_unwind_info(&reader, &obj, 0x1_4000_2000).expect("解码");
+
+        assert!(
+            matches!(
+                info.ops.as_slice(),
+                [PeUnwindOp::PushMachineFrame { size: 0x28 }]
+            ),
+            "info=0 应为 0x28 字节的机器帧，实际 {:?}",
+            info.ops
+        );
+        assert_eq!(info.frame_size(), Some(0x28));
+    }
+
+    /// 保留操作码（6/7）必须如实报未识别，不猜语义。
+    #[test]
+    fn unwind_reserved_opcodes_6_and_7_are_reported_unknown() {
+        // 两个保留码：opbyte = (1<<4)|6 = 0x16 与 (2<<4)|7 = 0x27
+        let blob = [
+            0x01, 0x01, 0x02, 0x00, // 头
+            0x00, 0x16, // 保留 op=6, info=1
+            0x04, 0x27, // 保留 op=7, info=2
+        ];
+        let (obj, bytes) = object_with_rdata(&blob);
+        let reader = Reader::with_base(&bytes, 0);
+        let info = parse_unwind_info(&reader, &obj, 0x1_4000_2000).expect("解码");
+
+        assert_eq!(info.ops.len(), 2);
+        assert!(info
+            .ops
+            .iter()
+            .all(|o| matches!(o, PeUnwindOp::Unknown { .. })));
+        assert!(
+            info.notes
+                .iter()
+                .any(|n| n.contains("保留") && n.contains("非法")),
+            "保留码要写明 x64 上非法：{:?}",
+            info.notes
+        );
+        assert_eq!(info.frame_size(), Some(0));
     }
 
     /// ALLOC_LARGE（info=0）读取的是 8 字节单位，不是原始字节数。

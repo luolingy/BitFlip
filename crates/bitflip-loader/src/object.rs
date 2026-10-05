@@ -520,6 +520,9 @@ impl PeUnwindInfo {
                 PeUnwindOp::PushNonVolatile { reg, .. } => out.push(reg.as_str()),
                 PeUnwindOp::SaveNonVolatile { reg, .. } => out.push(reg.as_str()),
                 PeUnwindOp::SaveNonVolatileFar { reg, .. } => out.push(reg.as_str()),
+                // XMM 保存也是保存动作（Windows x64 的非易失 XMM6–15），
+                // 只是占栈宽度未计入 frame_size —— 见 notes 的说明。
+                PeUnwindOp::SaveXmm { reg, .. } => out.push(reg.as_str()),
                 _ => {}
             }
         }
