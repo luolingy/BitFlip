@@ -1114,3 +1114,257 @@ button:not(:disabled):hover {
   width: auto;
   padding: 2px 6px;
 }
+
+/* ── M7：脚本控制台 ────────────────────────────────────────────────────── */
+
+.script-console {
+  gap: 10px;
+}
+
+/* 编辑区与脚本库并排：写脚本时总要一边看示例一边改。 */
+.script-columns {
+  display: flex;
+  gap: 12px;
+  min-height: 0;
+  flex: 0 0 auto;
+}
+
+.script-editor-pane {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.script-editor {
+  width: 100%;
+  height: 220px;
+  resize: vertical;
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  tab-size: 2;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  white-space: pre;
+  overflow: auto;
+}
+
+.script-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.script-library-pane {
+  flex: 0 0 300px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.script-library {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.script-library-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.script-library-item:hover {
+  border-color: var(--accent);
+}
+
+.script-library-active {
+  border-color: var(--accent);
+  background: #17233a;
+}
+
+.script-library-name {
+  font-size: 12.5px;
+}
+
+.script-library-desc {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+
+.script-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 6px 10px;
+  background: var(--bg-pane);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+/* ── 进度 ── */
+
+.script-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.script-progress-track {
+  flex: 1 1 auto;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.script-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+
+/*
+ * 总数未知时的条纹动画。
+ * 不给百分比：一根停在 0% 的条会谎报"还没开始"，
+ * 而这与"正在进行但总量未知"是两种状态。
+ */
+.script-progress-indeterminate {
+  height: 100%;
+  width: 40%;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--accent) 0 12px,
+    transparent 12px 24px
+  );
+  animation: script-progress-slide 1s linear infinite;
+}
+
+@keyframes script-progress-slide {
+  from {
+    transform: translateX(-40%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+
+/* ── 日志 ── */
+
+.script-log-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.script-log {
+  flex: 1 1 auto;
+  min-height: 120px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 8px 10px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.script-log-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12.5px;
+}
+
+.script-log-level {
+  flex: 0 0 34px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.script-log-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-warn .script-log-level,
+.log-warn .script-log-text {
+  color: var(--warn);
+}
+
+.log-error .script-log-level,
+.log-error .script-log-text {
+  color: var(--error);
+}
+
+.script-stack {
+  max-height: 160px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+/* ── 结果表格 ── */
+
+.script-table-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.table-wrap-short {
+  max-height: 260px;
+}
+
+.script-save-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.script-storage-error {
+  color: var(--warn);
+}
+
+/* 用户脚本行：载入按钮 + 删除链接 */
+.script-own-row {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.script-own-row .script-library-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}

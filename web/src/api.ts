@@ -1103,3 +1103,181 @@ export function normalizeAddress(input: string): string | null {
   }
   return trimmed.toLowerCase().padStart(16, "0");
 }
+
+// ── M7：脚本 ────────────────────────────────────────────────────────────────
+
+/** 一行脚本日志。 */
+export interface ScriptLogWire {
+  /** `info` / `warn` / `error`。 */
+  level: string;
+  message: string;
+}
+
+/** 脚本上报的进度。 */
+export interface ScriptProgressWire {
+  /** 已完成。 */
+  done: number;
+  /**
+   * 总数；脚本没说时为 `null`。
+   *
+   * 界面必须把 `null` 显示成"进行中"而不是 `0%`：进度条停在 0%
+   * 与"正在进行但总量未知"是两种完全不同的状态。
+   */
+  total: number | null;
+  /** 当前在做什么。 */
+  label: string | null;
+}
+
+/**
+ * 脚本失败的分类。
+ *
+ * 用带标签的联合而不是一个 `{ message }`：界面对"被取消"、"超时"、
+ * "提交写了一半"要给完全不同的呈现，并让用户知道**该做什么**。
+ */
+export type ScriptErrorWire =
+  | { kind: "cancelled" }
+  | { kind: "timeout"; limit_ms: number }
+  | { kind: "syntax"; message: string; line: number | null }
+  | { kind: "runtime"; message: string; line: number | null; stack: string | null }
+  | { kind: "host"; message: string }
+  | { kind: "panic"; message: string }
+  | { kind: "commit"; committed: number; total: number; reason: string }
+  | { kind: "engine"; message: string };
+
+/** 运行状态。 */
+export interface ScriptStatusWire {
+  /** `idle` | `warming` | `running` | `done`。 */
+  state: string;
+  run_id: number | null;
+  elapsed_ms: number;
+  logs: ScriptLogWire[];
+  progress: ScriptProgressWire | null;
+  /** 目前暂存的写入条数。 */
+  staged: number;
+  /** 已提交条数（未结束时为 `null`）。 */
+  committed: number | null;
+  /** 本次尝试提交的条数（未结束时为 `null`）。 */
+  staged_total: number | null;
+  error: ScriptErrorWire | null;
+  /**
+   * 现在点"停止"是否有用。
+   *
+   * 单独给这个字段而不是让界面从 `state` 推断：预热阶段（构建分析结论）
+   * 看起来也是"在跑"，但取消无效 —— 分析不在脚本引擎里跑。
+   */
+  can_cancel: boolean;
+  /** 脚本 API 版本。 */
+  api_version: number;
+}
+
+/** 一份内置脚本。 */
+export interface BuiltinScriptWire {
+  id: string;
+  name: string;
+  description: string;
+  api_version: number;
+  source: string;
+}
+
+/** 脚本库。 */
+export interface ScriptLibraryWire {
+  api_version: number;
+  scripts: BuiltinScriptWire[];
+}
+
+/**
+ * 发起一次脚本运行。
+ *
+ * 服务端**立刻**返回（202），不等脚本跑完 —— 否则界面看不到进度、
+ * 也没有一个可被取消的运行对象。结果要靠 `fetchScriptStatus` 轮询。
+ */
+export function runScript(
+  token: string | null,
+  source: string,
+): Promise<ScriptStatusWire> {
+  return requestJsonResult<ScriptStatusWire>("POST", "/api/script/run", token, {
+    source,
+  });
+}
+
+/** 查询当前（或最近一次）运行的状态。 */
+export function fetchScriptStatus(token: string | null): Promise<ScriptStatusWire> {
+  return request<ScriptStatusWire>("/api/script/status", token);
+}
+
+/**
+ * 请求取消当前运行。
+ *
+ * 被拒（没有在跑 / 还在预热 / 已经结束）时**不抛异常**，而是把原因带回来：
+ * 那些都是有意义的回答，界面要显示它们，而不是弹一个红框。
+ */
+export async function cancelScript(
+  token: string | null,
+): Promise<{ ok: boolean; message: string }> {
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["x-bitflip-token"] = token;
+  }
+  const response = await fetch("/api/script/cancel", { method: "POST", headers });
+  const body: unknown = await response.json().catch(() => null);
+  if (body && typeof body === "object" && "ok" in body) {
+    const record = body as { ok: unknown; message: unknown };
+    return {
+      ok: record.ok === true,
+      message: typeof record.message === "string" ? record.message : "",
+    };
+  }
+  return {
+    ok: false,
+    message: `取消失败（HTTP ${response.status}）`,
+  };
+}
+
+/** 内置示例脚本集。 */
+export function fetchScriptLibrary(token: string | null): Promise<ScriptLibraryWire> {
+  return request<ScriptLibraryWire>("/api/script/library", token);
+}
+
+/**
+ * 带响应体的 `fetch`。
+ *
+ * 与 [`requestJson`] 的区别是它需要把响应解析回来，并且错误体里
+ * 除了 `error` 还认 `message`（取消端点用的是后者）。
+ */
+async function requestJsonResult<T>(
+  method: string,
+  path: string,
+  token: string | null,
+  body: unknown,
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["x-bitflip-token"] = token;
+  }
+  const init: RequestInit = { method, headers };
+  if (body !== null) {
+    headers["content-type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(path, init);
+  const text = await response.text();
+  if (!response.ok) {
+    let message = `请求失败（HTTP ${response.status}）`;
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (parsed && typeof parsed === "object") {
+        const record = parsed as { error?: unknown; message?: unknown };
+        const raw = record.error ?? record.message;
+        if (typeof raw === "string" && raw.length > 0) {
+          message = raw;
+        }
+      }
+    } catch {
+      // 响应体不是 JSON：保留默认信息。
+    }
+    throw new ApiError(response.status, message);
+  }
+
+  return JSON.parse(text) as T;
+}

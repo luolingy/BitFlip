@@ -115,6 +115,26 @@ try {
             Write-Host "=== loopback-only bind"
             Write-Host "--- SKIP (no debug binary; run: & .\scripts\cargo.ps1 build --workspace)"
         }
+
+        # M7: the only place where the whole stack is exercised at once -- SPA
+        # bundle, HTTP endpoints, script engine, core analysis, project store.
+        # It needs the release binary (it drives real analysis, and the run is
+        # charged against a wall-clock budget), plus the fixture that has a
+        # symbol table. Both sides are checked so a missing prerequisite is a
+        # SKIP with instructions rather than a confusing failure.
+        $consoleBin = Join-Path $repoRoot '.cargo-target/release/bitflip-cli.exe'
+        $consoleTarget = Join-Path $repoRoot 'tests/fixtures/generated/m3-mingw-static.unstripped.exe'
+        if ((Test-Path -LiteralPath $consoleBin) -and (Test-Path -LiteralPath $consoleTarget)) {
+            Invoke-Step -Name 'script console smoke' -Action {
+                & (Join-Path $PSScriptRoot 'smoke-script-console.ps1') | Out-Host
+            } | Out-Null
+        }
+        else {
+            Write-Host ""
+            Write-Host "=== script console smoke"
+            Write-Host "--- SKIP (needs a release binary and the unstripped fixture; run:"
+            Write-Host "          & .\scripts\cargo.ps1 build --release -p bitflip-cli; & .\scripts\gen-fixtures.ps1)"
+        }
     }
 
     Write-Host ""
