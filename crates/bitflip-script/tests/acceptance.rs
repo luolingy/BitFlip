@@ -220,6 +220,139 @@ fn a_script_reads_back_its_own_pending_writes() {
 }
 
 #[test]
+fn a_script_generates_a_patch_and_reads_it_back_as_hex() {
+    let store = TempStore::new();
+    let engine = engine_with_timeout_ms(2_000);
+    let host = Host::new(Some(store.take()));
+
+    // 补丁以**字节**落库，不是文本。两种输入形式各用一次：
+    // 字符串是逆向工程里的通用写法，数组是脚本算出来的字节最自然的落点。
+    let source = r#"
+        bitflip.setPatch("0000000000401000", "90 90");
+        bitflip.setPatch("0000000000401010", [0x48, 0x31, 0xc0]);
+        bitflip.log(bitflip.get("0000000000401000", "patch"));
+        bitflip.log(bitflip.get("0000000000401010", "patch"));
+        bitflip.log(bitflip.stagedCount());
+    "#;
+    let outcome = engine.run(&host, source).expect("应当成功");
+    assert_eq!(outcome.committed, 2);
+    // 读回来的是十六进制字符串：`get` 只取 `text` 的话这里会拿到 null，
+    // 而"脚本必须能读到自己刚写的东西"没有例外。
+    assert_eq!(outcome.logs[0].message, "9090");
+    assert_eq!(outcome.logs[1].message, "4831c0");
+    assert_eq!(outcome.logs[2].message, "2");
+
+    let reopened = store.reopen();
+    let patch = reopened
+        .get(0x401000, AnnotationKind::Patch)
+        .expect("补丁应当落库");
+    assert_eq!(
+        patch.patch_bytes(),
+        Some(vec![0x90, 0x90]),
+        "补丁必须按字节存，而不是把 \"90 90\" 当注释文本存下来"
+    );
+    assert_eq!(
+        patch.text, None,
+        "补丁不是注释：`text` 必须是 None，否则界面会把它按文本渲染"
+    );
+    assert_eq!(
+        reopened
+            .get(0x401010, AnnotationKind::Patch)
+            .and_then(|a| a.patch_bytes()),
+        Some(vec![0x48, 0x31, 0xc0])
+    );
+}
+
+#[test]
+fn every_hex_spelling_of_the_same_patch_is_the_same_patch() {
+    let store = TempStore::new();
+    let engine = engine_with_timeout_ms(2_000);
+    let host = Host::new(Some(store.take()));
+
+    let source = r#"
+        bitflip.setPatch("0000000000401000", "9090");
+        bitflip.setPatch("0000000000401001", "90,90");
+        bitflip.setPatch("0000000000401002", "0x90 0x90");
+        bitflip.setPatch("0000000000401003", "0X90:0x90");
+        bitflip.setPatch("0000000000401004", [144, 144]);
+        for (const a of ["0000000000401000", "0000000000401001", "0000000000401002", "0000000000401003", "0000000000401004"]) {
+            bitflip.log(a.slice(-1) + "=" + bitflip.get(a, "patch"));
+        }
+    "#;
+    let outcome = engine.run(&host, source).expect("应当成功");
+    for (index, log) in outcome.logs.iter().enumerate() {
+        assert!(
+            log.message.ends_with("=9090"),
+            "第 {index} 种写法没解析成同一个补丁：{}",
+            log.message
+        );
+    }
+}
+
+#[test]
+fn a_malformed_patch_is_rejected_by_naming_the_problem_and_stages_nothing() {
+    // 补丁写错了会改坏用户的目标文件。这里逐条钉住"拒绝执行"而不是"尽力而为"。
+    let cases: &[(&str, &str)] = &[
+        (r#"bitflip.setPatch("0000000000401000", "9");"#, "偶数"),
+        (
+            r#"bitflip.setPatch("0000000000401000", "zz");"#,
+            "非十六进制",
+        ),
+        (r#"bitflip.setPatch("0000000000401000", "");"#, "不能为空"),
+        (
+            r#"bitflip.setPatch("0000000000401000", "   ");"#,
+            "不能为空",
+        ),
+        (r#"bitflip.setPatch("0000000000401000", [256]);"#, "0..255"),
+        (r#"bitflip.setPatch("0000000000401000", [1.5]);"#, "0..255"),
+        (
+            r#"bitflip.setPatch("0000000000401000", ["90"]);"#,
+            "不是数字",
+        ),
+        (
+            r#"bitflip.setPatch("0000000000401000", 5);"#,
+            "十六进制字符串",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let store = TempStore::new();
+        let engine = engine_with_timeout_ms(2_000);
+        let host = Host::new(Some(store.take()));
+
+        let error = engine.run(&host, source).expect_err("非法补丁必须报错");
+        let message = error.to_string();
+        assert!(
+            message.contains(expected),
+            "错误里必须出现 {expected:?}，实际：{message}"
+        );
+        assert_eq!(
+            store.reopen().len(),
+            0,
+            "被拒绝的补丁不得留下任何写入（{source}）"
+        );
+    }
+}
+
+#[test]
+fn a_patch_larger_than_the_limit_is_refused_with_the_actual_size() {
+    let engine = engine_with_timeout_ms(2_000);
+    let host = Host::new(None);
+
+    let error = engine
+        .run(
+            &host,
+            r#"bitflip.setPatch("0000000000401000", new Array(65537).fill(0));"#,
+        )
+        .expect_err("超长补丁必须被拒绝");
+    let message = error.to_string();
+    assert!(
+        message.contains("65537") && message.contains("65536"),
+        "错误里要同时给出实际长度与上限，实际：{message}"
+    );
+}
+
+#[test]
 fn log_accepts_any_value_the_way_a_console_does() {
     let engine = engine_with_timeout_ms(2_000);
     let host = Host::new(None);

@@ -46,6 +46,14 @@ pub const SCRIPT_API_VERSION: u32 = 1;
 /// JS 安全整数上限（2^53 - 1）。超过它的整数在 JS 里已经无法精确表示。
 const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
+/// 一条补丁最多多少字节。
+///
+/// 补丁最终以十六进制文本存进工程库，而 `setPatch` 是脚本里唯一能一次塞进大量
+/// 数据的调用。给个上限不是为了省内存，而是为了让"单位搞错了"（把长度当字节数、
+/// 或在循环里累积却没清空）当场报错，而不是让工程库长出一个谁也说不清来路的
+/// 巨大 blob。64 KiB 已经超过任何真实的指令/数据补丁。
+const MAX_PATCH_BYTES: usize = 64 * 1024;
+
 /// 反汇编结果的提供者。
 ///
 /// 用闭包而不是直接传 `Arc<Disasm>`：传值意味着"构造 `Host` 时必须先反汇编"，
@@ -381,6 +389,31 @@ impl Host {
         {
             let state = state.clone();
             bitflip.set(
+                "setPatch",
+                Function::new(
+                    ctx.clone(),
+                    move |ctx: Ctx<'_>,
+                          address: Value<'_>,
+                          bytes: Value<'_>|
+                          -> rquickjs::Result<()> {
+                        let address = parse_address(&ctx, &address)?;
+                        let bytes = parse_patch_bytes(&ctx, &bytes)?;
+                        // 存的是**字节**，不是文本：`Annotation::patch` 负责
+                        // 生成 `patch_hex`。脚本不该自己拼十六进制字符串再塞进
+                        // 注释里 —— 那样补丁就不是补丁，只是一个长得像补丁的字符串。
+                        state
+                            .lock()
+                            .staged
+                            .stage(Annotation::patch(address, &bytes));
+                        Ok(())
+                    },
+                )?,
+            )?;
+        }
+
+        {
+            let state = state.clone();
+            bitflip.set(
                 "get",
                 Function::new(
                     ctx.clone(),
@@ -394,14 +427,14 @@ impl Host {
                         // 先看暂存，再看工程库：脚本必须能读到自己刚写的东西，
                         // 否则"没有名字才命名"这类脚本会重复劳动。
                         if let Some(a) = state.staged.get(address, kind) {
-                            return Ok(AnnotationText(a.text.clone()));
+                            return Ok(AnnotationText(annotation_value(a)));
                         }
                         Ok(AnnotationText(
                             state
                                 .store
                                 .as_ref()
                                 .and_then(|s| s.get(address, kind))
-                                .and_then(|a| a.text),
+                                .and_then(|a| annotation_value(&a)),
                         ))
                     },
                 )?,
@@ -507,15 +540,141 @@ pub(crate) fn parse_address(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Resul
 ///
 /// 未知取值**报错并列出可用值**，不静默回退到某个默认类别 ——
 /// 那会把用户的名字当成注释存进去（与 `AnnotationKind::parse` 的约定一致）。
+///
+/// `patch` 也在列表里：写入用 `bitflip.setPatch`，但读取用
+/// `bitflip.get(addr, 'patch')`，所以它必须出现在可用取值里，否则脚本作者
+/// 无从知道能这么读。
 pub(crate) fn parse_kind(ctx: &Ctx<'_>, raw: &str) -> rquickjs::Result<AnnotationKind> {
     AnnotationKind::parse(raw).ok_or_else(|| {
         Exception::throw_message(
             ctx,
             &format!(
-                "未知的标注类别：{raw:?}；可用：name / comment / type / bookmark / function-boundary / code-data"
+                "未知的标注类别：{raw:?}；可用：name / comment / type / bookmark / patch / function-boundary / code-data"
             ),
         )
     })
+}
+
+/// 取一条标注的可读值：注释/名字取 `text`，补丁取 `patch_hex`。
+///
+/// 只取 `text` 是不够的：补丁的正文在 `patch_hex` 里而 `text` 恒为 `None`，
+/// 于是 `get(addr, 'patch')` 会**永远**返回 `null` —— 而"脚本必须能读到自己
+/// 刚写的东西"是这里的硬要求。补丁读回来的是十六进制字符串（与
+/// `setPatch` 接受的字符串形式同一种表示，可以直接比对）。
+fn annotation_value(annotation: &Annotation) -> Option<String> {
+    annotation
+        .text
+        .clone()
+        .or_else(|| annotation.patch_hex.clone())
+}
+
+/// 解析补丁字节：十六进制字符串，或字节数组。
+///
+/// 两种形式都收，因为它们各自自然：字符串是逆向工程里的通用写法
+/// （`'90 90'`、`'9090'`、`'0x90 0x90'`，分隔符随意），数组是脚本里算出来的
+/// 字节（`bytes.map(...)`）最省事的落点。
+///
+/// 解析失败一律**报错并指出问题所在**，不做任何"尽力而为"的猜测：
+/// 补丁错了会改坏用户的目标文件，比拒绝执行糟得多。
+fn parse_patch_bytes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<u8>> {
+    let bytes = if value.is_string() {
+        let raw: String = value.get()?;
+        parse_hex_bytes(ctx, &raw)?
+    } else if let Some(array) = value.as_array() {
+        let mut out = Vec::new();
+        for (index, item) in array.iter::<Value<'_>>().enumerate() {
+            let item = item?;
+            if !item.is_number() {
+                return Err(Exception::throw_message(
+                    ctx,
+                    &format!("补丁第 {index} 个元素不是数字"),
+                ));
+            }
+            let number: f64 = item.get()?;
+            if !number.is_finite() || number.fract() != 0.0 || !(0.0..=255.0).contains(&number) {
+                return Err(Exception::throw_message(
+                    ctx,
+                    &format!("补丁第 {index} 个字节必须是 0..255 的整数，收到 {number}"),
+                ));
+            }
+            out.push(number as u8);
+        }
+        out
+    } else {
+        return Err(Exception::throw_message(
+            ctx,
+            "补丁必须是十六进制字符串（如 \"90 90\"）或字节数组（如 [0x90, 0x90]）",
+        ));
+    };
+
+    if bytes.is_empty() {
+        // 空补丁不是"什么都没做"，而是一个说不清的意图：用户以为自己写了点什么。
+        return Err(Exception::throw_message(ctx, "补丁不能为空"));
+    }
+    if bytes.len() > MAX_PATCH_BYTES {
+        return Err(Exception::throw_message(
+            ctx,
+            &format!(
+                "补丁过长：{} 字节，上限 {MAX_PATCH_BYTES} 字节",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// 解析十六进制字节串：按空白/`,`/`:` 切分，每段允许 `0x` 前缀。
+///
+/// 逐段去掉前缀再拼起来，而不是简单地把 `x` 当非法字符删掉 ——
+/// 后者会把 `'0x90'` 变成 `'090'`（奇数位），报出一个与真正原因无关的错误。
+fn parse_hex_bytes(ctx: &Ctx<'_>, raw: &str) -> rquickjs::Result<Vec<u8>> {
+    let mut digits = String::with_capacity(raw.len());
+    for token in raw.split(|c: char| c.is_whitespace() || c == ',' || c == ':') {
+        if token.is_empty() {
+            continue;
+        }
+        let body = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+            .unwrap_or(token);
+        if body.is_empty() {
+            return Err(Exception::throw_message(
+                ctx,
+                &format!("补丁里有空字节：{token:?}"),
+            ));
+        }
+        for ch in body.chars() {
+            if !ch.is_ascii_hexdigit() {
+                return Err(Exception::throw_message(
+                    ctx,
+                    &format!("补丁里有非十六进制字符 {ch:?}（出现在 {token:?} 里）"),
+                ));
+            }
+            digits.push(ch);
+        }
+    }
+
+    if digits.is_empty() {
+        return Err(Exception::throw_message(ctx, "补丁不能为空"));
+    }
+    if !digits.len().is_multiple_of(2) {
+        return Err(Exception::throw_message(
+            ctx,
+            &format!(
+                "补丁的十六进制位数必须是偶数（每字节两位），收到 {} 位：{digits:?}",
+                digits.len()
+            ),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.as_bytes().chunks(2) {
+        // 上面已经逐字符校验过是十六进制数字，这里不可能失败。
+        let byte = u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII"), 16)
+            .expect("已校验为十六进制");
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

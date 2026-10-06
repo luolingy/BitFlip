@@ -278,6 +278,31 @@ async fn a_script_write_lands_in_the_project_store() {
 }
 
 #[tokio::test]
+async fn a_patch_written_by_a_script_reaches_the_ui_as_bytes() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+
+    start_run(&state, "bitflip.setPatch('0000000000401000', '90 90 90');").await;
+    let done = wait_for_done(&state).await;
+    assert!(done["error"].is_null(), "补丁应当写入成功：{done}");
+    assert_eq!(done["committed"], 1, "应当提交一条：{done}");
+
+    let (status, body) = send(
+        state.clone(),
+        get_with_token("/api/annotations?from=0000000000401000&to=0000000000402000"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = body.to_string();
+    // `patch_hex` 是界面渲染补丁的内容来源。补丁必须按字节出现在这里，
+    // 而不是变成一个 `text` 字段里的字符串 —— 后者界面会当注释渲染。
+    assert!(
+        text.contains("patch_hex") && text.contains("909090"),
+        "补丁必须以十六进制字节到达界面，实际：{text}"
+    );
+    assert!(text.contains("patch"), "标注类别应当是 patch，实际：{text}");
+}
+
+#[tokio::test]
 async fn a_syntax_error_comes_back_with_a_line_number() {
     let (state, _target) = state_with_target(&build_elf_with_code());
 
