@@ -300,6 +300,25 @@ try {
         # Tab-separated output is what the console renders as its result table.
         Check -Label "export-functions emits tab-separated rows" -Ok ($exportText -match "`t")
 
+        # -- symbols come back through the live path too --
+        $symbolSource = "const hit = bitflip.symbols.find('memcpy'); bitflip.log('SYM=' + hit.length); bitflip.log('SYMVAL=' + hit[0].value);"
+        $null = Post-Json "$base/api/script/run" @{ source = $symbolSource }
+        $symbolRun = Wait-ForDone -Base $base
+        $symbolText = ''
+        if ($null -ne $symbolRun) { $symbolText = Join-Logs $symbolRun }
+        # A failed run produces no logs at all, so an empty detail would tell the
+        # reader nothing -- fall back to the error kind.
+        $symbolDetail = $symbolText -replace "`n", ' '
+        if (-not $symbolDetail -and $null -ne $symbolRun) {
+            $symbolDetail = 'error=' + [string]$symbolRun.error.kind
+        }
+        # The value must be the real virtual address: a PE COFF symbol's Value is
+        # a section offset, and getting that wrong is a defect this project has
+        # already shipped once.
+        Check -Label "symbols are readable over the live path" `
+            -Ok ($symbolText -match 'SYM=[1-9]' -and $symbolText -match 'SYMVAL=0000000140009218') `
+            -Detail $symbolDetail
+
         # -- progress is observable while the script is still running --
         $progressSource = "bitflip.progress(3, 7, 'x'); while (true) { }"
         $null = Post-Json "$base/api/script/run" @{ source = $progressSource }

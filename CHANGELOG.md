@@ -79,6 +79,14 @@
   是因为那样既看不到进度、也没有一个可被外部引用的运行对象可供取消，
   还会把 tokio 运行时占住（脚本执行是纯 CPU 的，跑在 `spawn_blocking` 里）。
   单槽运行：脚本会改标注，第二个并发请求明确得到 409 而不是排队。
+- **脚本 API：读符号**（`bitflip.symbols.*`）：`count` / `page` / `at(index)` /
+  `find(name)` / `atAddress(addr)`。三条不能含糊的地方：
+  符号表与函数表是**两份数据**（剥离后函数表还在、符号表空了，必须能分辨
+  "没有符号表"与"没有这个名字"）；`at` 按**下标**取，因为同一地址上可以有多条
+  符号，按地址取会静默丢数据；`atAddress` **只返回已定义符号** —— 未定义符号的
+  `value` 根本不是地址（PE 导入符号、ELF 未定义符号常见取值是 `0` 或节内偏移），
+  算进来会让"这个地址上有什么"多出一堆毫不相干的答案且毫无迹象。
+  没有目标时整个 `bitflip.symbols.*` 抛异常说明原因，**不返回空表**。
 - **内置示例脚本集**：`memcpy-args`（验收标准 1 的载体）、`rename-by-string`、
   `export-functions`、`library-patterns`，经 `GET /api/script/library` 下发。
   每一份都被 `crates/bitflip-script/tests/builtin.rs` **真的执行过** ——

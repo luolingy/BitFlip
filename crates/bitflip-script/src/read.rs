@@ -28,8 +28,8 @@
 use std::sync::Arc;
 
 use bitflip_core::{
-    Disasm, FunctionWire, InsnPage, InsnWire, Session, StringWire, TargetAnalysis, XrefFilter,
-    XrefWire, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    Disasm, FunctionWire, InsnPage, InsnWire, Session, StringWire, SymbolInfo, TargetAnalysis,
+    XrefFilter, XrefWire, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use rquickjs::prelude::Opt;
 use rquickjs::{Ctx, Exception, Function, Object, Value};
@@ -59,6 +59,7 @@ pub(crate) fn install<'js>(
     install_functions(ctx, state, bitflip)?;
     install_xrefs(ctx, state, bitflip)?;
     install_strings(ctx, state, bitflip)?;
+    install_symbols(ctx, state, bitflip)?;
     install_insns(ctx, state, bitflip)?;
     Ok(())
 }
@@ -97,6 +98,33 @@ fn disasm(ctx: &Ctx<'_>, state: &Shared) -> rquickjs::Result<Arc<Disasm>> {
         ));
     };
     provider().map_err(|err| Exception::throw_message(ctx, err.as_str()))
+}
+
+/// 在符号表上跑一段只读逻辑。
+///
+/// 符号表来自 `Session::parsed()` 的**借用**（不是拷贝）：一个带完整符号表的
+/// 大目标可以有十几万条符号，每次翻页都克隆一遍整张表等于把分页的意义抵消掉。
+/// 闭包在 `Arc<Session>` 存活期间执行，所以借用是安全的。
+fn with_symbols<T>(
+    ctx: &Ctx<'_>,
+    state: &Shared,
+    use_table: impl FnOnce(&[SymbolInfo]) -> T,
+) -> rquickjs::Result<T> {
+    let Some(session) = session_of(state) else {
+        return Err(Exception::throw_message(
+            ctx,
+            "本次会话没有打开目标，读不了符号表",
+        ));
+    };
+    let Some(parsed) = session.parsed() else {
+        // "解析失败"与"没有符号表"是两件事，报错文案必须分开：
+        // 前者用户要去查为什么解析不了，后者是目标的正常属性。
+        return Err(Exception::throw_message(
+            ctx,
+            "目标没有解析成功，因此没有符号表可读（与\"没有符号表\"不同）",
+        ));
+    };
+    Ok(use_table(&parsed.symbols))
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +520,107 @@ fn install_strings<'js>(
                             .find(|s| s.address == wanted)
                             .cloned(),
                     ))
+                },
+            )?,
+        )?;
+    }
+    Ok(())
+}
+
+fn install_symbols<'js>(
+    ctx: &Ctx<'js>,
+    state: &Shared,
+    bitflip: &Object<'js>,
+) -> rquickjs::Result<()> {
+    let symbols = sub(ctx, bitflip, "symbols")?;
+
+    {
+        let state = state.clone();
+        symbols.set(
+            "count",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>| -> rquickjs::Result<usize> {
+                    with_symbols(&ctx, &state, <[SymbolInfo]>::len)
+                },
+            )?,
+        )?;
+    }
+    {
+        let state = state.clone();
+        symbols.set(
+            "page",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>,
+                      offset: Opt<usize>,
+                      count: Opt<usize>|
+                      -> rquickjs::Result<Wire<serde_json::Value>> {
+                    let offset = offset.0.unwrap_or(0);
+                    let count = count.0.unwrap_or(DEFAULT_PAGE_SIZE);
+                    with_symbols(&ctx, &state, |table| slice_page(table, offset, count)).map(Wire)
+                },
+            )?,
+        )?;
+    }
+    {
+        // 按**下标**取一条，而不是按地址：符号表里同一个地址上可以有多条
+        // 符号（局部符号、别名、`.L` 标签），按地址取会静默丢掉其余几条。
+        let state = state.clone();
+        symbols.set(
+            "at",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, index: usize| -> rquickjs::Result<Wire<Option<SymbolInfo>>> {
+                    with_symbols(&ctx, &state, |table| table.get(index).cloned()).map(Wire)
+                },
+            )?,
+        )?;
+    }
+    {
+        // 按名字精确查找，返回**数组**：同名符号是常态（不同节的静态函数、
+        // 多个 `.o` 里的同名局部符号），只返回第一条会让调用方以为找到了唯一解。
+        let state = state.clone();
+        symbols.set(
+            "find",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, name: String| -> rquickjs::Result<Wire<Vec<SymbolInfo>>> {
+                    with_symbols(&ctx, &state, |table| {
+                        table
+                            .iter()
+                            .filter(|symbol| symbol.name == name)
+                            .cloned()
+                            .collect()
+                    })
+                    .map(Wire)
+                },
+            )?,
+        )?;
+    }
+    {
+        let state = state.clone();
+        symbols.set(
+            "atAddress",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>,
+                      address: Value<'_>|
+                      -> rquickjs::Result<Wire<Vec<SymbolInfo>>> {
+                    let address = parse_address(&ctx, &address)?;
+                    let wanted = bitflip_core::hex16(address);
+                    with_symbols(&ctx, &state, |table| {
+                        table
+                            .iter()
+                            // `defined` 这一条不是可选优化：**未定义符号的
+                            // `value` 根本不是地址**（PE 的导入符号、ELF 的
+                            // 未定义符号都是这样）。按地址匹配时把它们算进来，
+                            // 会让"这个地址上有什么"多出一堆毫不相干的答案。
+                            .filter(|symbol| symbol.defined && symbol.value == wanted)
+                            .cloned()
+                            .collect()
+                    })
+                    .map(Wire)
                 },
             )?,
         )?;

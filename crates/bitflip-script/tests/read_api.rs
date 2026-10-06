@@ -599,6 +599,148 @@ fn optional_arguments_really_are_optional() {
 }
 
 // ---------------------------------------------------------------------------
+// 符号表
+// ---------------------------------------------------------------------------
+
+/// 符号表是**另一份数据**，不是函数表。
+///
+/// 两者的区别会在剥离过的目标上突然变得重要：剥离后函数表还有（分析发现的），
+/// 符号表却空了。脚本必须能分辨"没有符号表"与"符号表里没有这个名字"。
+#[test]
+fn symbols_are_readable_and_keep_the_wire_shape() {
+    let engine = engine();
+    let host = host_with_disasm(SYMBOLS_FIXTURE);
+
+    let outcome = engine
+        .run(
+            &host,
+            r#"
+            const total = bitflip.symbols.count();
+            bitflip.log('total>0: ' + (total > 0));
+
+            // 分页的一致性：total 与逐页拿到的条数必须对得上
+            const page = bitflip.symbols.page(0, 100);
+            bitflip.log('page_total_matches: ' + (page.total === total));
+            bitflip.log('returned: ' + page.returned);
+            bitflip.log('truncated_matches: ' + (page.truncated === total - page.returned));
+
+            // 越界与空页：如实报 null / 空数组，不抛异常也不编造
+            bitflip.log('at_oob_is_null: ' + (bitflip.symbols.at(total) === null));
+            bitflip.log('find_missing_is_empty: ' + (bitflip.symbols.find('__nope__').length === 0));
+
+            // 字段形状与 HTTP /api/target 里的符号一致
+            const first = bitflip.symbols.at(0);
+            bitflip.log('has_fields: ' + ('name' in first && 'value' in first && 'defined' in first));
+            "#,
+        )
+        .expect("符号读 API 应当可用");
+
+    let text: Vec<&str> = outcome.logs.iter().map(|l| l.message.as_str()).collect();
+    for expected in [
+        "total>0: true",
+        "page_total_matches: true",
+        "truncated_matches: true",
+        "at_oob_is_null: true",
+        "find_missing_is_empty: true",
+        "has_fields: true",
+    ] {
+        assert!(
+            text.contains(&expected),
+            "缺少断言 `{expected}`，实际：{text:?}"
+        );
+    }
+}
+
+#[test]
+fn find_returns_every_symbol_with_that_name_and_a_real_address() {
+    let engine = engine();
+    let host = host_with_disasm(SYMBOLS_FIXTURE);
+
+    let outcome = engine
+        .run(
+            &host,
+            r#"
+            const found = bitflip.symbols.find('memcpy');
+            bitflip.log('found: ' + found.length);
+            bitflip.log('name: ' + found[0].name);
+            bitflip.log('value: ' + found[0].value);
+            bitflip.log('defined: ' + found[0].defined);
+            "#,
+        )
+        .expect("查符号名应当可用");
+
+    let messages: Vec<&str> = outcome.logs.iter().map(|l| l.message.as_str()).collect();
+    assert_eq!(
+        messages[1], "name: memcpy",
+        "find 必须按精确名字匹配，实际：{messages:?}"
+    );
+    assert_eq!(
+        messages[2], "value: 0000000140009218",
+        "符号的值必须是与函数表一致的虚拟地址（PE 的 COFF Value 是节内偏移，\
+         这一点曾经出过缺陷）：{messages:?}"
+    );
+    assert_eq!(messages[3], "defined: true");
+}
+
+/// 未定义符号的 `value` **不是地址**，按地址查必须把它们排除掉。
+///
+/// 这是最容易静默出错的一条：PE 的导入符号与 ELF 的未定义符号在 `value` 上
+/// 往往是 `0` 或节内偏移，把它们算进"这个地址上有什么符号"，用户会看到一堆
+/// 与那个地址毫不相干的答案，而且没有任何迹象表明它们不可信。
+#[test]
+fn at_address_excludes_undefined_symbols_whose_value_is_not_an_address() {
+    let engine = engine();
+    let host = host_with_disasm(SYMBOLS_FIXTURE);
+
+    let outcome = engine
+        .run(
+            &host,
+            r#"
+            // 先把未定义符号找出来（它们的 value 不是地址）
+            const all = bitflip.symbols.page(0, 4096);
+            let zeroValued = 0;
+            for (const s of all.items) {
+                if (!s.defined && s.value === '0000000000000000') { zeroValued += 1; }
+            }
+            bitflip.log('zero_valued_undefined: ' + zeroValued);
+
+            // 地址 0 上按地址查：只可能返回**已定义**且真的落在 0 的符号
+            const atZero = bitflip.symbols.atAddress('0000000000000000');
+            let anyUndefined = false;
+            for (const s of atZero) { if (!s.defined) { anyUndefined = true; } }
+            bitflip.log('at_zero_has_undefined: ' + anyUndefined);
+            "#,
+        )
+        .expect("按地址查符号应当可用");
+
+    let messages: Vec<&str> = outcome.logs.iter().map(|l| l.message.as_str()).collect();
+    assert!(
+        messages[1] == "at_zero_has_undefined: false",
+        "按地址查不得返回未定义符号，实际：{messages:?}"
+    );
+}
+
+/// 一个没有打开目标 / 没有解析结果的会话：符号 API 必须**报错**而不是返回空表。
+#[test]
+fn symbols_error_out_loudly_without_a_target() {
+    let engine = engine();
+    let host = Host::new(None);
+
+    let error = engine
+        .run(&host, "bitflip.log(bitflip.symbols.count());")
+        .expect_err("没有目标时读符号必须报错");
+    let message = error.to_string();
+    assert!(
+        message.contains("没有打开目标"),
+        "错误要说清原因，实际：{message}"
+    );
+    assert!(
+        !message.contains("0"),
+        "不能表现成\"符号表里有 0 条\"，实际：{message}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 按下标遍历全部交叉引用 + 落盘
 // ---------------------------------------------------------------------------
 //
