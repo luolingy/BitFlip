@@ -34,13 +34,14 @@
 //! 它们演进节奏不同，所以**不合并**。脚本要判断自己能不能跑，看前者；
 //! 嵌入方要判断数据格式，看后者。
 
+mod builtin;
 mod engine;
 mod error;
 mod host;
 mod js;
 mod read;
 mod stage;
-
+pub use builtin::{builtin_script, builtin_scripts, BuiltinScript};
 pub use engine::{CancelToken, Limits, ScriptEngine, ScriptOutcome};
 pub use error::ScriptError;
 pub use host::{DisasmProvider, Host, LogLevel, ScriptLog, ScriptProgress, SCRIPT_API_VERSION};

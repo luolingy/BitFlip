@@ -514,6 +514,7 @@ async fn script_endpoints_require_a_token() {
         ("POST", "/api/script/run"),
         ("GET", "/api/script/status"),
         ("POST", "/api/script/cancel"),
+        ("GET", "/api/script/library"),
     ] {
         let (status, _) = send(state.clone(), without(method, path)).await;
         assert_eq!(
@@ -522,4 +523,89 @@ async fn script_endpoints_require_a_token() {
             "{method} {path} 没有令牌时必须 403"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 脚本库
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_library_ships_source_and_the_current_api_version() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+
+    let (status, body) = send(state.clone(), get_with_token("/api/script/library")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["api_version"],
+        bitflip_script::SCRIPT_API_VERSION,
+        "库要报出引擎当前的 API 版本，界面据此判断示例是否适用"
+    );
+
+    let scripts = body["scripts"].as_array().expect("scripts 应当是数组");
+    assert!(!scripts.is_empty(), "内置脚本集不该是空的");
+    for script in scripts {
+        assert!(script["id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(script["name"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(
+            script["description"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "UI 上只有名字的脚本没人敢按"
+        );
+        assert_eq!(script["api_version"], bitflip_script::SCRIPT_API_VERSION);
+        // 源码随库下发：用户必须能"看一眼再决定跑不跑"，
+        // 且这份源码就是被测试真的执行过的那一份。
+        assert!(
+            script["source"]
+                .as_str()
+                .is_some_and(|s| s.contains("bitflip.")),
+            "每份脚本都要真的调用脚本 API"
+        );
+    }
+
+    let ids: Vec<&str> = scripts.iter().filter_map(|s| s["id"].as_str()).collect();
+    for expected in [
+        "memcpy-args",
+        "rename-by-string",
+        "export-functions",
+        "library-patterns",
+    ] {
+        assert!(
+            ids.contains(&expected),
+            "PLAN §M7 交付物 4 要求的示例里少了 `{expected}`，实际：{ids:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_script_taken_from_the_library_runs_through_the_http_path() {
+    // 这条是"示例脚本真的能用"的端到端证明：源码从库里取，原样 POST 回去跑。
+    // 内置脚本的可执行性在 bitflip-script 的测试里已经逐份验过，
+    // 这里验的是**HTTP 这条路**不会因为转义、长度或编码把源码弄坏。
+    let (state, _target) = state_with_target(&build_elf_with_code());
+
+    let (_, library) = send(state.clone(), get_with_token("/api/script/library")).await;
+    let scripts = library["scripts"].as_array().expect("scripts");
+    let chosen = scripts
+        .iter()
+        .find(|s| s["id"] == "export-functions")
+        .expect("脚本库里应当有 export-functions");
+    let source = chosen["source"].as_str().expect("源码应当是字符串");
+
+    let (status, _) = start_run(&state, source).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let done = wait_for_done(&state).await;
+    assert!(done["error"].is_null(), "库里的脚本原样跑应当成功：{done}");
+    let text = done["logs"]
+        .as_array()
+        .expect("logs")
+        .iter()
+        .filter_map(|log| log["message"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("函数总数="),
+        "脚本的产出应当完整回传到界面，实际：{text}"
+    );
 }

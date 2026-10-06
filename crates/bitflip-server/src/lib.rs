@@ -420,6 +420,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/script/run", post(script::run))
         .route("/api/script/status", get(script::status))
         .route("/api/script/cancel", post(script::cancel))
+        .route("/api/script/library", get(script::library))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()

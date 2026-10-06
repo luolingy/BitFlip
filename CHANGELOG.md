@@ -63,6 +63,28 @@
 - **能力缺失一律报错**：没有打开目标时读 API 抛异常而不是返回 `0`；
   没有反汇编结果时 `bitflip.insns.*` 抛异常而不是返回空数组；
   查不到时返回 `null` 而不是 `undefined`。
+- **可省略参数**：`page()` / `search()` / `progress(done)` 这类省略写法都真的成立。
+  此前可选参数写成 `Option<T>`，而 rquickjs 的 `Option<T>` 走的是**必填**的实参校验，
+  于是文档里承诺的默认值一调用就报
+  `Error calling function with 0 argument(s) while 2 where expected` ——
+  参数类型看起来完全正确，只有在用户照着文档写字时才暴露。
+- **外部取消**：`CancelToken` 让控制台的"停止"能掐断死循环脚本，
+  报 `ScriptError::Cancelled` 而**不是** `Timeout` —— 用户按的停止与脚本太慢是两回事，
+  混成一条会让人去改一段本来没问题的代码。没有脚本在跑时发出的取消会被忽略，
+  不会留给下一次运行（否则下一个脚本刚启动就被掐掉，现象是"莫名其妙立刻失败"）。
+- **批处理进度**：`bitflip.progress(done, total?, label?)` 由脚本主动上报。
+  宿主不替脚本估算百分比；`total` 省略时界面显示"进行中"而不是 `0%`。
+- **服务层脚本端点**：`POST /api/script/run`（立刻返回）、`GET /api/script/status`
+  （轮询观测日志与进度）、`POST /api/script/cancel`。不做成一个同步的 POST，
+  是因为那样既看不到进度、也没有一个可被外部引用的运行对象可供取消，
+  还会把 tokio 运行时占住（脚本执行是纯 CPU 的，跑在 `spawn_blocking` 里）。
+  单槽运行：脚本会改标注，第二个并发请求明确得到 409 而不是排队。
+- **内置示例脚本集**：`memcpy-args`（验收标准 1 的载体）、`rename-by-string`、
+  `export-functions`、`library-patterns`，经 `GET /api/script/library` 下发。
+  每一份都被 `crates/bitflip-script/tests/builtin.rs` **真的执行过** ——
+  文档里的示例没有编译期检查，会静默腐烂，一个跑不起来的示例比没有示例更糟。
+  写名字的脚本一律不覆盖已有名字、推断名带 `str_` 前缀、注释写明依据；
+  只给候选的脚本明写"不构成识别结论"（CLAUDE.md §7）。
 
 ### 修复
 

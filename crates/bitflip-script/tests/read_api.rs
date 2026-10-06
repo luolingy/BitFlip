@@ -599,8 +599,15 @@ fn optional_arguments_really_are_optional() {
 }
 
 // ---------------------------------------------------------------------------
-// PLAN §M7 验收标准 1：识别所有 memcpy 调用并写参数注释
+// 按下标遍历全部交叉引用 + 落盘
 // ---------------------------------------------------------------------------
+//
+// 注意：验收标准 1（"识别所有调用 memcpy 的位置并写参数注释"）的**权威**版本
+// 在 `tests/builtin.rs`：它跑的是随二进制发布出去的那一份内置脚本源码。
+// 这里这一份是**读 API 的练习**，走 `xrefs.at(i)` 这条按下标游标的路径
+// （内置脚本用的是 `search` 过滤），两条路径都值得被测到 ——
+// 但不要再把"验收标准 1"的名号挂在这里，否则将来两份实现分叉时，
+// 没人知道该以哪一份为准。
 
 /// 用未经剥离的样本：`memcpy` 这个名字只存在于符号表里，
 /// 剥离后的 `m3-mingw-static.exe` 上 `stripped_symbols=0`（见同名 .meta.txt），
@@ -608,7 +615,7 @@ fn optional_arguments_really_are_optional() {
 const SYMBOLS_FIXTURE: &str = "m3-mingw-static.unstripped.exe";
 
 #[test]
-fn acceptance_1_identifies_memcpy_calls_and_annotates_them_end_to_end() {
+fn reading_every_xref_by_index_annotates_every_memcpy_call_site() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("m7-memcpy.bfp");
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -618,9 +625,9 @@ fn acceptance_1_identifies_memcpy_calls_and_annotates_them_end_to_end() {
     let host = warm_host(SYMBOLS_FIXTURE)
         .with_project_store(ProjectStore::open(&path, hash).expect("打开工程库"));
 
-    // 这个脚本就是"内置示例脚本集"里那一份的原型：
-    // 找到 memcpy，遍历全部调用点，给每个调用点写一条参数注释。
-    // 它同时用到了读 API（分页遍历 + 按下标遍历）与写 API（暂存 + 提交）。
+    // 这一段就是内置示例脚本 `memcpy-args` 想做的事，只是遍历方式不同：
+    // 这里用按下标游标（`xrefs.at`），内置脚本用过滤器（`xrefs.search`）。
+    // 它同时用到了读 API 与写 API（暂存 + 提交）。
     let source = r#"
         // 1) 找到 memcpy 的入口地址（分页遍历，不一次物化全部函数）
         let memcpy = null;

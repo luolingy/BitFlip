@@ -504,6 +504,51 @@ pub async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(observe(&state.script))
 }
 
+/// 一份内置脚本的 wire 形状。
+#[derive(Debug, Serialize)]
+pub struct BuiltinScriptWire {
+    /// 稳定标识。
+    pub id: &'static str,
+    /// 显示名。
+    pub name: &'static str,
+    /// 说明。
+    pub description: &'static str,
+    /// 写就时依据的脚本 API 版本。
+    pub api_version: u32,
+    /// 源码。
+    pub source: &'static str,
+}
+
+/// 脚本库的响应。
+#[derive(Debug, Serialize)]
+pub struct LibraryResponse {
+    /// 当前脚本 API 版本（UI 据此判断示例是否适用于本引擎）。
+    pub api_version: u32,
+    /// 内置脚本。
+    pub scripts: Vec<BuiltinScriptWire>,
+}
+
+/// `GET /api/script/library`：内置示例脚本集。
+///
+/// 源码随响应一起给出（而不是只给标识让前端自己拼）：脚本库要能"看一眼源码
+/// 再决定跑不跑"，而且进二进制的这份源码是被测试真的执行过的 ——
+/// 前端若自己维护一份副本，那份恰好就是没被跑过的那一份。
+pub async fn library() -> Json<LibraryResponse> {
+    Json(LibraryResponse {
+        api_version: bitflip_script::SCRIPT_API_VERSION,
+        scripts: bitflip_script::builtin_scripts()
+            .iter()
+            .map(|script| BuiltinScriptWire {
+                id: script.id,
+                name: script.name,
+                description: script.description,
+                api_version: script.api_version,
+                source: script.source,
+            })
+            .collect(),
+    })
+}
+
 /// 取消请求的响应。
 #[derive(Debug, Serialize)]
 pub struct CancelResponse {
