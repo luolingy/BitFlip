@@ -242,6 +242,8 @@ version = "0.0.1"
 dependencies = [
  "bitflip-core",
  "rquickjs",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

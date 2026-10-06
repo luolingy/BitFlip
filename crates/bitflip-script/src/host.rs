@@ -1,4 +1,11 @@
-//! 脚本的宿主侧：`bitflip` 全局对象与写入暂存。
+//! 脚本的宿主侧：`bitflip` 全局对象、写入暂存与能力注入。
+//!
+//! # 能力是**注入**的，不是自己找的
+//!
+//! `Host` 不负责打开目标、构建分析结论或反汇编 —— 这些由调用方（服务层）
+//! 传入。理由不是洁癖，是**避免两份**：服务层已经把这些结果缓存在
+//! `OnceLock` 里，脚本层自己再算一遍不只是慢，还会在同一进程里同时存在
+//! 两份指令索引与分析结论。大目标上这是可观的内存。
 //!
 //! # 地址在脚本里也是字符串
 //!
@@ -8,10 +15,9 @@
 //! 精度上限，超出范围**必须报错**而不是悄悄截断 —— 一个被截断的地址会把注释
 //! 写到另一个函数上，而且看起来完全正常。
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use bitflip_core::{Annotation, AnnotationKind, ProjectStore};
+use bitflip_core::{Annotation, AnnotationKind, Disasm, ProjectStore, Session};
 use rquickjs::{Coerced, Ctx, Exception, Function, IntoJs, Object, Value};
 
 use crate::error::ScriptError;
@@ -26,6 +32,13 @@ pub const SCRIPT_API_VERSION: u32 = 1;
 
 /// JS 安全整数上限（2^53 - 1）。超过它的整数在 JS 里已经无法精确表示。
 const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// 反汇编结果的提供者。
+///
+/// 用闭包而不是直接传 `Arc<Disasm>`：传值意味着"构造 `Host` 时必须先反汇编"，
+/// 于是只写 `bitflip.log(1)` 的脚本也要等一次全量扫描。闭包让第一次真正需要
+/// 指令的脚本才付这个代价。
+pub type DisasmProvider = Arc<dyn Fn() -> Result<Arc<Disasm>, String> + Send + Sync>;
 
 /// 日志级别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,21 +72,44 @@ pub struct ScriptLog {
     pub message: String,
 }
 
-/// 宿主内部状态（被 JS 闭包与调用方共享）。
+/// 宿主内部状态。
 pub(crate) struct HostState {
     pub(crate) store: Option<ProjectStore>,
+    pub(crate) session: Option<Arc<Session>>,
+    pub(crate) disasm: Option<DisasmProvider>,
     pub(crate) staged: StagedWrites,
     pub(crate) logs: Vec<ScriptLog>,
 }
 
-/// 脚本宿主：读工程库、暂存写入、收集日志。
+/// 共享状态句柄。
 ///
-/// `Clone` 是**共享**语义（内部 `Rc`），不是复制：脚本侧持有的句柄与调用方
+/// `Arc<Mutex<_>>` 而不是 `Rc<RefCell<_>>`：脚本引擎本身是单线程的，但让
+/// `Host` 保持 `Send` 能让服务层把它直接构造在 `spawn_blocking` 的闭包里，
+/// 而"`Rc` 不能跨线程"这个限制会在增量 3 变成一个很难懂的编译错误。
+/// 锁永远不会有竞争（同一个运行时只在一条线程上跑），代价可以忽略。
+#[derive(Clone)]
+pub(crate) struct Shared(Arc<Mutex<HostState>>);
+
+impl Shared {
+    /// 取状态。
+    ///
+    /// 中毒的锁直接取出里面的值：唯一会中毒的情形是宿主绑定 panic，而那种
+    /// 情况下我们要的是"报告这个 panic"，不是让后续所有调用都跟着失败。
+    pub(crate) fn lock(&self) -> MutexGuard<'_, HostState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// 脚本宿主：读分析结论、暂存写入、收集日志。
+///
+/// `Clone` 是**共享**语义（内部 `Arc`），不是复制：脚本侧持有的句柄与调用方
 /// 看到的是同一份暂存区。这一点必须成立，否则"脚本写了 N 条"与"提交了 N 条"
 /// 会对不上。
 #[derive(Clone)]
 pub struct Host {
-    state: Rc<RefCell<HostState>>,
+    state: Shared,
 }
 
 impl Host {
@@ -84,18 +120,85 @@ impl Host {
     #[must_use]
     pub fn new(store: Option<ProjectStore>) -> Self {
         Self {
-            state: Rc::new(RefCell::new(HostState {
+            state: Shared(Arc::new(Mutex::new(HostState {
                 store,
+                session: None,
+                disasm: None,
                 staged: StagedWrites::new(),
                 logs: Vec::new(),
-            })),
+            }))),
         }
+    }
+
+    /// 注入会话（读目标信息、读字节、构建分析结论）。
+    #[must_use]
+    pub fn with_session(self, session: Arc<Session>) -> Self {
+        self.state.lock().session = Some(session);
+        self
+    }
+
+    /// 注入反汇编结果的提供者。
+    ///
+    /// 不注入时 `bitflip.insns.*` 会明确报"本次会话没有反汇编结果"，
+    /// 而不是返回空数组让脚本以为"这个目标没有指令"。
+    #[must_use]
+    pub fn with_disasm(self, provider: DisasmProvider) -> Self {
+        self.state.lock().disasm = Some(provider);
+        self
+    }
+
+    /// 注入工程库（覆盖 [`Host::new`] 时传入的那个）。
+    ///
+    /// 存在的意义是让构造顺序自由：调用方往往先拿会话再开工程库，
+    /// 而 [`Host`] 是共享句柄（`Clone` 即同一份状态），后注入才能保证
+    /// 脚本侧与调用方看到的是同一个库。
+    #[must_use]
+    pub fn with_project_store(self, store: ProjectStore) -> Self {
+        self.state.lock().store = Some(store);
+        self
+    }
+
+    /// 预热：把分析结论与反汇编提前算好，让它们**不计入**脚本的墙钟上限。
+    ///
+    /// # 为什么必须有这个入口
+    ///
+    /// ntdll.dll 的全量分析要 10.6 秒，而脚本默认上限是 5 秒。不预热的话，
+    /// 第一个碰到 `bitflip.functions` 的脚本会报"脚本执行超时" —— 可这**不是
+    /// 脚本的错**，用户会因此去改一段本来没问题的代码。调用方（服务层）应当
+    /// 在跑脚本之前调用它，并在此期间显示"分析中"而不是"脚本超时"。
+    ///
+    /// 失败不致命：拿不到分析结论时读 API 会各自报出准确原因，脚本仍然可以跑
+    /// （比如只做 `bitflip.log` 的脚本）。
+    ///
+    /// # Errors
+    ///
+    /// 返回第一次失败的原因（分析或反汇编）。调用方可以忽略它 —— 真正的错误
+    /// 会在脚本真正用到那个能力时以异常形式浮出来。
+    pub fn warmup(&self) -> Result<(), String> {
+        let session = self.state.lock().session.clone();
+        if let Some(session) = session {
+            session
+                .analysis(&session.detached_job())
+                .map_err(|err| err.to_string())?;
+        }
+
+        let provider = self.state.lock().disasm.clone();
+        if let Some(provider) = provider {
+            provider()?;
+        }
+        Ok(())
     }
 
     /// 本次运行收集到的日志。
     #[must_use]
     pub fn logs(&self) -> Vec<ScriptLog> {
-        self.state.borrow().logs.clone()
+        self.state.lock().logs.clone()
+    }
+
+    /// 暂存条数。
+    #[must_use]
+    pub fn staged_len(&self) -> usize {
+        self.state.lock().staged.len()
     }
 
     /// 开始一次新的运行：清空日志与暂存。
@@ -104,20 +207,14 @@ impl Host {
     /// 所以每次运行必须从干净状态开始 —— 否则上一次的日志会混进这一次的结果，
     /// 上一次被丢弃的暂存也会莫名其妙地跟着这一次一起提交。
     pub fn begin_run(&self) {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock();
         state.logs.clear();
         state.staged.clear();
     }
 
-    /// 暂存条数。
-    #[must_use]
-    pub fn staged_len(&self) -> usize {
-        self.state.borrow().staged.len()
-    }
-
     /// 丢弃全部暂存写入（中断或失败时调用）。
     pub fn discard(&self) {
-        self.state.borrow_mut().staged.clear();
+        self.state.lock().staged.clear();
     }
 
     /// 把暂存写入提交到工程库，返回提交条数。
@@ -125,7 +222,7 @@ impl Host {
     /// 部分失败时返回 [`ScriptError::Commit`]，并如实报出"已写入多少"——
     /// 这是本操作唯一真正危险的结局，含糊其辞会让用户以为要么全成要么全不成。
     pub fn commit(&self, now_unix: u64) -> Result<usize, ScriptError> {
-        let mut state = self.state.borrow_mut();
+        let mut state = self.state.lock();
         let items = state.staged.take_all();
         let total = items.len();
         if total == 0 {
@@ -156,7 +253,7 @@ impl Host {
 
     /// 把 `bitflip` 全局对象装进上下文。
     pub(crate) fn install(&self, ctx: &Ctx<'_>) -> rquickjs::Result<()> {
-        let state = Rc::clone(&self.state);
+        let state = self.state.clone();
         let globals = ctx.globals();
         let bitflip = Object::new(ctx.clone())?;
 
@@ -167,11 +264,11 @@ impl Host {
             // 于是控制台里最自然的写法 `bitflip.log(count)` 会报
             // "Error converting from js 'int' into type 'string'"。
             // 日志函数应当像 `console.log` 一样接受任何值。
-            let state = Rc::clone(&state);
+            let state = state.clone();
             bitflip.set(
                 "log",
                 Function::new(ctx.clone(), move |message: Coerced<String>| {
-                    state.borrow_mut().logs.push(ScriptLog {
+                    state.lock().logs.push(ScriptLog {
                         level: LogLevel::Info,
                         message: message.0,
                     });
@@ -179,11 +276,11 @@ impl Host {
             )?;
         }
         {
-            let state = Rc::clone(&state);
+            let state = state.clone();
             bitflip.set(
                 "warn",
                 Function::new(ctx.clone(), move |message: Coerced<String>| {
-                    state.borrow_mut().logs.push(ScriptLog {
+                    state.lock().logs.push(ScriptLog {
                         level: LogLevel::Warn,
                         message: message.0,
                     });
@@ -191,11 +288,11 @@ impl Host {
             )?;
         }
         {
-            let state = Rc::clone(&state);
+            let state = state.clone();
             bitflip.set(
                 "error",
                 Function::new(ctx.clone(), move |message: Coerced<String>| {
-                    state.borrow_mut().logs.push(ScriptLog {
+                    state.lock().logs.push(ScriptLog {
                         level: LogLevel::Error,
                         message: message.0,
                     });
@@ -204,14 +301,14 @@ impl Host {
         }
 
         {
-            let state = Rc::clone(&state);
+            let state = state.clone();
             bitflip.set(
                 "setName",
                 Function::new(
                     ctx.clone(),
                     move |ctx: Ctx<'_>, address: Value<'_>, text: String| -> rquickjs::Result<()> {
                         let address = parse_address(&ctx, &address)?;
-                        state.borrow_mut().staged.stage(Annotation::text(
+                        state.lock().staged.stage(Annotation::text(
                             address,
                             AnnotationKind::Name,
                             text,
@@ -222,14 +319,14 @@ impl Host {
             )?;
         }
         {
-            let state = Rc::clone(&state);
+            let state = state.clone();
             bitflip.set(
                 "setComment",
                 Function::new(
                     ctx.clone(),
                     move |ctx: Ctx<'_>, address: Value<'_>, text: String| -> rquickjs::Result<()> {
                         let address = parse_address(&ctx, &address)?;
-                        state.borrow_mut().staged.stage(Annotation::text(
+                        state.lock().staged.stage(Annotation::text(
                             address,
                             AnnotationKind::Comment,
                             text,
@@ -241,7 +338,7 @@ impl Host {
         }
 
         {
-            let state = Rc::clone(&state);
+            let state = state.clone();
             bitflip.set(
                 "get",
                 Function::new(
@@ -252,7 +349,7 @@ impl Host {
                           -> rquickjs::Result<AnnotationText> {
                         let address = parse_address(&ctx, &address)?;
                         let kind = parse_kind(&ctx, &kind)?;
-                        let state = state.borrow();
+                        let state = state.lock();
                         // 先看暂存，再看工程库：脚本必须能读到自己刚写的东西，
                         // 否则"没有名字才命名"这类脚本会重复劳动。
                         if let Some(a) = state.staged.get(address, kind) {
@@ -271,14 +368,14 @@ impl Host {
         }
 
         {
-            let state = Rc::clone(&state);
+            let state = state.clone();
             bitflip.set(
                 "stagedCount",
-                Function::new(ctx.clone(), move || -> usize {
-                    state.borrow().staged.len()
-                })?,
+                Function::new(ctx.clone(), move || -> usize { state.lock().staged.len() })?,
             )?;
         }
+
+        crate::read::install(ctx, &state, &bitflip)?;
 
         globals.set("bitflip", bitflip)?;
         Ok(())
@@ -307,7 +404,7 @@ impl<'js> IntoJs<'js> for AnnotationText {
 }
 
 /// 解析脚本传来的地址：定长十六进制字符串（规范）或 JS 安全整数。
-fn parse_address(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<u64> {
+pub(crate) fn parse_address(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<u64> {
     if value.is_string() {
         let raw: String = value.get()?;
         return bitflip_core::parse_address(&raw).ok_or_else(|| {
@@ -349,7 +446,7 @@ fn parse_address(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<u64> {
 ///
 /// 未知取值**报错并列出可用值**，不静默回退到某个默认类别 ——
 /// 那会把用户的名字当成注释存进去（与 `AnnotationKind::parse` 的约定一致）。
-fn parse_kind(ctx: &Ctx<'_>, raw: &str) -> rquickjs::Result<AnnotationKind> {
+pub(crate) fn parse_kind(ctx: &Ctx<'_>, raw: &str) -> rquickjs::Result<AnnotationKind> {
     AnnotationKind::parse(raw).ok_or_else(|| {
         Exception::throw_message(
             ctx,
@@ -379,7 +476,7 @@ mod tests {
 
         // 有暂存但没有工程库：必须报错，而且要报出"0/total"
         host.state
-            .borrow_mut()
+            .lock()
             .staged
             .stage(Annotation::text(0x1000, AnnotationKind::Name, "x"));
         let err = host.commit(0).unwrap_err();
@@ -390,7 +487,7 @@ mod tests {
     fn discarding_leaves_nothing_to_commit() {
         let host = Host::new(None);
         host.state
-            .borrow_mut()
+            .lock()
             .staged
             .stage(Annotation::text(0x1000, AnnotationKind::Name, "x"));
         host.discard();

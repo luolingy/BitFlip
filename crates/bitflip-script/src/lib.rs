@@ -36,11 +36,13 @@
 mod engine;
 mod error;
 mod host;
+mod js;
+mod read;
 mod stage;
 
 pub use engine::{Limits, ScriptEngine, ScriptOutcome};
 pub use error::ScriptError;
-pub use host::{Host, LogLevel, ScriptLog, SCRIPT_API_VERSION};
+pub use host::{DisasmProvider, Host, LogLevel, ScriptLog, SCRIPT_API_VERSION};
 pub use stage::StagedWrites;
 
 /// 脚本 API 中 `bitflip` 全局对象的名字。
