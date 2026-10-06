@@ -1673,9 +1673,32 @@ fn parse_coff_symbols(
             continue;
         }
 
+        let section = if section_number > 0 {
+            object.sections.get((section_number - 1) as usize)
+        } else {
+            None
+        };
+
+        // COFF 符号的 Value 是**节内偏移**，不是虚拟地址。
+        //
+        // 这一点值得写清楚，因为常见的说法是"映像里的符号值就是 RVA"，
+        // 而 GNU ld 产出的 PE 映像不是这样 —— 实测才对得上：
+        // memcpy 的原始值是 0x8218，.text 的 VA 是 0x140001000，
+        // 0x140001000 + 0x8218 = 0x140009218，正是 objdump 给出的绝对地址。
+        //
+        // 少了这一加的后果不是"名字丢了"，而是**同一个映像里出现两套地址**：
+        // 符号表来的函数落在 0x8218，分析发现的函数落在 0x1400096c0，
+        // 两者其实是同一段代码。界面与脚本都会据此认错地址。
+        let value = match section {
+            Some(section) => section.vaddr.wrapping_add(u64::from(value)),
+            // 有节号却查不到节：这不是能猜的情形，保持原值（并且这条符号
+            // 会因为 `defined` 之外的证据不足而不被当作函数候选）。
+            None => u64::from(value),
+        };
+
         out.push(RawSymbol {
             name,
-            value: u64::from(value),
+            value,
             size: 0,
             defined: section_number > 0,
             is_function,
@@ -1687,14 +1710,7 @@ fn parse_coff_symbols(
                 2 => 1, // EXTERNAL → 全局
                 _ => 0,
             },
-            section: if section_number > 0 {
-                object
-                    .sections
-                    .get((section_number - 1) as usize)
-                    .map(|s| s.name.clone())
-            } else {
-                None
-            },
+            section: section.map(|s| s.name.clone()),
             source: SymbolTableSource::Static,
         });
     }
@@ -2549,5 +2565,81 @@ mod tests {
         let reader = Reader::with_base(&bundle.1, 0);
         // 一个不在任何段内的 VA
         assert!(parse_unwind_info(&reader, &bundle.0, 0x4000_0000).is_none());
+    }
+
+    /// 在 [`minimal_pe64`] 上补一条 COFF 符号，`value` 是**原始的节内偏移**。
+    fn minimal_pe64_with_symbol(name: &str, value: u32, section_number: i16) -> Vec<u8> {
+        const SYMBOL_SIZE: usize = 18;
+        const SYMBOL_TABLE: usize = 0x600;
+
+        let mut bytes = minimal_pe64();
+        bytes.resize(0x800, 0);
+
+        let coff = 0x84;
+        bytes[coff + 8..coff + 12].copy_from_slice(&(SYMBOL_TABLE as u32).to_le_bytes());
+        bytes[coff + 12..coff + 16].copy_from_slice(&1u32.to_le_bytes()); // NumberOfSymbols
+
+        let raw = name.as_bytes();
+        assert!(raw.len() <= 8, "短名才不需要字符串表");
+        bytes[SYMBOL_TABLE..SYMBOL_TABLE + raw.len()].copy_from_slice(raw);
+        // 其余字节为 0，即名字以 NUL 结束，不走"前 4 字节为 0 → 查字符串表"那条分支。
+        bytes[SYMBOL_TABLE + 8..SYMBOL_TABLE + 12].copy_from_slice(&value.to_le_bytes());
+        bytes[SYMBOL_TABLE + 12..SYMBOL_TABLE + 14].copy_from_slice(&section_number.to_le_bytes());
+        bytes[SYMBOL_TABLE + 14..SYMBOL_TABLE + 16].copy_from_slice(&0x20u16.to_le_bytes()); // 派生类型
+        bytes[SYMBOL_TABLE + 16] = 2; // StorageClass = EXTERNAL
+        bytes[SYMBOL_TABLE + 17] = 0; // 无辅助记录
+
+        // 字符串表：解析器按 count * 18 定位它，所以要留一个合法的 4 字节头。
+        let strtab = SYMBOL_TABLE + SYMBOL_SIZE;
+        bytes[strtab..strtab + 4].copy_from_slice(&4u32.to_le_bytes());
+
+        bytes
+    }
+
+    /// COFF 符号的 Value 是**节内偏移**，不是虚拟地址。
+    ///
+    /// 这条不变量抓的是一处真实存在过的缺陷：早先把原始 Value 直接当地址存下来，
+    /// 于是同一个映像里出现了两套地址 —— 符号表来的函数落在 `0x8218`，
+    /// 而分析发现的函数落在 `0x1400096c0`，两者其实是同一段代码。
+    ///
+    /// 实测依据（`m3-mingw-static.unstripped.exe`）：`memcpy` 的原始 Value 是
+    /// `0x8218`，`.text` 的 VA 是 `0x140001000`，相加正好是 objdump 给出的
+    /// 绝对地址 `0x140009218`。
+    #[test]
+    fn coff_symbol_values_are_section_offsets_not_addresses() {
+        let bytes = minimal_pe64_with_symbol("memcpy", 0x218, 1);
+        let obj = parse(&bytes, 0, ObjectId::Plain).expect("解析带符号表的 PE");
+
+        assert_eq!(obj.sections[0].vaddr, 0x1_4000_1000, "前提：节 vaddr 是 VA");
+        let sym = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "memcpy")
+            .expect("应当解析出 memcpy");
+        assert_eq!(
+            sym.value,
+            0x1_4000_1000 + 0x218,
+            "符号值必须换算成虚拟地址，而不是原样保留节内偏移 —— \
+             否则符号表来的地址与分析发现的地址会落在两套基址上"
+        );
+        assert!(sym.is_function, "Type 0x20 + EXTERNAL 应当判为函数");
+        assert!(sym.defined);
+        assert_eq!(sym.section.as_deref(), Some(".text"));
+    }
+
+    /// 没有节号的符号（未定义外部符号）不能凭空加上基址。
+    #[test]
+    fn a_symbol_without_a_section_keeps_its_raw_value() {
+        let bytes = minimal_pe64_with_symbol("printf", 0, 0);
+        let obj = parse(&bytes, 0, ObjectId::Plain).expect("解析");
+
+        let sym = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "printf")
+            .expect("应当解析出 printf");
+        assert_eq!(sym.value, 0, "未定义符号没有节可依托，不能加基址");
+        assert!(!sym.defined);
+        assert!(sym.section.is_none());
     }
 }
