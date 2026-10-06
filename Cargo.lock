@@ -254,6 +254,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "bitflip-core",
+ "bitflip-script",
  "mime_guess",
  "rand 0.8.8",
  "rust-embed",

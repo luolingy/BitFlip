@@ -11,6 +11,7 @@
 //! 令牌与 Origin 是**同时**生效的两道门，不是二选一。
 
 mod assets;
+pub mod script;
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -22,7 +23,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use bitflip_core::TargetInfo;
 use serde::Serialize;
@@ -82,6 +83,12 @@ pub struct AppState {
     /// 惰性而不是在 `serve` 时预先算：用户可能只想看段表，
     /// 不该为此付出一次 100MB 扫描的代价。
     disasm: Arc<std::sync::OnceLock<Result<Arc<bitflip_core::Disasm>, String>>>,
+    /// 脚本运行器（M7，单槽）。
+    ///
+    /// 放在 `AppState` 里而不是每个请求各建一个：取消端点必须能找到
+    /// "当前在跑的那一次"，而观测点（日志/进度）也要跨请求存活。
+    /// 用 `Arc` 是因为阻塞任务需要在 `'static` 闭包里更新它。
+    script: Arc<script::ScriptRunner>,
     started: Instant,
 }
 
@@ -96,6 +103,9 @@ impl AppState {
             parsed: None,
             session: None,
             disasm: Arc::new(std::sync::OnceLock::new()),
+            script: Arc::new(script::ScriptRunner::new(bitflip_script::Limits {
+                timeout: script::DEFAULT_TIMEOUT,
+            })),
             started: Instant::now(),
         }
     }
@@ -304,6 +314,42 @@ impl AppState {
             .read_virtual(address, length)
             .map_err(|error| error.to_string())
     }
+
+    /// 为脚本层构造宿主（M7）。
+    ///
+    /// # 能力是**借出去**的，不是脚本层自己算的
+    ///
+    /// 会话、反汇编、工程库都来自本状态：
+    ///
+    /// - 反汇编走 [`AppState::disasm`]，于是脚本与服务层用的是**同一份**
+    ///   指令索引（`OnceLock` 里那一个），不会在同一个进程里同时存在两套；
+    /// - 分析结论走 `Session` 自己的缓存，同理；
+    /// - 工程库与标注端点走同一个开法（目标旁的 `.bitflip`），
+    ///   否则脚本写的注释会落到一个用户看不见的库里。
+    ///
+    /// 工程库打不开**不作为错误**：只做分析与日志的脚本照样应当能跑，
+    /// 真正需要写入时提交阶段会明确报"无处可存"，比在这里一刀切拒绝有用。
+    ///
+    /// # Errors
+    ///
+    /// 本次会话没有打开目标。
+    pub fn script_host(&self) -> Result<bitflip_script::Host, String> {
+        let Some(session) = self.session.as_ref() else {
+            return Err("本次会话没有打开目标；脚本的读 API 将全部不可用".to_string());
+        };
+
+        let store = self.project().ok();
+
+        // 提供者捕获的是 `AppState` 的克隆（内部全是 Arc），不是 `&self`：
+        // `DisasmProvider` 要求 `'static + Send + Sync`，而脚本可能在任何
+        // 时刻第一次碰到指令。
+        let owner = self.clone();
+        let provider: bitflip_script::DisasmProvider = Arc::new(move || owner.disasm());
+
+        Ok(bitflip_script::Host::new(store)
+            .with_session(Arc::clone(session))
+            .with_disasm(provider))
+    }
 }
 
 /// 生成访问令牌：32 字节随机数的十六进制表示（64 字符）。
@@ -367,6 +413,13 @@ pub fn router(state: AppState) -> Router {
                 .put(put_annotation)
                 .delete(delete_annotation),
         )
+        // ── M7：脚本 ──
+        // 三个端点而不是一个：`run` 立刻返回"已开始"，期间靠 `status` 观察
+        // 日志与进度，`cancel` 发取消请求。同步的 run 既看不到进度，
+        // 也没有一个可被外部引用的运行对象可供取消。
+        .route("/api/script/run", post(script::run))
+        .route("/api/script/status", get(script::status))
+        .route("/api/script/cancel", post(script::cancel))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
