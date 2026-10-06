@@ -1,17 +1,19 @@
-//! 脚本引擎：运行时生命周期、墙钟超时、错误映射。
+//! 脚本引擎：运行时生命周期、墙钟超时、外部取消、错误映射。
 //!
 //! # 中断是怎么做到的
 //!
 //! QuickJS 支持注册一个"中断回调"，解释器每隔若干条指令问它一次
 //! "要不要停"。回调返回 `true` 即中止执行并抛出异常。这里把回调实现成
-//! **墙钟截止时间比较**，于是"用户点了停止"和"脚本跑太久"变成同一件事。
+//! **墙钟截止时间比较 + 一个取消标志**，于是"用户点了停止"和"脚本跑太久"
+//! 在中断这一层是同一件事，只在**报错**那一层分开成
+//! [`ScriptError::Cancelled`] 与 [`ScriptError::Timeout`] ——
+//! 两者的成因与建议完全不同。
 //!
 //! 三个候选引擎实测都能中断死循环，所以这不是选型的区分点（见
 //! `docs/D1-SCRIPT-ENGINE-ANALYSIS.md` §3）；真正的区别是中断后**留下什么** ——
 //! 这里保证一条都不留（见 [`crate::stage`]）。
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,6 +53,60 @@ pub struct ScriptOutcome {
     pub logs: Vec<ScriptLog>,
     /// 真正提交到工程库的写入条数。
     pub committed: usize,
+    /// 本次运行**尝试**提交的条数（去重后）。
+    ///
+    /// 正常路径下等于 `committed`；带上它是因为没有打开工程库时
+    /// `committed` 会是 0 —— 只报 0 会让界面显示"什么都没做"，
+    /// 而真相是"脚本写了 N 条，但没地方存"。
+    pub staged: usize,
+}
+
+/// 一次运行的共享状态。
+///
+/// 超时、取消、运行中标志放在**同一把锁**里，是为了让"外部请求取消"与
+/// "开始新一次运行时的重置"不可能交错：两者都必须先拿到这把锁。否则会出现
+/// 用户点了停止、而那个请求恰好落进下一次运行的窗口里，把刚启动的脚本掐掉。
+#[derive(Debug)]
+struct RunControl {
+    /// 本次运行的墙钟截止时间。
+    deadline: Instant,
+    /// 是否已有脚本在跑（决定取消请求是否被接受）。
+    running: bool,
+    /// 是否因为超时被掐断（用于事后区分超时与脚本自身的异常）。
+    timed_out: bool,
+    /// 是否收到了外部取消请求。
+    cancelled: bool,
+}
+
+/// 外部取消令牌。
+///
+/// 由 [`ScriptEngine::cancel_token`] 取得，可以交给另一个线程（服务层的取消
+/// 端点）持有。取消请求只对**正在运行的那一次**有效：没有脚本在跑时
+/// [`CancelToken::cancel`] 返回 `false` 并忽略请求，不会影响下一次运行。
+#[derive(Debug, Clone)]
+pub struct CancelToken {
+    control: Arc<Mutex<RunControl>>,
+}
+
+impl CancelToken {
+    /// 请求中断当前正在运行的脚本。
+    ///
+    /// 返回 `false` 表示当前没有脚本在运行，请求被忽略。调用方应当据此告知
+    /// 用户"没有可取消的运行"，而不是显示"已取消"却什么也没发生。
+    pub fn cancel(&self) -> bool {
+        let mut control = lock(&self.control);
+        if !control.running {
+            return false;
+        }
+        control.cancelled = true;
+        true
+    }
+
+    /// 是否已有脚本在跑。
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        lock(&self.control).running
+    }
 }
 
 /// 脚本引擎。
@@ -61,8 +117,18 @@ pub struct ScriptOutcome {
 pub struct ScriptEngine {
     runtime: Runtime,
     limits: Limits,
-    deadline: Arc<Mutex<Instant>>,
-    timed_out: Arc<AtomicBool>,
+    control: Arc<Mutex<RunControl>>,
+}
+
+/// 取锁，忽略中毒。
+///
+/// 中毒发生在"持锁线程 panic"之后，而脚本层的 panic 已经被 `catch_unwind`
+/// 兜住并转成错误 —— 此时让后续调用继续工作，比连锁失败更有用；状态本身也
+/// 只是几个标量，不会处于半更新的不一致形态。
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl ScriptEngine {
@@ -72,24 +138,25 @@ impl ScriptEngine {
             message: format!("无法创建 QuickJS 运行时：{err}"),
         })?;
 
-        let deadline = Arc::new(Mutex::new(Instant::now()));
-        let timed_out = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(Mutex::new(RunControl {
+            deadline: Instant::now(),
+            running: false,
+            timed_out: false,
+            cancelled: false,
+        }));
 
         {
-            let deadline = Arc::clone(&deadline);
-            let timed_out = Arc::clone(&timed_out);
+            let control = Arc::clone(&control);
             runtime.set_interrupt_handler(Some(Box::new(move || {
-                if timed_out.load(Ordering::Relaxed) {
+                let mut control = lock(&control);
+                if control.cancelled || control.timed_out {
                     return true;
                 }
-                let expired = Instant::now()
-                    >= *deadline
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let expired = Instant::now() >= control.deadline;
                 if expired {
                     // 记下来，好在事后区分"超时"与"脚本自己抛异常" ——
                     // 两者给用户的建议完全不同。
-                    timed_out.store(true, Ordering::Relaxed);
+                    control.timed_out = true;
                 }
                 expired
             })));
@@ -98,9 +165,19 @@ impl ScriptEngine {
         Ok(Self {
             runtime,
             limits,
-            deadline,
-            timed_out,
+            control,
         })
+    }
+
+    /// 取一个取消令牌。
+    ///
+    /// 同一个引擎可以取多个令牌（都指向同一份运行状态），交给关心取消的
+    /// 那个线程即可。
+    #[must_use]
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken {
+            control: Arc::clone(&self.control),
+        }
     }
 
     /// 上限配置。
@@ -114,22 +191,25 @@ impl ScriptEngine {
     /// 语义（按 PLAN §M7 验收 2）：
     ///
     /// - 正常结束 → 提交全部暂存写入，返回 [`ScriptOutcome`]；
-    /// - 超时 / 抛异常 / panic → **丢弃全部暂存写入**并返回错误。
+    /// - 超时 / 被取消 / 抛异常 / panic → **丢弃全部暂存写入**并返回错误。
     ///
     /// 不存在"写了一半"的结局（除了提交阶段本身失败，那时会如实报出
     /// [`ScriptError::Commit`] 的已写条数）。
     pub fn run(&self, host: &Host, source: &str) -> Result<ScriptOutcome, ScriptError> {
-        let started = Instant::now();
-        *self
-            .deadline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = started + self.limits.timeout;
-        self.timed_out.store(false, Ordering::Relaxed);
-        host.begin_run();
+        let context = {
+            // 重置与"标记运行中"在同一把锁内完成，取消请求不可能挤进两者之间。
+            let mut control = lock(&self.control);
+            control.deadline = Instant::now() + self.limits.timeout;
+            control.timed_out = false;
+            control.cancelled = false;
+            control.running = true;
 
-        let context = Context::full(&self.runtime).map_err(|err| ScriptError::Engine {
-            message: format!("无法创建脚本上下文：{err}"),
-        })?;
+            Context::full(&self.runtime).map_err(|err| ScriptError::Engine {
+                message: format!("无法创建脚本上下文：{err}"),
+            })?
+        };
+
+        host.begin_run();
 
         // panic 会被兜住：脚本层位于 FFI 边界上，一个宿主绑定的 bug 不该
         // 让整个进程退出（CLAUDE.md §4）。这是防御性分支，正常脚本走不到。
@@ -137,11 +217,19 @@ impl ScriptEngine {
             context.with(|ctx| self.eval(&ctx, host, source))
         }));
 
-        match outcome {
+        // 运行期间在闭包内求值，所以这里释放"运行中"标志要放在**所有**
+        // 出口上（含 panic 分支）—— 否则一次 panic 会让取消端点永远认为
+        // 还有脚本在跑，用户再也点不动停止。
+        let verdict = match outcome {
             Ok(Ok(())) => {
                 let logs = host.logs();
-                let committed = host.commit(now_unix())?;
-                Ok(ScriptOutcome { logs, committed })
+                let staged = host.staged_len();
+                let commit = host.commit(now_unix());
+                commit.map(|committed| ScriptOutcome {
+                    logs,
+                    committed,
+                    staged,
+                })
             }
             Ok(Err(err)) => {
                 host.discard();
@@ -153,7 +241,10 @@ impl ScriptEngine {
                     message: panic_message(&panic),
                 })
             }
-        }
+        };
+
+        lock(&self.control).running = false;
+        verdict
     }
 
     /// 在给定上下文里求值，并把引擎错误就地翻译成 [`ScriptError`]。
@@ -179,9 +270,19 @@ impl ScriptEngine {
 
     /// 把引擎错误翻译成面向人的 [`ScriptError`]。
     fn map_error(&self, ctx: &Ctx<'_>, err: Error) -> ScriptError {
-        // 超时优先判定：中断回调抛出的也是异常，但它的成因是宿主掐断的，
-        // 不该被报成"脚本运行错误"让用户去改脚本。
-        if self.timed_out.load(Ordering::Relaxed) {
+        let (cancelled, timed_out) = {
+            let control = lock(&self.control);
+            (control.cancelled, control.timed_out)
+        };
+
+        // 取消优先于超时：两者都由中断回调触发，但用户按了停止的时候报"超时"
+        // 会让人以为自己需要去优化脚本。用户自己按的，就得如实说是被取消的。
+        if cancelled {
+            return ScriptError::Cancelled;
+        }
+        // 中断回调抛出的也是异常，但成因是宿主掐断的，不该被报成"脚本运行错误"
+        // 让用户去改脚本。
+        if timed_out {
             return ScriptError::Timeout {
                 limit: self.limits.timeout,
             };

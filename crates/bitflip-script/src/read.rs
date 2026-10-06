@@ -15,6 +15,15 @@
 //! 而 `search()` 返回的页对象里**同时**带 `total` 与 `truncated` ——
 //! 只给"本页几条"，用户没法判断"是被过滤掉了还是本来就没有"（core 的
 //! `XrefPage` 已经因为这个问题返工过一次）。
+//!
+//! # 可省略参数必须写 `Opt<T>`，不能写 `Option<T>`
+//!
+//! rquickjs 对实参个数是**严格校验**的：`Option<T>` 的 `ParamRequirement`
+//! 是 `single()`（必填），只有 `rquickjs::prelude::Opt<T>` 才是 `optional()`。
+//! 写成 `Option<T>` 时类型看起来完全正确，但脚本按文档写 `page()` 会得到
+//! "Error calling function with 0 argument(s) while 2 where expected" ——
+//! 一个只在用户侧才炸的坑。文档里承诺了默认值的参数，这里必须有对应的
+//! `Opt` 与测试。
 
 use std::sync::Arc;
 
@@ -22,6 +31,7 @@ use bitflip_core::{
     Disasm, FunctionWire, InsnPage, InsnWire, Session, StringWire, TargetAnalysis, XrefFilter,
     XrefWire, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
+use rquickjs::prelude::Opt;
 use rquickjs::{Ctx, Exception, Function, Object, Value};
 
 use crate::host::{parse_address, Shared};
@@ -257,14 +267,14 @@ fn install_functions<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>,
-                      offset: Option<usize>,
-                      count: Option<usize>|
+                      offset: Opt<usize>,
+                      count: Opt<usize>|
                       -> rquickjs::Result<Wire<serde_json::Value>> {
                     let analysis = analysis(&ctx, &state)?;
                     Ok(Wire(slice_page(
                         analysis.functions(),
-                        offset.unwrap_or(0),
-                        count.unwrap_or(DEFAULT_PAGE_SIZE),
+                        offset.0.unwrap_or(0),
+                        count.0.unwrap_or(DEFAULT_PAGE_SIZE),
                     )))
                 },
             )?,
@@ -335,14 +345,14 @@ fn install_xrefs<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>,
-                      offset: Option<usize>,
-                      count: Option<usize>|
+                      offset: Opt<usize>,
+                      count: Opt<usize>|
                       -> rquickjs::Result<Wire<serde_json::Value>> {
                     let analysis = analysis(&ctx, &state)?;
                     Ok(Wire(slice_page(
                         analysis.xrefs(),
-                        offset.unwrap_or(0),
-                        count.unwrap_or(DEFAULT_PAGE_SIZE),
+                        offset.0.unwrap_or(0),
+                        count.0.unwrap_or(DEFAULT_PAGE_SIZE),
                     )))
                 },
             )?,
@@ -402,9 +412,9 @@ fn install_xrefs<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>,
-                      filter: Value<'_>|
+                      filter: Opt<Value<'_>>|
                       -> rquickjs::Result<Wire<serde_json::Value>> {
-                    let (filter, offset, count) = parse_filter(&ctx, &filter)?;
+                    let (filter, offset, count) = parse_filter(&ctx, filter.0.as_ref())?;
                     let analysis = analysis(&ctx, &state)?;
                     let page = analysis.search_xrefs(&filter, offset, count.min(MAX_PAGE_SIZE));
                     Ok(Wire(serde_json::json!({
@@ -450,14 +460,14 @@ fn install_strings<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>,
-                      offset: Option<usize>,
-                      count: Option<usize>|
+                      offset: Opt<usize>,
+                      count: Opt<usize>|
                       -> rquickjs::Result<Wire<serde_json::Value>> {
                     let analysis = analysis(&ctx, &state)?;
                     Ok(Wire(slice_page(
                         analysis.strings(),
-                        offset.unwrap_or(0),
-                        count.unwrap_or(DEFAULT_PAGE_SIZE),
+                        offset.0.unwrap_or(0),
+                        count.0.unwrap_or(DEFAULT_PAGE_SIZE),
                     )))
                 },
             )?,
@@ -504,11 +514,13 @@ fn install_insns<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'_>,
                       from: Value<'_>,
-                      count: Option<usize>|
+                      count: Opt<usize>|
                       -> rquickjs::Result<Wire<InsnPage>> {
                     let from = parse_address(&ctx, &from)?;
                     let disasm = disasm(&ctx, &state)?;
-                    Ok(Wire(disasm.page(from, count.unwrap_or(DEFAULT_PAGE_SIZE))))
+                    Ok(Wire(
+                        disasm.page(from, count.0.unwrap_or(DEFAULT_PAGE_SIZE)),
+                    ))
                 },
             )?,
         )?;
@@ -546,11 +558,21 @@ fn install_insns<'js>(
 // ---------------------------------------------------------------------------
 
 /// 解析 `xrefs.search` 的参数对象。
-fn parse_filter(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<(XrefFilter, usize, usize)> {
+///
+/// `value` 为 `None` 表示调用时没给参数（`search()`），与给了 `{}` 等价 ——
+/// rquickjs 对实参个数是严格校验的，所以"可省略"必须写成 [`Opt`]，
+/// 用 `Option<T>` 只会得到一个"实参个数不符"的错误。
+fn parse_filter(
+    ctx: &Ctx<'_>,
+    value: Option<&Value<'_>>,
+) -> rquickjs::Result<(XrefFilter, usize, usize)> {
     let mut filter = XrefFilter::default();
     let mut offset = 0usize;
     let mut count = DEFAULT_PAGE_SIZE;
 
+    let Some(value) = value else {
+        return Ok((filter, offset, count));
+    };
     if value.is_undefined() || value.is_null() {
         return Ok((filter, offset, count));
     }

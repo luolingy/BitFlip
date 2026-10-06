@@ -547,6 +547,58 @@ fn insns_at_is_an_exact_lookup_not_a_cursor() {
 }
 
 // ---------------------------------------------------------------------------
+// 可省略参数
+// ---------------------------------------------------------------------------
+
+/// 文档里写的默认值必须**真的**成立。
+///
+/// rquickjs 对实参个数是严格校验的：把可选参数写成 `Option<T>` 只会得到
+/// `Error calling function with 0 argument(s) while 2 where expected`，
+/// 而不是"取默认值"。这个坑很隐蔽 —— 参数类型看起来完全正确，
+/// 只有用户照着文档写 `page()` 时才会炸。所以这里逐个把省略写法跑一遍。
+#[test]
+fn optional_arguments_really_are_optional() {
+    let engine = engine();
+    let host = host_with_disasm("m3-mingw-static.exe");
+
+    let outcome = engine
+        .run(
+            &host,
+            r#"
+            // 全部省略
+            const f = bitflip.functions.page();
+            bitflip.log(f.requested);
+            bitflip.log(f.returned > 0);
+
+            // 只给偏移
+            const f2 = bitflip.functions.page(2);
+            bitflip.log(f2.skipped === 2);
+
+            // 完全不传过滤器，必须等价于传 {}
+            const bare = bitflip.xrefs.search();
+            const empty = bitflip.xrefs.search({});
+            bitflip.log(bare.total > 0 && bare.total === empty.total);
+
+            const s = bitflip.strings.page();
+            bitflip.log(s.total === bitflip.strings.count());
+
+            const entry = f.items[0].start;
+            const i = bitflip.insns.page(entry);
+            bitflip.log(i.instructions.length > 0);
+            "#,
+        )
+        .expect("省略可选参数不应当报错");
+
+    for (index, message) in outcome.logs.iter().enumerate() {
+        let expected = if index == 0 { "512" } else { "true" };
+        assert_eq!(
+            message.message, expected,
+            "第 {index} 条省略参数的断言失败（说明 `Opt` 用法或默认值不对）"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PLAN §M7 验收标准 1：识别所有 memcpy 调用并写参数注释
 // ---------------------------------------------------------------------------
 

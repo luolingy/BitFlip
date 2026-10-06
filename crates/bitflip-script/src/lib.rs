@@ -17,7 +17,8 @@
 //! ADR-0013 明确要求这句话不能被含糊掉：脚本在**宿主进程内**执行，
 //! QuickJS 的缺陷就是宿主进程的内存安全问题。本 crate 能承诺的是：
 //!
-//! - 死循环脚本会被**墙钟超时**掐断（[`Limits::timeout`]）；
+//! - 死循环脚本会被**墙钟超时**掐断（[`Limits::timeout`]），
+//!   或被外部通过 [`CancelToken`] 主动中断；
 //! - 脚本抛异常或触发 panic 不会让宿主进程退出；
 //! - 被中断的脚本**不会留下写了一半的标注**（[`Host`] 的暂存区语义）。
 //!
@@ -40,9 +41,9 @@ mod js;
 mod read;
 mod stage;
 
-pub use engine::{Limits, ScriptEngine, ScriptOutcome};
+pub use engine::{CancelToken, Limits, ScriptEngine, ScriptOutcome};
 pub use error::ScriptError;
-pub use host::{DisasmProvider, Host, LogLevel, ScriptLog, SCRIPT_API_VERSION};
+pub use host::{DisasmProvider, Host, LogLevel, ScriptLog, ScriptProgress, SCRIPT_API_VERSION};
 pub use stage::StagedWrites;
 
 /// 脚本 API 中 `bitflip` 全局对象的名字。

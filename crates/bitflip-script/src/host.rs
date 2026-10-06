@@ -18,6 +18,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bitflip_core::{Annotation, AnnotationKind, Disasm, ProjectStore, Session};
+use rquickjs::prelude::Opt;
 use rquickjs::{Coerced, Ctx, Exception, Function, IntoJs, Object, Value};
 
 use crate::error::ScriptError;
@@ -72,6 +73,21 @@ pub struct ScriptLog {
     pub message: String,
 }
 
+/// 脚本上报的进度。
+///
+/// 只有脚本自己知道要做多少件事（遍历 5000 个函数、处理 12 个归档成员……），
+/// 所以进度由脚本主动上报 —— 这与 IDA 的 `replace_wait_box` 是同一个设计：
+/// 宿主无法凭空推断批处理进行到哪儿了。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptProgress {
+    /// 已完成的数量。
+    pub done: u64,
+    /// 总数；脚本也不知道时为 `None`（此时界面只能显示"进行中"）。
+    pub total: Option<u64>,
+    /// 当前在做什么（可空）。
+    pub label: Option<String>,
+}
+
 /// 宿主内部状态。
 pub(crate) struct HostState {
     pub(crate) store: Option<ProjectStore>,
@@ -79,6 +95,7 @@ pub(crate) struct HostState {
     pub(crate) disasm: Option<DisasmProvider>,
     pub(crate) staged: StagedWrites,
     pub(crate) logs: Vec<ScriptLog>,
+    pub(crate) progress: Option<ScriptProgress>,
 }
 
 /// 共享状态句柄。
@@ -126,6 +143,7 @@ impl Host {
                 disasm: None,
                 staged: StagedWrites::new(),
                 logs: Vec::new(),
+                progress: None,
             }))),
         }
     }
@@ -195,21 +213,32 @@ impl Host {
         self.state.lock().logs.clone()
     }
 
+    /// 脚本上报的进度（脚本没上报过时为 `None`）。
+    ///
+    /// 服务层在脚本运行时轮询它，用来显示批处理进度；返回 `None` 时应当显示
+    /// "进行中"而不是编一个百分比 —— 脚本没说过的事，宿主不该替它说。
+    #[must_use]
+    pub fn progress(&self) -> Option<ScriptProgress> {
+        self.state.lock().progress.clone()
+    }
+
     /// 暂存条数。
     #[must_use]
     pub fn staged_len(&self) -> usize {
         self.state.lock().staged.len()
     }
 
-    /// 开始一次新的运行：清空日志与暂存。
+    /// 开始一次新的运行：清空日志、暂存与进度。
     ///
     /// 同一个 [`Host`] 会被反复用于多次运行（控制台里连着重放几次脚本），
     /// 所以每次运行必须从干净状态开始 —— 否则上一次的日志会混进这一次的结果，
-    /// 上一次被丢弃的暂存也会莫名其妙地跟着这一次一起提交。
+    /// 上一次被丢弃的暂存也会莫名其妙地跟着这一次一起提交，
+    /// 上一次的进度条会停在"80%"让用户以为这一次卡住了。
     pub fn begin_run(&self) {
         let mut state = self.state.lock();
         state.logs.clear();
         state.staged.clear();
+        state.progress = None;
     }
 
     /// 丢弃全部暂存写入（中断或失败时调用）。
@@ -372,6 +401,26 @@ impl Host {
             bitflip.set(
                 "stagedCount",
                 Function::new(ctx.clone(), move || -> usize { state.lock().staged.len() })?,
+            )?;
+        }
+
+        {
+            // 进度必须是脚本**主动**上报的：只有脚本知道总共要做多少件事。
+            // 宿主凭空推断（比如按已暂存条数估）会在"这一轮不写任何东西"的
+            // 阶段停住不动，看起来像卡死。
+            let state = state.clone();
+            bitflip.set(
+                "progress",
+                Function::new(
+                    ctx.clone(),
+                    move |done: u64, total: Opt<u64>, label: Opt<String>| {
+                        state.lock().progress = Some(ScriptProgress {
+                            done,
+                            total: total.0,
+                            label: label.0,
+                        });
+                    },
+                )?,
             )?;
         }
 

@@ -418,3 +418,154 @@ fn logs_are_per_run_not_accumulated() {
     );
     assert_eq!(second.logs[0].message, "第二次");
 }
+
+// ---------------------------------------------------------------------------
+// 外部取消（服务层的"停止"按钮）
+// ---------------------------------------------------------------------------
+
+/// 死循环 + 很长的超时，只能靠外部取消结束。
+const FOREVER: &str = "while (true) { }";
+
+#[test]
+fn an_external_cancel_stops_the_script_and_is_reported_as_cancelled() {
+    let engine = engine_with_timeout_ms(60_000);
+    let token = engine.cancel_token();
+    let host = Host::new(None);
+
+    // 必须在另一条线程上取消：脚本跑起来之后本线程就被占住了。
+    let canceller = std::thread::spawn(move || {
+        // 等到脚本真的开始跑再取消，否则取消请求会因为"没有脚本在运行"被忽略
+        // （那正是 CancelToken 的语义，见下一个用例）。
+        while !token.is_running() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        token.cancel()
+    });
+
+    let err = engine
+        .run(&host, FOREVER)
+        .expect_err("死循环脚本只能以错误结束");
+    assert!(
+        matches!(err, ScriptError::Cancelled),
+        "用户按的停止必须报成\"已取消\"，不能报成超时 —— \
+         否则用户会去优化一段本来没问题的脚本。实际：{err:?}"
+    );
+    assert!(
+        canceller.join().expect("取消线程"),
+        "取消请求应当被接受（返回 true）"
+    );
+
+    // 取消之后引擎必须还能用：不能每次点停止就得重启服务。
+    let outcome = engine
+        .run(&host, "bitflip.log('取消后仍可用');")
+        .expect("取消之后引擎应当仍然可用");
+    assert_eq!(outcome.logs[0].message, "取消后仍可用");
+}
+
+#[test]
+fn a_cancelled_script_leaves_no_writes_behind() {
+    let store = TempStore::new();
+    let engine = engine_with_timeout_ms(60_000);
+    let token = engine.cancel_token();
+    let host = Host::new(Some(store.take()));
+
+    let canceller = std::thread::spawn(move || {
+        while !token.is_running() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        token.cancel()
+    });
+
+    // 先写 3 条、再死循环：这 3 条绝不能落盘。
+    let source = "\
+        bitflip.setComment('0000000000401000', 'a');\n\
+        bitflip.setComment('0000000000401004', 'b');\n\
+        bitflip.setComment('0000000000401008', 'c');\n\
+        while (true) { }";
+    let err = engine.run(&host, source).expect_err("应当被取消");
+    assert!(matches!(err, ScriptError::Cancelled), "{err:?}");
+    canceller.join().expect("取消线程");
+
+    assert_eq!(
+        store.reopen().len(),
+        0,
+        "被取消的脚本不许留下写了一半的标注"
+    );
+}
+
+#[test]
+fn a_cancel_with_no_running_script_is_ignored_rather_than_poisoning_the_next_run() {
+    let engine = engine_with_timeout_ms(60_000);
+    let token = engine.cancel_token();
+
+    // 没有任何脚本在跑时点停止 —— 这是用户手快，不是错误。
+    assert!(
+        !token.cancel(),
+        "没有在跑的脚本时取消应当返回 false，好让界面如实说\"没有可取消的运行\""
+    );
+
+    // 关键：这个落空的取消不能把下一次运行掐掉。
+    // 若把取消实现成一个只在开始时重置的全局标志，这里就会挂。
+    let host = Host::new(None);
+    let outcome = engine
+        .run(&host, "bitflip.log('照常跑完');")
+        .expect("落空的取消请求不该影响下一次运行");
+    assert_eq!(outcome.logs[0].message, "照常跑完");
+}
+
+// ---------------------------------------------------------------------------
+// 进度上报
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_script_can_report_batch_progress() {
+    let engine = engine_with_timeout_ms(5_000);
+    let host = Host::new(None);
+
+    engine
+        .run(&host, "bitflip.progress(3, 10, '正在处理函数');")
+        .expect("上报进度应当成功");
+
+    let progress = host.progress().expect("应当能读到进度");
+    assert_eq!(progress.done, 3);
+    assert_eq!(progress.total, Some(10));
+    assert_eq!(progress.label.as_deref(), Some("正在处理函数"));
+}
+
+#[test]
+fn progress_without_a_total_is_reported_as_unknown_rather_than_zero() {
+    let engine = engine_with_timeout_ms(5_000);
+    let host = Host::new(None);
+
+    engine
+        .run(&host, "bitflip.progress(7);")
+        .expect("不带总数的上报应当成功");
+
+    let progress = host.progress().expect("应当能读到进度");
+    assert_eq!(progress.done, 7);
+    assert_eq!(
+        progress.total, None,
+        "总数未知时必须报 null，不能填 0 —— 界面会显示成 0% 而看起来像卡住"
+    );
+}
+
+#[test]
+fn progress_is_cleared_between_runs() {
+    let engine = engine_with_timeout_ms(5_000);
+    let host = Host::new(None);
+
+    engine
+        .run(&host, "bitflip.progress(9, 10);")
+        .expect("第一次");
+    assert!(host.progress().is_some());
+
+    // 第二次没有上报任何进度：不能把上一次的 90% 留在那里，
+    // 否则用户看到进度条停在 90% 会以为这一次卡住了。
+    engine
+        .run(&host, "bitflip.log('不给进度');")
+        .expect("第二次");
+    assert!(
+        host.progress().is_none(),
+        "上一次的进度必须清掉，否则进度条会停在一个与本次无关的位置"
+    );
+}
