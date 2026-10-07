@@ -423,7 +423,15 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
         } else {
             SymbolTableSource::Static
         };
-        match parse_symbols(&reader, &header, sh, &section_headers, source, &mut object) {
+        match parse_symbols(
+            &reader,
+            &header,
+            sh,
+            &section_headers,
+            &shstrtab,
+            source,
+            &mut object,
+        ) {
             Ok(symbols) => object.symbols.extend(symbols),
             Err(error) => object.note(format!(
                 "节 {index}（{}）符号表解析失败：{}",
@@ -918,11 +926,17 @@ fn section_name(raw: &[SectionHeader], shstrtab: &[u8], index: usize) -> String 
 }
 
 /// 解析符号表。
+///
+/// `shstrtab` 是**必须**的：符号的 `st_shndx` 只是个下标，要变成"这个符号在哪个节"
+/// 就得查节名，而节名在 `.shstrtab` 里。少了它，符号的节名全部解析不出来
+/// （`section_name` 会给出 `<节 N>` 占位，这里再判成 `None`），消费方就找不到
+/// 这个符号所在的字节 —— 签名生成、交叉引用都要按"符号 → 节 → 文件偏移"取内容。
 fn parse_symbols(
     reader: &Reader<'_>,
     header: &ElfHeader,
     sh: &SectionHeader,
     raw_sections: &[SectionHeader],
+    shstrtab: &[u8],
     source: SymbolTableSource,
     object: &mut Object,
 ) -> Result<Vec<RawSymbol>, ParseError> {
@@ -1022,7 +1036,7 @@ fn parse_symbols(
 
         // 节符号（STT_SECTION）的名字通常为空，用节名代替，否则这一堆符号全是空的。
         let section = if (shndx as usize) < raw_sections.len() {
-            let name = section_name(raw_sections, &[], shndx as usize);
+            let name = section_name(raw_sections, shstrtab, shndx as usize);
             if name.starts_with("<节 ") {
                 None
             } else {
