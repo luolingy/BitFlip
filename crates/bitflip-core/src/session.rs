@@ -573,6 +573,12 @@ pub struct Session {
     object_raw: Option<Arc<Object>>,
     /// 用户给的签名库（没有就是 `None` —— 剥离目标上就只有"未识别"这一种诚实的结论）。
     signatures: Option<Arc<SignatureLibrary>>,
+    /// 目标自带的调试信息（DWARF；PDB 待接）。
+    ///
+    /// **永远有值**：读不到任何东西时，里面是一条说明而不是空对象 ——
+    /// "这份文件没有调试信息"与"有但被裁掉了"对用户是两个不同的结论。
+    /// 它不需要用户给路径（不像签名库），所以打开时直接读，读不到也不让打开失败。
+    debug: Arc<bitflip_debug::DebugInfo>,
     /// 整个文件的字节。
     ///
     /// 分析层需要按虚拟地址随机访问原始字节（反汇编、字符串搜索、交叉引用）。
@@ -835,6 +841,17 @@ impl Session {
             });
         }
 
+        // 调试信息：目标自带，不需要用户指定路径。读不到**不是**错误 —— 它是
+        // "有更好、没有也行"的东西，所以这里不让打开失败，而是把说明写进 notes，
+        // 让"为什么没有行号"这件事在界面上有答案（CLAUDE.md §7）。
+        let debug = Arc::new(match object_raw.as_deref() {
+            Some(object) => bitflip_debug::read(object, &bytes),
+            None => bitflip_debug::DebugInfo::default(),
+        });
+        for note in &debug.notes {
+            info.notes.push(format!("调试信息：{note}"));
+        }
+
         Ok(Self {
             path,
             guess,
@@ -842,6 +859,7 @@ impl Session {
             object,
             object_raw,
             signatures,
+            debug,
             bytes,
             hash: std::sync::OnceLock::new(),
             analysis: std::sync::OnceLock::new(),
@@ -1195,6 +1213,9 @@ impl Session {
         // 用户一眼看出分析的是哪个成员，也让哈希天然分开（内容不同）。
         let path = PathBuf::from(format!("{}#{}", self.path.display(), member.name));
         let info = TargetInfo::from_guess(&path, member.size, &guess);
+        // 调试信息按成员各自读：每个成员是独立的编译单元，行表也是各自的。
+        // 先读再构造（object 随后会被移进 Arc）。
+        let debug = Arc::new(bitflip_debug::read(&object, slice));
 
         Ok((
             Self {
@@ -1206,6 +1227,7 @@ impl Session {
                 // 签名库跟着容器一起继承：静态库的成员正是签名库最该发挥作用的地方
                 // （成员就是编译单元，函数没有大小、剥离后一无所有）。
                 signatures: self.signatures.clone(),
+                debug,
                 bytes: Arc::from(slice),
                 hash: std::sync::OnceLock::new(),
                 analysis: std::sync::OnceLock::new(),
@@ -1224,6 +1246,12 @@ impl Session {
     #[must_use]
     pub fn signatures(&self) -> Option<&Arc<SignatureLibrary>> {
         self.signatures.as_ref()
+    }
+
+    /// 目标自带的调试信息（读不到东西时里面只有说明）。
+    #[must_use]
+    pub fn debug(&self) -> &Arc<bitflip_debug::DebugInfo> {
+        &self.debug
     }
 
     /// 建立反汇编（线性 + 递归下降扫描）。
@@ -1264,7 +1292,10 @@ impl Session {
         let bytes: Arc<[u8]> = self.bytes.clone();
         // 扫描产生的 notes（合成地址、截断、解码失败）随 `Disasm` 一起返回，
         // 由 UI 显示 —— 分析质量的"折扣"必须写在界面上（CLAUDE.md §7）。
-        Ok(Disasm::build(object, bytes, options))
+        let mut disasm = Disasm::build(object, bytes, options);
+        // 行号挂在反汇编这一层：反汇编列表、交叉引用、调用图用的是同一份映射。
+        disasm.attach_debug(Some(Arc::clone(&self.debug)));
+        Ok(disasm)
     }
 
     /// 目标路径。

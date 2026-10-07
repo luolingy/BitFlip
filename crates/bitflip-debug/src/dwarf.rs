@@ -194,8 +194,19 @@ pub fn read_dwarf(object: &Object, bytes: &[u8]) -> DebugInfo {
             Ok(Some(header)) => header,
             Ok(None) => break,
             Err(error) => {
-                info.notes
-                    .push(format!("DWARF 编译单元列表在读取中断：{error}"));
+                // 读到节尾时 gimli 会报一次 `UnexpectedEof`：`.debug_*` 按对齐补零，
+                // 补零之后再来一个"单元头"就撞到结尾了。已经读出过编译单元时，
+                // 这是**正常结束**，但不说成"一切正常" —— 尾部确实有东西没被解析，
+                // 万一是被截断的单元，用户在这里能看到线索。
+                if unit_index == 0 {
+                    info.notes
+                        .push(format!("DWARF 编译单元列表在读取中断：{error}"));
+                } else {
+                    info.notes.push(format!(
+                        "`.debug_info` 在最后一个编译单元之后还有读不下去的尾部（{error}），\
+                         通常是补零对齐；已读出 {unit_index} 个编译单元"
+                    ));
+                }
                 break;
             }
         };

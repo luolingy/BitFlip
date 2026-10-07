@@ -13,6 +13,7 @@ categories.workspace = true
 [dependencies]
 bitflip-analyze = { workspace = true }
 bitflip-arch = { workspace = true }
+bitflip-debug = { workspace = true }
 bitflip-loader = { workspace = true }
 bitflip-project = { workspace = true }
 bitflip-signature = { workspace = true }

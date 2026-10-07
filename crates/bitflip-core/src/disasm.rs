@@ -59,6 +59,13 @@ pub struct InsnWire {
     /// **这个字段是诚实性的关键**：线性扫描会把数据误当指令。
     /// 前端据此把"仅线性扫到"的指令标灰，而不是假装同样可信。
     pub reachable: bool,
+    /// 源文件（来自调试信息）；没有调试信息就是 `null`，不拿别的东西顶替。
+    pub file: Option<String>,
+    /// 源码行号（来自调试信息）；没有就是 `null`。
+    ///
+    /// 地址落在两行之间（行表是稀疏的）时为 `null` —— 不返回"最近的那一行"，
+    /// 那会把别的代码的行号安到这条指令上。
+    pub line: Option<u32>,
 }
 
 /// 一页反汇编。
@@ -127,6 +134,13 @@ pub struct Disasm {
     ///
     /// 这些必须能浮到 UI：分析质量的"折扣"要写在界面上，而不是埋在日志里。
     pub notes: Vec<String>,
+    /// 调试信息（地址 → 源位置）。
+    ///
+    /// 放在反汇编这一层而不是分析层：行号是"这条指令来自哪一行"，属于反汇编
+    /// 视图本身；而且反汇编列表、交叉引用、调用图三处都要查同一份映射 ——
+    /// 各查各的会漂移（同一地址在两处显示不同的行号是没法解释的）。
+    /// `None` 表示目标没有调试信息，此时所有位置字段如实为空。
+    pub debug: Option<Arc<bitflip_debug::DebugInfo>>,
 }
 
 impl std::fmt::Debug for Disasm {
@@ -253,6 +267,9 @@ impl Disasm {
             decoder,
             renderer,
             notes,
+            // 调试信息由 ttach_debug 挂上：扫描阶段不需要它，uild 也不该
+            // 依赖调用方手上有没有调试信息（没有照常反汇编）。
+            debug: None,
         }
     }
 
@@ -322,6 +339,8 @@ impl Disasm {
     /// flow 为 `unknown`。这样 UI 上不会出现"看起来像指令其实是垃圾"的行。
     fn render(&self, addr: u64, len: u8) -> InsnWire {
         let bytes = self.space.read(addr, usize::from(len)).unwrap_or_default();
+        // 行号查同一份行表；查不到就是"没有"（落在行与行之间也算没有）。
+        let location = self.debug.as_ref().and_then(|info| info.location_at(addr));
 
         let decoded = if bytes.is_empty() {
             None
@@ -351,7 +370,22 @@ impl Disasm {
             flow_label: bitflip_arch::flow_label(flow).to_string(),
             target: target.map(hex16),
             reachable: self.coverage.is_reachable(addr),
+            file: location.as_ref().and_then(|row| row.file.clone()),
+            line: location.as_ref().map(|row| row.line),
         }
+    }
+
+    /// 挂上调试信息（行号）。返回是否**有**行表可查。
+    ///
+    /// 只有说明、没有行表时返回 `false`：调用方据此知道"行号这条路是空的"，
+    /// 而不是以为挂上就有行号（说明本身仍然留在 `DebugInfo::notes` 里，
+    /// 由 session 汇总给用户看）。
+    pub fn attach_debug(&mut self, debug: Option<Arc<bitflip_debug::DebugInfo>>) -> bool {
+        let usable = debug
+            .as_ref()
+            .is_some_and(|info| !info.lines.is_empty() || !info.functions.is_empty());
+        self.debug = debug;
+        usable
     }
 }
 
@@ -500,6 +534,7 @@ mod tests {
             decoder: Arc::clone(&renderer) as Arc<dyn Decoder>,
             renderer: Some(renderer),
             notes: Vec::new(),
+            debug: None,
         }
     }
 

@@ -208,6 +208,7 @@ version = "0.0.1"
 dependencies = [
  "bitflip-analyze",
  "bitflip-arch",
+ "bitflip-debug",
  "bitflip-loader",
  "bitflip-project",
  "bitflip-signature",
