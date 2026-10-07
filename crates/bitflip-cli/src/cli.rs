@@ -88,11 +88,12 @@ pub enum Command {
     Version,
 }
 
-/// 原始二进制的架构/基址覆盖参数。
+/// 打开目标时的通用输入参数。
 ///
 /// 单独成一个结构体是因为**每个接受目标文件的命令都需要它**：
-/// 固件里没有头可读，不给架构就没法反汇编。用 `#[command(flatten)]`
-/// 摊平进各个参数结构，命令行上就是每个命令都直接支持 `--arch` / `--base`。
+/// 固件里没有头可读，不给架构就没法反汇编；剥离过的目标不给签名库就没有名字。
+/// 用 `#[command(flatten)]` 摊平进各个参数结构，命令行上就是每个命令都直接支持
+/// `--arch` / `--base` / `--signatures`。
 #[derive(Debug, Args, Clone, Default)]
 pub struct RawOverrideArgs {
     /// 手工指定架构（原始二进制必须；也用于覆盖嗅探结论）
@@ -114,6 +115,13 @@ pub struct RawOverrideArgs {
     /// 视作原始二进制：忽略嗅探出的容器与对象格式
     #[arg(long)]
     pub force_raw: bool,
+
+    /// 签名库文件（`signature build` 的产物）：给剥离过的目标找回函数名
+    ///
+    /// 只做字节比对，不认识架构、不联网。文件读不出或版本不符会**直接报错**，
+    /// 不会静默跳过 —— 否则"给了签名库却什么都没认出来"会被误解成库不够全。
+    #[arg(long, value_name = "FILE")]
+    pub signatures: Option<PathBuf>,
 }
 
 impl RawOverrideArgs {
@@ -160,6 +168,10 @@ impl RawOverrideArgs {
                 anyhow::anyhow!("基址无法解析：{text:?}（十六进制，可带 0x 前缀）")
             })?;
             opts.base_address = Some(base);
+        }
+
+        if let Some(path) = &self.signatures {
+            opts.signatures = Some(path.clone());
         }
 
         Ok(opts)

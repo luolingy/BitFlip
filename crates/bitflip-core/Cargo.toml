@@ -15,6 +15,7 @@ bitflip-analyze = { workspace = true }
 bitflip-arch = { workspace = true }
 bitflip-loader = { workspace = true }
 bitflip-project = { workspace = true }
+bitflip-signature = { workspace = true }
 bitflip-symbols.workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }

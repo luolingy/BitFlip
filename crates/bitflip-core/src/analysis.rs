@@ -20,6 +20,7 @@ use bitflip_analyze::{
 };
 use bitflip_arch::Flow;
 use bitflip_loader::object::RelocKind;
+use bitflip_signature::matcher::{Matcher, TargetFunction};
 use bitflip_symbols::{SymbolCandidate, SymbolSource};
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,26 @@ use crate::disasm::{hex16, parse_address, Disasm};
 
 /// wire 格式版本。
 pub const ANALYSIS_FORMAT_VERSION: u32 = 1;
+
+/// 签名库这一遍的账目（M8）。
+///
+/// 存在的意义是**把"没认出来"分类**：认不出可能是因为库里没有这段字节（正常的漏报）、
+/// 也可能是因为几个库函数长得一模一样（同形，无法区分）、或者目标函数太短、
+/// 目标函数范围缺失导致装不下。后三种都不是"库里没有"，必须分开说 ——
+/// 否则用户会去补库，而问题根本不在库上。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureUseWire {
+    /// 认出名字的函数个数。
+    pub matched: usize,
+    /// 有多少个候选函数的字节同时匹配多个库函数名（同形，未命名）。
+    pub ambiguous: usize,
+    /// 参与了比对的候选函数总数。
+    pub checked: u64,
+    /// 可读字节不足以验证任何签名的候选数（"没有证据"，不是"不匹配"）。
+    pub skipped_short: u64,
+    /// 因为签名比目标函数更长而被排除的条数。
+    pub rejected_by_size: u64,
+}
 
 /// 函数的 wire 表示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +291,8 @@ pub struct TargetAnalysis {
     arg_scan: ArgScanWire,
     /// 栈帧与局部变量视图。M6 引入。
     frame_scan: FrameScanWire,
+    /// 签名库的账目。M8 引入：`None` = 这次分析没有用签名库。
+    signatures: Option<SignatureUseWire>,
     notes: Vec<String>,
 }
 
@@ -573,17 +596,22 @@ impl TargetAnalysis {
     /// 从反汇编结果 + 目标对象构建目标级分析。
     ///
     /// `disasm` 提供地址空间、指令索引、覆盖标记与解码器；
-    /// `object` 提供符号/导出/展开表（识别函数的多来源候选）。
+    /// `object` 提供符号/导出/展开表（识别函数的多来源候选）；
+    /// `signatures` 是用户给的签名库匹配器（`None` = 没有签名库可用）。
     #[must_use]
     pub fn build(
         disasm: &Disasm,
         object: &bitflip_loader::object::Object,
         opts: &StringOptions,
+        signatures: Option<&Matcher<'_>>,
     ) -> Self {
         let mut notes = Vec::new();
 
         // ── 函数候选收集（多来源）──
         let mut by_addr: HashMap<u64, Vec<SymbolCandidate>> = HashMap::new();
+        // 签名库这一遍的账目（只有在用签名库时才非 `None`）：认出了几个、
+        // 有几个同形无法区分、有几个字节不够。见"来源 7"。
+        let mut signature_report: Option<SignatureUseWire> = None;
 
         // 来源 1：符号表中的函数符号
         for sym in &object.symbols {
@@ -907,6 +935,108 @@ impl TargetAnalysis {
             ));
         }
 
+        // ── 来源 7：签名库 ──
+        //
+        // 这是**唯一**能在彻底剥离的目标上给出可读名字的来源：符号表空、没有导出、
+        // 没有调试信息，只剩字节。名字不是猜的 —— 它来自用户自己机器上那些库
+        // （`bitflip-cli signature build` 从静态库/目标文件抽的函数指纹），
+        // 比对的是字节，所以这里既不认架构也不编名字。
+        //
+        // 比对的**时机**很讲究：必须等其它来源把候选地址收齐之后。因为"这个函数
+        // 有多长"决定了"它装不装得下一条签名"（`Matcher` 的 `fits_in`）——
+        // 一条 24 字节的指纹当然不可能落在 1 字节的桩函数里，而目标函数范围
+        // 越准，这类排除就越有效。
+        if let Some(matcher) = signatures {
+            // 函数范围优先取展开表（`.pdata` 的 begin/end 是**精确**的函数边界，
+            // 这是 PE 上唯一可靠的来源）。拿不到就不给大小 —— 匹配器会把
+            // "大小未知"当成"不做这层排除"，而不是当成 0。
+            let ranges: HashMap<u64, u64> = object
+                .unwind
+                .iter()
+                .map(|entry| (entry.begin, entry.end))
+                .collect();
+
+            // 读多少字节：匹配器说它最长需要多少。给的字节比这多没有意义，
+            // 比这少会让"字节不够验证"的结论变多（那不是"不匹配"，是没证据）。
+            let needed = usize::try_from(matcher.longest_needed()).unwrap_or(0);
+            let mut candidates: Vec<u64> = by_addr.keys().copied().collect();
+            candidates.sort_unstable();
+
+            let mut buffers: Vec<(u64, Vec<u8>, Option<u64>)> = Vec::new();
+            for addr in candidates {
+                let size = ranges.get(&addr).map(|end| end.saturating_sub(addr));
+                // 有确切大小时按大小读就够（读多了是别人的字节）；没有就按签名
+                // 需要的最长字节读，让匹配器自己判断"字节够不够"。
+                let want = match size {
+                    Some(size) => usize::try_from(size).unwrap_or(needed).min(needed),
+                    None => needed,
+                };
+                if want == 0 {
+                    continue;
+                }
+                let Some(bytes) = disasm.space.read(addr, want) else {
+                    continue;
+                };
+                buffers.push((addr, bytes, size));
+            }
+
+            let targets: Vec<TargetFunction<'_>> = buffers
+                .iter()
+                .map(|(addr, bytes, size)| TargetFunction {
+                    addr: *addr,
+                    bytes,
+                    size: *size,
+                })
+                .collect();
+            let report = matcher.match_all(&targets);
+
+            for hit in &report.matches {
+                by_addr.entry(hit.addr).or_default().push(SymbolCandidate {
+                    addr: hit.addr,
+                    name: hit.name.clone(),
+                    source: SymbolSource::Signature,
+                    // 置信度来自签名形态：字节越长、屏蔽越少就越可信。
+                    // 这是**字节证据的强度**，不是"名字对不对"的概率。
+                    confidence: hit.confidence,
+                });
+            }
+
+            signature_report = Some(SignatureUseWire {
+                matched: report.matches.len(),
+                ambiguous: report.ambiguous_count(),
+                checked: report.checked,
+                skipped_short: report.skipped_short,
+                rejected_by_size: report.rejected_by_size,
+            });
+            if !report.matches.is_empty() {
+                notes.push(format!(
+                    "签名库认出 {} 个函数（共比对 {} 个候选）",
+                    report.matches.len(),
+                    report.checked
+                ));
+            }
+            // 这三条都是"没给出结论"的原因，必须说出来：否则用户看到"签名库认不出"
+            // 会以为是库不够全，而实际可能是目标函数太短、或目标大小信息缺失。
+            if report.ambiguous_count() > 0 {
+                notes.push(format!(
+                    "签名库里有 {} 个候选函数的字节同时匹配多个库函数名（同形无法区分），未命名",
+                    report.ambiguous_count()
+                ));
+            }
+            if report.skipped_short > 0 {
+                notes.push(format!(
+                    "有 {} 个候选函数的可读字节不足以验证任何签名（这不是「不匹配」，是没有证据）",
+                    report.skipped_short
+                ));
+            }
+            if report.rejected_by_size > 0 {
+                notes.push(format!(
+                    "有 {} 条签名因为「比目标函数更长」被排除（函数长度是硬上限）",
+                    report.rejected_by_size
+                ));
+            }
+        }
+
         // ── xref 提取（与候选收集同一遍流式解码）──
         //
         // 每条引用带两个元数据字段（M6 交付物 7）：
@@ -1147,8 +1277,15 @@ impl TargetAnalysis {
             const_scan,
             arg_scan,
             frame_scan,
+            signatures: signature_report,
             notes,
         }
+    }
+
+    /// 签名库的账目（`None` = 这次分析没有用签名库）。
+    #[must_use]
+    pub fn signatures(&self) -> Option<&SignatureUseWire> {
+        self.signatures.as_ref()
     }
 
     /// 常量/结构体初步推断结果。
@@ -2544,7 +2681,7 @@ mod tests {
             .disassemble(DisasmScanOptions::default())
             .expect("反汇编");
         let object = session.object().expect("object").clone();
-        let analysis = TargetAnalysis::build(&disasm, &object, &StringOptions::default());
+        let analysis = TargetAnalysis::build(&disasm, &object, &StringOptions::default(), None);
         (path, analysis)
     }
 
@@ -2663,6 +2800,7 @@ mod tests {
             const_scan: ConstScanWire::default(),
             arg_scan: ArgScanWire::default(),
             frame_scan: FrameScanWire::default(),
+            signatures: None,
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());

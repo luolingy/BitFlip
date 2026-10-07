@@ -74,7 +74,7 @@ fn analyze_sample() -> Option<(Session, TargetAnalysis)> {
         .expect("应能建立反汇编");
     let object = session.object().expect("应能拿到对象").clone();
 
-    let analysis = TargetAnalysis::build(&disasm, &object, &StringOptions::default());
+    let analysis = TargetAnalysis::build(&disasm, &object, &StringOptions::default(), None);
     Some((session, analysis))
 }
 
@@ -301,7 +301,7 @@ mod xref_consistency {
             .disassemble(DisasmScanOptions::default())
             .map_err(|e| format!("反汇编失败: {e}"))?;
         let object = session.object().ok_or("拿不到 object")?.clone();
-        let analysis = TargetAnalysis::build(&disasm, &object, &StringOptions::default());
+        let analysis = TargetAnalysis::build(&disasm, &object, &StringOptions::default(), None);
 
         let base = TEXT_VADDR;
         let mut edges = 0usize;

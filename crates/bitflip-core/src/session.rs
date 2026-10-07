@@ -8,6 +8,7 @@ use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
 use bitflip_loader::object::{Object, ObjectId};
 use bitflip_loader::{sniff_file, ContainerKind, Guess, ObjectKind};
 use bitflip_project::ProjectStore;
+use bitflip_signature::{signature_arch, Matcher, SignatureSet};
 use serde::Serialize;
 
 use crate::analysis::TargetAnalysis;
@@ -288,6 +289,15 @@ pub struct OpenOptions {
     /// `0x08000000` 开始。不给基址的话，反汇编出来的地址与用户手上的
     /// 参考手册对不上，跳转目标也就没法核对。
     pub base_address: Option<u64>,
+
+    /// 签名库文件（`bitflip-cli signature build` 产出的 JSON）。
+    ///
+    /// 只有**剥离**过的目标才需要它：符号表空、没有导出、没有调试信息时，
+    /// 函数字节是唯一证据，而"这段字节是哪个库函数"只有用户自己攒的签名库知道。
+    ///
+    /// 给定了但读不出来/格式不对时**报错**，不静默跳过 —— 否则用户会以为
+    /// "签名库用上了但什么都没认出来"，那是错的结论（CLAUDE.md §7）。
+    pub signatures: Option<PathBuf>,
 }
 
 /// 归档成员名的基名：去掉目录部分后的文件名。
@@ -492,6 +502,64 @@ pub struct AnalysisSummary {
     pub xrefs: usize,
 }
 
+/// 用户加载的签名库。
+///
+/// 与目标一起打开、随 `Session` 共享：一份签名库可以有上万条签名，
+/// 每个请求重新解析一遍 JSON 是没必要的开销（和 `bytes`、`object_raw` 同理）。
+#[derive(Debug)]
+pub struct SignatureLibrary {
+    path: PathBuf,
+    set: SignatureSet,
+}
+
+impl SignatureLibrary {
+    /// 从文件加载。
+    ///
+    /// 出错一律**报错**，不静默降级：文件不存在、JSON 坏了、`format_version`
+    /// 与当前程序不符（签名库是本地生成的派生物，版本不符要重新生成而不是勉强读），
+    /// 三种情况都会让"名字从哪来"这个结论不可信 —— 与其给出一个说不清来源的结果，
+    /// 不如让用户先修好输入。
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, BitflipError> {
+        let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(BitflipError::not_found(format!(
+                "签名库文件 {}",
+                path.display()
+            )));
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| BitflipError::InvalidInput(format!("读取签名库失败：{error}")))?;
+        let set = SignatureSet::from_json(&text)
+            .map_err(|error| BitflipError::InvalidInput(format!("签名库解析失败：{error}")))?;
+        Ok(Self { path, set })
+    }
+
+    /// 签名库文件路径（报告里要能说清名字是从哪来的）。
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 签名集合。
+    #[must_use]
+    pub fn set(&self) -> &SignatureSet {
+        &self.set
+    }
+
+    /// 这个签名库里有没有**适配该形态**的签名。
+    ///
+    /// 没有就必须如实说"这份签名库对这个目标没有可用签名"，而不是装作用过 ——
+    /// 用户会因为"给了签名库却什么都没认出来"去怀疑别的地方。
+    #[must_use]
+    pub fn covers(&self, arch: &ArchSpec) -> bool {
+        let wanted = signature_arch(arch);
+        self.set
+            .signatures
+            .iter()
+            .any(|signature| signature.arch == wanted)
+    }
+}
+
 /// 一个打开的目标。
 ///
 /// `Session` 是 `bitflip-core` 的核心类型，也是被其他项目嵌入时的入口。
@@ -503,6 +571,8 @@ pub struct Session {
     info: TargetInfo,
     object: Option<ObjectInfo>,
     object_raw: Option<Arc<Object>>,
+    /// 用户给的签名库（没有就是 `None` —— 剥离目标上就只有"未识别"这一种诚实的结论）。
+    signatures: Option<Arc<SignatureLibrary>>,
     /// 整个文件的字节。
     ///
     /// 分析层需要按虚拟地址随机访问原始字节（反汇编、字符串搜索、交叉引用）。
@@ -724,12 +794,54 @@ impl Session {
             Arc::from(Vec::new())
         };
 
+        // 签名库：用户给了就加载，加载失败**报错**而不是继续。
+        //
+        // 继续下去的结果是"分析跑完了、函数全是未识别"，而用户明明给了签名库 ——
+        // 他会去怀疑签名生成、怀疑目标格式，唯独不会想到是路径写错了。
+        // 这里让打开就失败，错误信息直接指出是哪个文件出了什么问题。
+        let signatures = match opts.signatures.as_deref() {
+            Some(path) => Some(Arc::new(SignatureLibrary::load(path)?)),
+            None => None,
+        };
+        if let Some(library) = &signatures {
+            let usable = object_raw
+                .as_ref()
+                .is_some_and(|object| library.covers(&object.arch));
+            info.notes.push(if usable {
+                format!(
+                    "签名库 {} 已加载：{} 条签名（{}）",
+                    library.path().display(),
+                    library.set().len(),
+                    library
+                        .set()
+                        .arches()
+                        .iter()
+                        .map(|arch| arch.to_string())
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )
+            } else {
+                format!(
+                    "签名库 {} 里没有适配本目标形态的签名（库里有：{}），本次不会用它命名任何函数",
+                    library.path().display(),
+                    library
+                        .set()
+                        .arches()
+                        .iter()
+                        .map(|arch| arch.to_string())
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )
+            });
+        }
+
         Ok(Self {
             path,
             guess,
             info,
             object,
             object_raw,
+            signatures,
             bytes,
             hash: std::sync::OnceLock::new(),
             analysis: std::sync::OnceLock::new(),
@@ -1091,6 +1203,9 @@ impl Session {
                 info,
                 object: Some(ObjectInfo::from_object(&object)),
                 object_raw: Some(Arc::new(object)),
+                // 签名库跟着容器一起继承：静态库的成员正是签名库最该发挥作用的地方
+                // （成员就是编译单元，函数没有大小、剥离后一无所有）。
+                signatures: self.signatures.clone(),
                 bytes: Arc::from(slice),
                 hash: std::sync::OnceLock::new(),
                 analysis: std::sync::OnceLock::new(),
@@ -1103,6 +1218,12 @@ impl Session {
     #[must_use]
     pub fn object(&self) -> Option<&Arc<Object>> {
         self.object_raw.as_ref()
+    }
+
+    /// 用户给的签名库（没有就是 `None`）。
+    #[must_use]
+    pub fn signatures(&self) -> Option<&Arc<SignatureLibrary>> {
+        self.signatures.as_ref()
     }
 
     /// 建立反汇编（线性 + 递归下降扫描）。
@@ -1259,10 +1380,19 @@ impl Session {
         // （CLAUDE.md §4）。
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let disasm = self.disassemble(DisasmScanOptions::default())?;
+            // 签名匹配器按**目标的形态**建索引：签名库可以有多个形态的签名，
+            // 拿别的形态去比对只会白跑一遍（字节完全不同）或匹配到错误的形态。
+            let matcher = match self.signatures.as_deref() {
+                Some(library) if library.covers(&object.arch) => {
+                    Some(Matcher::new(library.set(), &signature_arch(&object.arch)))
+                }
+                _ => None,
+            };
             Ok::<_, BitflipError>(TargetAnalysis::build(
                 &disasm,
                 object,
                 &StringOptions::default(),
+                matcher.as_ref(),
             ))
         }));
 
