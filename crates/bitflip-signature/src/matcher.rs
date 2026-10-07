@@ -68,6 +68,11 @@ pub struct MatchReport {
     pub checked: u64,
     /// 因为"目标里可读字节不够验证签名"而跳过的次数（诚实计数，不是匹配）。
     pub skipped_short: u64,
+    /// 因为"目标函数大小装不下这条签名"而被排除的候选条数。
+    ///
+    /// 与"证据不足"区分开：这是**明确不是**这个函数（例如 8 字节的桩函数里
+    /// 不可能有 24 字节的前缀）。
+    pub rejected_by_size: u64,
 }
 
 impl MatchReport {
@@ -126,6 +131,18 @@ impl<'a> Matcher<'a> {
     /// 比对单个函数。
     #[must_use]
     pub fn match_at(&self, addr: u64, bytes: &[u8], size: Option<u64>) -> Option<Hit> {
+        let mut ignored = 0u64;
+        self.match_at_inner(addr, bytes, size, &mut ignored)
+    }
+
+    /// 比对单个函数，并累计"被大小排除掉"的候选条数。
+    fn match_at_inner(
+        &self,
+        addr: u64,
+        bytes: &[u8],
+        size: Option<u64>,
+        rejected_by_size: &mut u64,
+    ) -> Option<Hit> {
         if bytes.len() < crate::generate::INDEX_BYTES {
             return None;
         }
@@ -138,6 +155,10 @@ impl<'a> Matcher<'a> {
             let Some(signature) = self.set.signatures.get(*index as usize) else {
                 continue;
             };
+            if !fits_in(signature, size) {
+                *rejected_by_size += 1;
+                continue;
+            }
             let Some(matched) = self.verify(signature, bytes, size) else {
                 continue;
             };
@@ -172,18 +193,23 @@ impl<'a> Matcher<'a> {
     }
 
     /// 前缀 + 尾部校验。
+    ///
+    /// `size` 是调用方知道的**目标函数大小**（`None` = 不知道）。它只用来做
+    /// "物理上装不下"的排除：函数比模式覆盖的字节还短时，模式不可能整段落在它里面。
+    /// 这类排除会单独计数（[`MatchReport::rejected_by_size`]），因为它是"明确不是"
+    /// 而不是"看不出来"。
+    ///
+    /// 注意：目标字节不够验证尾部校验时这里返回 `None`（当作不匹配）——
+    /// 调用方必须按 [`Matcher::longest_needed`] 提供字节，否则最长的那些签名会被
+    /// 静默漏掉。批量入口 [`Matcher::match_all`] 会为这种情况单独计数。
     fn verify(
         &self,
         signature: &FunctionSignature,
         bytes: &[u8],
         size: Option<u64>,
     ) -> Option<Match> {
-        let prefix_len = signature.prefix.len() as u64;
-        if let Some(size) = size {
-            // 函数比模式还短：模式不可能整段落在它里面。
-            if size < prefix_len {
-                return None;
-            }
+        if !fits_in(signature, size) {
+            return None;
         }
         if !signature.prefix.matches(bytes) {
             return None;
@@ -216,7 +242,12 @@ impl<'a> Matcher<'a> {
                 // 分开计数，免得报告里"未匹配"混进两件不同的事。
                 report.skipped_short += 1;
             }
-            match self.match_at(target.addr, target.bytes, target.size) {
+            match self.match_at_inner(
+                target.addr,
+                target.bytes,
+                target.size,
+                &mut report.rejected_by_size,
+            ) {
                 Some(Hit::Match(found)) => report.matches.push(found),
                 Some(Hit::Ambiguous(found)) => report.ambiguous.push(found),
                 None => {}
@@ -225,8 +256,13 @@ impl<'a> Matcher<'a> {
         report
     }
 
-    /// 索引里最长的签名需要多少字节（用于判断"目标可读字节是否够验证"）。
-    fn longest_needed(&self) -> u64 {
+    /// 索引里最长的签名需要目标提供多少字节。
+    ///
+    /// 调用方据此决定"每个目标函数该读多少字节"：读少了会让最长的那些签名永远
+    /// 验证不了（会被计入 [`MatchReport::skipped_short`]）。生成期已经把尾部校验
+    /// 限制在 [`crate::generate::TAIL_MAX_EXTENT`] 之内，所以这个值有上界。
+    #[must_use]
+    pub fn longest_needed(&self) -> u64 {
         self.set
             .signatures
             .iter()
@@ -240,6 +276,32 @@ impl<'a> Matcher<'a> {
             .max()
             .unwrap_or(0)
     }
+}
+
+/// 目标函数的字节数放得下这条签名要比对的所有字节吗？
+///
+/// 两件事都要成立：
+///
+/// * 前缀与尾部覆盖到的**最远字节**不能超出函数末尾 —— 超出的部分是**别的函数
+///   或填充**，拿它比对等于把"邻近代码长得像"当成"这个函数就是它"；
+/// * 签名自称的**精确长度**不能大于目标函数长度 —— 同一段代码在库里和链接后
+///   长度一致，"库里的函数比目标里这个函数还长"说明它们不是同一个函数。
+///
+/// 这两条只在目标大小**已知**时才成立（`None` 时一律放过）。它们排除的是"物理上
+/// 不可能"，而不是"证据不足"，所以单独计数。
+#[must_use]
+fn fits_in(signature: &FunctionSignature, size: Option<u64>) -> bool {
+    let Some(size) = size else {
+        return true;
+    };
+    let farthest = signature.tail.as_ref().map_or(0, |tail| {
+        u64::from(tail.offset).saturating_add(u64::from(tail.bytes))
+    });
+    let coverage = (signature.prefix.len() as u64).max(farthest);
+    if size < coverage {
+        return false;
+    }
+    !(signature.length_exact && u64::from(signature.length) > size)
 }
 
 /// 一次比对的结果。
@@ -281,6 +343,7 @@ mod tests {
             name: name.to_string(),
             arch: SignatureArch::new(64, "le", "test"),
             length: exact.len() as u32,
+            length_exact: true,
             prefix: Pattern::exact(exact),
             tail: tail.map(|(offset, bytes, crc16)| crate::signature::TailCheck {
                 offset,

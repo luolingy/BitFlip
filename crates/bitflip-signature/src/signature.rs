@@ -98,8 +98,16 @@ pub struct FunctionSignature {
     pub name: String,
     /// 适用形态。
     pub arch: SignatureArch,
-    /// 生成时这个函数有多少字节（尾部窗口按它定位）。
+    /// 生成时这个函数有多少字节 —— **上界**。
+    ///
+    /// 结束位置不可信时（见 [`Self::length_exact`]）它不是函数大小，只是"符号表能
+    /// 给出的上界"，可能远大于函数本身。它只用于报告与人工排查，**不要**拿它去读目标字节。
     pub length: u32,
+    /// [`Self::length`] 是否就是函数的真实大小。
+    ///
+    /// `true` 只来自符号表明确给出的函数大小；`false` 表示结束位置是上界，
+    /// 此时生成期不会做尾部校验（尾部落在函数之外就没有意义）。
+    pub length_exact: bool,
     /// 开头字节模式。
     pub prefix: Pattern,
     /// 尾部校验；`None` = 没有可用的连续无通配窗口。
@@ -206,6 +214,8 @@ pub struct GenerationStats {
     pub truncated_members: u64,
     /// 归档里被跳过的元数据成员个数（符号索引、长名表 —— 不是对象）。
     pub metadata_members: u64,
+    /// 前缀因为"尾部是对齐填充"而被截短的条数（签名仍可用，只是证据变少）。
+    pub padding_trimmed: u64,
     /// 解析失败的对象个数。
     pub unparsable_objects: u64,
     /// 见过的函数符号总数。
@@ -261,6 +271,12 @@ impl GenerationStats {
         }
         if self.metadata_members > 0 {
             parts.push(format!("跳过的元数据成员 {} 个", self.metadata_members));
+        }
+        if self.padding_trimmed > 0 {
+            parts.push(format!(
+                "因尾部是对齐填充而截短前缀 {} 条",
+                self.padding_trimmed
+            ));
         }
         if self.widened_wildcards > 0 {
             parts.push(format!(
@@ -381,6 +397,7 @@ mod tests {
                 name: "memcpy".to_string(),
                 arch: SignatureArch::new(64, "le", "test"),
                 length: 32,
+                length_exact: true,
                 prefix: Pattern::new(vec![
                     PatternByte::Exact(0x55),
                     PatternByte::Wildcard,

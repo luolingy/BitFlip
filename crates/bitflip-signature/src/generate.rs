@@ -39,6 +39,59 @@ pub const TAIL_WINDOW: usize = 16;
 /// 尾部窗口至少要有多长才值得做校验。
 pub const TAIL_MIN_BYTES: usize = 8;
 
+/// 尾部校验最多允许放在离函数起点这么远的地方。
+///
+/// 尾部校验的价值是"在共享前缀的函数之间分开"；代价是**每比对一次目标函数就要
+/// 读这么多字节**。符号表里的大小若被写坏（或某个函数真的巨大），一个几 MB 的尾部
+/// 会让匹配器的内存与耗时失控 —— 而前缀通常已经够区分了，所以超过这个距离就只留前缀。
+///
+/// 这不影响 `length_exact`：结束位置本身仍然可信，只是我们选择不做远端校验。
+pub const TAIL_MAX_EXTENT: u64 = 1024;
+
+/// 连续多少个**完全相同的字节**就不再算作函数指纹。
+///
+/// 真实代码里八字节连成一片的情况极少，而对齐填充（函数之间）与尾部填充（节末尾）
+/// 必然如此 —— 填什么值取决于目标与工具链（x86 常见 `90`/`cc`，其它目标常见 `00`
+/// 或定长 nop），所以这里**只看"一样不一样"，不看是什么值**，也就不引入架构假设。
+///
+/// 阈值取 8 与 [`MIN_EXACT_NO_TAIL`] 一致：这样活下来的签名，其确定字节里必定不含
+/// 八字节同值串，也就是"看起来像填充的部分不参与指纹"。
+pub const PADDING_RUN_MIN: usize = 8;
+
+/// 前缀里可以留下的长度：在第一次出现长同值串的地方截断。
+///
+/// 为什么必须截断：`ret` 后面跟着 15 个填充字节若被当成指纹，那么在目标里**任何**
+/// "ret + 对齐填充"的位置都会命中 —— 实测就把 `__gcc_deregister_frame` 认成了
+/// `__clear_cache`。填充是这个函数之外的字节，不能替它作证。
+///
+/// 通配**不**计入同值串：连续的通配是一段被屏蔽的重定位区（例如 8 字节立即数），
+/// 那是有意的"不知道"，不是填充。
+#[must_use]
+fn padding_free_prefix(pattern: &[PatternByte]) -> usize {
+    let mut run_start = 0;
+    let mut run_len = 0usize;
+    let mut previous: Option<PatternByte> = None;
+    for (index, byte) in pattern.iter().enumerate() {
+        if *byte == PatternByte::Wildcard {
+            previous = None;
+            run_start = index;
+            run_len = 1;
+            continue;
+        }
+        if Some(*byte) == previous {
+            run_len += 1;
+        } else {
+            run_start = index;
+            run_len = 1;
+        }
+        previous = Some(*byte);
+        if run_len >= PADDING_RUN_MIN {
+            return run_start;
+        }
+    }
+    pattern.len()
+}
+
 /// 索引键的字节数（前缀开头必须有这么多连续确定字节）。
 pub const INDEX_BYTES: usize = 4;
 
@@ -267,12 +320,11 @@ fn collect_object(
         // 长度：符号表的大小优先，其次"到下一个同节函数符号的距离"（COFF 的大小恒为
         // 0，不这样算一个函数都取不出来），再退回节尾。都只是**上界**。
         let peers = by_section.get(section_name).map_or(&[][..], Vec::as_slice);
-        let length = function_length(symbol, peers, section.file.size);
-        let Some(length) = length else {
+        let Some(length) = function_length(symbol, peers, section.file.size) else {
             stats.drop_one(DropReason::TooShort);
             continue;
         };
-        if length < MIN_FUNCTION_BYTES as u64 {
+        if length.bytes < MIN_FUNCTION_BYTES as u64 {
             stats.drop_one(DropReason::TooShort);
             continue;
         }
@@ -282,7 +334,15 @@ fn collect_object(
             stats.drop_one(DropReason::NoBytes);
             continue;
         };
-        let usable = length.min(section.file.size.saturating_sub(symbol.value));
+        // 取多少字节：最长只取到 [`TAIL_MAX_EXTENT`] —— 尾部校验不会比这更远，
+        // 而"函数长度"的上界可能大到几十 KB（实测出现过 33KB），按它取字节会白读。
+        //
+        // 这里**不**按前缀长度截断：上界本身就不会越过下一个函数符号
+        // （上界就是"到下一个符号的距离"），所以按上界取字节是安全的；
+        // 而按 24 字节草率地"补足"前缀，会让只有 4 字节的函数被拼上邻居的字节
+        // 认出来（实测 `bf_add` 就这么"复活"过）。
+        let want = length.bytes.min(TAIL_MAX_EXTENT);
+        let usable = want.min(section.file.size.saturating_sub(symbol.value));
         let Some(start) = usize::try_from(start).ok() else {
             stats.drop_one(DropReason::NoBytes);
             continue;
@@ -323,15 +383,43 @@ fn collect_object(
                 PatternByte::Exact(*byte)
             });
         }
+        // 尾部被对齐填充占满时截短：填充不是这个函数的指纹（见 [`padding_free_prefix`]）。
+        let informative = padding_free_prefix(&pattern);
+        if informative < pattern.len() {
+            pattern.truncate(informative);
+            stats.padding_trimmed += 1;
+        }
         let prefix = Pattern::new(pattern);
-        let tail = tail_check(window, &wildcards, prefix_len);
+
+        // 尾部校验的落点：只有**符号表给了确切大小**时才做（`length.exact`）。
+        //
+        // 为什么不用"到下一个符号的距离"代替 —— 那个距离只是上界，实测过一次就够：
+        // 拿它当结尾（4 个 mingw 静态库 → `m3-mingw-static.exe`），召回从 65 掉到 55、
+        // 还多出 1 个错名。原因很直白：库里"下一个符号"的位置与链接后函数真正结束的
+        // 位置经常对不上（中间夹着对齐填充或没有符号记录的局部代码），证据落在函数
+        // 之外就不是证据，只会让签名变脆。
+        //
+        // 代价是 COFF 的签名只有前缀（COFF 函数符号通常没有大小）。这不亏：
+        // [`MIN_EXACT_NO_TAIL`] 把门槛抬到 8 个确定字节，实测召回 65/65、错名 0。
+        //
+        // 窗口末尾若是**一长串同样的字节**，那是函数之间的对齐填充，不属于这个函数；
+        // 去掉它，剩下的末尾才是函数真正的结尾（只影响"确切大小"的那一类）。
+        let tail = if length.exact && usable as u64 == length.bytes {
+            let padding = trailing_padding(window);
+            let body = window.get(..window.len() - padding).unwrap_or(window);
+            // 尾部扫描从前缀**原本**的长度开始：尾部要取的是"函数结尾那几个字节"，
+            // 前缀被截短只影响它自己记录了多少证据，不改变结尾在哪。
+            tail_check(body, &wildcards, prefix_len)
+        } else {
+            None
+        };
 
         if prefix.leading_exact() < INDEX_BYTES {
             stats.drop_one(DropReason::PrefixWildcard);
             continue;
         }
-        let exact = prefix.exact_count();
-        if exact < MIN_EXACT_BYTES || (tail.is_none() && exact < MIN_EXACT_NO_TAIL) {
+        let exact_bytes = prefix.exact_count();
+        if exact_bytes < MIN_EXACT_BYTES || (tail.is_none() && exact_bytes < MIN_EXACT_NO_TAIL) {
             stats.drop_one(DropReason::TooFewExact);
             continue;
         }
@@ -339,10 +427,11 @@ fn collect_object(
         out.push(FunctionSignature {
             name: symbol.name.clone(),
             arch: arch.clone(),
-            length: u32::try_from(window.len()).unwrap_or(u32::MAX),
+            length: u32::try_from(length.bytes).unwrap_or(u32::MAX),
+            length_exact: length.exact,
             prefix,
             tail,
-            exact_bytes: u16::try_from(exact).unwrap_or(u16::MAX),
+            exact_bytes: u16::try_from(exact_bytes).unwrap_or(u16::MAX),
         });
         produced += 1;
     }
@@ -365,15 +454,68 @@ fn is_relocatable(object: &Object) -> bool {
 ///
 /// `peers` 必须是**同一节内、按 `value` 升序**的函数符号。用二分而不是每次遍历
 /// 整张符号表：一个静态库成员里几千个符号是常态，平方复杂度会让生成过程变得很慢。
-fn function_length(symbol: &RawSymbol, peers: &[&RawSymbol], section_size: u64) -> Option<u64> {
+///
+/// 三种来源都只是**上界**，只有第一种是确切大小：
+///
+/// * **符号表给出的大小**（ELF 的 `st_size`、带辅助记录的 COFF）—— 确切；
+/// * **到下一个函数符号的距离** —— 上界：中间可以夹着没有符号记录的局部代码
+///   （汇编写的 CRT 常见：只 `.globl` 几个入口，其余都是 `.L` 标签），
+///   实测出现过 33KB 的间距；
+/// * **到节尾** —— 那是"节里剩下的字节"，与函数大小无关。
+///
+/// 要注意 COFF 的函数符号**通常没有大小**（cli 与 GNU as 都写 0），
+/// 所以 mingw 静态库那边基本只能靠"到下一个符号的距离"。
+fn function_length(symbol: &RawSymbol, peers: &[&RawSymbol], section_size: u64) -> Option<Length> {
     if symbol.size > 0 {
-        return Some(symbol.size);
+        return Some(Length {
+            bytes: symbol.size,
+            exact: true,
+        });
     }
     // 按 `value` 升序切分：第一个**严格大于**本符号的同类符号就是它的上界。
     // 同址并列（别名、`.L` 标签）会被一起跳过，这正是想要的 —— 别名不是下一个函数。
     let index = peers.partition_point(|peer| peer.value <= symbol.value);
-    let end = peers.get(index).map_or(section_size, |peer| peer.value);
-    end.checked_sub(symbol.value)
+    match peers.get(index) {
+        Some(peer) => peer.value.checked_sub(symbol.value).map(|bytes| Length {
+            bytes,
+            exact: false,
+        }),
+        None => section_size.checked_sub(symbol.value).map(|bytes| Length {
+            bytes,
+            exact: false,
+        }),
+    }
+}
+
+/// [`function_length`] 的结果：长度上界，以及这个长度是不是确切大小。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Length {
+    /// 从函数起点算起的字节数上界。
+    bytes: u64,
+    /// `bytes` 是否就是函数的真实大小（只有符号表给了大小才为真）。
+    exact: bool,
+}
+
+/// 窗口末尾那串"完全相同的字节"有多长（不足 [`PADDING_RUN_MIN`] 就是 0）。
+///
+/// 与 [`padding_free_prefix`] 是同一套判据（只看一样不一样，不看是什么值），
+/// 用途反过来：前缀里出现它说明指纹混进了填充，要截掉；**末尾**出现它说明函数
+/// 就在这里结束 —— 对齐填充只会跟在函数后面，所以末尾那串填充之前就是函数结尾。
+#[must_use]
+fn trailing_padding(window: &[u8]) -> usize {
+    let Some(first) = window.last() else {
+        return 0;
+    };
+    let run = window
+        .iter()
+        .rev()
+        .take_while(|byte| *byte == first)
+        .count();
+    if run >= PADDING_RUN_MIN {
+        run
+    } else {
+        0
+    }
 }
 
 /// 一次屏蔽宽度：这条重定位改写了几个字节。

@@ -120,19 +120,27 @@ fn a_signature_comes_out_of_the_archive_with_readable_names() {
         result.set.stats
     );
 
-    // 长函数：前缀 24 字节全确定，另有尾部校验。
+    // 长函数：前缀 24 字节全确定。
     let long = result
         .set
         .signatures
         .iter()
         .find(|signature| signature.name == "bf_loop")
         .expect("bf_loop");
-    assert_eq!(long.length, 48);
+    assert_eq!(long.length, 48, "长度来自'到下一个函数符号的距离'");
     assert_eq!(long.exact_bytes, 24);
-    assert!(long.tail.is_some(), "长函数应当有尾部校验");
+    assert_eq!(
+        long.prefix.len(),
+        24,
+        "前缀取满：没有填充要截、重定位也不在开头"
+    );
+    // COFF 的函数符号**没有大小**（clang 与 GNU as 都写 0），所以这条长度只是上界，
+    // 结尾不可信 → 不做尾部校验。实测过拿"到下一个符号的距离"当结尾：召回 65→55
+    // 还多出 1 个错名，所以这里刻意只留前缀，由"确定字节 ≥8"把关。
+    assert!(!long.length_exact, "COFF 符号不给大小，长度只是上界");
+    assert!(long.tail.is_none(), "结尾不可信就不做尾部校验");
 
-    // 短函数（28 字节）：前缀只有 24 字节，重定位落在里面 —— 覆盖到尾部窗口之外，
-    // 所以没有尾部校验，只能靠确定字节数门槛兜住。
+    // 短函数（28 字节）：前缀 24 字节里有 4 个字节是重定位，要屏蔽。
     let short = result
         .set
         .signatures
@@ -141,7 +149,39 @@ fn a_signature_comes_out_of_the_archive_with_readable_names() {
         .expect("bf_entry");
     assert_eq!(short.prefix.len(), 24);
     assert_eq!(short.prefix.wildcard_count(), 4, "前缀里那段重定位要被屏蔽");
-    assert!(short.tail.is_none(), "前缀之后的窗口不足以做尾部校验");
+    assert!(short.tail.is_none(), "结尾不可信就不做尾部校验");
+}
+
+#[test]
+fn an_elf_object_with_symbol_sizes_gets_a_tail_check() {
+    // 另一条分支：符号表**给了**函数大小时（ELF 的 `st_size` 由
+    // `.size name, .-name` 填出来），结尾可信，于是补一道尾部校验。
+    let bytes = fixture("elf-x86_64.o");
+    let result = generate(&[ArchiveInput {
+        name: "elf-x86_64.o".to_string(),
+        bytes: &bytes,
+    }]);
+    assert!(!result.set.is_empty(), "{}", result.set.stats.summary_zh());
+    let with_tail: Vec<&str> = result
+        .set
+        .signatures
+        .iter()
+        .filter(|signature| signature.tail.is_some())
+        .map(|signature| signature.name.as_str())
+        .collect();
+    assert!(
+        !with_tail.is_empty(),
+        "ELF 符号带大小，应当有签名拿到尾部校验：{}",
+        result.set.stats.summary_zh()
+    );
+    assert!(
+        result
+            .set
+            .signatures
+            .iter()
+            .any(|signature| signature.length_exact),
+        "带大小的签名要标成确切长度"
+    );
 }
 
 #[test]
