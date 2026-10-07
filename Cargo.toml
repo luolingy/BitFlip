@@ -35,6 +35,7 @@ capstone = "0.14"
 # DWARF/PDB 解析（M8 交付物 1）。gimli 是纯 Rust、无 unsafe、无 C 依赖；pdb 同理，
 # 两者都只做读取，不引入任何运行期外部工具（交付形态仍是单文件可执行）。
 gimli = "0.31"
+pdb = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 mime_guess = "2"
 rand = "0.8"

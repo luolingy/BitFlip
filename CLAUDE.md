@@ -29,6 +29,9 @@
 ## 3. 环境与构建
 
 - 目标平台：Windows 优先（开发机 Windows 10 x64），Linux 次之，macOS 推迟。
+- **F: 盘满时的第一刀**：删 `.cargo-target/*/deps/*.pdb`（实测 357 个文件、13.3 GB）。
+  那些是链接器写下的调试信息副本，删掉不影响跑测试与运行二进制；比删 `deps/` 本体
+  （20 GB，删了要全量重编）划算得多。`.`cargo-target/debug/incremental` 是第二刀。
 - 所有构建/缓存目录必须在 F: 盘：
   - `.cargo/config.toml` 里固定 `[build] target-dir = ".cargo-target"`；
   - 如 `C:\Users\...\.cargo` 空间吃紧，用 `CARGO_HOME` 指到 F:；

@@ -340,3 +340,84 @@ fn xrefs_carry_the_source_line_of_the_referencing_instruction() {
         analysis.xrefs().len()
     );
 }
+
+/// PDB 黄金文件里的一个函数（`m8-pdb.golden.txt`，由 llvm-pdbutil 产出）。
+fn pdb_golden_subprogram(name: &str) -> Option<(u64, u64, u32, String)> {
+    let text = std::fs::read_to_string(fixtures().join("m8-pdb.golden.txt")).ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("subprogram ") else {
+            continue;
+        };
+        let mut fields = rest.split(' ');
+        let low = u64::from_str_radix(fields.next()?.trim_start_matches("0x"), 16).ok()?;
+        let high = u64::from_str_radix(fields.next()?.trim_start_matches("0x"), 16).ok()?;
+        let decl_line = fields.next()?.parse().ok()?;
+        if fields.next()? == name {
+            let file = fields.collect::<Vec<_>>().join(" ");
+            return Some((low, high, decl_line, file));
+        }
+    }
+    None
+}
+
+/// PDB（MSVC 系）是另一条路：调试信息在**旁边的 .pdb** 里，不在镜像里。
+///
+/// 这里验的是完整那条链：符号表被剥光、镜像里没有 DWARF、只有同名 PDB 时，
+/// 分析层照样拿得到名字、精确边界与声明位置 —— 与 DWARF 那份测试同样的断言，
+/// 因为对用户来说这两者本来就该是同一件事（M8 验收标准 2）。
+#[test]
+fn a_pdb_target_gets_names_and_declaration_sites_too() {
+    let Some(session) = open("m8-pdb-nosym.exe") else {
+        eprintln!("SKIPPED: 缺少 tests/fixtures/generated/m8-pdb-nosym.exe");
+        return;
+    };
+    let Some((low, high, decl_line, decl_file)) = pdb_golden_subprogram("bf_pdb_add") else {
+        eprintln!("SKIPPED: PDB 黄金文件里没有 bf_pdb_add");
+        return;
+    };
+    let object = session.object().expect("应当解析成功");
+    assert!(object.symbols.is_empty(), "这份目标应当没有符号表");
+    let disasm = session
+        .disassemble(DisasmScanOptions::default())
+        .expect("应当能反汇编");
+    let analysis = TargetAnalysis::build(
+        &disasm,
+        object,
+        &StringOptions::default(),
+        None,
+        Some(session.debug()),
+    );
+
+    let function = analysis
+        .functions()
+        .iter()
+        .find(|f| f.start == format!("{low:016x}"))
+        .unwrap_or_else(|| panic!("分析结果里没有 {low:#x} 这个函数"));
+    assert_eq!(function.name, "bf_pdb_add", "名字应当来自 PDB");
+    assert_eq!(function.source, "debug-info");
+    assert_eq!(function.source_label, "调试信息");
+    assert_eq!(
+        function.size,
+        Some(high - low),
+        "PDB 给了精确边界，应当用上"
+    );
+    assert_eq!(
+        function.line,
+        Some(decl_line),
+        "声明行来自 llvm-pdbutil 真值"
+    );
+    assert!(
+        function
+            .file
+            .as_deref()
+            .is_some_and(|file| file_name(file) == file_name(&decl_file)),
+        "声明文件应当与 llvm-pdbutil 一致，实际是 {:?}",
+        function.file
+    );
+
+    // 账目要对得上真值：6 个函数、23 条行记录（都来自 PDB）。
+    let used = analysis.debug_use().expect("应当有调试信息账目");
+    assert_eq!(used.functions, 6);
+    assert_eq!(used.lines, 23);
+    assert_eq!(used.named, 6);
+}

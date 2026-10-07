@@ -845,7 +845,7 @@ impl Session {
         // "有更好、没有也行"的东西，所以这里不让打开失败，而是把说明写进 notes，
         // 让"为什么没有行号"这件事在界面上有答案（CLAUDE.md §7）。
         let debug = Arc::new(match object_raw.as_deref() {
-            Some(object) => bitflip_debug::read(object, &bytes),
+            Some(object) => bitflip_debug::read_target(Some(&path), object, &bytes),
             None => bitflip_debug::DebugInfo::default(),
         });
         for note in &debug.notes {
@@ -1215,7 +1215,7 @@ impl Session {
         let info = TargetInfo::from_guess(&path, member.size, &guess);
         // 调试信息按成员各自读：每个成员是独立的编译单元，行表也是各自的。
         // 先读再构造（object 随后会被移进 Arc）。
-        let debug = Arc::new(bitflip_debug::read(&object, slice));
+        let debug = Arc::new(bitflip_debug::read_target(None, &object, slice));
 
         Ok((
             Self {
