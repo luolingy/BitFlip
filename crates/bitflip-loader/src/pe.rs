@@ -187,6 +187,43 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
         |_i, view| parse_section_header(&view),
     )?;
 
+    // 长节名（超过 8 字节的，例如 `.debug_info`）在节头里存成 `/NNN`，
+    // 真正的名字在 COFF 字符串表里。字符串表紧跟在符号表之后：
+    // 偏移 = PointerToSymbolTable + 18 × NumberOfSymbols。
+    //
+    // 注意 `NumberOfSymbols == 0` 但指针非零是**正常且有意义的**：
+    // objcopy 剥掉符号表之后仍然把字符串表留在原处（M8 的 nosym fixture 正是
+    // 这个形态）。只看 NumberOfSymbols 就会丢掉整张字符串表，于是调试节的
+    // 名字全变成 `/19` 这样的东西 —— 界面上看到的是"一堆看不懂的节"，
+    // 而调试信息其实好端端地在那里。
+    let strtab_offset = if symbol_table_ptr == 0 {
+        None
+    } else {
+        Some(
+            u64::from(symbol_table_ptr)
+                .checked_add(18u64.saturating_mul(u64::from(num_symbols)))
+                .ok_or_else(|| ParseError::Overflow("COFF 字符串表偏移".into()))?,
+        )
+    };
+    let mut raw_sections = raw_sections;
+    let mut unresolved = 0usize;
+    for section in &mut raw_sections {
+        if !section.name.starts_with('/') {
+            continue;
+        }
+        let resolved = crate::coff::resolve_section_name(&reader, &section.name, strtab_offset);
+        if resolved == section.name {
+            unresolved += 1;
+        } else {
+            section.name = resolved;
+        }
+    }
+    if unresolved > 0 {
+        object.note(format!(
+            "有 {unresolved} 个节的名字在 COFF 字符串表里找不到，节名保持原样（可能是 `/NNN` 形式）"
+        ));
+    }
+
     // ── 镜像基址与入口 ──
     object.image_base = optional.as_ref().map_or(0, |o| o.image_base);
     object.entry = optional.as_ref().and_then(|o| {
@@ -1793,6 +1830,59 @@ mod tests {
         bytes[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXEC|READ
 
         bytes
+    }
+
+    /// 长节名（`/NNN`）要到 COFF 字符串表里查。
+    ///
+    /// 为什么值得单独一条测试：`.text` / `.data` 这些名字都在 8 字节以内，
+    /// 直接存在节头里，所以这条路径在普通可执行文件上**永远走不到**。
+    /// 而调试节的第一个字节就超过 8（`.debug_info` 11 个字符），名字全变成
+    /// `/19` 这样的东西 —— 于是"文件里有一堆看不懂的节"，而调试信息其实好端端地
+    /// 在那里（M8 的 DWARF 支持就是被这个卡住的）。
+    #[test]
+    fn long_section_names_resolve_via_string_table() {
+        let mut bytes = minimal_pe64();
+        bytes.resize(0x800, 0);
+        let coff = 0x84;
+        // 字符串表紧跟在符号表之后；NumberOfSymbols = 0 而指针非零是正常的
+        // （objcopy 剥掉符号表后就是这个形态）。
+        bytes[coff + 8..coff + 12].copy_from_slice(&0x700u32.to_le_bytes());
+        bytes[coff + 12..coff + 16].copy_from_slice(&0u32.to_le_bytes());
+
+        let sec = coff + 20 + 0xf0;
+        bytes[sec..sec + 5].copy_from_slice(b"/4\0\0\0");
+
+        let names = b".debug_info\0";
+        bytes[0x700..0x704].copy_from_slice(&(4u32 + names.len() as u32).to_le_bytes());
+        bytes[0x704..0x704 + names.len()].copy_from_slice(names);
+
+        let obj = parse(&bytes, 0, ObjectId::Plain).unwrap();
+        assert_eq!(obj.sections[0].name, ".debug_info");
+        assert!(
+            !obj.notes.iter().any(|n| n.contains("字符串表")),
+            "名字已经解析出来了，不该有降级说明：{:?}",
+            obj.notes
+        );
+    }
+
+    /// 字符串表够不着时保持原样，并且**说出来**。
+    #[test]
+    fn unresolvable_long_section_names_are_reported() {
+        let mut bytes = minimal_pe64();
+        bytes.resize(0x800, 0);
+        let coff = 0x84;
+        // 没有符号表指针 → 没有字符串表可查。
+        bytes[coff + 8..coff + 12].copy_from_slice(&0u32.to_le_bytes());
+        let sec = coff + 20 + 0xf0;
+        bytes[sec..sec + 5].copy_from_slice(b"/4\0\0\0");
+
+        let obj = parse(&bytes, 0, ObjectId::Plain).unwrap();
+        assert_eq!(obj.sections[0].name, "/4", "查不到就保持原样，不猜");
+        assert!(
+            obj.notes.iter().any(|n| n.contains("字符串表")),
+            "查不到长节名必须在 notes 里说明，实际是 {:?}",
+            obj.notes
+        );
     }
 
     /// 构造一个**带导出表**的最小 PE32+。

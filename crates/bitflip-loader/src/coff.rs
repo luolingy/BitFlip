@@ -179,7 +179,11 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
 }
 
 /// 解析 `/NNN` 形式的长节名。
-fn resolve_section_name(reader: &Reader<'_>, name: &str, strtab_offset: Option<u64>) -> String {
+pub(crate) fn resolve_section_name(
+    reader: &Reader<'_>,
+    name: &str,
+    strtab_offset: Option<u64>,
+) -> String {
     let Some(rest) = name.strip_prefix('/') else {
         return name.to_string();
     };
