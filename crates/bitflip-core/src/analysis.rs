@@ -730,6 +730,104 @@ impl TargetAnalysis {
             ));
         }
 
+        // 来源 5b：PLT 桩命名。
+        //
+        // 这是 M5 明确欠下的一项（当时的原话："PLT 桩的语义命名留给 M6"），
+        // 缺的是符号归属依据。现在依据是现成的：`.rela.plt` 里每条
+        // JUMP_SLOT 重定位都写着"这个 GOT 槽属于哪个导入符号"，而桩的
+        // 唯一职责就是从这个槽里取地址跳过去。两边对上，名字就是确定的 ——
+        // 这不是猜，是重定位表里写着的事实加上桩的形状。
+        //
+        // **形状识别不在这里**（`bitflip_arch::plt_stub`）：哪些字节是桩是
+        // 架构知识，这一层只做"槽 → 符号名"的对照。分层的收益是两边能各自
+        // 单独验证：arch 侧用一串写死的字节，这里用"名字对不对"。
+        //
+        // 对不上就**不命名**：宁可让用户看到"未识别"，也不要给一个普通函数
+        // 起个 `xxx@plt` 的错名字。来源标成 `ImportThunk`（priority 60）而不是
+        // 更高的来源：目标自己带符号时以符号为准，但这条比"分析推断"强，
+        // 因为"这个槽是导入符号"是重定位表里写着的事实。
+        let plt_ranges: Vec<(u64, u64)> = object
+            .sections
+            .iter()
+            .filter(|section| section.name.to_ascii_lowercase().starts_with(".plt"))
+            .map(|section| {
+                (
+                    section.vaddr,
+                    section.vaddr.saturating_add(section.file.size),
+                )
+            })
+            .collect();
+
+        let mut import_slots: HashMap<u64, String> = HashMap::new();
+        for reloc in &object.relocations {
+            if reloc.kind != RelocKind::ImportLookup {
+                continue;
+            }
+            if let Some(name) = reloc.symbol.as_deref() {
+                // 按序号导入（无名字）时如实不建映射：`@plt` 后面接个序号
+                // 只是把"不知道名字"伪装成知道。
+                if !name.is_empty() {
+                    import_slots.insert(reloc.address, name.to_string());
+                }
+            }
+        }
+
+        let mut plt_named = 0usize;
+        if !plt_ranges.is_empty() {
+            let spec = disasm.decoder.spec();
+            if !bitflip_arch::supports_plt_stub(spec) {
+                // 降级必须说出来：否则"没有导入符号名"会被读成"这个目标没有导入"，
+                // 而真实原因是本架构还没实现桩识别。
+                notes.push(format!(
+                    "有 {} 个 PLT 段，但本架构尚未实现 PLT 桩识别，导入调用的桩不会有名字",
+                    plt_ranges.len()
+                ));
+            } else if !import_slots.is_empty() {
+                for (start, end) in plt_ranges {
+                    let mut addr = start;
+                    while addr < end {
+                        // 一次读够一条桩：x86_64 的桩首指令是 6 字节，
+                        // 留足余量；读不到（段尾）就停。
+                        let Some(bytes) = disasm.space.read(addr, MAX_PLT_STUB_BYTES) else {
+                            break;
+                        };
+                        if let Some(stub) = bitflip_arch::plt_stub(spec, &bytes, addr) {
+                            if let Some(name) = import_slots.get(&stub.slot) {
+                                by_addr.entry(addr).or_default().push(SymbolCandidate {
+                                    addr,
+                                    name: format!("{name}@plt"),
+                                    source: SymbolSource::ImportThunk,
+                                    confidence: 85,
+                                });
+                                plt_named += 1;
+                            }
+                        }
+                        // 按**指令边界**前进，而不是按桩长：PLT 段里混着
+                        // 对齐填充（`endbr64`、多字节 nop）与解析器桩
+                        // （`.plt[0]`），跳着走会错位到指令中间，
+                        // 于是后面的桩一条都认不出来。
+                        let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
+                            break;
+                        };
+                        if insn.len == 0 {
+                            break;
+                        }
+                        addr = addr.saturating_add(u64::from(insn.len));
+                    }
+                }
+                if plt_named > 0 {
+                    notes.push(format!(
+                        "按导入符号命名了 {plt_named} 条 PLT 桩（形如 `名字@plt`）"
+                    ));
+                } else {
+                    notes.push(format!(
+                        "PLT 段里的桩没有一条对上导入槽位（导入槽位 {} 个）—— 桩可能不是本架构的标准形态",
+                        import_slots.len()
+                    ));
+                }
+            }
+        }
+
         // 来源 6：重定位驱动的指针表。
         //
         // 共享库把函数地址放进表里（虚表、`__init_array`、跳转表），
@@ -2156,6 +2254,13 @@ fn build_cfgs(
 /// 上限刻意取小：宁可漏掉一个畸形桩，也不要把"一段以 jmp 开头的小代码"
 /// 误判成桩（那会凭空造出一个函数，违反 §7）。
 const MAX_THUNK_BYTES: u64 = 16;
+
+/// 读一条 PLT 桩时向地址空间要多少字节。
+///
+/// 桩的**形状**由 `bitflip_arch::plt_stub` 判定，这里只是把够用的字节递给它：
+/// x86_64/i386 的桩首指令是 6 字节，留到 16 是给将来架构（多指令桩）的余量。
+/// 读多了没有代价（地址空间按段取），读少了会把一条正常的桩判成"字节不够"。
+const MAX_PLT_STUB_BYTES: usize = 16;
 
 /// 桩的判据：`jmp *disp(%rip)` 之后必须是**填充或另一个桩**，不能是真实代码体。
 ///
