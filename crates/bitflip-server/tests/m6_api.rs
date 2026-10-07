@@ -699,11 +699,22 @@ async fn xref_search_response_matches_the_frontend_contract() {
         "跳过 + 返回 + 截断 必须等于总数"
     );
 
-    // 每条引用都要带来源与可达性两个字段（前端据此分列显示）
+    // 每条引用都要带来源与可达性两个字段（前端据此分列显示），
+    // 以及**发起指令的源位置**（M8：有了它，"谁调用了这个函数"能直接跳到那一行）。
+    // 没有调试信息时后两个字段是 null，字段本身仍然在 —— 前端不必为"有没有调试信息"
+    // 准备两套渲染路径。
     let first = &body["xrefs"].as_array().unwrap()[0];
     assert_keys(
         first,
-        &["from", "to", "kind", "source", "reachable"],
+        &[
+            "from",
+            "to",
+            "kind",
+            "source",
+            "reachable",
+            "from_file",
+            "from_line",
+        ],
         "xref 条目",
     );
     assert!(

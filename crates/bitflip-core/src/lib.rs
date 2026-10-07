@@ -17,7 +17,7 @@ mod session;
 
 pub use analysis::{
     xref_source, ArgInferenceWire, ArgScanWire, BlockWire, CallEdgeWire, CallGraphSummaryWire,
-    CallGraphWire, CfgWire, CodeMap, CodeMapSample, CodeMapStats, ConstScanWire,
+    CallGraphWire, CfgWire, CodeMap, CodeMapSample, CodeMapStats, ConstScanWire, DebugUseWire,
     FrameInferenceWire, FrameScanWire, FunctionWire, ImmediateWire, ReachabilityWire,
     ReachableFunctionWire, StrideWire, StringUsageWire, StringWire, TargetAnalysis,
     UnresolvedCallWire, XrefFilter, XrefPage, XrefWire, ANALYSIS_FORMAT_VERSION,

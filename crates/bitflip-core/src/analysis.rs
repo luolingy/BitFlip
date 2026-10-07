@@ -19,6 +19,7 @@ use bitflip_analyze::{
     merge_candidates, scan_jump_tables, unwind_candidates, Cfg, JumpTableScan, StringOptions,
 };
 use bitflip_arch::Flow;
+use bitflip_debug::DebugInfo;
 use bitflip_loader::object::RelocKind;
 use bitflip_signature::matcher::{Matcher, TargetFunction};
 use bitflip_symbols::{SymbolCandidate, SymbolSource};
@@ -49,6 +50,33 @@ pub struct SignatureUseWire {
     pub rejected_by_size: u64,
 }
 
+/// 调试信息这一遍的账目（M8 交付物 1/2）。
+///
+/// # 为什么不是一个布尔值"有没有调试信息"
+///
+/// "有调试信息"这句话在用户那里要能兑现成具体数量：多少个函数拿得到名字、
+/// 多少条指令拿得到行号。只给一个 `true`，用户看到函数名没出来时无法判断
+/// 是"调试信息里本来就没有"还是"我们没读出来"—— 这两件事的下一步动作完全不同。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugUseWire {
+    /// 解析出的编译单元数。
+    pub units: usize,
+    /// 带地址的子程序数（能当函数用的那些）。
+    pub functions: usize,
+    /// 其中带名字的个数。
+    pub named: usize,
+    /// 行表里的地址条数。
+    pub lines: usize,
+    /// 被跳过的子程序数：只有声明没有代码（例如头文件里的库函数）。
+    pub skipped_declarations: u64,
+    /// 被跳过的子程序数：没有地址范围，无法定位。
+    pub skipped_without_range: u64,
+    /// 内联进来的子程序数（本版不展开，但要数出来）。
+    pub skipped_inlined: u64,
+    /// 降级说明（中文）。**没有调试信息时也要有话说**。
+    pub notes: Vec<String>,
+}
+
 /// 函数的 wire 表示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FunctionWire {
@@ -68,6 +96,14 @@ pub struct FunctionWire {
     pub confidence: u8,
     /// 大小（`end` 未知时 `null`）。
     pub size: Option<u64>,
+    /// 声明所在的源文件（来自调试信息）；没有就是 `null`。
+    ///
+    /// 只在**函数入口正好等于调试信息里的函数起始地址**时给出：调试信息是按
+    /// 编译单元组织的，函数入口对不上时套用邻近函数的声明位置，等于把
+    /// 别人的源文件安到这个函数头上。
+    pub file: Option<String>,
+    /// 声明所在的行号（来自调试信息）；没有就是 `null`。
+    pub line: Option<u32>,
 }
 
 /// 常量/结构体初步推断的 wire 表示（M6）。
@@ -155,6 +191,13 @@ pub struct XrefWire {
     /// 那条"指令"解出的引用目标可能是伪影。这是**可信度**信号，
     /// UI 必须把它显出来，而不是当作同等事实展示。
     pub reachable: bool,
+    /// 发起指令所在的源文件（来自调试信息）；没有就是 `null`。
+    ///
+    /// 有了它，用户从"谁调用了这个函数"能直接跳到**发起调用的那一行**，
+    /// 而不是先反汇编再自己找行号。
+    pub from_file: Option<String>,
+    /// 发起指令所在的源码行号（来自调试信息）；没有就是 `null`。
+    pub from_line: Option<u32>,
 }
 
 /// xref 来源短名。
@@ -293,6 +336,8 @@ pub struct TargetAnalysis {
     frame_scan: FrameScanWire,
     /// 签名库的账目。M8 引入：`None` = 这次分析没有用签名库。
     signatures: Option<SignatureUseWire>,
+    /// 调试信息的账目。M8 引入：`None` = 这个目标没有可用的调试信息。
+    debug: Option<DebugUseWire>,
     notes: Vec<String>,
 }
 
@@ -604,6 +649,7 @@ impl TargetAnalysis {
         object: &bitflip_loader::object::Object,
         opts: &StringOptions,
         signatures: Option<&Matcher<'_>>,
+        debug: Option<&DebugInfo>,
     ) -> Self {
         let mut notes = Vec::new();
 
@@ -935,6 +981,61 @@ impl TargetAnalysis {
             ));
         }
 
+        // ── 来源 8：调试信息（DWARF）──
+        //
+        // 它同时给出**名字**和**精确边界**，这个组合别处都没有：符号表给名字不给边界，
+        // 展开表给边界不给名字。所以它在优先级表里排在导出之前、签名库之后
+        // （见 `SymbolSource` 的优先级注释）。
+        //
+        // 关键场景是**符号表被剥掉、调试信息留着**的目标：那是剥符号之后唯一还有
+        // 名字的地方，也是 M8 存在的理由。
+        //
+        // 位置在签名这一遍之前，为的是让签名匹配拿到 `debug_ranges` 里的精确长度 ——
+        // 范围越准，"签名比函数长"这类排除就越有效。
+        let mut decl_sites: HashMap<u64, (Option<String>, Option<u32>)> = HashMap::new();
+        let mut debug_ranges: HashMap<u64, u64> = HashMap::new();
+        let mut debug_use: Option<DebugUseWire> = None;
+        if let Some(info) = debug {
+            let mut named = 0usize;
+            for f in &info.functions {
+                decl_sites.insert(f.low_pc, (f.decl_file.clone(), f.decl_line));
+                debug_ranges.insert(f.low_pc, f.high_pc);
+                if !f.name.trim().is_empty() {
+                    named += 1;
+                }
+                // 边界仍然走"编码在 name 里"的那条约定（`<name>\t<end>`）：
+                // 名字可以为空（调试信息里没名字的子程序仍然提供了精确边界，
+                // 而"这里有个函数、从哪到哪"本身就是有用的信息）。
+                by_addr.entry(f.low_pc).or_default().push(SymbolCandidate {
+                    addr: f.low_pc,
+                    name: format!("{}\t{:x}", f.name.trim(), f.high_pc),
+                    source: SymbolSource::DebugInfo,
+                    // 置信度是"这条信息有多硬"：调试信息由编译器在编译这个文件时
+                    // 直接写下，名字与边界都是权威的 —— 比符号表硬（符号表可能
+                    // 只剩残渣、边界根本没有）。
+                    confidence: 85,
+                });
+            }
+            if !info.functions.is_empty() || !info.lines.is_empty() {
+                notes.push(format!(
+                    "调试信息参与识别：{} 个带地址的子程序（{} 个有名字）、{} 条行记录",
+                    info.functions.len(),
+                    named,
+                    info.lines.len()
+                ));
+            }
+            debug_use = Some(DebugUseWire {
+                units: info.units.len(),
+                functions: info.functions.len(),
+                named,
+                lines: info.lines.len(),
+                skipped_declarations: info.skipped.declarations,
+                skipped_without_range: info.skipped.without_range,
+                skipped_inlined: info.skipped.inlined,
+                notes: info.notes.clone(),
+            });
+        }
+
         // ── 来源 7：签名库 ──
         //
         // 这是**唯一**能在彻底剥离的目标上给出可读名字的来源：符号表空、没有导出、
@@ -950,11 +1051,16 @@ impl TargetAnalysis {
             // 函数范围优先取展开表（`.pdata` 的 begin/end 是**精确**的函数边界，
             // 这是 PE 上唯一可靠的来源）。拿不到就不给大小 —— 匹配器会把
             // "大小未知"当成"不做这层排除"，而不是当成 0。
-            let ranges: HashMap<u64, u64> = object
+            let mut ranges: HashMap<u64, u64> = object
                 .unwind
                 .iter()
                 .map(|entry| (entry.begin, entry.end))
                 .collect();
+            // 调试信息的边界补进来（两者都是精确边界；都有时以调试信息为准 ——
+            // 它由编译器直接给出，而展开表是运行时元数据，可能被链接器裁剪过）。
+            for (start, end) in &debug_ranges {
+                ranges.insert(*start, *end);
+            }
 
             // 读多少字节：匹配器说它最长需要多少。给的字节比这多没有意义，
             // 比这少会让"字节不够验证"的结论变多（那不是"不匹配"，是没证据）。
@@ -1059,12 +1165,20 @@ impl TargetAnalysis {
                 let idx = xrefs.len();
                 xref_by_from.entry(x.from).or_default().push(idx);
                 xref_by_to.entry(x.to).or_default().push(idx);
+                // 发起指令的源位置取自**挂在反汇编上**的那份行表：xref 面板与
+                // 反汇编列表必须显示同一个行号，两处各查一次会漂移。
+                let origin = disasm
+                    .debug
+                    .as_ref()
+                    .and_then(|info| info.location_at(x.from));
                 xrefs.push(XrefWire {
                     from: hex16(x.from),
                     to: hex16(x.to),
                     kind: x.kind.as_str().to_string(),
                     source: xref_source::DIRECT.to_string(),
                     reachable: disasm.coverage.is_reachable(x.from),
+                    from_file: origin.as_ref().and_then(|row| row.file.clone()),
+                    from_line: origin.as_ref().map(|row| row.line),
                 });
             }
         }
@@ -1080,6 +1194,10 @@ impl TargetAnalysis {
             let f = merge_candidates(addr, cands);
             // 只有调用目标推断的地址也保留：它确实被调用过，是有信息量的位置。
             // 但名字留空、named=false —— UI 显示"未命名"，而不是编一个 sub_xxx。
+            // 声明位置只在**入口与调试信息里的函数起始地址完全一致**时采用：
+            // 调试信息按编译单元组织，入口对不上时套用邻近函数的声明位置，
+            // 等于把别人的源文件安到这个函数头上（§7）。
+            let site = decl_sites.get(&addr);
             functions.push(FunctionWire {
                 start: hex16(addr),
                 end: f.end.map(hex16),
@@ -1089,6 +1207,8 @@ impl TargetAnalysis {
                 source_label: f.name_source.label_zh().to_string(),
                 confidence: f.confidence,
                 size: f.end.map(|e| e.saturating_sub(addr)),
+                file: site.and_then(|(file, _)| file.clone()),
+                line: site.and_then(|(_, line)| *line),
             });
         }
         if call_target_count > 0 {
@@ -1213,6 +1333,10 @@ impl TargetAnalysis {
                 let idx = xrefs.len();
                 xref_by_from.entry(key_from).or_default().push(idx);
                 xref_by_to.entry(target).or_default().push(idx);
+                let origin = disasm
+                    .debug
+                    .as_ref()
+                    .and_then(|info| info.location_at(key_from));
                 xrefs.push(XrefWire {
                     from: hex16(key_from),
                     to: hex16(target),
@@ -1220,6 +1344,8 @@ impl TargetAnalysis {
                     source: xref_source::JUMP_TABLE.to_string(),
                     // 间接跳转本身在指令流里，它的可达性按发起指令算
                     reachable: disasm.coverage.is_reachable(key_from),
+                    from_file: origin.as_ref().and_then(|row| row.file.clone()),
+                    from_line: origin.as_ref().map(|row| row.line),
                 });
                 jump_table_xrefs += 1;
             }
@@ -1278,8 +1404,15 @@ impl TargetAnalysis {
             arg_scan,
             frame_scan,
             signatures: signature_report,
+            debug: debug_use,
             notes,
         }
+    }
+
+    /// 调试信息的账目（`None` = 这个目标没有可用的调试信息）。
+    #[must_use]
+    pub fn debug_use(&self) -> Option<&DebugUseWire> {
+        self.debug.as_ref()
     }
 
     /// 签名库的账目（`None` = 这次分析没有用签名库）。
@@ -2681,7 +2814,8 @@ mod tests {
             .disassemble(DisasmScanOptions::default())
             .expect("反汇编");
         let object = session.object().expect("object").clone();
-        let analysis = TargetAnalysis::build(&disasm, &object, &StringOptions::default(), None);
+        let analysis =
+            TargetAnalysis::build(&disasm, &object, &StringOptions::default(), None, None);
         (path, analysis)
     }
 
@@ -2784,6 +2918,8 @@ mod tests {
             source_label: "分析推断".into(),
             confidence: 40,
             size: end.map(|e| e - start),
+            file: None,
+            line: None,
         };
         let analysis = TargetAnalysis {
             functions: vec![mk(0x1000, Some(0x1040)), mk(0x2000, None)],
@@ -2801,6 +2937,7 @@ mod tests {
             arg_scan: ArgScanWire::default(),
             frame_scan: FrameScanWire::default(),
             signatures: None,
+            debug: None,
             notes: Vec::new(),
         };
         assert!(analysis.function_containing(0x1000).is_some());
@@ -2876,6 +3013,8 @@ mod tests {
             kind: kind.to_string(),
             source: source.to_string(),
             reachable: true,
+            from_file: None,
+            from_line: None,
         }
     }
 

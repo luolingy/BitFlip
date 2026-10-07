@@ -1424,6 +1424,9 @@ impl Session {
                 object,
                 &StringOptions::default(),
                 matcher.as_ref(),
+                // 调试信息永远传给分析层（哪怕它是空的）：它带着说明，
+                // 而"为什么没有行号"必须在分析结论里看得见。
+                Some(&self.debug),
             ))
         }));
 

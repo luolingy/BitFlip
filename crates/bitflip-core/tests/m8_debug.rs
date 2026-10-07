@@ -10,7 +10,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use bitflip_core::{DisasmScanOptions, OpenOptions, Session};
+use bitflip_analyze::StringOptions;
+use bitflip_core::{DisasmScanOptions, OpenOptions, Session, TargetAnalysis};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -205,5 +206,137 @@ fn lines_survive_a_stripped_symbol_table() {
     assert!(
         with_line >= 20,
         "符号表没了之后行号也必须还在（这正是调试信息作为独立来源的意义），实际只有 {with_line} 条"
+    );
+}
+
+/// 黄金文件里的 `subprogram <low> <high> <decl_line> <name> <decl_file>` 行。
+fn golden_subprograms(name: &str) -> Option<(u64, u64, u32, String)> {
+    let text = std::fs::read_to_string(fixtures().join("m8-debug.golden.txt")).ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("subprogram ") else {
+            continue;
+        };
+        let mut fields = rest.split(' ');
+        let low = u64::from_str_radix(fields.next()?.trim_start_matches("0x"), 16).ok()?;
+        let high = u64::from_str_radix(fields.next()?.trim_start_matches("0x"), 16).ok()?;
+        let decl_line: u32 = fields.next()?.parse().ok()?;
+        let symbol = fields.next()?.to_owned();
+        let decl_file = fields.next()?.to_owned();
+        if symbol == name {
+            return Some((low, high, decl_line, decl_file));
+        }
+    }
+    None
+}
+
+fn golden_subprogram_count() -> usize {
+    std::fs::read_to_string(fixtures().join("m8-debug.golden.txt"))
+        .map(|text| {
+            text.lines()
+                .filter(|line| line.trim().starts_with("subprogram "))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// 剥掉符号表之后，名字与源位置必须仍然从调试信息里出来。
+///
+/// 这是 M8 验收标准 2 的核心断言：**没有符号表**的目标上，界面要有函数名、
+/// 源文件、行号。真值来自 `llvm-dwarfdump`（见 `scripts/gen-debug-fixture.ps1`），
+/// 本项目自己的解析器只是被检验的一方。
+#[test]
+fn stripped_target_gets_names_and_declaration_sites_from_debug_info() {
+    let Some(session) = open("m8-debug-nosym.exe") else {
+        eprintln!("SKIPPED: 缺少 tests/fixtures/generated/m8-debug-nosym.exe");
+        return;
+    };
+    let Some((low, high, decl_line, decl_file)) = golden_subprograms("bf_add") else {
+        eprintln!("SKIPPED: 黄金文件里没有 bf_add");
+        return;
+    };
+    let object = session.object().expect("应当解析成功");
+    assert!(object.symbols.is_empty(), "这份目标应当没有符号表");
+    let disasm = session
+        .disassemble(DisasmScanOptions::default())
+        .expect("应当能反汇编");
+    let analysis = TargetAnalysis::build(
+        &disasm,
+        object,
+        &StringOptions::default(),
+        None,
+        Some(session.debug()),
+    );
+
+    let function = analysis
+        .functions()
+        .iter()
+        .find(|f| f.start == format!("{low:016x}"))
+        .unwrap_or_else(|| panic!("分析结果里没有 {low:#x} 这个函数"));
+    assert_eq!(function.name, "bf_add", "名字应当来自调试信息");
+    assert_eq!(function.source, "debug-info");
+    assert_eq!(function.source_label, "调试信息");
+    assert_eq!(
+        function.size,
+        Some(high - low),
+        "调试信息给了精确边界，应当用上"
+    );
+    assert_eq!(function.line, Some(decl_line), "声明行来自 dwarfdump 真值");
+    assert!(
+        function
+            .file
+            .as_deref()
+            .is_some_and(|file| file_name(file) == file_name(&decl_file)),
+        "声明文件应当与 dwarfdump 一致，实际是 {:?}",
+        function.file
+    );
+
+    // 账目要对得上真值：多少个函数、多少条行记录，不能"大约"。
+    let used = analysis.debug_use().expect("应当有调试信息账目");
+    assert_eq!(used.functions, golden_subprogram_count());
+    assert_eq!(
+        used.lines,
+        golden_lines().map(|rows| rows.len()).unwrap_or(0)
+    );
+    assert!(used.named > 0 && used.named <= used.functions);
+}
+
+/// 交叉引用也要能说清"谁在这一行引用了它"。
+#[test]
+fn xrefs_carry_the_source_line_of_the_referencing_instruction() {
+    let Some(session) = open("m8-debug-nosym.exe") else {
+        eprintln!("SKIPPED: 缺少 tests/fixtures/generated/m8-debug-nosym.exe");
+        return;
+    };
+    let object = session.object().expect("应当解析成功");
+    let disasm = session
+        .disassemble(DisasmScanOptions::default())
+        .expect("应当能反汇编");
+    let analysis = TargetAnalysis::build(
+        &disasm,
+        object,
+        &StringOptions::default(),
+        None,
+        Some(session.debug()),
+    );
+
+    let with_origin = analysis
+        .xrefs()
+        .iter()
+        .filter(|xref| xref.from_line.is_some())
+        .count();
+    assert!(
+        with_origin > 0,
+        "{} 条 xref 没有一条带发起位置的源码行",
+        analysis.xrefs().len()
+    );
+    for xref in analysis.xrefs() {
+        if xref.from_line.is_some() {
+            assert!(xref.from_file.is_some(), "{} 有行号却没有源文件", xref.from);
+        }
+    }
+    println!(
+        "{} 条 xref 带发起位置（共 {} 条）",
+        with_origin,
+        analysis.xrefs().len()
     );
 }
