@@ -1149,7 +1149,19 @@ fn parse_relocs(
     });
 
     let mut out = Vec::new();
-    let target_name = section_name(raw_sections, shstrtab, 0);
+    // `sh_info` 才是"这些重定位作用在哪个节上"（ELF 规范：SHT_REL/SHT_RELA 的
+    // sh_info 是目标节的节头索引）。这里早先写的是字面量 0 —— 取到的当然是
+    // 空节的名字，而且取完就被丢掉，所以一直没被发现。签名匹配要求
+    // 「地址 + 节名」配对，这个字段从"没用"变成了"必需"，顺手改正。
+    //
+    // sh_info 为 0（`.rela.dyn` 这类作用于整个映像的重定位表）时如实给 `None`：
+    // 它们不对应单个节。**不**退回 `<节 0>` 这种占位名 —— 那会把"没这个信息"
+    // 伪装成一个看起来像名字的东西。
+    let target_name = raw_sections
+        .get(sh.info as usize)
+        .filter(|section| section.name_offset != 0)
+        .and_then(|section| read_strtab(shstrtab, u64::from(section.name_offset)))
+        .filter(|name| !name.is_empty());
 
     for index in 0..count {
         let offset = sh
@@ -1220,6 +1232,7 @@ fn parse_relocs(
 
         out.push(Reloc {
             address: r_offset,
+            section: target_name.clone(),
             kind: classify_reloc(header.machine, raw_kind),
             raw_kind,
             symbol,
@@ -1227,7 +1240,6 @@ fn parse_relocs(
         });
     }
 
-    let _ = target_name;
     Ok(out)
 }
 

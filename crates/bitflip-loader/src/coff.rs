@@ -360,7 +360,8 @@ fn parse_all_relocations(
         let section_name = object
             .sections
             .get(index as usize)
-            .map_or_else(|| format!("节 {index}"), |s| s.name.clone());
+            .map(|section| section.name.clone())
+            .filter(|name| !name.is_empty());
 
         if total + u64::from(count) > MAX_RELOCS {
             object.note(format!(
@@ -393,6 +394,7 @@ fn parse_all_relocations(
                         .map(|s| s.name.clone());
                     object.relocations.push(Reloc {
                         address: u64::from(address),
+                        section: section_name.clone(),
                         kind: classify(machine, reloc_type),
                         raw_kind: u32::from(reloc_type),
                         symbol,
@@ -403,7 +405,8 @@ fn parse_all_relocations(
             }
             Err(error) => {
                 object.note(format!(
-                    "{section_name} 的重定位表解析失败：{}",
+                    "{} 的重定位表解析失败：{}",
+                    section_name.as_deref().unwrap_or("未知节"),
                     error.summary_zh()
                 ));
             }

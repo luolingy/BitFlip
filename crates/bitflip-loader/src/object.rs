@@ -306,8 +306,22 @@ impl RelocKind {
 /// 一条重定位。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reloc {
-    /// 需要修改的位置的虚拟地址。
+    /// 需要修改的位置。
+    ///
+    /// **语义随文件类别而不同，这一点必须按 [`Self::section`] 配对理解**：
+    ///
+    /// * 已链接的镜像（PE/ELF 可执行与 `.so`/`.dll`）里是虚拟地址；
+    /// * 可重定位对象（`.o`/`.obj`）里是**该节内的偏移** —— 那些文件的
+    ///   节虚拟地址通常全是 0，几个节的偏移会落在同一批数值上。
+    ///
+    /// 早先这里只写了"虚拟地址"，于是 `.text` 与 `.data` 的重定位在地址上
+    /// 混成一堆且无从分辨（M8 做签名匹配时踩到）。
     pub address: u64,
+    /// 该重定位**修改的节**的名字。
+    ///
+    /// 对可重定位对象是必需的：没有它，[`Self::address`] 无法定位到具体位置。
+    /// `None` 表示来源没有给出（而不是"不属于任何节"）。
+    pub section: Option<String>,
     /// 归一化类型。
     pub kind: RelocKind,
     /// 格式特有的原始类型编号（排错用）。
@@ -631,6 +645,21 @@ impl Object {
     pub fn segment_at(&self, addr: u64) -> Option<&Segment> {
         // 段数量很小（通常 < 20），线性扫描比建索引更省事且无维护成本。
         self.segments.iter().find(|segment| segment.contains(addr))
+    }
+
+    /// 按虚拟地址查找所在节。
+    ///
+    /// 与 [`Self::segment_at`] 的分工：段是**内存视角**（加载器按权限归类），
+    /// 节是**文件视角**（链接器/编译器写的）。两者边界并不一致，所以不能互相替代。
+    ///
+    /// 注意：**可重定位对象（`.o`/`.obj`）的节虚拟地址通常全是 0**，此时
+    /// 该函数无法区分节 —— 那种情况下"这个地址属于哪一节"只能由数据来源
+    /// 自己说清（例如 [`Reloc::section`]）。
+    #[must_use]
+    pub fn section_at(&self, addr: u64) -> Option<&Section> {
+        self.sections
+            .iter()
+            .find(|section| addr >= section.vaddr && addr - section.vaddr < section.file.size)
     }
 
     /// 按名称查找节。

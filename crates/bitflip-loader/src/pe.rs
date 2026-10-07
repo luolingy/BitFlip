@@ -580,16 +580,28 @@ fn subsystem_label(subsystem: u16) -> String {
 /// RVA → 文件偏移（用节表映射）。
 ///
 /// 返回 `None` 表示 RVA 不在任何有文件后备的节里（例如 .bss 或头部）。
+///
+/// **两个 `?` 曾经写在这里，代价很大**：一个没有文件后备的段（`.bss` 是常客）
+/// 会让整个查找提前返回 `None`，于是**排在该段之后的每个表都解析不了** ——
+/// mingw 链接出来的 PE 里 `.text/.rdata/.pdata` 在 `.bss` 之前、`.idata` 与
+/// `.reloc` 在它之后，实测结果是"导入表与重定位表解析失败"，而降级说明还把
+/// 原因写成"文件结构自相矛盾"（文件没问题，是这里找错了）。
+/// 没有文件后备 / 地址在映像基址之下，都只说明"这个段不是答案"，继续找下一个。
 fn rva_to_offset(object: &Object, rva: u32) -> Option<u64> {
     let rva = u64::from(rva);
     for segment in &object.segments {
         // segments 里的 vaddr 是 VA，需要减去 image_base 才是 RVA
-        let seg_rva = segment.vaddr.checked_sub(object.image_base)?;
+        let Some(seg_rva) = segment.vaddr.checked_sub(object.image_base) else {
+            continue;
+        };
         if rva < seg_rva {
             continue;
         }
         let delta = rva - seg_rva;
-        let file = segment.file?;
+        // `.bss` 这类段在文件里没有对应内容：跳过它，而不是放弃整个查找。
+        let Some(file) = segment.file else {
+            continue;
+        };
         if delta >= file.size {
             continue;
         }
@@ -619,7 +631,10 @@ fn parse_imports(
         return Ok((Vec::new(), Vec::new()));
     }
     let offset = rva_to_offset(object, dir.rva).ok_or_else(|| {
-        ParseError::Inconsistent(format!("导入表 RVA {:#x} 不在任何节内", dir.rva))
+        ParseError::Inconsistent(format!(
+            "导入表 RVA {:#x} 不在任何有文件后备的节里",
+            dir.rva
+        ))
     })?;
 
     let mut out = Vec::new();
@@ -718,7 +733,7 @@ fn parse_imports(
     // 读不到的东西必须留下痕迹，不能静默少给数据（CLAUDE.md §7）
     if !skipped_modules.is_empty() {
         skipped.push(format!(
-            "{} 个模块的导入 thunk 不在任何节内，其导入符号未列出：{}",
+            "{} 个模块的导入 thunk 不在任何有文件后备的节里，其导入符号未列出：{}",
             skipped_modules.len(),
             skipped_modules.join("、")
         ));
@@ -749,7 +764,10 @@ fn parse_delay_imports(
         return Ok(Vec::new());
     }
     let offset = rva_to_offset(object, dir.rva).ok_or_else(|| {
-        ParseError::Inconsistent(format!("延迟导入表 RVA {:#x} 不在任何节内", dir.rva))
+        ParseError::Inconsistent(format!(
+            "延迟导入表 RVA {:#x} 不在任何有文件后备的节里",
+            dir.rva
+        ))
     })?;
 
     let mut out = Vec::new();
@@ -791,7 +809,10 @@ fn parse_exports(
 ) -> Result<Vec<Export>, ParseError> {
     const HEADER_SIZE: u64 = 40;
     let offset = rva_to_offset(object, dir.rva).ok_or_else(|| {
-        ParseError::Inconsistent(format!("导出表 RVA {:#x} 不在任何节内", dir.rva))
+        ParseError::Inconsistent(format!(
+            "导出表 RVA {:#x} 不在任何有文件后备的节里",
+            dir.rva
+        ))
     })?;
     let view = reader.slice(offset, HEADER_SIZE, "导出目录")?;
     let view = Reader::with_base(view, reader.base() + offset);
@@ -812,7 +833,7 @@ fn parse_exports(
     // 地址表：每个 4 字节 RVA，0 表示这个序号没有导出
     let Some(funcs_offset) = rva_to_offset(object, funcs_rva) else {
         return Err(ParseError::Inconsistent(
-            "导出地址表 RVA 不在任何节内".into(),
+            "导出地址表 RVA 不在任何有文件后备的节里".into(),
         ));
     };
     let addresses: Vec<u32> = reader.for_each_entry(
@@ -903,7 +924,10 @@ fn parse_relocations(
     dir: DataDir,
 ) -> Result<(Vec<Reloc>, Vec<String>), ParseError> {
     let offset = rva_to_offset(object, dir.rva).ok_or_else(|| {
-        ParseError::Inconsistent(format!("重定位表 RVA {:#x} 不在任何节内", dir.rva))
+        ParseError::Inconsistent(format!(
+            "重定位表 RVA {:#x} 不在任何有文件后备的节里",
+            dir.rva
+        ))
     })?;
     let total = u64::from(dir.size);
     let mut out = Vec::new();
@@ -945,8 +969,15 @@ fn parse_relocations(
                 continue; // ABSOLUTE 是填充项，跳过
             }
 
+            let address = rva_to_va(object, page_rva.wrapping_add(page_offset));
             out.push(Reloc {
-                address: rva_to_va(object, page_rva.wrapping_add(page_offset)),
+                address,
+                // 镜像里的重定位项写的是虚拟地址，按节查回去即可；查不到就如实给
+                // `None`（地址落在任何节之外，例如头里）。
+                section: object
+                    .section_at(address)
+                    .map(|section| section.name.clone())
+                    .filter(|name| !name.is_empty()),
                 kind: match kind {
                     3 => RelocKind::Absolute,  // HIGHLOW
                     10 => RelocKind::Absolute, // DIR64
@@ -997,7 +1028,10 @@ fn parse_pdata(
         )));
     }
     let offset = rva_to_offset(object, dir.rva).ok_or_else(|| {
-        ParseError::Inconsistent(format!(".pdata RVA {:#x} 不在任何节内", dir.rva))
+        ParseError::Inconsistent(format!(
+            ".pdata RVA {:#x} 不在任何有文件后备的节里",
+            dir.rva
+        ))
     })?;
 
     let entries: Vec<(u32, u32, u32)> =
