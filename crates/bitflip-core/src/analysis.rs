@@ -694,40 +694,55 @@ impl TargetAnalysis {
         //
         // 判据严格：从某个指令边界起，必须是无条件间接跳转，且后续指令全是填充，
         // 且总长不超过一个桩的尺寸。宁可漏，不要误报（§7）。
+        //
+        // **这条来源只在能判填充的架构上跑。** 判据两头（"后面是填充"、"下一条
+        // 也是桩"）都是字节形状，非 x86 目标上那些字节是别的指令 —— 拿 x86 的
+        // 判据去匹配，会把普通代码认成桩（实测 `elf-armv7.o` 上凭空多出一个
+        // 函数）。这里不猜"大概也许是"：不支持的架构直接不跑，并在下面
+        // 如实记进 notes。
+        let spec = disasm.decoder.spec();
         let mut thunk_count = 0usize;
-        for (addr, len) in disasm.index.range(0, u64::MAX) {
-            // 只对"未识别"的位置找桩：已经认出来的函数不用改来源
-            if by_addr.contains_key(&addr) {
-                continue;
+        if !bitflip_arch::supports_padding(spec) {
+            notes.push(
+                "本架构尚未实现导入桩识别（判据是字节形状，只对已实现的架构生效）：\
+                 形如 `jmp *__imp_xxx` 的桩不会作为函数出现"
+                    .to_string(),
+            );
+        } else {
+            for (addr, len) in disasm.index.range(0, u64::MAX) {
+                // 只对"未识别"的位置找桩：已经认出来的函数不用改来源
+                if by_addr.contains_key(&addr) {
+                    continue;
+                }
+                let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
+                    continue;
+                };
+                let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
+                    continue;
+                };
+                // 桩的第一条：无条件跳转，且目标未知（间接 —— 走 IAT）
+                if !matches!(insn.flow, Flow::Branch { conditional: false }) {
+                    continue;
+                }
+                if insn.target.is_some() {
+                    continue; // 直接跳转是普通尾调用/跳转，不是桩
+                }
+                if !is_import_thunk_tail(&disasm.space, spec, addr, insn.len) {
+                    continue;
+                }
+                by_addr.entry(addr).or_default().push(SymbolCandidate {
+                    addr,
+                    name: String::new(), // 桩也没有名字 —— 不许编
+                    source: SymbolSource::ImportThunk,
+                    confidence: 60,
+                });
+                thunk_count += 1;
             }
-            let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
-                continue;
-            };
-            let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
-                continue;
-            };
-            // 桩的第一条：无条件跳转，且目标未知（间接 —— 走 IAT）
-            if !matches!(insn.flow, Flow::Branch { conditional: false }) {
-                continue;
+            if thunk_count > 0 {
+                notes.push(format!(
+                    "识别出 {thunk_count} 个导入桩（`jmp *__imp_xxx` 形式的间接跳转桩）"
+                ));
             }
-            if insn.target.is_some() {
-                continue; // 直接跳转是普通尾调用/跳转，不是桩
-            }
-            if !is_import_thunk_tail(&disasm.space, addr, insn.len) {
-                continue;
-            }
-            by_addr.entry(addr).or_default().push(SymbolCandidate {
-                addr,
-                name: String::new(), // 桩也没有名字 —— 不许编
-                source: SymbolSource::ImportThunk,
-                confidence: 60,
-            });
-            thunk_count += 1;
-        }
-        if thunk_count > 0 {
-            notes.push(format!(
-                "识别出 {thunk_count} 个导入桩（`jmp *__imp_xxx` 形式的间接跳转桩）"
-            ));
         }
 
         // 来源 5b：PLT 桩命名。
@@ -774,7 +789,6 @@ impl TargetAnalysis {
 
         let mut plt_named = 0usize;
         if !plt_ranges.is_empty() {
-            let spec = disasm.decoder.spec();
             if !bitflip_arch::supports_plt_stub(spec) {
                 // 降级必须说出来：否则"没有导入符号名"会被读成"这个目标没有导入"，
                 // 而真实原因是本架构还没实现桩识别。
@@ -2269,12 +2283,25 @@ const MAX_PLT_STUB_BYTES: usize = 16;
 /// 然后**下一个桩紧接着开始**，中间没有空隙。
 ///
 /// 所以不能要求"后面全是填充直到段尾/大段空白"：那样第一个桩后面的字节
-/// 立刻就是下一个桩的 `ff 25`，检查必然失败（这正是最初 12 个桩一个都没认出来的原因）。
+/// 立刻就是下一个桩的 `ff 25`，检查必然失败（这正是最初一批桩一个都没认出来的原因）。
 ///
 /// 正确判据是：**这段小窗口里只允许出现"填充"和"另一个桩的开头"**，
 /// 出现任何别的指令字节就否决。这样既能认出紧密排列的桩，又不会把
 /// `jmp` 开头的普通函数（后面接真实代码）误判成桩。
-fn is_import_thunk_tail(space: &bitflip_analyze::AddrSpace, addr: u64, first_len: u8) -> bool {
+///
+/// # 字节形状一律来自 `bitflip-arch`
+///
+/// "哪些字节是填充"（`padding_len`）与"哪些字节是桩"（`plt_stub`）都是
+/// **指令集知识**，判据按架构分派。早先这里直接匹配 `0x90`/`0xCC`/`66 0F 1F`/`ff 25`
+/// —— 分层门禁按标识符匹配，抓不到操作码字节，所以它一直是绿的，但拿 x86 的
+/// 字节去匹配 arm 目标会让普通代码被认成桩（实测 `elf-armv7.o` 上凭空多出一个）。
+/// 现在非 x86 目标如实判定为"不是桩"。
+fn is_import_thunk_tail(
+    space: &bitflip_analyze::AddrSpace,
+    spec: bitflip_arch::ArchSpec,
+    addr: u64,
+    first_len: u8,
+) -> bool {
     let rest_start = addr.saturating_add(u64::from(first_len));
     let window = MAX_THUNK_BYTES.saturating_sub(u64::from(first_len));
     let Some(tail) = space.read(rest_start, window as usize) else {
@@ -2284,48 +2311,32 @@ fn is_import_thunk_tail(space: &bitflip_analyze::AddrSpace, addr: u64, first_len
 
     let mut i = 0usize;
     while i < tail.len() {
-        match tail[i] {
-            0x90 => i += 1, // nop 填充
-            0xCC => i += 1, // int3 填充
-            0x66 | 0x0F => {
-                // 多字节 nop（`66 66 ... 0F 1F /0`）
-                if tail[i] == 0x66 {
-                    i += 1;
-                    continue;
-                }
-                if tail.get(i + 1) == Some(&0x1F) {
-                    let modrm = tail.get(i + 2).copied().unwrap_or(0);
-                    let extra = match (modrm >> 6) & 3 {
-                        0 => 0,
-                        1 => 1,
-                        2 => 4,
-                        _ => 0,
-                    };
-                    i += 3 + extra;
-                    continue;
-                }
-                return false;
-            }
-            0xff => {
-                // 下一个桩的开头：`ff 25 <disp32>`。只接受这一种形式；
-                // `ff 15` 之类的间接 call、`ff e0` 的 jmp reg 都不算。
-                if tail.get(i + 1) == Some(&0x25) {
-                    // 这个桩的长度也要在合理范围内，否则就是长函数
-                    let remaining = tail.len() - i;
-                    if remaining < 6 {
-                        return true; // 窗口到头了，视为合法
-                    }
-                    i += 6;
-                    continue;
-                }
-                return false;
-            }
-            0x00 => {
-                // 零填充结尾：后面必须全是零
-                return tail[i..].iter().all(|&b| b == 0x00);
-            }
-            _ => return false,
+        let rest = &tail[i..];
+
+        let pad = bitflip_arch::padding_len(spec, rest);
+        if pad > 0 {
+            // 非 0 即前进，不会死循环（`padding_len` 保证返回值 <= rest.len()）
+            i += pad;
+            continue;
         }
+
+        if bitflip_arch::plt_stub(spec, rest, rest_start.saturating_add(i as u64)).is_some() {
+            // 下一个桩的开头。
+            //
+            // `plt_stub` 只在**读满一条桩**时才给出结论，所以窗口末尾那半条桩
+            // 会落到下面被否决。比早先"看到 `ff 25` 就放行"更严一点 ——
+            // 宁可漏一个贴在段尾的桩，也不要凭两个字节猜出整条桩。
+            i += 6;
+            continue;
+        }
+
+        if rest[0] == 0x00 {
+            // 零填充结尾：后面必须**全是**零才算。单个零字节不是填充 ——
+            // `00 00` 解出来是 `add [rax], al`，是一条真实指令。
+            return rest.iter().all(|&b| b == 0x00);
+        }
+
+        return false;
     }
     true
 }

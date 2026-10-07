@@ -14,6 +14,7 @@ mod abi;
 mod backend;
 mod decode;
 mod insn;
+mod padding;
 mod plt;
 mod render;
 mod types;
@@ -24,6 +25,7 @@ pub use decode::{decoder_for, Abi, DecodeError, Decoder, UnsupportedDecoder};
 pub use insn::{
     ConditionCode, DecodedInsn, Flow, MemRef, MnemonicId, Operand, RegId, RegSet, ShiftKind,
 };
+pub use padding::{padding_len, supports_padding};
 pub use plt::{plt_stub, supports_plt_stub, PltStub};
 pub use render::{flow_label, format_insn, text_style, TextStyle};
 pub use types::{Arch, ArchSpec, Endian, Mode};
