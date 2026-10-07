@@ -300,6 +300,66 @@ try {
         # Tab-separated output is what the console renders as its result table.
         Check -Label "export-functions emits tab-separated rows" -Ok ($exportText -match "`t")
 
+        # -- script-declared tables reach the UI (custom view data sources) --
+        # @() around the property: PS 5.1 gives no .Count on a single object, so
+        # an unwrapped one-table result would make these checks pass vacuously.
+        $exportTables = @($export.tables)
+        Check -Label "export-functions publishes one declared table" `
+            -Ok ($exportTables.Count -eq 1 -and $exportTables[0].row_count -gt 0) `
+            -Detail "tables=$($exportTables.Count)"
+        Check -Label "the declared table reports its column kinds" `
+            -Ok ($exportTables.Count -eq 1 -and $exportTables[0].columns[0].kind -eq 'address') `
+            -Detail "kind=$($exportTables[0].columns[0].kind)"
+        Check -Label "the status summary carries no table data rows" `
+            -Ok ($exportTables.Count -eq 1 -and $null -eq $exportTables[0].rows)
+
+        # ASCII table name on purpose: this script must stay ASCII-only (PS 5.1
+        # reads a BOM-less .ps1 as ANSI), so the endpoint checks use their own run.
+        $tableSource = "bitflip.table('SMOKE-TABLE', " +
+            "[{name: 'addr', type: 'address'}, {name: 'n', type: 'number'}, " +
+            "{name: 'ok', type: 'bool'}, {name: 'note'}], " +
+            "[['0000000140009218', 3, true, 'x'], [null, 0, false, 'y']], " +
+            "{description: 'smoke'}); bitflip.log('TABLE-OK');"
+        $null = Post-Json "$base/api/script/run" @{ source = $tableSource }
+        $tableRun = Wait-ForDone -Base $base
+        $tableText = ''
+        if ($null -ne $tableRun) { $tableText = Join-Logs $tableRun }
+        Check -Label "a script can publish a table" -Ok ($tableText -match 'TABLE-OK') `
+            -Detail ("state=" + [string]$tableRun.state + " err=" + [string]$tableRun.error.kind)
+
+        $tablePage = Get-Json "$base/api/script/table?name=SMOKE-TABLE"
+        $rows = @($tablePage.Body.rows)
+        Check -Label "the table data comes back from its own endpoint" `
+            -Ok ($tablePage.Status -eq 200 -and $rows.Count -eq 2 -and $tablePage.Body.total -eq 2) `
+            -Detail "HTTP $($tablePage.Status) rows=$($rows.Count)"
+        # The address must travel as fixed-width hex text: a JSON number would
+        # reach the UI as 140009218 and stop being an address.
+        Check -Label "address cells travel as 16-hex strings, not numbers" `
+            -Ok ($rows.Count -eq 2 -and $rows[0][0] -eq '0000000140009218') `
+            -Detail ("first=" + [string]$rows[0][0])
+        Check -Label "an empty cell stays empty instead of becoming 0 or ''" `
+            -Ok ($rows.Count -eq 2 -and $null -eq $rows[1][0])
+
+        $missing = Get-Json "$base/api/script/table?name=NOPE"
+        Check -Label "asking for a table that does not exist is a 404, not an empty table" `
+            -Ok ($missing.Status -eq 404 -and $missing.Body.error -match 'SMOKE-TABLE') `
+            -Detail "HTTP $($missing.Status)"
+        $noName = Get-Json "$base/api/script/table"
+        Check -Label "asking for a table without a name is refused" `
+            -Ok ($noName.Status -eq 400) -Detail "HTTP $($noName.Status)"
+        $tooBig = Get-Json "$base/api/script/table?name=SMOKE-TABLE&count=999999"
+        Check -Label "an oversized page is refused instead of silently clamped" `
+            -Ok ($tooBig.Status -eq 400) -Detail "HTTP $($tooBig.Status)"
+
+        # A run that publishes nothing must not leave the previous table visible.
+        $null = Post-Json "$base/api/script/run" @{ source = "bitflip.log('no table here');" }
+        $noTableRun = Wait-ForDone -Base $base
+        Check -Label "a run without tables clears the previous run's tables" `
+            -Ok ($null -ne $noTableRun -and @($noTableRun.tables).Count -eq 0)
+        $gone = Get-Json "$base/api/script/table?name=SMOKE-TABLE"
+        Check -Label "the previous run's table is not served under the new run" `
+            -Ok ($gone.Status -eq 404) -Detail "HTTP $($gone.Status)"
+
         # -- symbols come back through the live path too --
         $symbolSource = "const hit = bitflip.symbols.find('memcpy'); bitflip.log('SYM=' + hit.length); bitflip.log('SYMVAL=' + hit[0].value);"
         $null = Post-Json "$base/api/script/run" @{ source = $symbolSource }

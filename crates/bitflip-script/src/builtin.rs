@@ -140,7 +140,7 @@ for (const note of bitflip.notes()) {
 
 /// 导出函数清单。
 const EXPORT_FUNCTIONS: &str = r#"
-// 导出函数清单（制表符分隔，可直接粘进表格软件）
+// 导出函数清单
 //
 // 列：起始地址 / 名字 / 名字来源 / 置信度 / 大小
 //
@@ -149,11 +149,28 @@ const EXPORT_FUNCTIONS: &str = r#"
 //   * 把 bitflip.notes() 的降级说明一并导出 —— 一份"函数边界靠线性扫描"
 //     得出的清单，和一份有 .eh_frame 支撑的清单，可信度不是一回事。
 //
-// 篇幅控制：每 200 行作为一条日志发出，避免单条日志过大；
-// 最后一条是总计。
+// 输出有两条路，它们是给不同用途的：
+//   * `bitflip.table(...)`：界面**按列类型**渲染的表（地址列按地址显示），
+//     可翻页、可多表切换 —— 用来看；
+//   * 制表符分隔的日志行：可以直接复制粘贴到表格软件里 —— 用来带走。
+//
+// 表有行数上限（宿主对一次运行的所有表格合计 20 万格），所以这里只列前
+// TABLE_ROWS 行并在日志里说明；完整清单始终在制表符行里，不截断。
+//
+// 篇幅控制：每 CHUNK 行作为一条日志发出，避免单条日志过大。
 
 const CHUNK = 200;
+const TABLE_ROWS = 20000;   // 5 列 × 20000 = 100000 格，低于宿主上限
+const COLUMNS = [
+  { name: '起始地址', type: 'address' },
+  { name: '名字' },
+  { name: '名字来源' },
+  { name: '置信度', type: 'number' },
+  { name: '大小' },
+];
+
 let buffer = [];
+let tableRows = [];
 let exported = 0;
 const total = bitflip.functions.count();
 
@@ -162,12 +179,23 @@ for (let off = 0; off < total; off += 512) {
     const name = f.named ? f.name : '(未命名)';
     const size = f.size === null ? '?' : String(f.size);
     buffer.push([f.start, name, f.source_label, String(f.confidence), size].join('\t'));
+    if (tableRows.length < TABLE_ROWS) {
+      tableRows.push([f.start, name, f.source_label, f.confidence, f.size === null ? null : f.size]);
+    }
     exported += 1;
     if (buffer.length >= CHUNK) { bitflip.log(buffer.join('\n')); buffer = []; }
   }
   bitflip.progress(exported, total, '导出函数清单');
 }
 if (buffer.length > 0) { bitflip.log(buffer.join('\n')); }
+
+bitflip.table('函数清单', COLUMNS, tableRows, {
+  description: '函数边界（起始地址 / 大小）与名字来源，置信度是边界的置信度',
+});
+if (total > tableRows.length) {
+  bitflip.warn('表只列了前 ' + tableRows.length + ' 个函数（共 ' + total + ' 个），' +
+               '完整清单见上面的制表符行。');
+}
 
 bitflip.log('# 函数总数=' + total + ' 已导出=' + exported);
 for (const note of bitflip.notes()) {
@@ -216,12 +244,16 @@ for (const [address, count] of callCount) {
 }
 candidates.sort((a, b) => b.count - a.count);
 
-bitflip.log('# 未命名且被多处调用的函数（前 ' + TOP + ' 名）');
-bitflip.log('# 调用次数\t大小\t边界置信度\t起始地址');
-for (const item of candidates.slice(0, TOP)) {
-  const size = item.size === null ? '?' : String(item.size);
-  bitflip.log(item.count + '\t' + size + '\t' + item.confidence + '\t' + item.address);
-}
+const top = candidates.slice(0, TOP);
+bitflip.table('未命名且被多处调用的函数', [
+  { name: '起始地址', type: 'address' },
+  { name: '调用次数', type: 'number' },
+  { name: '大小' },
+  { name: '边界置信度', type: 'number' },
+], top.map((item) => [item.address, item.count,
+                      item.size === null ? null : item.size, item.confidence]), {
+  description: '候选清单：按调用次数排序的前 ' + TOP + ' 名。这些只是候选，不是识别结论。',
+});
 
 bitflip.log('候选总数=' + candidates.length);
 bitflip.log('# 这些只是候选：大小小、被调用多，符合编译器辅助例程的特征，但不构成识别结论。');
@@ -252,7 +284,9 @@ pub static BUILTIN: &[BuiltinScript] = &[
         id: "export-functions",
         name: "导出函数清单",
         description: "按\"地址 / 名字 / 来源 / 置信度 / 大小\"导出全部函数，未命名的如实写\
-                      `(未命名)`，并连带导出 bitflip.notes() 里的降级说明。",
+                      `(未命名)`，并连带导出 bitflip.notes() 里的降级说明。\
+                      同时产出一张声明的表供界面渲染（地址列按地址显示），\
+                      以及可复制走的制表符分隔文本。",
         api_version: super::SCRIPT_API_VERSION,
         source: EXPORT_FUNCTIONS,
     },

@@ -27,11 +27,13 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use bitflip_script::{
     CancelToken, Host, Limits, ScriptEngine, ScriptError, ScriptLog, ScriptOutcome, ScriptProgress,
+    TableCell, TableColumn, TableSummary,
 };
 
 use crate::AppState;
@@ -111,6 +113,19 @@ impl ScriptRunner {
     #[must_use]
     pub fn limits(&self) -> Limits {
         self.limits.clone()
+    }
+
+    /// 当前（或最近一次）运行的宿主句柄。
+    ///
+    /// 取表数据要用它：表数据不在 `StatusResponse` 里（那是轮询用的摘要），
+    /// 而在脚本宿主上。没有运行过就是 `None` —— 调用方据此报"还没有表"，
+    /// 而不是返回一张空表。
+    #[must_use]
+    pub fn host(&self) -> Option<Host> {
+        self.lock()
+            .active
+            .as_ref()
+            .map(|active| active.host.clone())
     }
 }
 
@@ -329,6 +344,11 @@ pub struct StatusResponse {
     pub committed: Option<usize>,
     /// 本次运行尝试提交的条数（未结束时为 `null`）。
     pub staged_total: Option<usize>,
+    /// 本次运行产出的表（只给形状与行数，数据走 `/api/script/table`）。
+    ///
+    /// 单独给一个端点取数据行不是洁癖：界面每几百毫秒轮询一次状态，
+    /// 把整张表的每一格都塞进轮询响应，光序列化就够把界面拖慢。
+    pub tables: Vec<TableSummary>,
     /// 失败信息（成功或未结束时为 `null`）。
     pub error: Option<ErrorWire>,
     /// 现在点取消是否有用。
@@ -346,6 +366,7 @@ fn snapshot(
     logs: Vec<ScriptLog>,
     progress: Option<ScriptProgress>,
     staged: usize,
+    tables: Vec<TableSummary>,
 ) -> StatusResponse {
     let Some(active) = active else {
         return StatusResponse {
@@ -357,6 +378,7 @@ fn snapshot(
             staged: 0,
             committed: None,
             staged_total: None,
+            tables: Vec::new(),
             error: None,
             can_cancel: false,
             api_version: bitflip_script::SCRIPT_API_VERSION,
@@ -380,6 +402,7 @@ fn snapshot(
             staged,
             committed: None,
             staged_total: None,
+            tables,
             error: None,
             can_cancel: active.phase == Phase::Executing,
             api_version: bitflip_script::SCRIPT_API_VERSION,
@@ -393,6 +416,7 @@ fn snapshot(
             staged,
             committed: Some(outcome.committed),
             staged_total: Some(outcome.staged),
+            tables,
             error: None,
             can_cancel: false,
             api_version: bitflip_script::SCRIPT_API_VERSION,
@@ -406,6 +430,7 @@ fn snapshot(
             staged,
             committed: None,
             staged_total: None,
+            tables,
             error: Some(ErrorWire::from(error)),
             can_cancel: false,
             api_version: bitflip_script::SCRIPT_API_VERSION,
@@ -496,7 +521,8 @@ fn observe(runner: &ScriptRunner) -> StatusResponse {
     let logs = active.map_or_else(Vec::new, |active| active.host.logs());
     let progress = active.and_then(|active| active.host.progress());
     let staged = active.map_or(0, |active| active.host.staged_len());
-    snapshot(active, logs, progress, staged)
+    let tables = active.map_or_else(Vec::new, |active| active.host.table_summaries());
+    snapshot(active, logs, progress, staged, tables)
 }
 
 /// `GET /api/script/status`：观测当前（或最近一次）运行。
@@ -549,6 +575,129 @@ pub async fn library() -> Json<LibraryResponse> {
     })
 }
 
+/// 分页取表的查询参数。
+#[derive(Debug, Deserialize)]
+pub struct TableQuery {
+    /// 表名（必填）。
+    pub name: Option<String>,
+    /// 起始行（默认 0）。
+    pub offset: Option<usize>,
+    /// 取多少行（默认 [`DEFAULT_TABLE_PAGE`]，上限 [`MAX_TABLE_PAGE`]）。
+    pub count: Option<usize>,
+}
+
+/// 默认每页行数与上限。
+///
+/// 与界面上的"结果表格"同一量级：一张要给人看的表不会只有十行，
+/// 但一次几千行也远超一屏。上限存在的意义是**挡住一个数字**——
+/// `count=99999999` 会把整张表序列化进一次响应。
+pub const DEFAULT_TABLE_PAGE: usize = 2_000;
+/// 见 [`DEFAULT_TABLE_PAGE`]。
+pub const MAX_TABLE_PAGE: usize = 5_000;
+
+/// 一页表数据的响应。
+#[derive(Debug, Serialize)]
+pub struct TableResponse<'a> {
+    /// 表名。
+    pub name: &'a str,
+    /// 说明。
+    pub description: Option<&'a str>,
+    /// 列定义（含类型：界面按它渲染，不猜）。
+    pub columns: &'a [TableColumn],
+    /// 总行数。
+    pub total: usize,
+    /// 本页起始行。
+    pub offset: usize,
+    /// 数据行；每一格是 `null` / 布尔 / 数字 / 字符串（地址是十六进制字符串）。
+    pub rows: &'a [Vec<TableCell>],
+}
+
+/// `GET /api/script/table?name=<表名>&offset=<n>&count=<n>`：取表数据。
+///
+/// 表是**本次会话**的派生物（脚本产出，不落工程库），所以这里只认当前
+/// [`Host`] 上的那几张表；没有就叫 404 并列出有哪些表，而不是返回空数组 ——
+/// 空数组在界面上表现为"这张表是空的"，与"没有这张表"完全是两回事。
+pub async fn table(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<TableQuery>,
+) -> Response {
+    let Some(name) = query
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    else {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "需要 name 参数：/api/script/table?name=<表名>",
+        );
+    };
+
+    let Some(host) = state.script.host() else {
+        return failure(
+            StatusCode::NOT_FOUND,
+            "本次会话还没有运行过脚本，因此没有表",
+        );
+    };
+
+    let Some(table) = host.table(name) else {
+        let available: Vec<String> = host
+            .table_summaries()
+            .into_iter()
+            .map(|summary| summary.name)
+            .collect();
+        let hint = if available.is_empty() {
+            "本次运行的脚本没有产出表（脚本里要用 bitflip.table(...) 显式产出）".to_string()
+        } else {
+            format!("当前有：{}", available.join("、"))
+        };
+        return failure(
+            StatusCode::NOT_FOUND,
+            &format!("没有名为 {name:?} 的表；{hint}"),
+        );
+    };
+
+    let offset = query.offset.unwrap_or(0);
+    let count = query.count.unwrap_or(DEFAULT_TABLE_PAGE);
+    if count == 0 {
+        return failure(StatusCode::BAD_REQUEST, "count 必须大于 0");
+    }
+    if count > MAX_TABLE_PAGE {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            &format!("count 最多 {MAX_TABLE_PAGE}（收到 {count}）；要全部数据请分页取"),
+        );
+    }
+
+    let end = offset.saturating_add(count).min(table.row_count());
+    let rows = if offset >= table.row_count() {
+        &[][..]
+    } else {
+        &table.rows[offset..end]
+    };
+
+    Json(TableResponse {
+        name: &table.name,
+        description: table.description.as_deref(),
+        columns: &table.columns,
+        total: table.row_count(),
+        offset,
+        rows,
+    })
+    .into_response()
+}
+
+/// 出错时的响应（与状态码一起给出一句能照做的说明）。
+fn failure(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(MessageResponse {
+            error: message.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 /// 取消请求的响应。
 #[derive(Debug, Serialize)]
 pub struct CancelResponse {
@@ -557,7 +706,6 @@ pub struct CancelResponse {
     /// 面向用户的说明（被拒时解释原因）。
     pub message: String,
 }
-
 /// `POST /api/script/cancel`：请求取消。
 pub async fn cancel(State(state): State<AppState>) -> (StatusCode, Json<CancelResponse>) {
     let (status, ok, message) = match state.script.cancel() {

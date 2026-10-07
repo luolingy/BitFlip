@@ -23,6 +23,7 @@ use rquickjs::{Coerced, Ctx, Exception, Function, IntoJs, Object, Value};
 
 use crate::error::ScriptError;
 use crate::stage::StagedWrites;
+use crate::table::{self, ScriptTable, TableSummary, MAX_TABLES_PER_RUN, MAX_TABLE_CELLS};
 
 /// 脚本 API 版本。
 ///
@@ -114,6 +115,10 @@ pub(crate) struct HostState {
     pub(crate) session: Option<Arc<Session>>,
     pub(crate) disasm: Option<DisasmProvider>,
     pub(crate) staged: StagedWrites,
+    /// 本次运行产出的表（`bitflip.table`），按脚本产生的顺序。
+    ///
+    /// 与 [`HostState::staged`] 同生命周期：脚本正常结束才留下。
+    pub(crate) tables: Vec<ScriptTable>,
     pub(crate) logs: Vec<ScriptLog>,
     pub(crate) progress: Option<ScriptProgress>,
 }
@@ -162,6 +167,7 @@ impl Host {
                 session: None,
                 disasm: None,
                 staged: StagedWrites::new(),
+                tables: Vec::new(),
                 logs: Vec::new(),
                 progress: None,
             }))),
@@ -248,22 +254,60 @@ impl Host {
         self.state.lock().staged.len()
     }
 
-    /// 开始一次新的运行：清空日志、暂存与进度。
+    /// 本次运行产出的表（克隆；调用方要的是数据本身）。
+    #[must_use]
+    pub fn tables(&self) -> Vec<ScriptTable> {
+        self.state.lock().tables.clone()
+    }
+
+    /// 按名字取一张表。
+    #[must_use]
+    pub fn table(&self, name: &str) -> Option<ScriptTable> {
+        self.state
+            .lock()
+            .tables
+            .iter()
+            .find(|table| table.name == name)
+            .cloned()
+    }
+
+    /// 全部表的摘要（不含数据行）。
+    ///
+    /// 界面轮询状态时用的是它：把 20 万格的表每 300 毫秒克隆一次，
+    /// 光是内存流量就够把界面拖慢，而轮询只想知道"有哪些表、多少行"。
+    #[must_use]
+    pub fn table_summaries(&self) -> Vec<TableSummary> {
+        self.state
+            .lock()
+            .tables
+            .iter()
+            .map(ScriptTable::summary)
+            .collect()
+    }
+
+    /// 开始一次新的运行：清空日志、暂存、表与进度。
     ///
     /// 同一个 [`Host`] 会被反复用于多次运行（控制台里连着重放几次脚本），
     /// 所以每次运行必须从干净状态开始 —— 否则上一次的日志会混进这一次的结果，
     /// 上一次被丢弃的暂存也会莫名其妙地跟着这一次一起提交，
-    /// 上一次的进度条会停在"80%"让用户以为这一次卡住了。
+    /// 上一次的进度条会停在"80%"让用户以为这一次卡住了，上一次的表会以
+    /// "这一次的运行结果"的身份出现在视图列表里。
     pub fn begin_run(&self) {
         let mut state = self.state.lock();
         state.logs.clear();
         state.staged.clear();
+        state.tables.clear();
         state.progress = None;
     }
 
-    /// 丢弃全部暂存写入（中断或失败时调用）。
+    /// 丢弃全部暂存写入与表（中断或失败时调用）。
+    ///
+    /// 表与标注一样"要么全留、要么不留"：一个跑到一半被掐断的脚本若留下
+    /// 一张半截表，它看起来和一张完整的表没有任何区别。
     pub fn discard(&self) {
-        self.state.lock().staged.clear();
+        let mut state = self.state.lock();
+        state.staged.clear();
+        state.tables.clear();
     }
 
     /// 把暂存写入提交到工程库，返回提交条数。
@@ -464,6 +508,75 @@ impl Host {
                             total: total.0,
                             label: label.0,
                         });
+                    },
+                )?,
+            )?;
+        }
+
+        {
+            // 具名表格：脚本算出来的东西交给界面按**声明的**形状渲染。
+            //
+            // 返回行数而不是 `undefined`：脚本几乎总是想紧接着 `log` 一句
+            // "导出 N 行"，让它自己再取一次 `rows.length` 是多余的往返。
+            let state = state.clone();
+            bitflip.set(
+                "table",
+                Function::new(
+                    ctx.clone(),
+                    move |ctx: Ctx<'_>,
+                          name: Value<'_>,
+                          columns: Value<'_>,
+                          rows: Value<'_>,
+                          options: Opt<Value<'_>>|
+                          -> rquickjs::Result<usize> {
+                        // 额度是跨表合计的：单张表看不出别的表用掉了多少，
+                        // 所以在这里把"还剩多少格"算出来交给解析器。
+                        let (count, used) = {
+                            let state = state.lock();
+                            (
+                                state.tables.len(),
+                                state
+                                    .tables
+                                    .iter()
+                                    .map(ScriptTable::cell_count)
+                                    .sum::<usize>(),
+                            )
+                        };
+                        if count >= MAX_TABLES_PER_RUN {
+                            return Err(Exception::throw_message(
+                                &ctx,
+                                &format!(
+                                    "一次运行最多产出 {MAX_TABLES_PER_RUN} 张表，已经有 {count} 张了；\
+                                     视图列表是要人看的，请合并成一张"
+                                ),
+                            ));
+                        }
+
+                        let remaining = MAX_TABLE_CELLS.saturating_sub(used);
+                        let table = table::table_from_js(
+                            &ctx,
+                            name,
+                            columns,
+                            rows,
+                            options.0,
+                            remaining,
+                        )?;
+                        let row_count = table.row_count();
+
+                        let mut state = state.lock();
+                        if state.tables.iter().any(|existing| existing.name == table.name) {
+                            // 同名会让"看哪一张"没有答案 —— 而且脚本很可能
+                            // 是循环里漏了改名，报错比默默留两张更有用。
+                            return Err(Exception::throw_message(
+                                &ctx,
+                                &format!(
+                                    "表名「{}」重复了；一次运行内表名必须唯一",
+                                    table.name
+                                ),
+                            ));
+                        }
+                        state.tables.push(table);
+                        Ok(row_count)
                     },
                 )?,
             )?;

@@ -1144,6 +1144,53 @@ export type ScriptErrorWire =
   | { kind: "commit"; committed: number; total: number; reason: string }
   | { kind: "engine"; message: string };
 
+/**
+ * 列的类型。
+ *
+ * 它是**脚本声明的**，不是界面猜的。在加它之前，界面靠"定长十六进制"
+ * 猜哪一列是地址 —— 猜错了就是把不是地址的东西当地址渲染，
+ * 而用户以为是脚本声明的。
+ */
+export type ScriptColumnKind = "text" | "number" | "address" | "bool";
+
+/** 一列。 */
+export interface ScriptColumnWire {
+  name: string;
+  kind: ScriptColumnKind;
+}
+
+/**
+ * 一张脚本表的摘要（随 `status` 回来）。
+ *
+ * 摘要里**没有数据行**：界面每几百毫秒轮询一次状态，把整张表塞进去
+ * 会让轮询响应变成几百 KB。数据行走 [`fetchScriptTable`]。
+ */
+export interface ScriptTableSummaryWire {
+  name: string;
+  description: string | null;
+  columns: ScriptColumnWire[];
+  row_count: number;
+}
+
+/**
+ * 一个单元格的 wire 值。
+ *
+ * 地址在 wire 上就是**定长十六进制字符串**（本项目唯一的地址格式），
+ * 所以这里不需要"哪一列是地址"的推断 —— 列声明已经说了。
+ */
+export type ScriptCellWire = null | boolean | number | string;
+
+/** 一页表数据。 */
+export interface ScriptTableWire {
+  name: string;
+  description: string | null;
+  columns: ScriptColumnWire[];
+  /** 总行数；可能大于 `rows.length`（分页）。 */
+  total: number;
+  offset: number;
+  rows: ScriptCellWire[][];
+}
+
 /** 运行状态。 */
 export interface ScriptStatusWire {
   /** `idle` | `warming` | `running` | `done`。 */
@@ -1158,6 +1205,8 @@ export interface ScriptStatusWire {
   committed: number | null;
   /** 本次尝试提交的条数（未结束时为 `null`）。 */
   staged_total: number | null;
+  /** 本次运行产出的表（只给形状与行数）。 */
+  tables: ScriptTableSummaryWire[];
   error: ScriptErrorWire | null;
   /**
    * 现在点"停止"是否有用。
@@ -1236,6 +1285,26 @@ export async function cancelScript(
 /** 内置示例脚本集。 */
 export function fetchScriptLibrary(token: string | null): Promise<ScriptLibraryWire> {
   return request<ScriptLibraryWire>("/api/script/library", token);
+}
+
+/**
+ * 取一页表数据。
+ *
+ * 分页而不是"全部给我"：一张表可以有上万行，而界面一屏只画得下几百行。
+ * `total` 会一起回来，界面据此说清"还有多少没显示"。
+ */
+export function fetchScriptTable(
+  token: string | null,
+  name: string,
+  offset = 0,
+  count = 2000,
+): Promise<ScriptTableWire> {
+  const query = new URLSearchParams({
+    name,
+    offset: String(offset),
+    count: String(count),
+  });
+  return request<ScriptTableWire>(`/api/script/table?${query.toString()}`, token);
 }
 
 /**

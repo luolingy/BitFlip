@@ -421,6 +421,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/script/status", get(script::status))
         .route("/api/script/cancel", post(script::cancel))
         .route("/api/script/library", get(script::library))
+        // 脚本产出的表（自定义视图数据源）：`status` 里只给形状与行数，
+        // 数据行在这里分页取 —— 轮询响应里塞不下整张表。
+        .route("/api/script/table", get(script::table))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()

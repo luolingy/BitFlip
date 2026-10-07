@@ -41,11 +41,16 @@ mod host;
 mod js;
 mod read;
 mod stage;
+mod table;
 pub use builtin::{builtin_script, builtin_scripts, BuiltinScript};
 pub use engine::{CancelToken, Limits, ScriptEngine, ScriptOutcome};
 pub use error::ScriptError;
 pub use host::{DisasmProvider, Host, LogLevel, ScriptLog, ScriptProgress, SCRIPT_API_VERSION};
 pub use stage::StagedWrites;
+pub use table::{
+    ColumnKind, ScriptTable, TableCell, TableColumn, TableSummary, MAX_TABLES_PER_RUN,
+    MAX_TABLE_CELLS,
+};
 
 /// 脚本 API 中 `bitflip` 全局对象的名字。
 ///

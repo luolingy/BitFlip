@@ -1368,3 +1368,49 @@ button:not(:disabled):hover {
   flex: 1 1 auto;
   min-width: 0;
 }
+
+/* Script-declared tables (bitflip.table).
+   NOTE: this file is a mix of UTF-8 and legacy ANSI bytes (see the mojibake
+   comments above), so new blocks stay ASCII-only on purpose: an ASCII byte is
+   valid in either encoding, while a new non-ASCII byte would not be. */
+.script-table-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.script-table-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* Number of rows on the table tab. */
+.tab-count {
+  margin-left: 6px;
+  color: var(--text-dim);
+  font-size: 10.5px;
+}
+
+/* The declared column kind, shown next to the column name: it is the evidence
+   that the column means what the script said, not what the UI guessed. */
+.col-kind {
+  margin-left: 6px;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 400;
+}
+
+.cell-number {
+  text-align: right;
+}
+
+.cell-empty {
+  color: var(--text-dim);
+}
+
+.cell-address,
+.cell-bool {
+  white-space: nowrap;
+}

@@ -59,6 +59,12 @@ pub struct ScriptOutcome {
     /// `committed` 会是 0 —— 只报 0 会让界面显示"什么都没做"，
     /// 而真相是"脚本写了 N 条，但没地方存"。
     pub staged: usize,
+    /// 本次运行产出的表（`bitflip.table`）数量。
+    ///
+    /// 表不落工程库（它是分析会话的派生物，见 `crate::table` 的模块文档），
+    /// 数据本身在 [`crate::Host`] 上按名字取；这里只报数量，
+    /// 让调用方能说清"这次运行产出了几张视图"。
+    pub tables: usize,
 }
 
 /// 一次运行的共享状态。
@@ -224,11 +230,15 @@ impl ScriptEngine {
             Ok(Ok(())) => {
                 let logs = host.logs();
                 let staged = host.staged_len();
+                // 表不进 `commit`：它不落工程库（分析会话的派生物），
+                // 提交后再数一次只是为了如实报出"这次产出了几张视图"。
                 let commit = host.commit(now_unix());
+                let tables = host.table_summaries().len();
                 commit.map(|committed| ScriptOutcome {
                     logs,
                     committed,
                     staged,
+                    tables,
                 })
             }
             Ok(Err(err)) => {

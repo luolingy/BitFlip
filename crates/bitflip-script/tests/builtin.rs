@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 
 use bitflip_core::{AnnotationKind, DisasmScanOptions, ProjectStore, Session};
-use bitflip_script::{builtin_script, builtin_scripts, Host, Limits, ScriptEngine};
+use bitflip_script::{
+    builtin_script, builtin_scripts, ColumnKind, Host, Limits, ScriptEngine, TableCell,
+};
 
 /// 未经剥离的样本：`memcpy` 只存在于符号表里。
 const SYMBOLS_FIXTURE: &str = "m3-mingw-static.unstripped.exe";
@@ -66,8 +68,9 @@ fn host(name: &str) -> Host {
 /// （"写入无处可存"）。让通用测试也带上库，才是真的把"暂存 → 提交"这条路
 /// 走完了 —— 否则这类脚本永远只在"读"的那一半被测过。
 ///
-/// 返回重新打开的工程库，方便调用方核对落盘的内容。
-fn run_script(name: &str, source: &str) -> (bitflip_script::ScriptOutcome, ProjectStore) {
+/// 返回重新打开的工程库与宿主：前者用来核对落盘的内容，后者用来核对脚本
+/// 产出的表（表不落库，只活在宿主上）。
+fn run_script(name: &str, source: &str) -> (bitflip_script::ScriptOutcome, ProjectStore, Host) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("builtin.bfp");
     let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -82,7 +85,7 @@ fn run_script(name: &str, source: &str) -> (bitflip_script::ScriptOutcome, Proje
 
     // 先重开再让临时目录析构：库里的内容要能在"脚本结束之后"被读到。
     let reopened = ProjectStore::open(&path, hash).expect("重新打开工程库");
-    (outcome, reopened)
+    (outcome, reopened, host)
 }
 
 fn logs(outcome: &bitflip_script::ScriptOutcome) -> String {
@@ -103,7 +106,7 @@ fn every_builtin_script_runs_on_a_real_target() {
             // 剥离样本上它**应当**报错，由下面那条测试单独管。
             continue;
         }
-        let (outcome, _store) = run_script(STRIPPED_FIXTURE, script.source);
+        let (outcome, _store, _host) = run_script(STRIPPED_FIXTURE, script.source);
         let text = logs(&outcome);
         assert!(
             !text.is_empty(),
@@ -235,7 +238,7 @@ fn acceptance_1_degrades_honestly_when_memcpy_is_not_identified() {
 
 #[test]
 fn rename_by_string_only_names_functions_and_says_why() {
-    let (outcome, store) = run_script(
+    let (outcome, store, _host) = run_script(
         STRIPPED_FIXTURE,
         builtin_script("rename-by-string").unwrap().source,
     );
@@ -281,7 +284,7 @@ fn rename_by_string_only_names_functions_and_says_why() {
 
 #[test]
 fn export_functions_includes_unnamed_ones_and_the_degradation_notes() {
-    let (outcome, _store) = run_script(
+    let (outcome, _store, _host) = run_script(
         STRIPPED_FIXTURE,
         builtin_script("export-functions").unwrap().source,
     );
@@ -301,9 +304,75 @@ fn export_functions_includes_unnamed_ones_and_the_degradation_notes() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 内置脚本是"声明式表"的参考实现
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_example_scripts_show_how_to_publish_a_table() {
+    // 示例脚本是用户抄的第一个模板。`bitflip.table` 是新加的（自定义视图
+    // 数据源），如果连内置示例都不用，用户就没有可抄的用法 —— 而界面上
+    // "结果表格"会继续显示从日志里猜出来的那张表。
+    let (outcome, _store, _host) = run_script(
+        STRIPPED_FIXTURE,
+        builtin_script("export-functions").unwrap().source,
+    );
+    assert!(
+        outcome.tables > 0,
+        "导出脚本应当产出一张声明的表，实际 {} 张",
+        outcome.tables
+    );
+}
+
+#[test]
+fn the_exported_table_declares_its_column_types() {
+    let (outcome, _store, host) = run_script(
+        STRIPPED_FIXTURE,
+        builtin_script("export-functions").unwrap().source,
+    );
+    assert_eq!(outcome.tables, 1, "这份脚本只产出一张表");
+
+    let table = &host.tables()[0];
+    assert_eq!(table.name, "函数清单");
+    assert!(
+        table.description.is_some(),
+        "表要说清它是什么，否则用户在界面上只看到一个表名"
+    );
+    let kinds: Vec<ColumnKind> = table.columns.iter().map(|column| column.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ColumnKind::Address,
+            ColumnKind::Text,
+            ColumnKind::Text,
+            ColumnKind::Number,
+            ColumnKind::Text
+        ],
+        "列类型的声明就是这个脚本要教的东西：地址列必须是 address 而不是文本"
+    );
+
+    // 声明了 address，宿主就必须按地址收：每一格的地址都要真的解析成了 u64。
+    for (index, row) in table.rows.iter().enumerate() {
+        assert!(
+            matches!(row[0], TableCell::Address(_)),
+            "第 {} 行的第一列不是地址单元格：{:?}",
+            index + 1,
+            row[0]
+        );
+    }
+    // 置信度声明成 number，因此不会有"看起来像数字的字符串"混进来。
+    for row in &table.rows {
+        assert!(
+            matches!(row[3], TableCell::Number(_)),
+            "置信度列必须是数字单元格：{:?}",
+            row[3]
+        );
+    }
+}
+
 #[test]
 fn library_patterns_lists_candidates_and_refuses_to_conclude() {
-    let (outcome, _store) = run_script(
+    let (outcome, _store, _host) = run_script(
         STRIPPED_FIXTURE,
         builtin_script("library-patterns").unwrap().source,
     );
@@ -316,5 +385,10 @@ fn library_patterns_lists_candidates_and_refuses_to_conclude() {
     assert!(
         text.contains("不构成识别结论"),
         "必须明确说自己只是候选，实际：{text}"
+    );
+    assert!(
+        outcome.tables > 0,
+        "候选清单应当是声明的表（列类型：地址/次数/大小/置信度），实际 {} 张",
+        outcome.tables
     );
 }

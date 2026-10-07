@@ -16,9 +16,18 @@
  *
  * # 结果表格从哪来
  *
- * 没有"查询结果集"这种东西：脚本的输出就是日志。所以制表符分隔的日志行会被
- * 摘出来渲染成表格 —— 内置的 `export-functions` 与 `library-patterns` 正是
- * 这么输出的。数据全部来自脚本自己，界面不加工、不推断列的含义。
+ * 两条路，界面上分开显示，标签也分得很清楚：
+ *
+ * 1. **脚本产出的表**（`bitflip.table(...)`）：列名与列类型由脚本声明，
+ *    界面照声明渲染（地址列按地址显示、数字列右对齐、空值显示成"——"），
+ *    数据从 `/api/script/table` 分页取。这是脚本要给用户"看一张表"时的正道。
+ * 2. **日志里的制表符行**：给"把数据复制出去"用的（内置 `export-functions`
+ *    就是一边产出表、一边打制表符行）。这条路**没有列声明**，所以界面
+ *    一个字都不加工 —— 之前这里靠"定长十六进制"猜地址列，猜错了就是把
+ *    别的东西当地址渲染，而用户以为是脚本声明的。
+ *
+ * 两条都渲染：脚本同时产出两者时，一个是"看"的，一个是"带走"的，
+ * 少任何一个都少了东西。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -27,12 +36,17 @@ import {
   cancelScript,
   fetchScriptLibrary,
   fetchScriptStatus,
+  fetchScriptTable,
   formatAddress,
   runScript,
   type BuiltinScriptWire,
+  type ScriptCellWire,
+  type ScriptColumnKind,
   type ScriptErrorWire,
   type ScriptLogWire,
   type ScriptStatusWire,
+  type ScriptTableSummaryWire,
+  type ScriptTableWire,
 } from "./api";
 import {
   ScriptStorageError,
@@ -49,6 +63,14 @@ const POLL_MS = 250;
 
 /** 表格最多渲染多少行。再多就该导出到文件，而不是塞进 DOM。 */
 const MAX_TABLE_ROWS = 2000;
+
+/**
+ * 一次向服务端取多少行表数据。
+ *
+ * 与 [`MAX_TABLE_ROWS`] 同一个量级：一屏画不下两千行，取更多只是白花内存。
+ * 服务端的上限是 5000（见 `bitflip-server` 的 `MAX_TABLE_PAGE`）。
+ */
+const TABLE_PAGE = 2000;
 
 const STARTER = `// 直接写 JavaScript。每次运行都是全新的上下文：上一次的变量不会留下。
 bitflip.log('函数总数：' + bitflip.functions.count());
@@ -79,9 +101,16 @@ export function ScriptConsole({ token }: { token: string | null }) {
   const [ownScripts, setOwnScripts] = useState<UserScript[]>([]);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [saveName, setSaveName] = useState("");
+  /** 当前在看的表名；`null` 表示还没选（或这次运行没有产出表）。 */
+  const [pickedTable, setPickedTable] = useState<string | null>(null);
+  /** 已取回来的表数据（只装当前选中的那一张）。 */
+  const [tableData, setTableData] = useState<ScriptTableWire | null>(null);
+  const [tableError, setTableError] = useState<string | null>(null);
+  const [tableLoading, setTableLoading] = useState(false);
 
   const state = status?.state ?? "idle";
   const active = state === "warming" || state === "running";
+  const tableSummaries = status?.tables ?? [];
 
   // 恢复草稿与用户脚本。放在一个 effect 里：`localStorage` 在 SSR/受限环境
   // 下不存在，写在 useState 的初始化函数里会直接把组件炸掉。
@@ -171,9 +200,87 @@ export function ScriptConsole({ token }: { token: string | null }) {
     };
   }, [active, token]);
 
+  const tableKey = tableSummaries.map((table) => `${table.name}\u0000${table.row_count}`).join("\u0001");
+
+  // ── 选中哪张表 ──
+  // 依赖是那个**稳定键**而不是摘要数组本身：摘要每次轮询都是新数组，
+  // 用数组当依赖会让这个 effect 每 250 毫秒跑一次。
+  useEffect(() => {
+    if (tableSummaries.length === 0) {
+      setPickedTable(null);
+      setTableData(null);
+      setTableError(null);
+      return;
+    }
+    if (pickedTable === null || !tableSummaries.some((table) => table.name === pickedTable)) {
+      // 默认看第一张：脚本产出的顺序就是它自己的重要度顺序。
+      const first = tableSummaries[0];
+      if (first !== undefined) {
+        setPickedTable(first.name);
+      }
+    }
+  }, [tableKey]);
+
+  // ── 取选中那张表的数据 ──
+  // 表数据不在轮询响应里（那会让每 250ms 的响应变成几百 KB），所以单独取。
+  // 键里带行数：脚本一边跑一边产出时，表长大会自动重新取。
+  useEffect(() => {
+    if (pickedTable === null) {
+      return;
+    }
+    if (!tableSummaries.some((table) => table.name === pickedTable)) {
+      return;
+    }
+    let cancelled = false;
+    setTableLoading(true);
+    void fetchScriptTable(token, pickedTable, 0, TABLE_PAGE).then(
+      (data) => {
+        if (!cancelled) {
+          setTableData(data);
+          setTableError(null);
+        }
+      },
+      (error: unknown) => {
+        if (!cancelled) {
+          setTableData(null);
+          setTableError(error instanceof Error ? error.message : String(error));
+        }
+      },
+    ).finally(() => {
+      if (!cancelled) {
+        setTableLoading(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [pickedTable, tableKey, token]);
+
+  const onLoadMore = useCallback(async () => {
+    if (tableData === null || pickedTable === null) {
+      return;
+    }
+    setTableLoading(true);
+    try {
+      const next = await fetchScriptTable(token, pickedTable, tableData.rows.length, TABLE_PAGE);
+      // 追加而不是替换：这是"同一张表的下一页"。
+      setTableData({ ...next, rows: [...tableData.rows, ...next.rows] });
+      setTableError(null);
+    } catch (error) {
+      setTableError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setTableLoading(false);
+    }
+  }, [token, pickedTable, tableData]);
+
   const onRun = useCallback(async () => {
     setNotice(null);
     setSubmitting(true);
+    // 上一次的表属于上一次的运行：连同选择一起清掉，否则新运行结束后
+    // 界面上还挂着旧表，看起来像是这次产出的。
+    setPickedTable(null);
+    setTableData(null);
+    setTableError(null);
     try {
       // 立刻拿到的只是"已开始"，随后靠轮询看它怎么结束。
       setStatus(await runScript(token, source));
@@ -408,6 +515,22 @@ export function ScriptConsole({ token }: { token: string | null }) {
 
       <ErrorBanner error={status?.error ?? null} />
 
+      {tableSummaries.length > 0 && (
+        <ScriptTables
+          summaries={tableSummaries}
+          picked={pickedTable}
+          data={tableData}
+          error={tableError}
+          loading={tableLoading}
+          onPick={setPickedTable}
+          onLoadMore={() => void onLoadMore()}
+        />
+      )}
+
+      {/* 日志里的制表符行仍然成表：脚本已经把数据"写出来准备粘贴"时，
+          那些行是用户要带走的东西，藏起来等于把导出功能藏起来。
+          两张表同时出现时，上面那张是脚本声明的（有列类型），
+          下面那张是从日志里摘的（没有列类型）—— 标签上分得很清楚。 */}
       {logs.rows.length > 0 && <ResultTable rows={logs.rows} />}
 
       <div className="script-log-pane">
@@ -594,6 +717,163 @@ function levelLabel(level: string): string {
   }
 }
 
+/**
+ * 脚本产出的表（`bitflip.table`）。
+ *
+ * 与 [`ResultTable`] 是两回事，这里要分清：
+ *
+ * * 这张表的列与类型是**脚本声明的**，界面照它渲染 —— 地址列按地址显示，
+ *   数字列右对齐，空值显示成"——"而不是空白（空白看起来像"这一格丢了"）。
+ * * 数据从 `/api/script/table` **分页**取，一次最多 `TABLE_PAGE` 行；
+ *   没取完时明确说"只显示了前 N 行，共 M 行"，并给一个继续取的按钮。
+ *   不一次全取是因为一张表可以有几万行，而 DOM 里放不下也不需要。
+ */
+function ScriptTables({
+  summaries,
+  picked,
+  data,
+  error,
+  loading,
+  onPick,
+  onLoadMore,
+}: {
+  summaries: ScriptTableSummaryWire[];
+  picked: string | null;
+  data: ScriptTableWire | null;
+  error: string | null;
+  loading: boolean;
+  onPick: (name: string) => void;
+  onLoadMore: () => void;
+}) {
+  const summary = summaries.find((table) => table.name === picked) ?? summaries[0];
+  if (summary === undefined) {
+    // 调用方只在有表时渲染这个组件；这里是给类型收窄用的兜底。
+    return null;
+  }
+
+  return (
+    <div className="script-table-pane">
+      <div className="script-table-head">
+        <label className="compact-label">
+          脚本产出的表（{summaries.length} 张）
+        </label>
+        {summaries.length > 1 && (
+          <div className="script-table-tabs">
+            {summaries.map((table) => (
+              <button
+                key={table.name}
+                type="button"
+                className={`tab${table.name === summary.name ? " tab-active" : ""}`}
+                onClick={() => onPick(table.name)}
+                title={table.description ?? undefined}
+              >
+                {table.name}
+                <span className="tab-count">{table.row_count}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {summary.description !== null && summary.description !== "" && (
+        <p className="hint">{summary.description}</p>
+      )}
+
+      {error !== null ? (
+        // 取表失败要说清楚是"取不到"而不是"表是空的"：后者会让用户
+        // 以为脚本没产出东西。
+        <p className="hint">表数据取不回来：{error}</p>
+      ) : data === null ? (
+        <p className="hint">{loading ? "正在取表数据…" : "还没有表数据。"}</p>
+      ) : (
+        <>
+          <div className="table-wrap table-wrap-short">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  {data.columns.map((column, index) => (
+                    <th key={index}>
+                      {column.name}
+                      {/* 把声明的类型显示出来：这是"列的含义来自脚本"的凭据，
+                          用户不必猜界面为什么把这一列当地址渲染。 */}
+                      <span className="col-kind">{column.kind}</span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {data.rows.map((row, rowIndex) => (
+                  <tr key={rowIndex}>
+                    {row.map((cell, cellIndex) => {
+                      const column = data.columns[cellIndex];
+                      const rendered = renderCell(cell, column?.kind ?? "text");
+                      return (
+                        <td
+                          key={cellIndex}
+                          className={rendered.className}
+                          title={rendered.raw}
+                        >
+                          {rendered.text}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {data.rows.length === 0 && (
+            // 0 行是结论，不是错误：脚本查了，结果就是没有。
+            <p className="hint">这张表没有数据行（脚本查到了 0 条）。</p>
+          )}
+
+          {data.rows.length < data.total && (
+            <p className="hint">
+              已显示前 {data.rows.length} 行，共 {data.total} 行。
+              <button
+                type="button"
+                className="link-button"
+                onClick={onLoadMore}
+                disabled={loading}
+              >
+                {loading ? "取数中…" : `再取 ${TABLE_PAGE} 行`}
+              </button>
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** 按列类型渲染一个单元格。 */
+function renderCell(
+  cell: ScriptCellWire,
+  kind: ScriptColumnKind,
+): { text: string; className: string; raw: string } {
+  if (cell === null) {
+    return { text: "——", className: "cell-empty", raw: "空" };
+  }
+  const raw = String(cell);
+  switch (kind) {
+    case "address":
+      // 地址在 wire 上已经是定长十六进制（服务端按本项目唯一的地址格式
+      // 序列化），所以这里只负责显示形态，不做任何猜测。
+      return { text: formatAddress(raw), className: "mono cell-address", raw };
+    case "number":
+      return { text: raw, className: "mono cell-number", raw };
+    case "bool":
+      return {
+        text: cell === true ? "是" : cell === false ? "否" : raw,
+        className: "cell-bool",
+        raw,
+      };
+    default:
+      return { text: raw, className: "", raw };
+  }
+}
+
 /** 结果表格（来自制表符分隔的日志行）。 */
 function ResultTable({ rows }: { rows: string[][] }) {
   // 首行以 `#` 开头时当表头：内置脚本就是这么标表头的。
@@ -606,7 +886,7 @@ function ResultTable({ rows }: { rows: string[][] }) {
   return (
     <div className="script-table-pane">
       <label className="compact-label">
-        结果表格（{body.length} 行，来自脚本输出的制表符分隔行）
+        日志里的制表符行（{body.length} 行，界面不知道这些列是什么，只是照原样显示）
       </label>
       <div className="table-wrap table-wrap-short">
         <table className="data-table">
@@ -623,9 +903,10 @@ function ResultTable({ rows }: { rows: string[][] }) {
             {shown.map((row, rowIndex) => (
               <tr key={rowIndex}>
                 {row.map((cell, cellIndex) => (
+                  // 照原样显示：这一路没有列声明，所以界面**不猜**哪一列是地址。
+                  // 想把地址按地址显示，就让脚本用 bitflip.table 声明列类型。
                   <td key={cellIndex} className="mono">
-                    {/* 地址列跟着界面语言走：定长十六进制在这里也当地址渲染。 */}
-                    {/^0[0-9a-f]{15}$/.test(cell) ? formatAddress(cell) : cell}
+                    {cell}
                   </td>
                 ))}
               </tr>

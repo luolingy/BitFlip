@@ -634,3 +634,258 @@ async fn a_script_taken_from_the_library_runs_through_the_http_path() {
         "脚本的产出应当完整回传到界面，实际：{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 脚本产出的表（M7 交付物"自定义视图数据源"）
+// ---------------------------------------------------------------------------
+
+/// 一张带四种列类型的表：地址列必须在 wire 上是**十六进制字符串**，
+/// 因为那是全项目唯一的地址格式（CLAUDE.md §4）；如果这里漏成数字，
+/// 前端拿到的就是 `140009218`，与列声明脱钩。
+const TABLE_SCRIPT: &str = r#"
+    const rows = bitflip.table(
+        'memcpy 调用点',
+        [
+            {name: '地址', type: 'address'},
+            {name: '调用者'},
+            {name: '参数个数', type: 'number'},
+            {name: '可能内联', type: 'bool'},
+        ],
+        [
+            [0x140009218, 'main', 3, false],
+            ['0000000000401000', 'helper', 2, true],
+        ],
+        {description: '按直接调用 xref 收集'}
+    );
+    bitflip.log('共 ' + rows + ' 行');
+"#;
+
+#[tokio::test]
+async fn a_script_table_reaches_the_ui_with_its_declared_shape() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let (status, _) = start_run(&state, TABLE_SCRIPT).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let done = wait_for_done(&state).await;
+    assert!(done["error"].is_null(), "脚本应当成功：{done}");
+
+    // 摘要随状态一起回来：界面据此列出可选视图，且**不带数据行**。
+    let tables = done["tables"].as_array().expect("status 里应当有 tables");
+    assert_eq!(tables.len(), 1, "实际：{done}");
+    assert_eq!(tables[0]["name"], "memcpy 调用点");
+    assert_eq!(tables[0]["row_count"], 2);
+    assert_eq!(tables[0]["description"], "按直接调用 xref 收集");
+    assert!(
+        tables[0].get("rows").is_none(),
+        "摘要里不该有数据行（轮询响应要塞得下）：{}",
+        tables[0]
+    );
+    let columns = tables[0]["columns"].as_array().expect("columns");
+    assert_eq!(columns.len(), 4);
+    assert_eq!(columns[0]["kind"], "address");
+    assert_eq!(columns[1]["kind"], "text");
+    assert_eq!(columns[2]["kind"], "number");
+    assert_eq!(columns[3]["kind"], "bool");
+
+    // 数据行走单独的端点。
+    let (status, body) = send(
+        state.clone(),
+        get_with_token("/api/script/table?name=memcpy%20%E8%B0%83%E7%94%A8%E7%82%B9"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "取表应当成功：{body}");
+    assert_eq!(body["name"], "memcpy 调用点");
+    assert_eq!(body["total"], 2);
+    assert_eq!(body["offset"], 0);
+    assert_eq!(
+        body["rows"],
+        serde_json::json!([
+            ["0000000140009218", "main", 3.0, false],
+            ["0000000000401000", "helper", 2.0, true],
+        ]),
+        "地址列在 wire 上必须是定长十六进制字符串：{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_table_page_is_bounded_and_reports_the_total() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let source = r#"
+        const rows = [];
+        for (let i = 0; i < 1200; i++) { rows.push([i, '第 ' + i + ' 项']); }
+        bitflip.table('长表', [{name: '序号', type: 'number'}, '名字'], rows);
+    "#;
+    let (status, _) = start_run(&state, source).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let done = wait_for_done(&state).await;
+    assert!(done["error"].is_null(), "{done}");
+
+    // 默认页够大，也不至于把整张表一次吐出来。
+    let (status, body) = send(
+        state.clone(),
+        get_with_token("/api/script/table?name=%E9%95%BF%E8%A1%A8"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["total"], 1200,
+        "总数要如实报出，否则界面无法说明还有多少"
+    );
+    assert_eq!(body["rows"].as_array().expect("rows").len(), 1200);
+
+    // 分页取：第二页从这里开始。
+    let (status, body) = send(
+        state.clone(),
+        get_with_token("/api/script/table?name=%E9%95%BF%E8%A1%A8&offset=1190&count=100"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["offset"], 1190);
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 10, "越界的页必须只给剩下的行，而不是补空行");
+    assert_eq!(rows[0][0], 1190.0);
+
+    // 越界取整页：给空数组 + 真实总数，界面才能说"没有更多了"。
+    let (status, body) = send(
+        state.clone(),
+        get_with_token("/api/script/table?name=%E9%95%BF%E8%A1%A8&offset=99999"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 1200);
+    assert_eq!(body["rows"].as_array().expect("rows").len(), 0);
+
+    // 不合理的 count 明确拒绝，而不是悄悄按默认值办 —— 后者会让调用方
+    // 拿到比它以为的少得多的数据，还以为是全部。
+    for bad in ["count=0", "count=999999"] {
+        let (status, body) = send(
+            state.clone(),
+            get_with_token(&format!("/api/script/table?name=%E9%95%BF%E8%A1%A8&{bad}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad} 应当被拒绝：{body}");
+        assert!(
+            body["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "拒绝时必须给出说明：{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn asking_for_a_table_that_does_not_exist_lists_the_ones_that_do() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let (_, _) = start_run(&state, "bitflip.table('真实表', ['a'], [[1]]);").await;
+    let done = wait_for_done(&state).await;
+    assert!(done["error"].is_null(), "{done}");
+
+    let (status, body) = send(state.clone(), get_with_token("/api/script/table?name=nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let message = body["error"].as_str().expect("error");
+    assert!(
+        message.contains("nope") && message.contains("真实表"),
+        "要同时说清'没有这张'和'有哪些'：{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_table_request_becomes_an_honest_error_when_there_are_no_tables() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+
+    // 还没跑过脚本。
+    let (status, body) = send(state.clone(), get_with_token("/api/script/table?name=x")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("没有运行过脚本")),
+        "要说清原因，而不是给一张空表：{body}"
+    );
+
+    // 跑过，但脚本没产出表：要区分于上一条（原因不同，用户的下一步也不同）。
+    let (_, _) = start_run(&state, "bitflip.log('这次没有表');").await;
+    let done = wait_for_done(&state).await;
+    assert!(done["error"].is_null(), "{done}");
+    assert!(
+        done["tables"].as_array().expect("tables").is_empty(),
+        "没有产出就是没有：{done}"
+    );
+
+    let (status, body) = send(state.clone(), get_with_token("/api/script/table?name=x")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("bitflip.table")),
+        "要指出脚本需要显式产出表，而不是让用户去猜是不是坏了：{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_run_leaves_no_table_to_fetch() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let (_, _) = start_run(
+        &state,
+        "bitflip.table('半截表', ['a'], [[1], [2]]); throw new Error('之后失败了');",
+    )
+    .await;
+    let done = wait_for_done(&state).await;
+    assert!(!done["error"].is_null(), "这次运行应当失败：{done}");
+    assert!(
+        done["tables"].as_array().expect("tables").is_empty(),
+        "失败运行不得留下表：{done}"
+    );
+
+    let (status, body) = send(
+        state.clone(),
+        get_with_token("/api/script/table?name=%E5%8D%8A%E6%88%AA%E8%A1%A8"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "半截表不该取得到：{body}");
+}
+
+#[tokio::test]
+async fn the_previous_runs_table_is_not_served_under_the_new_run() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+    let (_, _) = start_run(&state, "bitflip.table('上一次的表', ['a'], [[1]]);").await;
+    let done = wait_for_done(&state).await;
+    assert!(done["error"].is_null(), "{done}");
+
+    // 第二次运行没有产出表：界面上的视图列表必须跟着清空，
+    // 否则用户会以为那是这次运行的结果。
+    let (_, _) = start_run(&state, "bitflip.log('这次什么都不产出');").await;
+    let done = wait_for_done(&state).await;
+    assert!(
+        done["tables"].as_array().expect("tables").is_empty(),
+        "{done}"
+    );
+    let (status, _) = send(
+        state.clone(),
+        get_with_token("/api/script/table?name=%E4%B8%8A%E4%B8%80%E6%AC%A1%E7%9A%84%E8%A1%A8"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_table_endpoint_needs_a_name_and_a_token() {
+    let (state, _target) = state_with_target(&build_elf_with_code());
+
+    // 缺 name：明确说清怎么调，而不是返回某张表（那会让调用方以为成功了）。
+    let (status, body) = send(state.clone(), get_with_token("/api/script/table")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().is_some_and(|e| e.contains("name")),
+        "要说清缺什么：{body}"
+    );
+
+    // 与其它脚本端点一样要有令牌：表里是用户目标的函数名与地址，
+    // 不是公开数据。令牌缺失与不匹配都是 403（与其它端点一致）。
+    let request = Request::builder()
+        .uri("/api/script/table?name=x")
+        .body(Body::empty())
+        .expect("构造请求");
+    let response = router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("路由响应");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
