@@ -634,6 +634,7 @@ fn sniff_ar(bytes: &[u8], g: &mut Guess, depth: u8) {
             offset: data_off as u64,
             size: data_size as u64,
             truncated: end > bytes.len(),
+            payload: is_payload_member,
         });
 
         // 成员数据按偶数对齐。
@@ -917,6 +918,19 @@ mod tests {
             "成员格式必须跳过符号索引后取到真实对象"
         );
         assert_eq!(g.arch, Some(ArchSpec::x86_64()));
+
+        // 成员"是不是对象"要能直接问出来，而不是靠名字前缀去猜：
+        // 消费方（成员遍历、签名生成）对元数据与"名字解析失败"的处置并不相同。
+        assert!(
+            !g.members[0].payload,
+            "符号索引不是装载对象的成员：{:?}",
+            g.members[0]
+        );
+        assert!(
+            g.members[1].payload,
+            "真实对象是载荷成员：{:?}",
+            g.members[1]
+        );
     }
 
     #[test]
