@@ -145,6 +145,15 @@ export interface InsnWire {
    * `reachable === false` 的行必须被显著地区分显示，而不是与可达指令同样对待。
    */
   reachable: boolean;
+  /** 源文件（来自调试信息）；目标没有调试信息时是 `null`。 */
+  file: string | null;
+  /**
+   * 源码行号（来自调试信息）；没有就是 `null`。
+   *
+   * 地址落在行与行之间时同样是 `null`：后端不返回"最近的那一行"，
+   * 界面也不许去找一行凑上 —— 那会显示成别的代码的行号。
+   */
+  line: number | null;
 }
 
 /** 一页反汇编。对应 `bitflip-core::InsnPage`。 */
@@ -296,6 +305,25 @@ export async function fetchSections(token: string | null): Promise<SectionsRespo
   }
 }
 
+/// 源位置显示：`文件名:行号`。
+///
+/// 只给文件名、不给完整目录：窄列里目录会把行号挤出去，而用户要的是"哪一行"；
+/// 完整路径放在 `title` 里，鼠标停上去能看到。没有调试信息时返回 `null` ——
+/// 界面据此**什么也不显示**，而不是显示"未知行号"之类的占位（CLAUDE.md §7）。
+export function formatSourcePosition(
+  file: string | null | undefined,
+  line: number | null | undefined,
+): string | null {
+  if (line === null || line === undefined) {
+    return null;
+  }
+  if (!file) {
+    return `行 ${line}`;
+  }
+  const base = file.split(/[\\/]/).pop() || file;
+  return `${base}:${line}`;
+}
+
 /** 把定长十六进制地址渲染成带 `0x` 前缀的形式。 */
 export function formatAddress(address: string | null | undefined): string {
   if (!address) {
@@ -366,6 +394,15 @@ export interface FunctionWire {
   confidence: number;
   /** 大小；`end` 未知时为 `null`。 */
   size: number | null;
+  /**
+   * 声明所在的源文件（来自调试信息）；没有调试信息时为 `null`。
+   *
+   * 只有在**函数入口与调试信息里的函数起始地址完全一致**时后端才会给 ——
+   * 所以界面可以直接信它，不需要再自己按范围去找一个"最近"的函数。
+   */
+  file: string | null;
+  /** 声明所在的行号（来自调试信息）；没有就是 `null`。 */
+  line: number | null;
 }
 
 /** 归档里的一个成员。对应 `bitflip-server` 的 `MemberWire`。 */
@@ -427,6 +464,15 @@ export interface XrefWire {
    * 把数据误认成了指令"。低可信度的行要显著区分显示。
    */
   reachable: boolean;
+  /**
+   * 发起指令所在的源文件（来自调试信息）；没有就是 `null`。
+   *
+   * 有了它，"谁调用了这个函数"能直接定位到**发起调用的那一行**，
+   * 而不是先跳到反汇编再自己找行号。
+   */
+  from_file: string | null;
+  /** 发起指令所在的源码行号（来自调试信息）；没有就是 `null`。 */
+  from_line: number | null;
 }
 
 /** 引用来源短名 → 中文标签。 */

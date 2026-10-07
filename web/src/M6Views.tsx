@@ -27,6 +27,7 @@ import {
   fetchReachability,
   fetchXrefSearch,
   formatAddress,
+  formatSourcePosition,
   normalizeAddress,
   XREF_KIND_LABELS,
   XREF_SOURCE_LABELS,
@@ -273,6 +274,15 @@ export function CallGraphView({
                       fn.name
                     ) : (
                       <span className="unknown">未命名</span>
+                    )}
+                    {/*
+                      调用图上的节点也带源位置：函数名告诉你"这是谁"，
+                      源位置告诉你"它在哪"。没有调试信息时这一行不出现。
+                    */}
+                    {formatSourcePosition(fn.file, fn.line) && (
+                      <span className="src-pos" title={fn.file ?? undefined}>
+                        {formatSourcePosition(fn.file, fn.line)}
+                      </span>
                     )}
                   </td>
                   <td>

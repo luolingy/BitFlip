@@ -1414,3 +1414,21 @@ button:not(:disabled):hover {
 .cell-bool {
   white-space: nowrap;
 }
+/* M8：源位置（调试信息给出的"哪一行"）。没有调试信息时这些元素根本不渲染，
+   所以不需要"空状态"样式 —— 空状态是缺失，不是一种样式。 */
+.disasm-src {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 11px;
+  opacity: 0.62;
+  white-space: nowrap;
+}
+
+.src-pos {
+  display: block;
+  font-size: 11px;
+  opacity: 0.62;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchInsns,
   formatAddress,
+  formatSourcePosition,
   type DisasmStats,
   type InsnWire,
   type InsnsResponse,
@@ -366,6 +367,9 @@ function InsnRow({
     classes.push("disasm-row-linear");
   }
 
+  // 源位置（调试信息）。没有调试信息时是 null —— 不显示，也不写"未知"。
+  const source = formatSourcePosition(insn.file, insn.line);
+
   return (
     <div
       className={classes.join(" ")}
@@ -382,6 +386,16 @@ function InsnRow({
       <span className={`disasm-flow flow-${insn.flow}`}>{insn.flow_label}</span>
       {insn.target && (
         <span className="disasm-target mono">{formatAddress(insn.target)}</span>
+      )}
+      {/*
+        源位置靠右显示（`margin-left: auto`）：它不像地址/目标那样属于控制流，
+        但又是"这条指令在源码哪一行"的唯一答案。没有调试信息时整列不出现，
+        而不是每行都挂一个"未知"。
+      */}
+      {source && (
+        <span className="disasm-src mono" title={insn.file ?? undefined}>
+          {source}
+        </span>
       )}
     </div>
   );

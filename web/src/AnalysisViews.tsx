@@ -24,6 +24,7 @@ import {
   fetchStrings,
   fetchXrefs,
   formatAddress,
+  formatSourcePosition,
   formatSize,
   normalizeAddress,
   putAnnotation,
@@ -182,6 +183,7 @@ export function FunctionsView({
                 <th>来源</th>
                 <th>置信度</th>
                 <th>大小</th>
+                <th>源位置</th>
               </tr>
             </thead>
             <tbody>
@@ -207,6 +209,18 @@ export function FunctionsView({
                       `${fn.size} B`
                     )}
                   </td>
+                  {/*
+                    源位置：函数名回答"这是谁"，源文件:行号回答"它在哪"。
+                    没有调试信息时显示"无"并说明原因 —— 空着会让人以为是界面漏了。
+                  */}
+                  <td className="mono src-pos" title={fn.file ?? undefined}>
+                    {formatSourcePosition(fn.file, fn.line) ?? (
+                      <span className="unknown" title="目标里没有这个函数的调试信息">
+                        无
+                      </span>
+                    )}
+                  </td>
+
                 </tr>
               ))}
             </tbody>
@@ -451,6 +465,15 @@ function XrefList({
                     title="点击查看该地址"
                   >
                     {formatAddress(xref.from)}
+                    {/*
+                      发起指令的源码行：用户问"谁调用了它"时，真正想知道的是
+                      "在哪一行调用的"。没有调试信息就不显示这一行。
+                    */}
+                    {formatSourcePosition(xref.from_file, xref.from_line) && (
+                      <span className="src-pos" title={xref.from_file ?? undefined}>
+                        {formatSourcePosition(xref.from_file, xref.from_line)}
+                      </span>
+                    )}
                   </td>
                   <td
                     className="mono row-clickable"
@@ -484,6 +507,7 @@ function XrefList({
                       </span>
                     )}
                   </td>
+
                 </tr>
               ))}
             </tbody>
@@ -662,6 +686,7 @@ export function StringsView({
                   <td className="string-cell" title={s.text}>
                     {s.text}
                   </td>
+
                 </tr>
               ))}
             </tbody>
