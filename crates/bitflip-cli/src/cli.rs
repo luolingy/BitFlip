@@ -80,6 +80,8 @@ pub enum Command {
     Functions(FunctionsArgs),
     /// 在目标里定位一个符号（函数名或地址）
     Symbol(SymbolArgs),
+    /// 签名库：从静态库生成签名文件、查看签名文件
+    Signature(SignatureArgs),
     /// 启动本地 Web 服务
     Serve(ServeArgs),
     /// 打印版本与 API 版本
@@ -256,6 +258,57 @@ pub struct SymbolArgs {
     pub raw: RawOverrideArgs,
 }
 
+/// `signature` 参数。
+#[derive(Debug, Args)]
+pub struct SignatureArgs {
+    /// 子命令
+    #[command(subcommand)]
+    pub command: SignatureCommand,
+}
+
+/// `signature` 的子命令。
+#[derive(Debug, Subcommand)]
+pub enum SignatureCommand {
+    /// 从静态库 / 目标文件生成签名文件
+    Build(SignatureBuildArgs),
+    /// 查看签名文件的内容与来源
+    Info(SignatureInfoArgs),
+}
+
+/// `signature build` 参数。
+#[derive(Debug, Args)]
+pub struct SignatureBuildArgs {
+    /// 输入：静态库（`.a` / `.lib`）或可重定位目标文件，可给多个
+    #[arg(value_name = "INPUT", required = true)]
+    pub inputs: Vec<PathBuf>,
+    /// 输出签名文件路径
+    #[arg(long, value_name = "FILE")]
+    pub out: PathBuf,
+    /// 覆盖已存在的签名文件
+    ///
+    /// 默认拒绝覆盖：签名文件是用户自己攒的资产，被一次手滑的命令清掉
+    /// 没有任何地方能恢复。要覆盖就明说。
+    #[arg(long)]
+    pub force: bool,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `signature info` 参数。
+#[derive(Debug, Args)]
+pub struct SignatureInfoArgs {
+    /// 签名文件
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+    /// 最多列出多少个名字（0 = 不列）
+    #[arg(long, default_value_t = 20, value_name = "N")]
+    pub count: usize,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `info` 参数。
 #[derive(Debug, Args)]
 pub struct InfoArgs {
@@ -405,6 +458,69 @@ mod tests {
         assert!(
             result.is_err(),
             "symbol 缺少 QUERY 应当解析失败，而不是拿空字符串去搜"
+        );
+    }
+
+    /// `signature` 的两个子命令必须能解析；`--out` 是必需的。
+    #[test]
+    fn signature_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "signature",
+            "build",
+            "libgcc.a",
+            "libmingw32.a",
+            "--out",
+            "mingw.sig.json",
+        ])
+        .expect("解析 signature build");
+        match cli.command {
+            Command::Signature(args) => match args.command {
+                SignatureCommand::Build(build) => {
+                    assert_eq!(build.inputs.len(), 2);
+                    assert_eq!(build.out.to_string_lossy(), "mingw.sig.json");
+                    // 默认拒绝覆盖：用户攒的签名文件不该被一次手滑清掉。
+                    assert!(!build.force);
+                    assert!(!build.json);
+                }
+                other => panic!("期望 build，得到 {other:?}"),
+            },
+            other => panic!("期望 signature，得到 {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "signature",
+            "info",
+            "mingw.sig.json",
+            "--count",
+            "5",
+        ])
+        .expect("解析 signature info");
+        match cli.command {
+            Command::Signature(args) => match args.command {
+                SignatureCommand::Info(info) => {
+                    assert_eq!(info.file.to_string_lossy(), "mingw.sig.json");
+                    assert_eq!(info.count, 5);
+                }
+                other => panic!("期望 info，得到 {other:?}"),
+            },
+            other => panic!("期望 signature，得到 {other:?}"),
+        }
+    }
+
+    /// 没给 `--out` 时不能"随便找个地方写"。
+    #[test]
+    fn signature_build_requires_an_output_path() {
+        let result = Cli::try_parse_from(["bitflip-cli", "signature", "build", "libgcc.a"]);
+        assert!(
+            result.is_err(),
+            "signature build 缺少 --out 应当解析失败，而不是默认写到当前目录"
+        );
+        let result = Cli::try_parse_from(["bitflip-cli", "signature", "build", "--out", "x.json"]);
+        assert!(
+            result.is_err(),
+            "signature build 缺少输入应当解析失败，而不是产出空文件"
         );
     }
 }

@@ -5,6 +5,7 @@ mod cli;
 mod info;
 mod members;
 mod serve;
+mod signature;
 mod tracing_setup;
 
 use std::process::ExitCode;
@@ -13,11 +14,12 @@ use clap::Parser;
 
 pub use cli::{
     Cli, Command, FunctionsArgs, InfoArgs, MembersArgs, OpenCli, RawOverrideArgs, ServeArgs,
-    SymbolArgs,
+    SignatureArgs, SignatureBuildArgs, SignatureCommand, SignatureInfoArgs, SymbolArgs,
 };
 pub use info::run_info;
 pub use members::{run_functions, run_members, run_symbol};
 pub use serve::{serve_blocking, ServeRequest};
+pub use signature::run_signature;
 
 /// `bitflip <target>` 的入口。
 #[must_use]
@@ -50,6 +52,7 @@ pub fn cli_main() -> ExitCode {
         Command::Members(args) => report(run_members(&args)),
         Command::Functions(args) => report(run_functions(&args)),
         Command::Symbol(args) => report(run_symbol(&args)),
+        Command::Signature(args) => report(run_signature(&args)),
         Command::Serve(args) => {
             let open_options = match args.raw.to_open_options() {
                 Ok(o) => o,
