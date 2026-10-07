@@ -1,0 +1,23 @@
+[package]
+name = "bitflip-debug"
+description = "BitFlip 调试信息来源：DWARF/PDB 中的函数名、源文件与行号"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bitflip-arch = { workspace = true }
+bitflip-loader = { workspace = true }
+gimli = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

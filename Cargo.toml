@@ -21,6 +21,7 @@ bitflip-loader = { path = "crates/bitflip-loader", version = "0.0.1" }
 bitflip-analyze = { path = "crates/bitflip-analyze", version = "0.0.1" }
 bitflip-symbols = { path = "crates/bitflip-symbols", version = "0.0.1" }
 bitflip-signature = { path = "crates/bitflip-signature", version = "0.0.1" }
+bitflip-debug = { path = "crates/bitflip-debug", version = "0.0.1" }
 bitflip-project = { path = "crates/bitflip-project", version = "0.0.1" }
 bitflip-core = { path = "crates/bitflip-core", version = "0.0.1" }
 bitflip-script = { path = "crates/bitflip-script", version = "0.0.1" }
@@ -31,6 +32,9 @@ bitflip-cli = { path = "crates/bitflip-cli", version = "0.0.1" }
 anyhow = "1"
 axum = "0.8"
 capstone = "0.14"
+# DWARF/PDB 解析（M8 交付物 1）。gimli 是纯 Rust、无 unsafe、无 C 依赖；pdb 同理，
+# 两者都只做读取，不引入任何运行期外部工具（交付形态仍是单文件可执行）。
+gimli = "0.31"
 clap = { version = "4", features = ["derive", "env"] }
 mime_guess = "2"
 rand = "0.8"

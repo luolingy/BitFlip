@@ -211,6 +211,20 @@ impl Endian {
             Self::Big => "be",
         }
     }
+
+    /// 是否小端。
+    ///
+    /// 给"把目标端序翻译成别的库的端序枚举"这类消费方用：下游拿到的应当是
+    /// 一个**值**，而不是自己去 `match` 端序变体 —— 那样端序知识会散到各层，
+    /// 与架构知识被门禁挡住的理由完全一样（见 scripts/check-arch-layering.ps1）。
+    pub const fn is_little(self) -> bool {
+        matches!(self, Self::Little)
+    }
+
+    /// 是否大端。
+    pub const fn is_big(self) -> bool {
+        matches!(self, Self::Big)
+    }
 }
 
 impl fmt::Display for Endian {

@@ -52,7 +52,11 @@ $guarded = @(
     'crates/bitflip-core/src',
     'crates/bitflip-server/src',
     'crates/bitflip-script/src',
-    'crates/bitflip-signature/src'
+    'crates/bitflip-signature/src',
+    # bitflip-debug is guarded for the same reason: DWARF/PDB describe source
+    # locations, not instructions. If it ever branched on architecture, one
+    # debug reader would silently become x86-only.
+    'crates/bitflip-debug/src'
 )
 
 # Architecture-specific tokens. Deliberately broad: a false positive costs a
@@ -117,7 +121,20 @@ foreach ($dir in $guarded) {
             if ($trimmed.StartsWith('//') -or $trimmed.StartsWith('*')) { continue }
 
             foreach ($token in $tokens) {
-                if ($line -notmatch [regex]::Escape($token)) { continue }
+                # For a type-qualified token (`Endian::Big`) require that nothing
+                # identifier-like sits immediately before it: a THIRD-PARTY type
+                # whose name merely ends with ours must not be reported, and the
+                # worst outcome for this gate is noise that trains people to add
+                # exceptions. `bitflip_arch::Endian::Big` still matches (the
+                # character before is `:`), `RunTimeEndian::Big` does not (it is
+                # `e`), and plain-word tokens keep the old substring rule so that
+                # `ARCH_X86_64` is still caught.
+                $pattern = if ($token.Contains('::')) {
+                    '(?<![\w])' + [regex]::Escape($token)
+                } else {
+                    [regex]::Escape($token)
+                }
+                if ($line -notmatch $pattern) { continue }
                 $isAllowed = $false
                 foreach ($a in $allowed) {
                     if ($token.StartsWith($a, [System.StringComparison]::Ordinal)) { $isAllowed = $true }
