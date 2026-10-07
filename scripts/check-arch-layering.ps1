@@ -41,11 +41,18 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 # Directories whose PRODUCTION code must be architecture-agnostic.
 # bitflip-arch itself is deliberately absent: that is where arch belongs.
+#
+# bitflip-signature is guarded because its whole job is to compare BYTES: it
+# consumes relocations and raw function bytes, and takes the target shape as a
+# value. If it ever branched on an architecture (e.g. "on x86 a call is rel32"),
+# the same signature set would silently stop being reusable across targets,
+# which is exactly the cumulative failure this gate exists to prevent.
 $guarded = @(
     'crates/bitflip-analyze/src',
     'crates/bitflip-core/src',
     'crates/bitflip-server/src',
-    'crates/bitflip-script/src'
+    'crates/bitflip-script/src',
+    'crates/bitflip-signature/src'
 )
 
 # Architecture-specific tokens. Deliberately broad: a false positive costs a

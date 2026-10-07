@@ -20,6 +20,7 @@ bitflip-arch = { path = "crates/bitflip-arch", version = "0.0.1" }
 bitflip-loader = { path = "crates/bitflip-loader", version = "0.0.1" }
 bitflip-analyze = { path = "crates/bitflip-analyze", version = "0.0.1" }
 bitflip-symbols = { path = "crates/bitflip-symbols", version = "0.0.1" }
+bitflip-signature = { path = "crates/bitflip-signature", version = "0.0.1" }
 bitflip-project = { path = "crates/bitflip-project", version = "0.0.1" }
 bitflip-core = { path = "crates/bitflip-core", version = "0.0.1" }
 bitflip-script = { path = "crates/bitflip-script", version = "0.0.1" }
