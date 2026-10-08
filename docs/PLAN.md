@@ -852,6 +852,14 @@ M6 交付物至此**全部完成**。
 **未做（继续 M8 时要接上的）**：交付物 1 的三处收尾（PE 调试目录里的 CodeView 记录 —— 现在按同名
 约定找 PDB；MSVC 名字反修饰；静态库成员的 PDB）；符号表 NOTYPE 符号里的函数名（见记录 9）。
 **浏览器目视确认**仍未做：源位置列与"另有 N 个候选"都只有数据层与测试撑着，没用人眼在浏览器里看过。
+**CodeView 收尾（做到一半，下一步接）**：`crates/bitflip-debug/src/codeview.rs` 的解析器已就位
+（4 条单测，含"截断到任意长度都不许 panic"），但真实 lld-link 样本上 `codeview::find` 返回 `None`。
+用 `llvm-readobj --coff-debug-directory tests/fixtures/generated/m8-pdb.exe` 拿到的真值：
+调试目录 RVA `0x2000`、条目 `Type=0x2 / SizeOfData=0x50 / PointerToRawData=0x61C`、
+记录里 `PDBFileName = F:\exeliang\BitFlip\tests\fixtures\generated\m8-pdb.pdb`、`PDBAge=1`。
+解析器的假设与这份真值对不上，偏差没查出来 —— 所以 `read_target` **没有**接这条路径（接了一半
+就宣布完成，是这一层最容易被当成"能用"的假象）。另：即便读到了记录，GUID/age 校验也没做
+（拿到 PDB 后应当核对 GUID/age，现在只按路径猜）。
 签名库本身待改进的两处：同形报"N 个候选之一"、按目标切换签名库（`Session` 已按目标持有，接口不缺）。
 交付物 1 的收尾：读 PE 调试目录里的 CodeView 记录（现在按同名约定找，别名 PDB 找不到）、
 MSVC 修饰名反修饰、静态库 PDB。

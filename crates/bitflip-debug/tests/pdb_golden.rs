@@ -299,9 +299,16 @@ fn a_target_without_a_pdb_says_so() {
         return;
     };
     let info = read_target(Some(&path), &object, &bytes);
+    // M8 收尾时改了文案：现在不仅说"没找到"，还要列出**试过哪些路径**
+    // （CodeView 记录里的路径 → 目标旁边的同名文件 → 同名约定）。§7：拿不到要说清楚拿了哪里。
     assert!(
-        info.notes.iter().any(|n| n.contains("没找到同名 PDB")),
+        info.notes.iter().any(|n| n.contains("没找到可读的 PDB")),
         "PE 目标找不到 PDB 时必须说明找过哪里，实际 notes={:?}",
+        info.notes
+    );
+    assert!(
+        info.notes.iter().any(|n| n.contains("m3-mingw-static.pdb")),
+        "notes 要列出试过的路径，实际 notes={:?}",
         info.notes
     );
 }

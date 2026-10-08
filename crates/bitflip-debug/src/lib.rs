@@ -30,6 +30,7 @@
 //! * 不做类型系统（M8 明确把类型后置）：结构体布局、变量位置一律不读。
 //! * 不因为调试信息缺失而失败：返回空的 [`DebugInfo`] 加一条 `notes` 说明。
 
+pub mod codeview;
 mod dwarf;
 pub mod pdb;
 
@@ -64,31 +65,70 @@ pub fn read_target(target: Option<&Path>, object: &Object, bytes: &[u8]) -> Debu
     let Some(path) = target else {
         return info;
     };
-    let Some(pdb_path) = default_pdb_path(path) else {
-        let mut info = info;
-        info.notes.push(format!(
-            "目标是 PE，但没找到同名 PDB（找的是 {}）—— 只有 DWARF 可读",
-            pdb_match_path(path).display()
-        ));
-        return info;
-    };
 
-    match std::fs::read(&pdb_path) {
-        Ok(pdb_bytes) => {
-            let mut info = info;
-            info.notes
-                .push(format!("读取同名 PDB {}", pdb_path.display()));
-            merge(info, read_pdb(object, &pdb_bytes))
+    // 找 PDB 的候选路径，按可信度排序：
+    //
+    // 1. PE 调试目录里 CodeView 记录写着的那条路径 —— 链接器当时用的，最权威（常是绝对路径）；
+    // 2. 记录里的文件名放到**目标文件旁边** —— 目标连同 PDB 一起搬走时用这个；
+    // 3. `foo.exe` → `foo.pdb` 的同名约定 —— 没有调试目录（不是 MSVC 链接、或记录被抹掉）时兜底。
+    //
+    // 三条都试不到就照实说"没找到"，并把试过哪些路径写进 notes。找到时也写清楚是**按哪条**
+    // 找到的：CodeView 记录里的路径可能指向一次旧构建，用户得能看见我们用的是哪一个（§7）。
+    let record = codeview::find(bytes);
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(record) = &record {
+        let from_record = std::path::PathBuf::from(&record.path);
+        if let Some(name) = from_record.file_name() {
+            if let Some(dir) = path.parent() {
+                candidates.push(dir.join(name));
+            }
         }
-        Err(err) => {
-            let mut info = info;
-            info.notes.push(format!(
-                "找到 {} 但读不了（{err}）—— 只有 DWARF 可读",
-                pdb_path.display()
-            ));
-            info
+        // 记录路径排最后入列、但可信度最高 —— 建列时先放它，前面 push 的名字只是它的旁支。
+        let sibling = candidates.pop();
+        candidates.insert(0, from_record);
+        if let Some(sibling) = sibling {
+            candidates.push(sibling);
         }
     }
+    let convention = pdb_match_path(path);
+    if !candidates.iter().any(|candidate| candidate == &convention) {
+        candidates.push(convention);
+    }
+
+    let mut tried: Vec<String> = Vec::new();
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return match std::fs::read(candidate) {
+                Ok(pdb_bytes) => {
+                    let mut info = info;
+                    info.notes.push(format!(
+                        "读取 PDB {}（按{}找到）",
+                        candidate.display(),
+                        match &record {
+                            Some(_) => "调试目录里的 CodeView 记录",
+                            None => "同名约定",
+                        }
+                    ));
+                    merge(info, read_pdb(object, &pdb_bytes))
+                }
+                Err(err) => {
+                    let mut info = info;
+                    info.notes.push(format!(
+                        "找到 {} 但读不了（{err}）—— 只有 DWARF 可读",
+                        candidate.display()
+                    ));
+                    info
+                }
+            };
+        }
+        tried.push(candidate.display().to_string());
+    }
+    let mut info = info;
+    info.notes.push(format!(
+        "目标是 PE，但没找到可读的 PDB —— 试过 {}；只有 DWARF 可读",
+        tried.join("、")
+    ));
+    info
 }
 
 /// 按约定会去找的那个 PDB 路径（不检查是否存在），用于把"找过哪里"写进 `notes`。
