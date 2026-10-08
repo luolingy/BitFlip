@@ -92,7 +92,13 @@ pub fn find(pe: &[u8]) -> Option<Record> {
     let entries = usize::try_from(debug_size).ok()? / DEBUG_DIRECTORY_ENTRY;
     for index in 0..entries {
         let entry = debug_at + index * DEBUG_DIRECTORY_ENTRY;
-        if u32_at(pe, entry)? != TYPE_CODEVIEW {
+        // `IMAGE_DEBUG_DIRECTORY` 的字段顺序：Characteristics(+0)、TimeDateStamp(+4)、
+        // MajorVersion(+8)、MinorVersion(+10)、**Type(+12)**、SizeOfData(+16)、
+        // AddressOfRawData(+20)、PointerToRawData(+24)。
+        // 踩过的坑：把 Type 读在 +0（那是 Characteristics），于是永远匹配不上 —— 单元测试
+        // 当时是绿的，因为测试里的合成镜像按同一个错误假设拼的（自证其说）。
+        // 所以这里写下偏移，测试也按同一份规格拼，另外有一条真实样本测试兜底。
+        if u32_at(pe, entry + 12)? != TYPE_CODEVIEW {
             continue;
         }
         let size = usize::try_from(u32_at(pe, entry + 16)?).ok()?;
@@ -155,7 +161,7 @@ mod tests {
         pe[sections + 20..sections + 24].copy_from_slice(&0x200u32.to_le_bytes());
         // 调试目录条目：CodeView，数据在文件偏移 0x400
         let entry = 0x200usize;
-        pe[entry..entry + 4].copy_from_slice(&TYPE_CODEVIEW.to_le_bytes());
+        pe[entry + 12..entry + 16].copy_from_slice(&TYPE_CODEVIEW.to_le_bytes());
         pe[entry + 16..entry + 20].copy_from_slice(&(cv.len() as u32).to_le_bytes());
         pe[entry + 20..entry + 24].copy_from_slice(&debug_rva.to_le_bytes());
         pe[entry + 24..entry + 28].copy_from_slice(&0x400u32.to_le_bytes());
@@ -210,7 +216,7 @@ mod tests {
     fn a_non_codeview_debug_entry_is_skipped() {
         let mut pe = synthetic_pe(&rsds("x.pdb"));
         let entry = 0x200usize;
-        pe[entry..entry + 4].copy_from_slice(&16u32.to_le_bytes()); // IMAGE_DEBUG_TYPE_VC_FEATURE
+        pe[entry + 12..entry + 16].copy_from_slice(&16u32.to_le_bytes()); // IMAGE_DEBUG_TYPE_VC_FEATURE
         assert!(find(&pe).is_none(), "非 CodeView 条目不该被当成记录");
     }
 }

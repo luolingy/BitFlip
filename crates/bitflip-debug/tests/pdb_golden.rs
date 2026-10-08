@@ -327,3 +327,69 @@ fn an_empty_pdb_is_reported() {
         info.notes
     );
 }
+
+#[test]
+fn the_pe_debug_directory_points_at_the_pdb() {
+    // 真值来自 lld-link 写下的 CodeView 记录。失败时把头部与节表整张打出来 ——
+    // 这条链断在哪一步（节表映射？条目偏移？）光看"返回 None"是查不出来的。
+    let path = fixtures().join("m8-pdb.exe");
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("SKIPPED: 缺少 {}", path.display());
+        return;
+    };
+    let u16_at = |at: usize| -> u16 { u16::from_le_bytes([bytes[at], bytes[at + 1]]) };
+    let u32_at = |at: usize| -> u32 {
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    };
+    let pe_offset = u32_at(0x3c) as usize;
+    let coff = pe_offset + 4;
+    let section_count = u16_at(coff + 2) as usize;
+    let optional_size = u16_at(coff + 16) as usize;
+    let optional = coff + 20;
+    let magic = u16_at(optional);
+    eprintln!("pe_offset=0x{pe_offset:x} magic=0x{magic:x} sections={section_count} optsize=0x{optional_size:x}");
+    let data_directory = match magic {
+        0x10b => optional + 96,
+        0x20b => optional + 112,
+        other => {
+            eprintln!("unexpected magic 0x{other:x}");
+            return;
+        }
+    };
+    for index in 0..7 {
+        let rva = u32_at(data_directory + index * 8);
+        let size = u32_at(data_directory + index * 8 + 4);
+        if rva != 0 {
+            eprintln!("  dir[{index}] rva=0x{rva:x} size=0x{size:x}");
+        }
+    }
+    let debug_rva = u32_at(data_directory + 6 * 8);
+    let debug_size = u32_at(data_directory + 6 * 8 + 4);
+    let sections_at = optional + optional_size;
+    eprintln!("sections at 0x{sections_at:x}, debug rva=0x{debug_rva:x} size=0x{debug_size:x}");
+    for index in 0..section_count {
+        let entry = sections_at + index * 40;
+        let name = String::from_utf8_lossy(&bytes[entry..entry + 8])
+            .trim_end_matches('\0')
+            .to_string();
+        let virtual_size = u32_at(entry + 8);
+        let virtual_address = u32_at(entry + 12);
+        let raw_size = u32_at(entry + 16);
+        let raw_ptr = u32_at(entry + 20);
+        let covers = debug_rva >= virtual_address
+            && debug_rva - virtual_address < raw_size.max(virtual_size).max(1);
+        eprintln!(
+            "  {name:<8} va=0x{virtual_address:x} vsize=0x{virtual_size:x} rawsize=0x{raw_size:x} rawptr=0x{raw_ptr:x}{}",
+            if covers { "  <-- 覆盖调试目录 RVA" } else { "" }
+        );
+    }
+    let record = bitflip_debug::codeview::find(&bytes);
+    eprintln!("codeview::find -> {record:?}");
+    let record = record.expect("调试目录里应当有 RSDS 记录");
+    assert!(
+        record.path.contains("m8-pdb.pdb"),
+        "记录里的路径应当指向构建时用的 PDB，实际 {}",
+        record.path
+    );
+    assert!(record.age > 0, "age 应当非零");
+}
