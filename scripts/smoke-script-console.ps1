@@ -245,6 +245,26 @@ try {
         Check -Label "SPA bundle contains the script console" `
             -Ok ($bundle.Text -match 'bitflip\.script\.library\.v1')
 
+        # M8 deliverable 4: the alias/conflict marker must be inside the EMBEDDED bundle.
+        # Checking the source is not enough -- the bundle is what users see, and a stale
+        # bundle is the realistic failure here. The class name only exists in the new build.
+        Check -Label "SPA bundle contains the alias/conflict marker" `
+            -Ok ($bundle.Text -match 'chip-conflict')
+
+        # M8: every function row must carry an aliases array (empty is fine, missing is not),
+        # and the builtin-pattern accounting must reach the notes the UI shows.
+        $functions = Get-Json "$base/api/functions?offset=0&count=200"
+        Check -Label "functions answers 200" -Ok ($functions.Status -eq 200) -Detail "HTTP $($functions.Status)"
+        $rows = @()
+        if ($functions.Body) { $rows = @($functions.Body.functions) }
+        Check -Label "functions returns rows" -Ok ($rows.Count -gt 0) -Detail "$($rows.Count) row(s)"
+        $missing = @($rows | Where-Object { $null -eq $_.aliases }).Count
+        Check -Label "every function row carries an aliases array" -Ok ($missing -eq 0) -Detail "missing=$missing"
+        $notes = @()
+        if ($functions.Body) { $notes = @($functions.Body.notes) }
+        $builtin = @($notes | Where-Object { $_ -match '___chkstk_ms' }).Count
+        Check -Label "notes carry the builtin pattern accounting" -Ok ($builtin -ge 1) -Detail "$builtin line(s)"
+
         # -- acceptance 1 through HTTP, using the SHIPPED source --
         $memcpySource = [string](($library.Body.scripts | Where-Object { $_.id -eq 'memcpy-args' }).source)
         Check -Label "memcpy script source came back" -Ok ($memcpySource.Length -gt 500) -Detail "$($memcpySource.Length) chars"
