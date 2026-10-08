@@ -403,6 +403,28 @@ export interface FunctionWire {
   file: string | null;
   /** 声明所在的行号（来自调试信息）；没有就是 `null`。 */
   line: number | null;
+  /**
+   * 同一地址上**名字不同**的其他候选（M8 交付物 4）。
+   *
+   * 后端按来源优先级选定名字，但落选的说法不会消失 —— 用户看到"符号表说 memcpy、
+   * 签名库说另一个名字"时，才有资格自己判断。空数组表示没有别的说法，不是"没分析"。
+   */
+  aliases: FunctionAliasWire[];
+}
+
+/**
+ * 同一地址上的"另一种说法"（M8 交付物 4）。
+ *
+ * 来源取值与 `FunctionWire.source` / `source_label` 是同一套，所以界面不需要第二套映射。
+ */
+export interface FunctionAliasWire {
+  name: string;
+  /** 来源的 wire 名。 */
+  source: string;
+  /** 来源的中文名。 */
+  source_label: string;
+  /** 该候选自己的置信度（0–100）。 */
+  confidence: number;
 }
 
 /** 归档里的一个成员。对应 `bitflip-server` 的 `MemberWire`。 */

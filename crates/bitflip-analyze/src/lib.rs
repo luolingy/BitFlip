@@ -7,6 +7,7 @@
 
 mod addrspace;
 mod args;
+pub mod builtins;
 mod callgraph;
 mod cfg;
 mod codemap;

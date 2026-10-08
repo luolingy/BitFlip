@@ -195,6 +195,21 @@ export function FunctionsView({
                   </td>
                   <td>
                     <span className="chip chip-small">{fn.source_label}</span>
+                    {/*
+                      多来源冲突：同一个地址上还有别的说法。界面**不替用户选**，也不把落选者
+                      藏起来 —— 只把"还有几个"和它们分别是谁摆出来（M8 交付物 4）。
+                      鼠标停在上面能看到每个候选的名字、来源与置信度。
+                    */}
+                    {fn.aliases.length > 0 && (
+                      <span
+                        className="chip chip-small chip-conflict"
+                        title={fn.aliases
+                          .map((a) => `${a.name} — ${a.source_label}（置信度 ${a.confidence}）`)
+                          .join("\n")}
+                      >
+                        另有 {fn.aliases.length} 个候选
+                      </span>
+                    )}
                   </td>
                   <td>
                     <ConfidenceBar value={fn.confidence} />

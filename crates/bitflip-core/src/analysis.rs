@@ -96,6 +96,12 @@ pub struct FunctionWire {
     pub confidence: u8,
     /// 大小（`end` 未知时 `null`）。
     pub size: Option<u64>,
+    /// 同一地址上**名字不同**的其他候选（M8 交付物 4）。
+    ///
+    /// 选谁由优先级决定（见 `bitflip-symbols`），但**落选的那些不该消失** —— 用户看到
+    /// "符号表说 memcpy、签名库说别的东西"时，才有资格自己判断。空数组表示没有别的说法，
+    /// **不表示没有分析**。
+    pub aliases: Vec<AliasWire>,
     /// 声明所在的源文件（来自调试信息）；没有就是 `null`。
     ///
     /// 只在**函数入口正好等于调试信息里的函数起始地址**时给出：调试信息是按
@@ -1143,6 +1149,61 @@ impl TargetAnalysis {
             }
         }
 
+        // ── 来源 9：编译器内置模式（M8 交付物 3）──
+        //
+        // 与来源 7（用户签名库）的分工：签名库的指纹抽自用户机器上的静态库，目标是
+        // "找回那些库函数的名字"；这里认的是**编译器自己生成**的函数（栈探测助手之类），
+        // 判据是公开、可复核的固定字节序列，所以一台没有签名库的机器也能用。
+        //
+        // 边界可以不知道：判据自己会在窗口内**第一条 `ret`** 处收尾（x86-64 上直线代码
+        // 就是这么结束的），所以不必先拿到展开表/调试信息。实测 mingw 的那个纯汇编小助手
+        // 没有 `.pdata` 条目 —— 如果这里要求"边界已知"，它在剥光符号的目标上就永远认不出来。
+        // 已知边界时仍然只用这个函数自己的字节（读多了是别人的）。
+        let mut builtin_hits = 0usize;
+        {
+            let mut probe_sizes: HashMap<u64, u64> = object
+                .unwind
+                .iter()
+                .map(|entry| (entry.begin, entry.end))
+                .collect();
+            for (start, end) in &debug_ranges {
+                probe_sizes.insert(*start, *end);
+            }
+
+            let window = u64::try_from(bitflip_analyze::builtins::PATTERN_WINDOW).unwrap_or(0x60);
+            let mut addrs: Vec<u64> = by_addr.keys().copied().collect();
+            addrs.sort_unstable();
+            for addr in addrs {
+                let need = match probe_sizes.get(&addr).copied() {
+                    Some(end) => end.saturating_sub(addr).min(window),
+                    None => window,
+                };
+                if need == 0 {
+                    continue;
+                }
+                let Ok(want) = usize::try_from(need) else {
+                    continue;
+                };
+                let Some(bytes) = disasm.space.read(addr, want) else {
+                    continue;
+                };
+                let Some(hit) = bitflip_analyze::builtins::match_builtin(&bytes) else {
+                    continue;
+                };
+                by_addr.entry(addr).or_default().push(SymbolCandidate {
+                    addr,
+                    name: hit.name.to_string(),
+                    source: SymbolSource::BuiltinPattern,
+                    confidence: hit.confidence,
+                });
+                builtin_hits += 1;
+            }
+        }
+        // 报账：判据有几条、命中几个，都写在结论里。没命中不代表目标里没有编译器生成的
+        // 函数，只代表这条判据不管 —— 这句话必须让用户看到，否则"零命中"会被读成"没有"。
+        notes.push(format!(
+            "编译器内置模式库：1 条判据（GCC x64 逐页栈探测助手 ___chkstk_ms），命中 {builtin_hits} 个函数"
+        ));
         // ── xref 提取（与候选收集同一遍流式解码）──
         //
         // 每条引用带两个元数据字段（M6 交付物 7）：
@@ -1209,6 +1270,7 @@ impl TargetAnalysis {
                 size: f.end.map(|e| e.saturating_sub(addr)),
                 file: site.and_then(|(file, _)| file.clone()),
                 line: site.and_then(|(_, line)| *line),
+                aliases: aliases_for(&f.name, &f.candidates),
             });
         }
         if call_target_count > 0 {
@@ -2920,6 +2982,7 @@ mod tests {
             size: end.map(|e| e - start),
             file: None,
             line: None,
+            aliases: Vec::new(),
         };
         let analysis = TargetAnalysis {
             functions: vec![mk(0x1000, Some(0x1040)), mk(0x2000, None)],
@@ -3124,4 +3187,155 @@ mod tests {
         assert_eq!(page.truncated(), 3);
         assert!(!filter.is_empty() || filter.matches(&all[0]));
     }
+
+    /// 别名里不该出现边界编码（`\t<end>`）或空名字 —— 两者都"不是名字"。
+    #[test]
+    fn alias_names_are_never_encoding_artifacts() {
+        let cand = |name: &str| SymbolCandidate {
+            addr: 0x1000,
+            name: name.to_string(),
+            source: SymbolSource::Unwind,
+            confidence: 85,
+        };
+        for raw in ["plain\t140001010", "\t140001010", "   "] {
+            for row in aliases_for("", &[cand(raw)]) {
+                assert!(!row.name.contains('\t'), "别名名字里还有边界编码：{row:?}");
+                assert!(!row.name.trim().is_empty(), "别名名字不该是空的：{row:?}");
+            }
+        }
+        let rows = aliases_for("", &[cand("plain\t140001010")]);
+        assert_eq!(rows.len(), 1, "有名字的那种必须留下：{rows:?}");
+        assert_eq!(rows[0].name, "plain");
+    }
+
+    /// 冲突展示：同一地址上"别的说法"要留下，但未命名的候选与同名的候选都不算冲突。
+    #[test]
+    fn aliases_keep_other_sayings_but_not_placeholders() {
+        let rows = aliases_for(
+            "memcpy",
+            &[
+                SymbolCandidate {
+                    addr: 0x1000,
+                    name: "memcpy".into(),
+                    source: SymbolSource::SymbolTable,
+                    confidence: 70,
+                },
+                SymbolCandidate {
+                    addr: 0x1000,
+                    name: "bcrypt_hash".into(),
+                    source: SymbolSource::Signature,
+                    confidence: 60,
+                },
+                // 未命名候选是"没认出来"，不是"另一种说法"。
+                SymbolCandidate {
+                    addr: 0x1000,
+                    name: "   ".into(),
+                    source: SymbolSource::Discovery,
+                    confidence: 40,
+                },
+                // 同名不同来源是相互印证，也不是冲突。
+                SymbolCandidate {
+                    addr: 0x1000,
+                    name: "memcpy".into(),
+                    source: SymbolSource::Export,
+                    confidence: 90,
+                },
+            ],
+        );
+        assert_eq!(rows.len(), 1, "只应留下一个真正不同的说法：{rows:?}");
+        assert_eq!(rows[0].name, "bcrypt_hash");
+        assert_eq!(rows[0].source, "signature");
+        assert_eq!(rows[0].source_label, "签名库");
+        assert_eq!(rows[0].confidence, 60);
+
+        // 强来源排前面：用户的说法在最前，启发式在最后。
+        let rows = aliases_for(
+            "memcpy",
+            &[
+                SymbolCandidate {
+                    addr: 0x1000,
+                    name: "heuristic_name".into(),
+                    source: SymbolSource::Heuristic,
+                    confidence: 99,
+                },
+                SymbolCandidate {
+                    addr: 0x1000,
+                    name: "my_name".into(),
+                    source: SymbolSource::User,
+                    confidence: 10,
+                },
+                SymbolCandidate {
+                    addr: 0x1000,
+                    name: "bcrypt_hash".into(),
+                    source: SymbolSource::Signature,
+                    confidence: 60,
+                },
+            ],
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["my_name", "bcrypt_hash", "heuristic_name"]
+        );
+    }
+}
+
+/// 同一地址上**名字不同**的其他候选（M8 交付物 4）。
+///
+/// BitFlip 的候选是"多个来源各说各话"：符号表、导出表、调试信息、签名库、调用目标推断
+/// 都可能给同一个地址起名字。选谁由优先级决定（见 `bitflip-symbols`），但落选的那些不该
+/// 消失 —— 用户看到"符号表说 memcpy、签名库说另一个名字"时，才有资格自己判断。
+///
+/// 两条与诚实性有关的选择：
+///
+/// * 只收**有名字**的候选。未命名的候选不是"另一种说法"，而是"没认出来"，混进来会让
+///   人以为存在冲突（CLAUDE.md §7）。与最终采用的名字**相同**的候选也不算"别的说法" ——
+///   它们是相互印证，不是冲突。
+/// * `[]` 表示没有别的说法，不表示"没分析"；界面上据此显示"另有 N 个候选"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasWire {
+    /// 候选名字。
+    pub name: String,
+    /// 候选来源的 wire 名（与 `FunctionWire::source` 同一套）。
+    pub source: String,
+    /// 候选来源的中文名。
+    pub source_label: String,
+    /// 该候选自己的置信度（0–100）。
+    pub confidence: u8,
+}
+
+/// 收集"同一地址、不同名字"的候选。强来源排前面，用户一眼看出谁的说法更硬。
+fn aliases_for(chosen: &str, candidates: &[SymbolCandidate]) -> Vec<AliasWire> {
+    let mut rows: Vec<(SymbolSource, u8, String)> = Vec::new();
+    for c in candidates {
+        // 候选名字里可能带 `\t<end-hex>` 后缀（边界编码，见 `bitflip-analyze` 的
+        // `merge_candidates`：来源把"这个函数到哪结束"编码在名字后面）。这里要的是
+        // 用户看得见的那个名字，所以按第一个 `\t` 截断 —— 否则界面上会列出
+        // "140001010" 这种根本不是名字的东西。
+        let name = c.name.split('\t').next().unwrap_or("").trim();
+        if name.is_empty() || name == chosen {
+            continue;
+        }
+        if rows
+            .iter()
+            .any(|(source, _, existing)| *source == c.source && existing == name)
+        {
+            continue;
+        }
+        rows.push((c.source, c.confidence, name.to_string()));
+    }
+    rows.sort_by_key(|(source, confidence, name)| {
+        (
+            source.priority(),
+            std::cmp::Reverse(*confidence),
+            name.clone(),
+        )
+    });
+    rows.into_iter()
+        .map(|(source, confidence, name)| AliasWire {
+            name,
+            source: source.as_str().to_string(),
+            source_label: source.label_zh().to_string(),
+            confidence,
+        })
+        .collect()
 }

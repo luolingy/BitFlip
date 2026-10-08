@@ -1432,3 +1432,10 @@ button:not(:disabled):hover {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* M8 交付物 4：多来源冲突。不是错误提示，是"还有别的说法" —— 所以用中性偏警示的色调，
+   与"未识别"（unknown）明确区分：冲突说明我们**有两个**结论，未识别说明一个都没有。 */
+.chip-conflict {
+  background: rgba(214, 158, 46, 0.18);
+  border-color: rgba(214, 158, 46, 0.45);
+  cursor: help;
+}

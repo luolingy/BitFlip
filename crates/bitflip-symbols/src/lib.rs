@@ -38,6 +38,12 @@ pub enum SymbolSource {
     Unwind,
     /// 导入 thunk（IAT/PLT 桩）。
     ImportThunk,
+    /// 编译器内置模式：由固定字节形状认出的编译器/运行时生成函数（M8 交付物 3）。
+    ///
+    /// 与 [`Self::Signature`] 的区别在证据来源：签名库的指纹抽自用户机器上的库，
+    /// 而这里的判据是**手写的、公开的、可复核的**固定序列（例如 GCC 的 `chkstk.S`）。
+    /// 形状相同也可能意味着别的东西，所以它排在所有"事实"之后、纯推断之前。
+    BuiltinPattern,
     /// 重定位驱动的指针表：虚表、`__init_array`、跳转表等。
     ///
     /// 与 [`Self::Discovery`] 的区别在于证据强度：重定位表明确写着
@@ -64,6 +70,7 @@ impl SymbolSource {
             Self::Unwind => "unwind",
             Self::ImportThunk => "import-thunk",
             Self::RelocPointer => "reloc-pointer",
+            Self::BuiltinPattern => "builtin-pattern",
             Self::Discovery => "discovery",
             Self::Heuristic => "heuristic",
         }
@@ -82,6 +89,7 @@ impl SymbolSource {
             Self::Unwind => "展开表",
             Self::ImportThunk => "导入桩",
             Self::RelocPointer => "重定位指针表",
+            Self::BuiltinPattern => "编译器模式",
             Self::Discovery => "分析推断",
             Self::Heuristic => "启发式",
         }
@@ -105,6 +113,9 @@ impl SymbolSource {
             // 指针"是确定的；但"这个指针指向函数"仍是推断（也可能是数据
             // 指针），因此排在导入桩之后、分析推断之前。
             Self::RelocPointer => 65,
+            // 内置模式是间接证据：形状是编译器生成的固定套路，确实不是猜的；
+            // 但"形状像"不等于"就是它"，所以排在所有事实之后、纯推断之前。
+            Self::BuiltinPattern => 68,
             Self::Discovery => 70,
             Self::Heuristic => 90,
         }
