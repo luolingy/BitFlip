@@ -854,8 +854,11 @@ M6 交付物至此**全部完成**。
     界面可读、身份不变（签名库/脚本/地址表仍按原始名匹配）。真值取自 MSVC 的 `undname.exe`，
     其中 `?foo@@YAHH@Z` → `int __cdecl foo(int)` 是两方印证。已知风格差异（`__ptr64`）与本机缺
     `llvm-undname` 的事实写在代码注释里。
-    **未完成**：没有 MSVC 名字的端到端样本（现有 fixture 都是 C/Itanium，没有 `?…@@` 名字流过链路），
-    下一步用 `cl.exe`/`clang-cl` 编 C++ 样例（`/Zi` + PDB）+ `undname`/`dumpbin` 取真值补上。
+    **端到端已验**：`tests/fixtures/m8_cxx_sample.cpp` + `scripts/gen-cxx-fixture.ps1`
+    （clang-cl `/Zi` + `lld-link /debug`；真值走 `dumpbin /symbols` + `undname`）。分析 `m8-cxx.obj` 实测：
+    显示名 `public: int __cdecl Widget::bar(int)`，`aliases` 留存 `?bar@Widget@@QEAAHH@Z`。
+    注意风格差异：golden 存 `undname` 原话（带 `__ptr64`），我们输出 LLVM 风格，断言要按语义比。
+    仍欠：自动化回归测试；以及"PDB 路径上可读名从哪来"没查清（那条路上反修饰没被用到）。
 
 **未做（继续 M8 时要接上的）**：交付物 1 的收尾（静态库成员的 PDB —— 现在
 只做镜像本身，PE 调试目录与 CodeView 记录见记录 10）；符号表 NOTYPE 符号里的函数名（见记录 9）。
