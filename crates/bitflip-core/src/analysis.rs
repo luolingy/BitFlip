@@ -1262,7 +1262,8 @@ impl TargetAnalysis {
             functions.push(FunctionWire {
                 start: hex16(addr),
                 end: f.end.map(hex16),
-                name: f.name.clone(),
+                name: bitflip_debug::demangle::readable_name(&f.name)
+                    .unwrap_or_else(|| f.name.clone()),
                 named: !f.name.is_empty(),
                 source: f.name_source.as_str().to_string(),
                 source_label: f.name_source.label_zh().to_string(),
@@ -1270,7 +1271,11 @@ impl TargetAnalysis {
                 size: f.end.map(|e| e.saturating_sub(addr)),
                 file: site.and_then(|(file, _)| file.clone()),
                 line: site.and_then(|(_, line)| *line),
-                aliases: aliases_for(&f.name, &f.candidates),
+                aliases: aliases_for(
+                    &bitflip_debug::demangle::readable_name(&f.name)
+                        .unwrap_or_else(|| f.name.clone()),
+                    &f.candidates,
+                ),
             });
         }
         if call_target_count > 0 {
@@ -3189,6 +3194,26 @@ mod tests {
     }
 
     /// 别名里不该出现边界编码（`\t<end>`）或空名字 —— 两者都"不是名字"。
+    /// 名字反修饰之后，"身份"必须还在：界面显示可读名，`aliases` 里留着原始修饰名。
+    ///
+    /// 这条测试盯的就是那个最容易犯的错 —— 把原始名丢掉。签名库、脚本、地址表都按原始名匹配，
+    /// 丢了它们就全废；而用户只需要看到 `int __cdecl foo(int)` 而不是 `?foo@@YAHH@Z`。
+    #[test]
+    fn the_raw_mangled_name_survives_as_an_alias() {
+        let candidates = vec![SymbolCandidate {
+            addr: 0x1000,
+            name: "?foo@@YAHH@Z".to_string(),
+            source: SymbolSource::DebugInfo,
+            confidence: 90,
+        }];
+        let display = bitflip_debug::demangle::readable_name(&candidates[0].name)
+            .unwrap_or_else(|| candidates[0].name.clone());
+        assert_eq!(display, "int __cdecl foo(int)");
+        let aliases = aliases_for(&display, &candidates);
+        assert_eq!(aliases.len(), 1, "原始名应当作为别名留下：{aliases:?}");
+        assert_eq!(aliases[0].name, "?foo@@YAHH@Z");
+        assert_eq!(aliases[0].source_label, "调试信息");
+    }
     #[test]
     fn alias_names_are_never_encoding_artifacts() {
         let cand = |name: &str| SymbolCandidate {
