@@ -97,31 +97,34 @@ pub fn read_target(target: Option<&Path>, object: &Object, bytes: &[u8]) -> Debu
 
     let mut tried: Vec<String> = Vec::new();
     for candidate in &candidates {
-        if candidate.is_file() {
-            return match std::fs::read(candidate) {
-                Ok(pdb_bytes) => {
-                    let mut info = info;
-                    info.notes.push(format!(
-                        "读取 PDB {}（按{}找到）",
-                        candidate.display(),
-                        match &record {
-                            Some(_) => "调试目录里的 CodeView 记录",
-                            None => "同名约定",
-                        }
-                    ));
-                    merge(info, read_pdb(object, &pdb_bytes))
-                }
-                Err(err) => {
-                    let mut info = info;
-                    info.notes.push(format!(
-                        "找到 {} 但读不了（{err}）—— 只有 DWARF 可读",
-                        candidate.display()
-                    ));
-                    info
-                }
-            };
+        let Ok(pdb_bytes) = std::fs::read(candidate) else {
+            tried.push(format!("{}（没有这个文件或读不了）", candidate.display()));
+            continue;
+        };
+        let identity = pdb::pdb_identity(&pdb_bytes);
+        // 有记录就必须核对 GUID/age：同目录放着一个**上一次构建**的同名 PDB 很常见，
+        // 名字对、内容不对，用它就会把旧行号安到新镜像上。核对不了就照实说核不了，
+        // 而不是默认它配得上（§7）。
+        if let (Some(record), Some((guid, age))) = (&record, &identity) {
+            if !codeview::matches(record, guid, *age) {
+                tried.push(format!(
+                    "{}（GUID/age 与调试目录记录不符：{guid}/{age} ≠ {}/{}，疑似别的构建，不采用）",
+                    candidate.display(),
+                    codeview::guid_text(&record.guid),
+                    record.age
+                ));
+                continue;
+            }
         }
-        tried.push(candidate.display().to_string());
+        let how = match (&record, &identity) {
+            (Some(_), Some(_)) => "调试目录里的 CodeView 记录，GUID/age 已核对",
+            (Some(_), None) => "调试目录里的 CodeView 记录，但 PDB 头读不出、GUID/age 核不了",
+            (None, _) => "同名约定（镜像里没有 CodeView 记录）",
+        };
+        let mut info = info;
+        info.notes
+            .push(format!("读取 PDB {}（按{how}找到）", candidate.display()));
+        return merge(info, read_pdb(object, &pdb_bytes));
     }
     let mut info = info;
     info.notes.push(format!(

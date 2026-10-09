@@ -238,3 +238,14 @@ fn collect(
 
     Ok(())
 }
+
+/// PDB 自己报告的 GUID/age —— 用来核对"这份 PDB 配得上这个镜像"。
+///
+/// 读不出来（头损坏、根本不是 PDB）返回 `None`：调用方据此报"核不了"，
+/// 而不是默认认为配得上（§7：拿不到就说拿不到）。
+#[must_use]
+pub fn pdb_identity(bytes: &[u8]) -> Option<(String, u32)> {
+    let mut pdb = ::pdb::PDB::open(std::io::Cursor::new(bytes)).ok()?;
+    let information = pdb.pdb_information().ok()?;
+    Some((information.guid.to_string(), information.age))
+}

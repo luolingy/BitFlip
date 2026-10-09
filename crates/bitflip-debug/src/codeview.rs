@@ -133,6 +133,30 @@ fn parse_rsds(data: &[u8]) -> Option<Record> {
     })
 }
 
+/// CodeView 记录里的 GUID 是**混合端序**：前三个字段小端，后两个字段原样。
+/// 写成文本是为了和 PDB 自己报告的 GUID（`uuid` 的连字符小写形式）比得上。
+#[must_use]
+pub fn guid_text(guid: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid[3], guid[2], guid[1], guid[0],
+        guid[5], guid[4],
+        guid[7], guid[6],
+        guid[8], guid[9],
+        guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]
+    )
+}
+
+/// 候选 PDB 是否就是这个镜像的那一份：GUID 与 age 都要对上。
+///
+/// 只看路径是不够的 —— 同目录放着一个**上一次构建**留下的同名 PDB 是很常见的事，
+/// 名字对、内容不对，用它就会把旧的行号/类型安到新镜像上。核不了（读不出 PDB 头）
+/// 时由调用方决定怎么记账，这里只回答"配得上吗"。
+#[must_use]
+pub fn matches(record: &Record, pdb_guid: &str, pdb_age: u32) -> bool {
+    pdb_age == record.age && guid_text(&record.guid).eq_ignore_ascii_case(pdb_guid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
