@@ -227,6 +227,7 @@ dependencies = [
  "bitflip-arch",
  "bitflip-loader",
  "gimli",
+ "msvc-demangler",
  "pdb",
  "serde",
  "serde_json",
@@ -853,6 +854,16 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "msvc-demangler"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbeff6bd154a309b2ada5639b2661ca6ae4599b34e8487dc276d2cd637da2d76"
+dependencies = [
+ "bitflags",
+ "itoa",
 ]
 
 [[package]]

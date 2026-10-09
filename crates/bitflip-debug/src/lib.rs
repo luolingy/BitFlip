@@ -31,6 +31,7 @@
 //! * 不因为调试信息缺失而失败：返回空的 [`DebugInfo`] 加一条 `notes` 说明。
 
 pub mod codeview;
+pub mod demangle;
 mod dwarf;
 pub mod pdb;
 
