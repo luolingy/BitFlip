@@ -11,6 +11,7 @@
 //! 下层永不反向依赖（CLAUDE.md §4）。
 
 mod analysis;
+mod diff;
 mod disasm;
 mod error;
 mod export;
@@ -22,6 +23,10 @@ pub use analysis::{
     ConstScanWire, DebugUseWire, FrameInferenceWire, FrameScanWire, FunctionWire, ImmediateWire,
     ReachabilityWire, ReachableFunctionWire, StrideWire, StringUsageWire, StringWire,
     TargetAnalysis, UnresolvedCallWire, XrefFilter, XrefPage, XrefWire, ANALYSIS_FORMAT_VERSION,
+};
+pub use diff::{
+    diff, diff_with_disasm, render_text as render_diff_text, DiffEntry, DiffKind, DiffOptions,
+    DiffReport, DiffScope, DiffTotals, MatchBasis, Normalization, DIFF_FORMAT_VERSION,
 };
 pub use disasm::{
     hex16, parse_address, Cursor, Disasm, DisasmStats, InsnPage, InsnWire, DEFAULT_PAGE_SIZE,

@@ -153,6 +153,25 @@ try {
             Write-Host "--- SKIP (needs the debug binary plus the m3-mingw-static and elf-aarch64 fixtures; run:"
             Write-Host "          & .\scripts\cargo.ps1 build --workspace; & .\scripts\gen-fixtures.ps1)"
         }
+
+        # M9: GET /api/diff. Same reasoning as the export smoke: the core diff
+        # has unit tests, but they cannot see whether the normalization method
+        # and BOTH image bases survive JSON serialization. Without them a client
+        # gets a list where every function "changed" and no way to notice.
+        $diffOld = Join-Path $repoRoot 'tests/fixtures/generated/diff-pe-x86_64-v1.exe'
+        $diffNew = Join-Path $repoRoot 'tests/fixtures/generated/diff-pe-x86_64-v2.exe'
+        if ((Test-Path -LiteralPath $smokeBin) -and (Test-Path -LiteralPath $diffOld) -and (Test-Path -LiteralPath $diffNew)) {
+            Invoke-Step -Name 'diff HTTP smoke (M9)' -Action {
+                & (Join-Path $PSScriptRoot 'smoke-diff-http.ps1') -Bin '.cargo-target/debug/bitflip-cli.exe' | Out-Host
+            } | Out-Null
+        }
+        else {
+            Write-Host ""
+            Write-Host "=== diff HTTP smoke (M9)"
+            Write-Host "--- SKIP (needs the debug binary plus the two diff fixture binaries; run:"
+            Write-Host "          & .\scripts\cargo.ps1 build --workspace;"
+            Write-Host "          python scripts/gen-diff-fixture.py --out tests/fixtures/generated/diff-pe-x86_64)"
+        }
     }
 
     Write-Host ""

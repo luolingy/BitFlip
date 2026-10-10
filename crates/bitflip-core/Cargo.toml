@@ -22,6 +22,11 @@ serde = { workspace = true }
 # 导出（M9）要用它序列化。**刻意不做成 feature**：JSON 导出是交付物的一部分，
 # 不是可选项 —— 做成 optional 只会让"导不出来"变成一种编译期配置。
 serde_json = { workspace = true }
+# 差分的函数体哈希（`diff.rs`）。用 SHA-256 而不是自己写个 64 位散列：
+# 哈希在这里是"两段代码是否逐字节相同"的判据，碰撞意味着把改动报成未变，
+# 也就是**漏报**——最不能容忍的一类错误。工作区里已经有这个依赖
+# （`bitflip-signature` 在用），没有引入新的外部面。
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -84,6 +84,8 @@ pub enum Command {
     Signature(SignatureArgs),
     /// 导出分析结论（反汇编 / 函数清单 / 符号表 / 交叉引用 / CFG）
     Export(ExportArgs),
+    /// 比较同一个目标的两个版本
+    Diff(DiffArgs),
     /// 启动本地 Web 服务
     Serve(ServeArgs),
     /// 打印版本与 API 版本
@@ -381,6 +383,53 @@ pub struct ExportArgs {
     pub raw: RawOverrideArgs,
 }
 
+/// `diff` 参数。
+///
+/// 同样只做参数解析与 IO：比对逻辑全在 `bitflip_core::diff` 里，
+/// 服务端 `GET /api/diff` 走同一条路。
+///
+/// 这里**刻意不做** `--arch` / `--base` 覆盖：一次开两个文件，一份覆盖
+/// 参数该套到哪个上？套两个可能是错的，套一个又表达不了"哪个"。
+/// 先各自用 `info` 确认能打开，再来比。
+#[derive(Debug, Args)]
+pub struct DiffArgs {
+    /// v1（旧版本）目标文件
+    #[arg(value_name = "OLD")]
+    pub old: PathBuf,
+    /// v2（新版本）目标文件
+    #[arg(value_name = "NEW")]
+    pub new: PathBuf,
+    /// 比哪几类：functions（默认）、sections、symbols、all
+    #[arg(long, value_name = "SCOPE", default_value = "functions")]
+    pub scope: String,
+    /// 只列出某一类：added、removed、changed、moved、unchanged
+    ///
+    /// 过滤发生在记账**之后**：总量仍然是"比了多少条"，
+    /// 不会因为只看新增就变成"只有 1 条"。
+    #[arg(long, value_name = "KIND")]
+    pub only: Option<String>,
+    /// 条目上限；超出时截断并记账（不静默丢弃）
+    #[arg(long, default_value_t = 20_000, value_name = "N")]
+    pub max_entries: usize,
+    /// 输出格式：text（默认，人读）、json（机器读，带 format_version）
+    #[arg(long, value_name = "FORMAT", default_value = "text")]
+    pub format: String,
+    /// 输出文件；缺省写标准输出
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<PathBuf>,
+    /// 覆盖已存在的输出文件
+    ///
+    /// 默认拒绝覆盖：比对报告常被拿去存档或交给别人，手滑一次没地方恢复。
+    #[arg(long)]
+    pub force: bool,
+    /// 只打印摘要，不打印正文
+    #[arg(long)]
+    pub summary: bool,
+    /// 打开调试日志
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
 /// `info` 参数。
 #[derive(Debug, Args)]
 pub struct InfoArgs {
@@ -662,6 +711,98 @@ mod tests {
         assert!(
             Cli::try_parse_from(["bitflip-cli", "export"]).is_err(),
             "export 缺少 TARGET 应当解析失败"
+        );
+    }
+
+    /// M9：`diff` 必须能解析，且默认值是**有界**的。
+    #[test]
+    fn diff_command_parses_with_bounded_defaults() {
+        let cli =
+            Cli::try_parse_from(["bitflip-cli", "diff", "old.exe", "new.exe"]).expect("解析 diff");
+        match cli.command {
+            Command::Diff(args) => {
+                assert_eq!(args.old.to_string_lossy(), "old.exe");
+                assert_eq!(args.new.to_string_lossy(), "new.exe");
+                // 默认比函数：那是用户最常问的"哪些函数变了"。
+                assert_eq!(args.scope, "functions");
+                // 默认不过滤：给全清单，让用户自己看。
+                assert!(args.only.is_none());
+                // 默认人要能读。
+                assert_eq!(args.format, "text");
+                // 缺省写标准输出，不偷偷写文件。
+                assert!(args.out.is_none());
+                assert!(!args.force && !args.summary);
+                // 上限必须在**有界**的默认值上：不然一个几十万函数的
+                // 二进制会把输出刷爆，而用户没地方知道"被截断了"。
+                assert_eq!(args.max_entries, 20_000);
+            }
+            other => panic!("期望 diff，得到 {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "diff",
+            "old.exe",
+            "new.exe",
+            "--scope",
+            "all",
+            "--only",
+            "removed",
+            "--max-entries",
+            "8",
+            "--format",
+            "json",
+            "--out",
+            "report.json",
+            "--force",
+            "--summary",
+        ])
+        .expect("解析 diff 全参数");
+        match cli.command {
+            Command::Diff(args) => {
+                assert_eq!(args.scope, "all");
+                assert_eq!(args.only.as_deref(), Some("removed"));
+                assert_eq!(args.max_entries, 8);
+                assert_eq!(args.format, "json");
+                assert_eq!(
+                    args.out.as_ref().expect("out").to_string_lossy(),
+                    "report.json"
+                );
+                assert!(args.force && args.summary);
+            }
+            other => panic!("期望 diff，得到 {other:?}"),
+        }
+    }
+
+    /// `diff` 要**两个**目标。只给一个必须解析失败 ——
+    /// 悄悄把"和它自己比"当成默认会让用户拿到一份"什么都没变"的报告，
+    /// 而那份报告看起来是成功的。
+    #[test]
+    fn diff_requires_two_targets() {
+        assert!(
+            Cli::try_parse_from(["bitflip-cli", "diff"]).is_err(),
+            "diff 不给目标应当解析失败"
+        );
+        assert!(
+            Cli::try_parse_from(["bitflip-cli", "diff", "only-one.exe"]).is_err(),
+            "diff 只给一个目标应当解析失败，不能默认与自身比对"
+        );
+    }
+
+    /// 覆盖参数**不能**出现在 `diff` 上。
+    ///
+    /// 一次开两个文件，一份 `--base` 套到哪个上都没有正当答案；
+    /// 与其猜，不如让它解析失败。这条测试钉住的是"这个选项不存在"，
+    /// 免得以后有人"顺手"加上去。
+    #[test]
+    fn diff_refuses_raw_overrides_that_cannot_be_attributed() {
+        assert!(
+            Cli::try_parse_from(["bitflip-cli", "diff", "a", "b", "--arch", "x86_64"]).is_err(),
+            "diff 不该接受 --arch：一个值没法同时描述两个目标"
+        );
+        assert!(
+            Cli::try_parse_from(["bitflip-cli", "diff", "a", "b", "--base", "0x400000"]).is_err(),
+            "diff 不该接受 --base：同上"
         );
     }
 }

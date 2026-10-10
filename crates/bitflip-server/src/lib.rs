@@ -422,6 +422,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/strings", get(strings))
         .route("/api/hex", get(hex))
         .route("/api/export", get(export))
+        .route("/api/diff", get(diff))
         // 标注是**主数据**，可读可写可删；写路径不触发重新分析。
         .route(
             "/api/annotations",
@@ -2029,6 +2030,168 @@ fn default_export_format() -> String {
 
 /// 单次 HTTP 导出的函数数上限（防止一次请求画出几万个 cluster）。
 const MAX_EXPORT_FUNCTIONS: usize = 4096;
+
+/// `GET /api/diff` 的查询参数。
+///
+/// ## 键名一律单词 + `deny_unknown_fields`
+///
+/// 与 [`ExportQuery`] 同一条理由：`serde_urlencoded` 默认**忽略**不认识的
+/// 字段，写错的参数会被静默吞掉，用户拿到一份"看起来成功"的响应。
+///
+/// ## 为什么必须有 `entries` 上界
+///
+/// 差分响应的体积随条目数线性增长，而两个大二进制之间可以有几十万条。
+/// 服务端不能因为一次请求把内存吃光，所以这里给默认值与硬上限；
+/// 被截断时报告里一定有账（`truncated` / `dropped` / `notes`），
+/// 不会安静地少给数据。
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiffQuery {
+    /// 与当前目标比对的另一个文件路径。
+    against: String,
+    /// 比对类型：`functions`（缺省）、`sections`、`symbols`、`all`。
+    scope: Option<String>,
+    /// 只列出某一类：`added`、`removed`、`changed`、`moved`、`unchanged`。
+    only: Option<String>,
+    /// 条目上限（受 `MAX_DIFF_ENTRIES` 约束）。
+    entries: Option<usize>,
+}
+
+/// HTTP 单次差分默认返回的条目数。
+///
+/// 比 `DiffOptions::default()` 的 20 000 小：CLI 的输出可以重定向进文件，
+/// HTTP 的响应要先过内存和网络，默认值该不同。
+const DEFAULT_DIFF_ENTRIES: usize = 2048;
+
+/// HTTP 单次差分返回的条目数硬上限。
+const MAX_DIFF_ENTRIES: usize = 20_000;
+
+/// 差分：`GET /api/diff?against=<path>&scope=<name>&only=<kind>&entries=<n>`。
+///
+/// # 安全边界（新增了一条"读另一个文件"的能力，必须说清）
+///
+/// 服务端本来就按启动参数读了一个目标文件；这个端点让持有令牌的人**再读
+/// 一个任意路径**。这是真实的能力扩张，所以：
+///
+/// * 它挂在同一条 `require_token` 之下 —— 没有令牌读不到；
+/// * 只接受**已存在的常规文件**，目录、设备、特殊文件一律拒绝
+///   （拿目录去 `open` 会得到一段和"文件格式不对"完全不同的报错，
+///   那种混乱会掩盖真实原因）；
+/// * 路径**原样**用于打开，不做规范化重写：规范化会把符号链接指向的目标
+///   隐藏起来，而"你读的到底是哪个文件"是这里最要紧的信息。
+///   解析后的路径会在响应的 `v2_path` 里原样回显；
+/// * 只读，从不写回。
+///
+/// 所以它适合本地开发工具的场景，不适合暴露到不受信任的网络。
+async fn diff(
+    State(state): State<AppState>,
+    query: Result<axum::extract::Query<DiffQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let session = match state.session() {
+        Ok(session) => session,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let query = match query {
+        Ok(query) => query,
+        Err(rejection) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("查询参数无法解析：{rejection}。可用参数：against、scope、only、entries"),
+            );
+        }
+    };
+
+    let scope = match query.scope.as_deref() {
+        None => bitflip_core::DiffScope::Functions,
+        Some(text) => match bitflip_core::DiffScope::parse(text) {
+            Some(scope) => scope,
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "未知比对类型 {text:?}；可用值：{}",
+                        bitflip_core::DiffScope::all()
+                            .iter()
+                            .map(|scope| scope.as_str())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ),
+                );
+            }
+        },
+    };
+
+    let only = match query.only.as_deref() {
+        None => None,
+        Some(text) => match bitflip_core::DiffKind::parse(text) {
+            Some(kind) => Some(kind),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "未知差异类别 {text:?}；可用值：{}",
+                        bitflip_core::DiffKind::all()
+                            .iter()
+                            .map(|kind| kind.as_str())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ),
+                );
+            }
+        },
+    };
+
+    // 先确认另一侧存在且是常规文件，再开会话。顺序很重要：直接 `Session::open`
+    // 一个目录，报错会是"无法解析该目录"之类，用户会以为文件格式有问题。
+    let against = std::path::PathBuf::from(&query.against);
+    match std::fs::metadata(&against) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("against 不是常规文件：{}", against.display()),
+            );
+        }
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("against 指向的文件读不到：{}（{error}）", against.display()),
+            );
+        }
+    }
+
+    // 另一侧**不套用本次会话的 `--arch` / `--base` 覆盖**：一个值没法同时
+    // 描述两个目标，猜错方向会让整份报告按错误的基址归一化，而报告本身
+    // 依然"看起来很具体"。与 CLI 的选择一致。
+    let other = match bitflip_core::Session::open(&against, bitflip_core::OpenOptions::default()) {
+        Ok(session) => session,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("打开 against 失败：{}（{error}）", against.display()),
+            );
+        }
+    };
+
+    let options = bitflip_core::DiffOptions {
+        scope,
+        only,
+        max_entries: query
+            .entries
+            .unwrap_or(DEFAULT_DIFF_ENTRIES)
+            .min(MAX_DIFF_ENTRIES),
+    };
+
+    // 当前目标是"旧版本"（v1）、`against` 是"新版本"（v2）：URL 里
+    // `/api/diff?against=...` 读起来就是"拿它和这个比"，方向固定且可预测。
+    let report = match bitflip_core::diff(&session, &other, &options) {
+        Ok(report) => report,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+
+    Json(report).into_response()
+}
 
 /// 单次 HTTP 导出的字节上限（128 MiB）。
 ///

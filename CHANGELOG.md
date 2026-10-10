@@ -350,7 +350,7 @@ M8 的四个交付物到这里齐了。这两件是最后两件：一件让"多�
 
 ### 新增 — M9：导出（反汇编文本 / JSON / 函数清单 / 符号表 / 交叉引用 / CFG-DOT）
 
-写回与差分**未做**，见 `docs/PLAN.md` §M9 的"完成情况"。这里记已落地的导出。
+写回**未做**，见 `docs/PLAN.md` §M9 的"完成情况"。这里记已落地的导出。
 
 - **`bitflip-core::export`（新模块）**：六种格式 —— `asm-intel`、`asm-att`、`json-functions`、
   `json-symbols`、`json-xrefs`、`dot-cfg`。每个导出都自述：文本类首行是
@@ -364,7 +364,7 @@ M8 的四个交付物到这里齐了。这两件是最后两件：一件让"多�
   AT&T 规则：`%reg` / `$imm` / `disp(%base,%index,scale)`、操作数倒序、直接跳转写绝对目标、
   间接跳转加 `*`、仅带内存操作数时给助记符加宽度后缀。`DecodedInsn` 不带段前缀与
   `lock`/`rep` 前缀，因此那几类不渲染（记在注释里，不假装支持）。
-  真值来自独立的 `objdump -d -M att`：对拍 6000 条，逐字相同 5859 条，已记录的解码层差异约 140 条，
+  真值来自独立的 `objdump -d -M att`：对拍 6000 条，逐字相同 5859 条，已记录的解码层差异 **141** 条，
   **未解释的不一致 0 条**。
 - **`Disasm` 新增 `text_style` / `set_text_style` / `with_text_style`**：语法风格是**反汇编视图**
   的属性，只有一条渲染路径。`with_text_style` 共享同一个索引 `Arc`，换风格不重扫。
@@ -395,6 +395,57 @@ M8 的四个交付物到这里齐了。这两件是最后两件：一件让"多�
 - `scripts/smoke-export-http.ps1`（46 项断言，已接入 `preflight.ps1`）：起真实服务进程打真 HTTP，
   验证元数据穿过 HTTP 层、截断被标记、写错的参数被拒、非 x86 的 AT&T 是 501。
 - 全量 `cargo test --workspace`：904 passed / 0 failed / 5 ignored。
+
+### 新增 — M9：差分视图（两个同族二进制的函数 / 节表 / 符号差异）
+
+指令级**逐条对齐**未做（现在按函数粒度判定内容是否相同），见 `docs/PLAN.md` §M9 的"未做"。
+
+- **`bitflip-core::diff`（新模块）**：`DIFF_FORMAT_VERSION = 1`。范围 `functions`（默认）/
+  `sections` / `symbols` / `all`；类别 `added` / `removed` / `changed` / `moved` / `unchanged`；
+  可按类别过滤、可设条目上限（超限截断并记账）。
+- **地址归一化是中心问题，不是实现细节。** 两版镜像基址几乎总不相同（fixture 里差 `0x40000000`），
+  裸比虚拟地址会得到"每个函数都变了"——条理清楚、字段齐全、**全错**。默认按 RVA 比，
+  并把**归一化方式连同两侧实测基址写进输出头部**（文本注释头 / JSON `normalization` +
+  `v1_image_base` + `v2_image_base`）。没有基址时（`.o` 这类）归一化判为**不可用**，
+  只用名字匹配，并在 `notes` 里写明"地址维度未参与比对"。
+- **两档指纹**，因为"没变"/"搬了家"/"搬了家又改了"是三件不同的事：
+  **强指纹**把落在镜像地址范围内的字面量换成"它指向的 RVA"（位置无关）；**弱指纹**把所有
+  十六进制字面量抹成占位符（只留指令形状）。函数体里嵌着被调用者的地址，被调用者挪了位置时
+  调用处的绝对地址也会变 —— 只有忽略地址那一维，"搬家"才认得出来。
+- **普通立即数原样保留**（不进归一化）：早期把每个字面量都减掉函数起点，于是 `sub rsp, 0x28`
+  变成 base-dependent 的值，两版基址不同就让每个带小立即数的函数被判成"改动"。
+  保留也是必需的 —— 抹平会让 `add eax, 0x5eed` 与 `add eax, 0x1234` 指纹相同（漏报）。
+- **匹配顺序本身是判据**：①同名（先看归一化地址是否也相同）→ ②未命名且归一化地址与内容都相同
+  → ③剩下的是新增与删除。第一版**先按地址配对**，把"被删的函数"与"恰好补在那个 RVA 上的新函数"
+  配成一条含糊的"改动"。合并阶段还有一条守则：配对不一对一（同一侧多个不同函数对上另一侧同一个）
+  说明是巧合，**拆成明确的删 + 增**并记进 `notes`。
+- **每个条目交代配对判据** `match_basis`（`name+address` / `content+size` / `name-only` /
+  `address-only`）；内容维度是**三态**（Same / Different / Unknown）—— `None == None`
+  曾被当成"内容相同"，于是凭空宣称"内容逐条相同"并把不相关函数配成一对"移动"。
+- **账目闭合且可自检**：每个条目恰好落进一个桶，`len(entries) == totals.total()` 且逐条重数一致；
+  按类别过滤发生在**记账之后**（否则"比了多少条"这个分母会被污染成 1）。
+- **CLI `bitflip-cli diff OLD NEW`**：`--scope/--only/--max-entries/--format text|json/--out/
+  --force/--summary`。`--out` 默认拒绝覆盖，父目录不存在即报错。**刻意不提供**
+  `--arch`/`--base`：一次开两个文件，一份覆盖参数套到哪个上都没有正当答案。
+- **HTTP `GET /api/diff?against=<path>&scope=&only=&entries=`**：返回 `DiffReport` JSON。
+  **这是新增的一条"读另一个文件"的能力**，边界写在端点文档里：挂在同一条 `require_token` 下；
+  只接受**已存在的常规文件**（目录/特殊文件拒绝，并明确说"不是常规文件"，不让它伪装成格式问题）；
+  路径原样使用**不做**规范化重写（规范化会把符号链接的目标藏起来）；只读，从不写回。
+  条目默认 2048、硬上限 20000（HTTP 响应要先过内存与网络）。
+
+**测试与门禁**：
+
+- `scripts/gen-diff-fixture.py`：编译两个源文件版本（`--image-base` 不同），真值由
+  `llvm-nm --print-size` 对两个符号表做集合运算得到 —— **差异是编译器与链接器实际产出的**。
+  受控差异四类俱全（新增 / 删除 / 同 RVA 不同内容 / 未变对照组）。生成器自带自检：
+  符号在文件里 ≠ 分析器看得见一个函数（早期 `df_removed` 被 `-O1` 内联，`llvm-nm` 照样列出它，
+  端到端测试因此红在**差分实现**上，方向完全错误），现在用 `llvm-objdump -d` 的函数标签核对。
+  fixture 已接入 `scripts/gen-fixtures.ps1` —— 否则差分冒烟会 SKIP，而 SKIP 会读成通过。
+- `crates/bitflip-core/tests/m9_diff.rs`：12 条端到端，**逐条断言真值文件**（不抄数字，
+  抄进来的数字会随 fixture 重新生成而失效，失效方式是"测试还在绿"）。
+- `crates/bitflip-core/src/diff.rs` 单测：直接钉两个归一化函数（bug 都出在这一层）。
+- `scripts/smoke-diff-http.ps1`（45 项断言，已接入 `preflight.ps1`）：起真实服务进程打真 HTTP。
+- 全量 `cargo test --workspace`：937 passed / 0 failed / 5 ignored。
 
 ### 修复
 

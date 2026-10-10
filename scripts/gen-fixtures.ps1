@@ -266,8 +266,29 @@ Invoke-Step -Label 'pe-x86_64.lib (llvm-lib, MSVC style)' -Tool $llvmLib -Output
 )
 
 Write-Host ""
-Write-Host "edge cases"
+Write-Host "diff pairs (M9: two versions of one program, plus golden truth)"
 
+# Why this belongs HERE and not in a hand-run command: the diff smoke test in
+# preflight SKIPs when the pair is missing, and a SKIP reads as a pass. That is
+# exactly the "the green light lies" failure mode called out in CLAUDE.md 7, so
+# the fixture has to come from the standard generation path.
+#
+# The generator is Python (it derives the truth by set arithmetic over two
+# llvm-nm symbol tables); it resolves clang/llvm-nm itself.
+$python = Resolve-Tool -Name 'python' -Candidates @()
+$diffGenerator = Join-Path $PSScriptRoot 'gen-diff-fixture.py'
+if ($python -and (Test-Path -LiteralPath $diffGenerator)) {
+    Invoke-Step -Label 'diff-pe-x86_64 (v1/v2 + truth.txt)' -Tool $python `
+        -OutputName 'diff-pe-x86_64.truth.txt' `
+        -Arguments @($diffGenerator, '--out', 'diff-pe-x86_64')
+}
+else {
+    [void]$script:skipped.Add('diff-pe-x86_64 (python or gen-diff-fixture.py not found)')
+    Write-Host "  skip diff-pe-x86_64 (python or gen-diff-fixture.py not found)"
+}
+
+Write-Host ""
+Write-Host "edge cases"
 # Raw binary: no recognizable header at all.
 $raw = New-Object byte[] 4096
 for ($i = 0; $i -lt $raw.Length; $i++) { $raw[$i] = [byte](($i * 7 + 13) % 256) }

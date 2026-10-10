@@ -339,6 +339,14 @@ pub fn export_with_disasm(
 > - **参数名一律单词且 `deny_unknown_fields`**：`serde_urlencoded` 默认忽略不认识的字段，
 >   那样 `/api/export?limit-bytes=1000` 会返回 200 和一份**没被限制大小**的响应。
 >   写错的键现在返回 400 并列出可用参数。
+>
+> 已落地的差分端点（M9）：`GET /api/diff?against=<path>&scope=&only=&entries=`
+> - 返回 `DiffReport` JSON，正文里带 `format_version` / `normalization` / 两个镜像基址；
+> - **这是唯一一个会读"本次会话之外的另一个文件"的端点**，边界：同一条 token 校验、
+>   只接受已存在的常规文件、路径原样使用不做规范化重写、只读不写回。
+>   它适合本地开发工具，不适合放到不受信任的网络里；
+> - `entries` 默认 2048、硬上限 20000：HTTP 响应要先过内存与网络，默认值该与 CLI 不同。
+>   截断一定会出现在 `truncated` / `dropped` / `notes` 里。
 
 Wire 规则（借鉴 adi web 的正确部分并修正其问题）：
 - 指令页列式：`{ total, from, count, a:[addr], b:[bytesHex], m:[mnemonic], o:[operands], f:[flags], t:[target] }`。
