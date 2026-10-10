@@ -27,7 +27,7 @@ pub use insn::{
 };
 pub use padding::{padding_len, supports_padding};
 pub use plt::{plt_stub, supports_plt_stub, PltStub};
-pub use render::{flow_label, format_insn, text_style, TextStyle};
+pub use render::{flow_label, format_insn, format_insn_with, text_style, TextStyle};
 pub use types::{Arch, ArchSpec, Endian, Mode};
 
 /// 本 crate 的公共 API 版本。跨 crate 契约变化时提升。

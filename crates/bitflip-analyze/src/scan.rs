@@ -54,7 +54,11 @@ impl Default for ScanOptions {
 }
 
 /// 扫描统计（诚实报告覆盖率，供 UI 显示）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Copy` 是有意的：这是四个计数的纯值类型，没有任何所有权语义。
+/// 上层"换个渲染风格就把视图复制一份"（见 `Disasm::with_text_style`）
+/// 需要它 —— 否则每次都要为了复制四个 `usize` 写 `.clone()`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanStats {
     /// 已解码指令数。
     pub decoded: usize,

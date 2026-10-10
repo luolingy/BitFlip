@@ -254,6 +254,52 @@ impl Session {
 - 查询返回**视图**（`InsnView`/`NameView`）而不是拷贝所有权类型，避免大对象复制。
 - 所有地址参数/返回值都是 `u64`；字符串化只发生在渲染层。
 
+### 7.1 导出：已经落地的实际形态（M9）
+
+上面那段是**目标形态的草图**，其中补丁与写回（`set_patch` / `apply_patches`）**尚未实现**。
+已经落地的是导出，实际接口与草图有出入，以本节为准：
+
+```rust
+/// 导出格式版本。与 `format_version` 一起构成对外契约。
+pub const EXPORT_FORMAT_VERSION: u32 = 1;
+
+pub enum ExportFormat { AsmIntel, AsmAtt, JsonFunctions, JsonSymbols, JsonXrefs, DotCfg }
+
+pub struct ExportOptions {
+    pub range: Option<(u64, u64)>,   // 半开区间
+    pub function: Option<u64>,       // 与 range 互斥
+    pub include_bytes: bool,
+    pub include_source: bool,
+    pub max_functions: usize,
+    pub byte_limit: Option<u64>,     // None = 不限
+    pub keep_partial: bool,
+}
+
+pub fn export(
+    session: &Session,
+    format: ExportFormat,
+    options: &ExportOptions,
+) -> Result<(String, ExportReport), BitflipError>;
+
+/// 复用调用方已建好的反汇编（服务端用，避免为一次导出重扫）。
+pub fn export_with_disasm(
+    session: &Session,
+    disasm: &Disasm,
+    format: ExportFormat,
+    options: &ExportOptions,
+) -> Result<(String, ExportReport), BitflipError>;
+```
+
+与草图的三点差异，各有理由：
+
+- **返回 `String` + 报告，而不是写进 `&mut dyn Write`。** 导出必须是"要么完整、要么说清为什么
+  不完整"的：报告里要带写出字节数、条目数、截断账目与降级说明，这些在流式接口里没有地方放。
+  真正的流式（大目标）留给后续，那时也要同时给出报告。
+- **写出的字节与报告分开传回。** 文本类的正文走 stdout / 响应体，报告走 stderr / 响应头 ——
+  正文要被重定向或落盘，报告要被看见，混在一起两边都做不好。
+- **`format_version` 独立演进**（`EXPORT_FORMAT_VERSION`），不跟 `CORE_API_VERSION` 绑。
+  字段含义变一次就递增一次，外部消费方据此判断能不能直接吃。
+
 ## 8. `bitflip-server`：HTTP/WS 协议
 
 绑定 `127.0.0.1` 随机或指定端口；启动生成 32 字节随机 token，注入 UI 的 URL fragment，
@@ -280,6 +326,19 @@ impl Session {
 | `POST` | `/api/sessions/:id/jobs/:job/cancel` | 取消作业 |
 | `GET` | `/api/sessions/:id/export` | 导出（asm/json/symbols/dot） |
 | `WS` | `/api/sessions/:id/events` | 进度、阶段、日志、标注冲突、作业状态 |
+
+> **实现现状与上表的差异**：当前服务端是**单会话**的（打开一个目标就起一个服务，
+> 路由不带 `:id`），所以已实现的路由形如 `/api/export`、`/api/functions`，
+> 而不是上表的 `/api/sessions/:id/...`。上表是目标形态（多会话），
+> 条目与已实现路由的对应关系以本节末的统一说明为准。
+>
+> 已落地的导出端点（M9）：`GET /api/export?format=&from=&to=&function=&bytes=&source=&max_functions=&limit=`
+> - 正文**就是导出的字节**（`text/plain` 或 `application/json`），可以直接落盘；
+> - 元信息走响应头：`x-bitflip-format`、`x-bitflip-export-format-version`、`x-bitflip-items`、
+>   `x-bitflip-truncated`、`x-bitflip-warning-N`（说明里的中文按 `%XX` 编码，HTTP 头是 ASCII）；
+> - **参数名一律单词且 `deny_unknown_fields`**：`serde_urlencoded` 默认忽略不认识的字段，
+>   那样 `/api/export?limit-bytes=1000` 会返回 200 和一份**没被限制大小**的响应。
+>   写错的键现在返回 400 并列出可用参数。
 
 Wire 规则（借鉴 adi web 的正确部分并修正其问题）：
 - 指令页列式：`{ total, from, count, a:[addr], b:[bytesHex], m:[mnemonic], o:[operands], f:[flags], t:[target] }`。

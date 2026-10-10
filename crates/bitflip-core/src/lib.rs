@@ -13,6 +13,7 @@
 mod analysis;
 mod disasm;
 mod error;
+mod export;
 mod session;
 
 pub use analysis::{
@@ -23,10 +24,14 @@ pub use analysis::{
     TargetAnalysis, UnresolvedCallWire, XrefFilter, XrefPage, XrefWire, ANALYSIS_FORMAT_VERSION,
 };
 pub use disasm::{
-    hex16, parse_address, Disasm, DisasmStats, InsnPage, InsnWire, DEFAULT_PAGE_SIZE,
+    hex16, parse_address, Cursor, Disasm, DisasmStats, InsnPage, InsnWire, DEFAULT_PAGE_SIZE,
     DISASM_FORMAT_VERSION, MAX_PAGE_SIZE,
 };
 pub use error::BitflipError;
+pub use export::{
+    export, export_with_disasm, ExportError, ExportFormat, ExportMeta, ExportOptions, ExportReport,
+    FormatVersions, Truncation, DEFAULT_EXPORT_BYTE_LIMIT, EXPORT_FORMAT_VERSION,
+};
 
 /// 重新导出归档成员描述：它是 [`Session::members`] / [`Session::member_session`]
 /// 的返回类型，嵌入方（如 CLI）要用它做成员选择而不必直接依赖 `bitflip-loader`。

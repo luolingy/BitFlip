@@ -345,7 +345,74 @@ M8 的四个交付物到这里齐了。这两件是最后两件：一件让"多�
 - 走 PDB 那条路时拿到的名字**已经是可读的**（`Widget::bar`），反修饰在那条路上没被真正用到；
   可读名从哪来（链接器写进 PDB，还是读取路径上某处做的）**没查清**，没写进文档当结论。
 - 自动化回归测试还没补（现在这次是手工测量）。手工验过又没进测试的东西，下次会悄悄退化。
+  → **已补**：`crates/bitflip-core/tests/m8_demangle_e2e.rs` 两条（显示名可读 + 原始名留存为
+  `aliases`；普通 C 名不被改动）。
+
+### 新增 — M9：导出（反汇编文本 / JSON / 函数清单 / 符号表 / 交叉引用 / CFG-DOT）
+
+写回与差分**未做**，见 `docs/PLAN.md` §M9 的"完成情况"。这里记已落地的导出。
+
+- **`bitflip-core::export`（新模块）**：六种格式 —— `asm-intel`、`asm-att`、`json-functions`、
+  `json-symbols`、`json-xrefs`、`dot-cfg`。每个导出都自述：文本类首行是
+  `# bitflip-export v1 format=... target=... arch=... generated_at=...` 注释头，
+  JSON 是 `{format_version, producer, meta, totals, 数据...}`，`meta` 含四个层的 wire 版本、
+  目标与架构、过滤参数、RFC 3339 时间。`EXPORT_FORMAT_VERSION` 独立演进。
+- **单一实现、两个入口**：格式与写出只在核心层写一遍；CLI `export` 子命令与服务端
+  `GET /api/export` 都调它。服务端用 `export_with_disasm` 复用 `AppState` 缓存的反汇编，
+  一次导出不重扫；因此也不会出现"CLI 与服务端各拼一份文本"的漂移。
+- **`bitflip-arch::render::format_insn_with`**：按 `TextStyle` 渲染 Intel / AT&T。
+  AT&T 规则：`%reg` / `$imm` / `disp(%base,%index,scale)`、操作数倒序、直接跳转写绝对目标、
+  间接跳转加 `*`、仅带内存操作数时给助记符加宽度后缀。`DecodedInsn` 不带段前缀与
+  `lock`/`rep` 前缀，因此那几类不渲染（记在注释里，不假装支持）。
+  真值来自独立的 `objdump -d -M att`：对拍 6000 条，逐字相同 5859 条，已记录的解码层差异约 140 条，
+  **未解释的不一致 0 条**。
+- **`Disasm` 新增 `text_style` / `set_text_style` / `with_text_style`**：语法风格是**反汇编视图**
+  的属性，只有一条渲染路径。`with_text_style` 共享同一个索引 `Arc`，换风格不重扫。
+- **CLI `bitflip-cli export`**：`--format/--out/--from/--to/--function/--no-bytes/--no-source/
+  --max-functions/--limit-bytes/--summary/--force`。正文走 stdout，截断与降级说明走 **stderr**
+  （混进正文会破坏"导出的文件就是那批字节"）。`--out` 默认拒绝覆盖，父目录不存在即报错。
+- **HTTP `GET /api/export`**：正文即导出字节，元信息走响应头
+  （`x-bitflip-format`/`-export-format-version`/`-items`/`-truncated`/`-warning-N`）。
+
+**诚实性（CLAUDE.md §7）的具体落点**：
+
+- **截断永远自述。** 每次导出有字节预算（CLI 默认 32 MiB，`--limit-bytes 0` = 不限；
+  HTTP 上限 128 MiB）。流式格式撞上预算就在报告里写清"少写了多少条"并给出下一步（按地址段分批）；
+  截断位置一定落在**行边界**，撞墙后不再补写后面的短行。
+- **不能交半份的格式明确失败。** JSON 是单个文档、DOT 是语法文件 —— 截断它们只会得到
+  解析不了的东西，所以超预算时返回 `ExportError::OverBudget` 并带上差额与说明
+  （`Display` 里连 `notes` 一起印出来：只存不印等于没存）。
+- **能力不匹配报错，不回落。** 对非 x86 目标要 `asm-att` 返回 `NotYetImplemented`
+  （HTTP 501），而不是给它 Intel 文本假装成功。
+- **不造名字。** DOT 里没有名字的函数标为「未识别」，不生成 `func_xxx`。
+
+**测试与门禁**：
+
+- `crates/bitflip-core/tests/m9_export.rs`：六种格式端到端（自述头、`format_version`、
+  `totals` 与数据一致、定长 hex 地址、未知 `iat_slot` 写 `null`、范围过滤生效、
+  截断有账目且落在行边界、超预算 JSON 报错、非 x86 的 AT&T 报错）。fixture 缺失时**响亮失败**。
+- `crates/bitflip-arch/tests/att_matches_objdump.rs`：与 `objdump -M att` 对拍。
+- `scripts/smoke-export-http.ps1`（46 项断言，已接入 `preflight.ps1`）：起真实服务进程打真 HTTP，
+  验证元数据穿过 HTTP 层、截断被标记、写错的参数被拒、非 x86 的 AT&T 是 501。
+- 全量 `cargo test --workspace`：904 passed / 0 failed / 5 ignored。
+
 ### 修复
+
+- **Intel 内存操作数缺 `+`：`[rax rax]`。** `format_mem` 把 base 与 index 各当一个"片段"用空格
+  拼起来，于是 `nop DWORD PTR [rax+rax*1+0x0]` 被渲染成 `nop dword ptr [rax rax]` ——
+  在任何汇编器里都是**语法错误**，而它"看起来像"一个地址。真实样本（`m3-mingw-static.exe`）
+  上 146 行受影响。改为按算术式拼装（组分之间一定有 `+`，比例总是写出来）。
+  真值取自 `objdump -M intel` 与 `llvm-objdump` 的实读输出。同处一并修正：
+  负位移原来写成 `- 0x12e`（有空格），改为 `-0x12e`；绝对地址不再带前导 `+`（`[+0x402000]`）。
+
+- **AT&T 渲染里负位移按无符号打印**（`0xfffffffffffffed2(%rip)`）。与 `objdump -M att`
+  对拍时发现，改为 `-0x12e(%rip)`。这条与上一条都是被"导出"这个新功能照出来的：
+  以前没有独立真值去逐条对拍渲染结果。
+
+- **服务端导出查询参数被静默忽略。** 第一版用 `limit-bytes`，而 `serde_urlencoded`
+  **默认忽略不认识的字段**，于是 `/api/export?limit-bytes=1000` 返回 200 和一份**没被限制大小**
+  的响应 —— 用户完全看不出来。现在参数名一律单词（`limit`/`bytes`/`source`/`max_functions`）
+  并加 `deny_unknown_fields`，写错的键返回 400 并列出可用参数。
 
 - **PE 映像的长节名（`/NNN`）从来没解析过。** `.text`/`.data` 这类名字在 8 字节以内、
   直接存在节头里，所以这条路径在普通可执行文件上**永远走不到**；而 `.debug_info` 从第一个
@@ -430,11 +497,26 @@ M8 的四个交付物到这里齐了。这两件是最后两件：一件让"多�
   不显示占位。**但没做浏览器目视确认** —— 编译、产物内容与 HTTP 数据都核过，"长得对不对"
   要人眼过一遍。
 - 调试信息参与命名后，**同一地址的多个来源（符号表/导出/调试信息/签名）仍未在界面上
-  摊开**（M8 交付物 4）：优先级与来源字段都有了，缺的是"冲突展示"。
+  摊开**（M8 交付物 4）：优先级与来源字段都有了，缺的是"冲突展示"（`aliases` 已经给出数据，
+  界面上的"另有 N 个候选"标记也已加上；缺的是逐来源摊开的视图）。
+- **导出（M9）已落地，但写回与差分未做**：
+  - 字节补丁编辑、写回（PE checksum / ELF 一致性校验、副本 + 原子替换 + 显式确认）、
+    差分视图、FlatBuffers 只读快照 —— **都还没有**。验收标准 1、2 挂在这里。
+  - 导出 JSON 只有结构与版本号断言，**schema 快照测试未做**。
+  - 导出在 SPA 里**还没有入口**（只有 CLI `export` 与 `GET /api/export`）。
+  - **AT&T 文本只对 x86 族目标实现**。非 x86 目标要 `asm-att` 会明确报"尚未实现"
+    （HTTP 501），而不是回落成 Intel 文本。
+  - 段前缀（`%gs:`）、`lock`/`rep`/`bnd`、多字节 NOP 的 hint 前缀**不渲染**：
+    `DecodedInsn`/`MemRef` 不带这些信息。这是"没有数据就说没有"，不是渲染 bug。
+  - 导出是**一次性成文**（返回 `String` + 报告），不是流式写出：超大目标要靠字节预算 +
+    按地址段分批。真正的流式留给后续（那时也要同时给出报告）。
 
 ### 计划中
-- M9：补丁、导出与差分（见 `docs/PLAN.md` §M9）
-- M8 遗留：MSVC 名字反修饰、静态库成员的 PDB、符号表 NOTYPE 符号里的函数名、按目标切换签名库
+- M9 剩余：字节补丁与写回、差分视图、FlatBuffers 只读快照、导出 schema 快照测试、
+  导出在 SPA 里的入口（见 `docs/PLAN.md` §M9）
+- M8 遗留：静态库成员的 PDB、符号表 NOTYPE 符号里的函数名（`objdump -t` 实读：`.text` 里的
+  NOTYPE 符号绝大多数是节符号与编译器标签；`m3-mingw-static.unstripped.exe` 上只有
+  `__C_specific_handler` 与 `___chkstk_ms` 两个像函数名）、按目标切换签名库
   （逐条见 §M8「未做」）
 ## [0.0.1-m0] - 2026-10-02
 

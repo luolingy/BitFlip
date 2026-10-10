@@ -17,7 +17,7 @@ use std::sync::Arc;
 use bitflip_analyze::{
     scan_linear, scan_recursive, AddrSpace, InsnIndex, ScanCoverage, ScanOptions, ScanStats,
 };
-use bitflip_arch::{format_insn, CapstoneDecoder, Decoder, Flow};
+use bitflip_arch::{format_insn_with, CapstoneDecoder, Decoder, Flow};
 use bitflip_loader::object::Object;
 use serde::{Deserialize, Serialize};
 
@@ -141,6 +141,17 @@ pub struct Disasm {
     /// 各查各的会漂移（同一地址在两处显示不同的行号是没法解释的）。
     /// `None` 表示目标没有调试信息，此时所有位置字段如实为空。
     pub debug: Option<Arc<bitflip_debug::DebugInfo>>,
+
+    /// 渲染指令文本用的语法风格。
+    ///
+    /// 放在**这里**而不是让每个调用方自己渲染：导出 AT&T 的第一版把它做成了
+    /// "导出层另调一次 `format_insn_with`"，结果忘了把风格接进来，导出的
+    /// 仍是 Intel 文本 —— 而那一版**看起来**完全正常（有地址、有指令、
+    /// 有字节），只有拿 `%`/`$` 去断言才会露馅。风格是反汇编视图的属性，
+    /// 就放在视图上，只有一条渲染路径。
+    ///
+    /// 改它不影响索引：`index` 只有地址与长度，与文本无关。
+    pub text_style: bitflip_arch::TextStyle,
 }
 
 impl std::fmt::Debug for Disasm {
@@ -267,9 +278,40 @@ impl Disasm {
             decoder,
             renderer,
             notes,
-            // 调试信息由 ttach_debug 挂上：扫描阶段不需要它，uild 也不该
+            // 调试信息由 `attach_debug` 挂上：扫描阶段不需要它，`build` 也不该
             // 依赖调用方手上有没有调试信息（没有照常反汇编）。
             debug: None,
+            // 默认 Intel：界面上与既有 golden 快照都用它。要 AT&T 由导出层
+            // 显式设置（见 `set_text_style`）。
+            text_style: bitflip_arch::TextStyle::Intel,
+        }
+    }
+
+    /// 设置渲染语法风格（原地）。
+    ///
+    /// 只影响**文本**，不影响索引与覆盖标记 —— 所以切换风格不需要重扫，
+    /// 也不会让同一份 `Disasm` 的两条路径看到不同的指令集合。
+    pub fn set_text_style(&mut self, style: bitflip_arch::TextStyle) {
+        self.text_style = style;
+    }
+
+    /// 换一个渲染语法风格，返回新的视图（索引仍是同一个 `Arc`，不重扫）。
+    ///
+    /// 给"手上是 `&Disasm`、但要换风格输出"的场景用（导出 AT&T）。
+    /// 选择 clone 而不是把索引也复制一份：索引是只读的大头，
+    /// `Arc` 共享它意味着换风格几乎不花代价。
+    #[must_use]
+    pub fn with_text_style(&self, style: bitflip_arch::TextStyle) -> Self {
+        Self {
+            space: self.space.clone(),
+            index: Arc::clone(&self.index),
+            coverage: self.coverage.clone(),
+            stats: self.stats,
+            decoder: Arc::clone(&self.decoder),
+            renderer: self.renderer.clone(),
+            notes: self.notes.clone(),
+            debug: self.debug.clone(),
+            text_style: style,
         }
     }
 
@@ -285,6 +327,23 @@ impl Disasm {
             truncated: self.stats.truncated as u64,
             mapped_bytes: self.space.total_vsize(),
             index_bytes: self.index.estimated_bytes() as u64,
+        }
+    }
+
+    /// 从 `from` 起顺序遍历已索引指令的地址。
+    ///
+    /// 这是**导出与分页共用的唯一走位实现**。分开写两份的代价是实测过的：
+    /// 那种重复不会编译失败，只会让两条路径在边界上慢慢漂移，
+    /// 而漂移的表现是"导出的指令数和界面显示的不一样" —— 用户没有
+    /// 办法判断哪个是对的。
+    ///
+    /// `from` 落在指令中间时从**包含**它的那条指令开始（与 [`Disasm::page`] 一致）。
+    #[must_use]
+    pub fn cursor(&self, from: u64) -> Cursor<'_> {
+        let start = self.index.containing(from).map_or(from, |(addr, _)| addr);
+        Cursor {
+            disasm: self,
+            inner: Box::new(self.index.range(start, u64::MAX)),
         }
     }
 
@@ -311,7 +370,7 @@ impl Disasm {
         };
 
         let mut instructions = Vec::with_capacity(count);
-        for (addr, len) in self.index.range(start, u64::MAX).take(count) {
+        for (addr, len) in self.cursor(start).take(count) {
             instructions.push(self.render(addr, len));
         }
 
@@ -353,7 +412,7 @@ impl Disasm {
                 // 只有 capstone 后端能把结构化指令渲染成文本。
                 // 没有它就退化为助记符编号 —— 不编造"看起来像汇编"的字符串。
                 let text = match &self.renderer {
-                    Some(cs) => format_insn(cs, insn),
+                    Some(cs) => format_insn_with(cs, insn, self.text_style),
                     None => format!("<insn:{}>", insn.mnemonic.get()),
                 };
                 (text, insn.flow, insn.target)
@@ -386,6 +445,43 @@ impl Disasm {
             .is_some_and(|info| !info.lines.is_empty() || !info.functions.is_empty());
         self.debug = debug;
         usable
+    }
+}
+
+/// [`Disasm::cursor`] 返回的指令游标。
+///
+/// 产出 `(地址, 编码长度)`，**不**在这里渲染 —— 渲染一次要解码 + 查行表，
+/// 导出大目标时把渲染结果全攒下来会白占内存，而调用方往往边渲染边写出。
+pub struct Cursor<'a> {
+    disasm: &'a Disasm,
+    inner: Box<dyn Iterator<Item = (u64, u8)> + 'a>,
+}
+
+impl Cursor<'_> {
+    /// 对应反汇编（渲染单条指令时要它）。
+    #[must_use]
+    pub const fn disasm(&self) -> &Disasm {
+        self.disasm
+    }
+
+    /// 渲染下一条指令。
+    pub fn render_next(&mut self) -> Option<InsnWire> {
+        let (addr, len) = self.inner.next()?;
+        Some(self.disasm.render(addr, len))
+    }
+
+    /// 剩余指令条数的提示（稀疏索引的 `size_hint` 下界）。
+    #[must_use]
+    pub fn remaining_hint(&self) -> usize {
+        self.inner.size_hint().0
+    }
+}
+
+impl Iterator for Cursor<'_> {
+    type Item = (u64, u8);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
     }
 }
 
@@ -522,6 +618,34 @@ mod tests {
         assert_eq!(page.from, hex16(0x1000), "from 应回显请求地址");
     }
 
+    #[test]
+    fn text_style_moves_between_intel_and_att_without_rescanning() {
+        // 这条测试锚的是一次真实的回归：导出 AT&T 曾经完全没生效，因为
+        // 渲染风格没接到导出路径上，导出的仍是 Intel 文本 —— 而那份输出
+        // **看起来**完全正常（有地址、有字节、有指令），只有拿 % / $ 去
+        // 断言才会露馅。
+        let mut disasm = empty_disasm();
+        let renderer = Arc::clone(&disasm.renderer.clone().expect("x86_64 后端应可用"));
+        let insn = renderer
+            .decode_one(&[0x48, 0x8b, 0x45, 0xf8], 0x1000)
+            .expect("解码 mov rax, [rbp-8]");
+
+        let intel = format_insn_with(renderer.as_ref(), &insn, bitflip_arch::TextStyle::Intel);
+        let att = format_insn_with(renderer.as_ref(), &insn, bitflip_arch::TextStyle::Att);
+        assert!(intel.contains("ptr"), "Intel 应当有 ptr：{intel}");
+        assert!(
+            att.contains('%') && !att.contains("ptr"),
+            "AT&T 应当有 % 且没有 ptr：{att}"
+        );
+
+        // 风格是"怎么看"，不是"看什么"：切换后索引（Arc）必须原封不动，
+        // 否则会出现"换了语法风格就得重扫"的隐性代价。
+        let index_before = Arc::as_ptr(&disasm.index);
+        disasm.set_text_style(bitflip_arch::TextStyle::Att);
+        assert_eq!(disasm.text_style, bitflip_arch::TextStyle::Att);
+        assert_eq!(Arc::as_ptr(&disasm.index), index_before);
+    }
+
     fn empty_disasm() -> Disasm {
         use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
         let spec = ArchSpec::from_arch(Arch::X86_64, Mode::M64, Endian::Little);
@@ -535,6 +659,7 @@ mod tests {
             renderer: Some(renderer),
             notes: Vec::new(),
             debug: None,
+            text_style: bitflip_arch::TextStyle::Intel,
         }
     }
 

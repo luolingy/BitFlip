@@ -2,6 +2,7 @@
 
 mod browser;
 mod cli;
+mod export;
 mod info;
 mod members;
 mod serve;
@@ -13,9 +14,10 @@ use std::process::ExitCode;
 use clap::Parser;
 
 pub use cli::{
-    Cli, Command, FunctionsArgs, InfoArgs, MembersArgs, OpenCli, RawOverrideArgs, ServeArgs,
-    SignatureArgs, SignatureBuildArgs, SignatureCommand, SignatureInfoArgs, SymbolArgs,
+    Cli, Command, ExportArgs, FunctionsArgs, InfoArgs, MembersArgs, OpenCli, RawOverrideArgs,
+    ServeArgs, SignatureArgs, SignatureBuildArgs, SignatureCommand, SignatureInfoArgs, SymbolArgs,
 };
+pub use export::run_export;
 pub use info::run_info;
 pub use members::{run_functions, run_members, run_symbol};
 pub use serve::{serve_blocking, ServeRequest};
@@ -53,6 +55,7 @@ pub fn cli_main() -> ExitCode {
         Command::Functions(args) => report(run_functions(&args)),
         Command::Symbol(args) => report(run_symbol(&args)),
         Command::Signature(args) => report(run_signature(&args)),
+        Command::Export(args) => report(run_export(&args)),
         Command::Serve(args) => {
             let open_options = match args.raw.to_open_options() {
                 Ok(o) => o,

@@ -203,6 +203,21 @@ impl AppState {
         self.started.elapsed()
     }
 
+    /// 取本次会话（导出等需要 `Session` 全量入口的能力用）。
+    ///
+    /// 与 `AppState::disasm` / `analysis` 不同，这里**不做任何缓存**：
+    /// 返回的就是那个共享的 `Arc<Session>`，它内部的缓存照常生效。
+    ///
+    /// # Errors
+    ///
+    /// 本次会话没有打开目标。
+    pub fn session(&self) -> Result<Arc<bitflip_core::Session>, String> {
+        self.session
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| "本次会话没有打开目标".to_string())
+    }
+
     /// 取反汇编（惰性建立，只成功建立一次）。
     ///
     /// 返回 `Arc` 以便跨请求共享，避免每次响应都克隆整个指令索引。
@@ -406,6 +421,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/reachability", get(reachability))
         .route("/api/strings", get(strings))
         .route("/api/hex", get(hex))
+        .route("/api/export", get(export))
         // 标注是**主数据**，可读可写可删；写路径不触发重新分析。
         .route(
             "/api/annotations",
@@ -1776,6 +1792,250 @@ async fn strings(
     .into_response()
 }
 
+async fn export(
+    State(state): State<AppState>,
+    // 手写提取而不是 `Query<ExportQuery>` 参数：需要区分"参数拼错"（400 且
+    // 列出可用参数）与"参数合法但值不行"（各自的中文原因）。`Query` 提取
+    // 失败时 axum 的默认响应是一段英文纯文本，对本地中文用户不友好。
+    query: Result<axum::extract::Query<ExportQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let session = match state.session() {
+        Ok(session) => session,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    // 与 CLI 同一套参数语义（见 `crates/bitflip-cli/src/export.rs`），
+    // 只是把"命令行开关"换成了查询串。内容与格式全在核心层，
+    // 所以 HTTP 拿到的字节和 `bitflip-cli export` 完全一致。
+    // 参数拼错必须报错并列出可用参数。`Query` 提取失败时 axum 直接把错误
+    // 写进响应体，而上面那句 `deny_unknown_fields` 让它带着"哪个参数不认识"
+    // 的原文 —— 这里只负责把状态码说清楚。
+    let query = match query {
+        Ok(query) => query,
+        Err(rejection) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "查询参数无法解析：{rejection}。可用参数：{}",
+                    "format、from、to、function、bytes、source、max_functions、limit"
+                ),
+            );
+        }
+    };
+
+    let format = match bitflip_core::ExportFormat::parse(&query.format) {
+        Some(format) => format,
+        None => {
+            let available: Vec<&str> = bitflip_core::ExportFormat::all()
+                .iter()
+                .map(|format| format.as_str())
+                .collect();
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "未知导出格式 {:?}；可用值：{}",
+                    query.format,
+                    available.join("、")
+                ),
+            );
+        }
+    };
+
+    if query.function.is_some() && (query.from.is_some() || query.to.is_some()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "function 与 from/to 不能同时给出：请只给其中一个",
+        );
+    }
+
+    let parse = |text: &Option<String>, name: &str| -> Result<Option<u64>, String> {
+        match text {
+            None => Ok(None),
+            Some(value) => bitflip_core::parse_address(value).map(Some).ok_or_else(|| {
+                format!("{name} 的地址无法解析：{value:?}（十六进制，可带 0x 前缀）")
+            }),
+        }
+    };
+
+    let from = match parse(&query.from, "from") {
+        Ok(value) => value,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let to = match parse(&query.to, "to") {
+        Ok(value) => value,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let function = match parse(&query.function, "function") {
+        Ok(value) => value,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+
+    let range = match (from, to) {
+        (None, None) => None,
+        (from, to) => {
+            let from = from.unwrap_or(0);
+            let to = to.unwrap_or(u64::MAX);
+            if to < from {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("地址范围为空：from {from:#x} 大于 to {to:#x}（范围是半开区间）"),
+                );
+            }
+            Some((from, to))
+        }
+    };
+
+    let options = bitflip_core::ExportOptions {
+        range,
+        function,
+        include_bytes: query.bytes.unwrap_or(true),
+        include_source: query.source.unwrap_or(true),
+        max_functions: query.max_functions.unwrap_or(512).min(MAX_EXPORT_FUNCTIONS),
+        byte_limit: match query.limit {
+            Some(0) => None,
+            Some(value) => Some(value.min(MAX_EXPORT_BYTES)),
+            None => Some(bitflip_core::DEFAULT_EXPORT_BYTE_LIMIT),
+        },
+        keep_partial: true,
+    };
+
+    // 复用 `AppState` 已经缓存的反汇编：一次导出不该触发重扫
+    // （服务端每次滚动都在用同一份，重扫的代价在真实目标上是秒级）。
+    // 核心层只有一条写文本的路径，所以这里不存在"服务端另拼一份"的漂移。
+    let disasm = match state.disasm() {
+        Ok(disasm) => disasm,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    };
+
+    let (text, report) = match bitflip_core::export_with_disasm(&session, &disasm, format, &options)
+    {
+        Ok(result) => result,
+        Err(error) => return export_error_response(&error),
+    };
+
+    // 元信息走响应头：正文保持"就是导出的字节"，可以直接落盘成文件。
+    // 截断与降级也必须让客户端看得到（CLAUDE.md §7），所以放在
+    // `X-Bitflip-Warning` 里 —— 只留一句"成功"会让不完整的导出看起来完整。
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(truncation) = &report.truncated {
+        warnings.push(format!(
+            "已截断：{} 未写出（已写出 {}）。{}",
+            truncation.dropped, truncation.written, truncation.hint
+        ));
+    }
+    warnings.extend(report.notes.iter().cloned());
+
+    let mut response = text.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(if format.is_text() {
+            "text/plain; charset=utf-8"
+        } else {
+            "application/json; charset=utf-8"
+        }),
+    );
+    headers.insert(
+        "x-bitflip-format",
+        axum::http::HeaderValue::from_static(format.as_str()),
+    );
+    headers.insert(
+        "x-bitflip-export-format-version",
+        axum::http::HeaderValue::from_str(&bitflip_core::EXPORT_FORMAT_VERSION.to_string())
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("1")),
+    );
+    headers.insert(
+        "x-bitflip-items",
+        axum::http::HeaderValue::from_str(&report.items.to_string())
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        "x-bitflip-truncated",
+        axum::http::HeaderValue::from_static(if report.truncated.is_some() {
+            "true"
+        } else {
+            "false"
+        }),
+    );
+    // 说明里可能有非 ASCII，逐一转义：HeaderValue 拒绝裸的 UTF-8，
+    // 而"降级原因"是中文，不能因此丢掉。
+    for (index, warning) in warnings.iter().take(8).enumerate() {
+        let encoded = percent_encode_for_header(warning);
+        let name = format!("x-bitflip-warning-{}", index + 1);
+        let Ok(name) = axum::http::HeaderName::try_from(name) else {
+            continue;
+        };
+        if let Ok(value) = axum::http::HeaderValue::from_str(&encoded) {
+            headers.insert(name, value);
+        }
+    }
+
+    response
+}
+
+/// 把任意文本编码成可以用在 HTTP 头里的 ASCII（非 ASCII 字节走 `%XX`）。
+///
+/// HTTP 头字段值是 ASCII；中文说明直接塞进去会被 `HeaderValue` 拒绝，
+/// 或者在某些栈上被静默丢弃 —— 那正好是"降级不出现在界面上"。
+fn percent_encode_for_header(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.as_bytes() {
+        if byte.is_ascii_graphic() || *byte == b' ' {
+            out.push(char::from(*byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// 导出格式参数：`GET /api/export?format=<name>&from=<hex>&to=<hex>&...`。
+///
+/// ## 参数名一律用单个词，且 `deny_unknown_fields`
+///
+/// 这不是风格洁癖，是踩过的坑：`serde_urlencoded` **默认忽略不认识的字段**，
+/// 所以 `/api/export?limit-bytes=1000` 会得到一个 200 和一份没被限制大小的
+/// 响应 —— 参数被静默吞掉，用户完全看不出来。两处一起改才管用：
+/// 键名都取单词（HTTP 侧的习惯也是 `limit` 而不是 `limit_bytes`），
+/// 再加上 `deny_unknown_fields` 让写错的键**报错**。
+///
+/// 顺便也是为什么不能保留 `limit-bytes`/`limit_bytes` 这种带分隔符的名字：
+/// 没有分隔符就没有"下划线还是连字符"的可猜之处。
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportQuery {
+    /// 格式短名，缺省 `asm-intel`。
+    #[serde(default = "default_export_format")]
+    format: String,
+    /// 起始地址（含）。
+    from: Option<String>,
+    /// 结束地址（不含）。
+    to: Option<String>,
+    /// 单个函数入口地址。
+    function: Option<String>,
+    /// 是否带机器码列；缺省 `true`。
+    bytes: Option<bool>,
+    /// 是否带源位置列；缺省 `true`。
+    source: Option<bool>,
+    /// DOT 最多画多少个函数。
+    max_functions: Option<usize>,
+    /// 字节上限；`0` = 不限。
+    limit: Option<u64>,
+}
+
+fn default_export_format() -> String {
+    "asm-intel".to_string()
+}
+
+/// 单次 HTTP 导出的函数数上限（防止一次请求画出几万个 cluster）。
+const MAX_EXPORT_FUNCTIONS: usize = 4096;
+
+/// 单次 HTTP 导出的字节上限（128 MiB）。
+///
+/// 比 CLI 的默认值大、但仍有上界：HTTP 客户端在等响应，服务端不能因为
+/// 一次请求把内存吃光。要更大就走 CLI。
+const MAX_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
+
 /// 十六进制视图响应。
 #[derive(Serialize)]
 struct HexResponse {
@@ -2136,6 +2396,20 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+/// 把核心层的错误映射成 HTTP 状态。
+///
+/// **不把所有错误都塞成 500**：能力未实现（非 x86 要 AT&T）与内容超预算
+/// 都是"这个请求本身不行"，客户端的正确反应是换参数，不是重试。
+fn export_error_response(error: &bitflip_core::BitflipError) -> Response {
+    // 未实现用 501，让调用方能和"目标/参数有问题"区分开：前者等版本，
+    // 后者改参数 —— 混成 400 会让人白改参数。
+    let status = match error {
+        bitflip_core::BitflipError::NotYetImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    error_response(status, &error.to_string())
 }
 
 // ── 绑定与运行 ──────────────────────────────────────────────────────────────

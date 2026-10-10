@@ -19,11 +19,13 @@ bitflip-project = { workspace = true }
 bitflip-signature = { workspace = true }
 bitflip-symbols.workspace = true
 serde = { workspace = true }
+# 导出（M9）要用它序列化。**刻意不做成 feature**：JSON 导出是交付物的一部分，
+# 不是可选项 —— 做成 optional 只会让"导不出来"变成一种编译期配置。
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.11.0"
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

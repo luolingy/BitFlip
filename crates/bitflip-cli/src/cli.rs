@@ -82,6 +82,8 @@ pub enum Command {
     Symbol(SymbolArgs),
     /// 签名库：从静态库生成签名文件、查看签名文件
     Signature(SignatureArgs),
+    /// 导出分析结论（反汇编 / 函数清单 / 符号表 / 交叉引用 / CFG）
+    Export(ExportArgs),
     /// 启动本地 Web 服务
     Serve(ServeArgs),
     /// 打印版本与 API 版本
@@ -321,6 +323,64 @@ pub struct SignatureInfoArgs {
     pub json: bool,
 }
 
+/// `export` 参数。
+///
+/// 这一层只做参数解析与 IO；格式与内容全在 `bitflip_core::export` 里，
+/// 服务端同一路径。**不要让 CLI 自己拼文本** —— 那早晚会和界面漂移。
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// 目标文件；归档可用 `--member` 指定成员
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 导出格式：asm-intel、asm-att、json-functions、json-symbols、json-xrefs、dot-cfg
+    #[arg(long, value_name = "FORMAT", default_value = "asm-intel")]
+    pub format: String,
+    /// 输出文件；缺省写标准输出
+    #[arg(long, value_name = "FILE")]
+    pub out: Option<PathBuf>,
+    /// 起始地址（含；十六进制，可带 0x）
+    #[arg(long, value_name = "ADDR")]
+    pub from: Option<String>,
+    /// 结束地址（不含；十六进制，可带 0x）
+    #[arg(long, value_name = "ADDR")]
+    pub to: Option<String>,
+    /// 只导出这一个函数（入口地址；十六进制，可带 0x）
+    ///
+    /// 与 `--from/--to` 互斥：两者都要就没有"哪个更具体"的合理答案。
+    #[arg(long, value_name = "ADDR")]
+    pub function: Option<String>,
+    /// 反汇编文本不带机器码列
+    #[arg(long)]
+    pub no_bytes: bool,
+    /// 反汇编文本不带源位置列
+    #[arg(long)]
+    pub no_source: bool,
+    /// DOT 最多画多少个函数的 CFG
+    #[arg(long, default_value_t = 512, value_name = "N")]
+    pub max_functions: usize,
+    /// 字节上限（0 = 不限制）
+    ///
+    /// 默认 32 MiB 是为了"别把内存吃光"，不是为了限制导出能力：
+    /// 要全量就调大它，或按地址段分批（截断时报告里会这么说）。
+    #[arg(long, value_name = "BYTES")]
+    pub limit_bytes: Option<u64>,
+    /// 覆盖已存在的输出文件
+    ///
+    /// 默认拒绝覆盖：导出文件可能是别人拿去继续加工的资料，
+    /// 被一次手滑的命令清掉没有地方能恢复。要覆盖就明说。
+    #[arg(long)]
+    pub force: bool,
+    /// 只打印摘要（写了多少、是否截断），不打印正文
+    #[arg(long)]
+    pub summary: bool,
+    /// 打开调试日志
+    #[arg(short, long)]
+    pub verbose: bool,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
+}
+
 /// `info` 参数。
 #[derive(Debug, Args)]
 pub struct InfoArgs {
@@ -533,6 +593,75 @@ mod tests {
         assert!(
             result.is_err(),
             "signature build 缺少输入应当解析失败，而不是产出空文件"
+        );
+    }
+
+    /// M9：`export` 必须能解析，且默认值是**有界**的。
+    #[test]
+    fn export_command_parses_with_bounded_defaults() {
+        let cli =
+            Cli::try_parse_from(["bitflip-cli", "export", "target.exe"]).expect("解析 export");
+        match cli.command {
+            Command::Export(args) => {
+                assert_eq!(args.target.to_string_lossy(), "target.exe");
+                // 默认格式是反汇编：导出最常用的就是它。
+                assert_eq!(args.format, "asm-intel");
+                // 缺省写标准输出（管道里好用），不偷偷写文件。
+                assert!(args.out.is_none());
+                // 缺省不覆盖任何东西（没有 --out 也就无从覆盖）。
+                assert!(!args.force);
+                // 预算缺省交由核心层决定（有界），CLI 不重复写一个数字。
+                assert!(args.limit_bytes.is_none());
+                assert!(!args.no_bytes);
+                assert_eq!(args.max_functions, 512);
+                assert!(args.from.is_none() && args.to.is_none() && args.function.is_none());
+            }
+            other => panic!("期望 export，得到 {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "export",
+            "target.exe",
+            "--format",
+            "dot-cfg",
+            "--out",
+            "cfg.dot",
+            "--from",
+            "0x401000",
+            "--to",
+            "0x402000",
+            "--limit-bytes",
+            "1048576",
+            "--no-bytes",
+            "--no-source",
+            "--max-functions",
+            "8",
+            "--summary",
+            "--force",
+        ])
+        .expect("解析 export 全参数");
+        match cli.command {
+            Command::Export(args) => {
+                assert_eq!(args.format, "dot-cfg");
+                assert_eq!(args.out.as_ref().expect("out").to_string_lossy(), "cfg.dot");
+                assert_eq!(args.from.as_deref(), Some("0x401000"));
+                assert_eq!(args.to.as_deref(), Some("0x402000"));
+                assert_eq!(args.limit_bytes, Some(1_048_576));
+                assert!(args.no_bytes && args.no_source);
+                assert_eq!(args.max_functions, 8);
+                assert!(args.summary && args.force);
+            }
+            other => panic!("期望 export，得到 {other:?}"),
+        }
+    }
+
+    /// `export` 缺 TARGET 必须解析失败，而不是拿空路径去开文件。
+    #[test]
+    fn export_requires_a_target() {
+        assert!(
+            Cli::try_parse_from(["bitflip-cli", "export"]).is_err(),
+            "export 缺少 TARGET 应当解析失败"
         );
     }
 }

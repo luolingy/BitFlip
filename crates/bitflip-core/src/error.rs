@@ -50,6 +50,14 @@ pub enum BitflipError {
     #[error("工程库错误: {0}")]
     Project(String),
 
+    /// 导出失败。
+    ///
+    /// 与 [`BitflipError::InvalidInput`] 分开是有意的：导出的失败都**带账目**
+    /// （写出多少、预算多少、要不要分批）。压成一句话会让 UI 只能显示
+    /// "导出失败"，而用户需要知道的是怎么才能导出来。
+    #[error(transparent)]
+    Export(#[from] crate::export::ExportError),
+
     /// 内部一致性错误（bug）。
     #[error("内部错误: {0}")]
     Internal(String),

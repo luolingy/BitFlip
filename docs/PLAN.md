@@ -842,6 +842,27 @@ M6 交付物至此**全部完成**。
    所以判据改成"函数体在窗口内第一条 `ret` 处结束"，而不是先要求边界已知）；mingw 的
    `___chkstk_ms` 在符号表里是 **NOTYPE**（`(ty 0)`），我们的符号表来源只收函数类型符号，
    所以即使不剥符号这个名字也只由内置判据给出。
+   复核（`objdump -t` 实读，只看 `.text` = `sec 1`）：`___chkstk_ms` 在 `m8-builtins.exe` 与
+   `m3-mingw-static.unstripped.exe` 上都是 `(ty 0)`，这一条在两个样本上都成立。
+   但 **"`ty 0`"本身不说明任何事** —— `.text` 里的 NOTYPE 符号按性质分三类：
+   节符号（名字就是 `.text`）、编译器标签（`.l_startw`/`.l_endw`/`.l_start`/`.l_end`，`scl 6`）、
+   以及看起来像函数名的。实测：
+
+   | 样本 | `.text` NOTYPE 合计 | 节符号 | 编译器标签 | 像函数名 |
+   |------|------|------|------|------|
+   | `m8-builtins.exe` | 90 | 74 | 4 | 12 |
+   | `m3-mingw-static.unstripped.exe` | 70 | 64 | 4 | 2 |
+
+   所以"NOTYPE 里藏着函数名"的实际规模是 **12 与 2**，不是"70 个"。
+   `m3-mingw-static.unstripped.exe` 那 2 个就是 `__C_specific_handler` 与 `___chkstk_ms`，
+   即这条欠账的全部内容。`m8-builtins.exe` 多出的 10 个是**导入桩**
+   （`SetUnhandledExceptionFilter`、`GetLastError`、`VirtualQuery`、`TlsGetValue`、
+   `VirtualProtect`、`EnterCriticalSection`、`Sleep`、`InitializeCriticalSection`、
+   `LeaveCriticalSection`、`DeleteCriticalSection`），节内偏移 `0x1770..0x17c0`
+   （`objdump -t` 实读：0x1770/1778/1780/1788/1790/1798/17a0/17a8/17b0/17b8，
+   严格等距 8 字节 —— 那就是一条 `jmp [rip+disp]`，10 个桩合计 0x50 字节）——
+   它们是"属于哪个 DLL"这个问题，
+   导入表里有答案，属于导入解析（M8 已有一条导入桩来源），不是符号表这条欠账的内容。
 
 **考虑过但没做的判据**（每条都因为"不够硬"）：`__security_check_cookie`（判据要落在 load config
 里的 cookie 地址上，本机没有能产生它的 MSVC fixture）、MSVC 的 `__chkstk`（与 GCC 的形状相近但
@@ -858,7 +879,9 @@ M6 交付物至此**全部完成**。
     （clang-cl `/Zi` + `lld-link /debug`；真值走 `dumpbin /symbols` + `undname`）。分析 `m8-cxx.obj` 实测：
     显示名 `public: int __cdecl Widget::bar(int)`，`aliases` 留存 `?bar@Widget@@QEAAHH@Z`。
     注意风格差异：golden 存 `undname` 原话（带 `__ptr64`），我们输出 LLVM 风格，断言要按语义比。
-    仍欠：自动化回归测试；以及"PDB 路径上可读名从哪来"没查清（那条路上反修饰没被用到）。
+    回归测试已补：`crates/bitflip-core/tests/m8_demangle_e2e.rs` 两条 —— 一条钉住"显示名可读、
+    原始修饰名作为 `aliases` 保留"（即"改显示不改身份"），一条钉住普通 C 名不被改动。
+    仍欠："PDB 路径上可读名从哪来"没查清（那条路上反修饰没被用到）。
 
 **未做（继续 M8 时要接上的）**：交付物 1 的收尾（静态库成员的 PDB —— 现在
 只做镜像本身，PE 调试目录与 CodeView 记录见记录 10）；符号表 NOTYPE 符号里的函数名（见记录 9）。
@@ -902,6 +925,89 @@ MSVC 修饰名反修饰、静态库 PDB。
 3. 导出 JSON schema 有版本号 + 快照测试。
 
 风险：写回是**破坏性操作**，必须默认安全（副本 + 原子替换 + 显式确认）。这一条是硬约束。
+
+**完成情况（据实记录，2026-10：非破坏性那一半已落地）**
+
+现状：交付物 3 的**导出**部分（反汇编文本 / JSON / 函数清单 / 符号表 / CFG-DOT）已实现，
+并已接到 CLI（`export` 子命令）与 HTTP（`GET /api/export`）。**写回、差分、FlatBuffers 快照
+未做** —— 验收标准 1、2 依赖写回，因此**尚未达成**；验收标准 3 只在"JSON 带版本号"这半边成立
+（schema 快照测试未做）。
+
+1. **单一实现，两个入口。** 格式与写出逻辑只在 `bitflip-core::export` 里写一遍；
+   CLI 与服务端只做参数解析与 IO。服务端复用 `AppState` 已缓存的反汇编
+   （`export_with_disasm`），所以一次 HTTP 导出不会触发重扫，也不存在"CLI 与服务端各拼一份文本"
+   的漂移风险。为此 `Disasm` 新增 `text_style` 与 `with_text_style`：语法风格设在**反汇编视图**上，
+   只有一条渲染路径（见下面第 3 条的教训）。
+2. **六种格式**：`asm-intel`、`asm-att`、`json-functions`、`json-symbols`、`json-xrefs`、`dot-cfg`。
+   每个导出都**自述**：文本类是首行 `# bitflip-export v1 ...` 注释头，JSON 是
+   `{format_version, producer, meta, totals, 数据...}`，`meta` 里带 producer、四个层的 wire 版本、
+   目标路径与大小、架构、过滤参数、生成时间（RFC 3339，自己换算，不为一格时间戳引入日期库）。
+3. **AT&T 渲染（意外发现并修掉的既有缺陷）**。为导出 AT&T 文本，`bitflip-arch::render` 新增
+   `format_insn_with(decoder, insn, TextStyle)`，`format_insn` 退化成 Intel 的薄封装。
+   规则：`%reg` / `$imm` / `disp(%base,%index,scale)`、操作数倒序、直接跳转写绝对目标、
+   间接跳转加 `*`、只有带内存操作数时才给助记符加宽度后缀。真值来自独立的
+   `objdump -d -M att`（对拍 6000 条：逐字相同 5859 条，已记录的解码层差异 **141** 条，
+   **未解释的不一致 0 条**；负向验证：把操作数倒序去掉，一致率掉到 43.8% 且出现 15 条未解释差异
+   —— 说明这条测试真的在锚行为，不是恒过）。
+4. **该过程里修掉两个真缺陷**（都是导出把它们照出来的）：
+   * **Intel 内存操作数缺 `+`。** 原实现把 base 与 index 各当一个"片段"用空格拼，于是
+     `nop DWORD PTR [rax+rax*1+0x0]` 被渲染成 `nop dword ptr [rax rax]` —— 在任何汇编器里都是
+     **语法错误**，而它"看起来像"一个地址。真实样本上 146 行受影响。真值取自 `objdump -M intel`
+     与 `llvm-objdump`。同处一并把负位移的空格写法（`- 0x12e`）改成 `-0x12e`，绝对地址不再带前导 `+`。
+   * **负位移按无符号打印**（`0xfffffffffffffed2(%rip)`），AT&T 对拍时发现，改为 `-0x12e(%rip)`。
+5. **诚实性（CLAUDE.md §7）落到了每一处**：
+   * **截断必须自述。** 每次导出都有字节预算（默认 32 MiB，`--limit-bytes 0` 表示不限），
+     流式格式（反汇编文本、DOT）撞上预算就在结果里写明少写了多少条并给出下一步
+     （按地址段分批）。**判断在写出处**做，不是"先拼好整串再截"，否则大目标上等于把限制内存做反了。
+     被截断的位置一定落在**行边界**，且撞墙后不再补写后面的短行（否则输出会缺中间一段）。
+   * **不能交半份的格式明确失败。** JSON 是单个文档、DOT 是语法文件，截断它们只会得到解析不了的
+     东西，所以超预算时**报错**并给出差额（`ExportError::OverBudget`，`Display` 里连 `notes`
+     一起印出来 —— 只存不印等于没存）。DOT 失败时还要带上"已画出多少块/还有多少函数没画"。
+   * **降级写在输出里。** 解不出的字节记数并进 `notes`；符号表为空要说明是"已剥离"而不是失败；
+     未命名的函数如实写"未识别"（**不造** `func_xxx` 假名）；函数清单里给"有 N 个没有名字"的账目；
+     覆盖率（索引/可达/仅线性）每次都报。
+   * **能力不匹配报错，不回落。** 对非 x86 目标要 `asm-att` 返回 `NotYetImplemented`
+     （HTTP 501），而不是给它 Intel 文本假装成功 —— 后者看起来完全正常。
+6. **两个入口的实测**：
+   * CLI：`bitflip-cli export <目标> --format ... [--out FILE] [--from/--to] [--function]
+     [--no-bytes] [--no-source] [--max-functions N] [--limit-bytes N] [--summary] [--force]`。
+     正文走 stdout（可重定向成文件），截断与说明走 **stderr** —— 混进正文会破坏"导出的文件就是
+     那批字节"，只写进正文又会因为重定向而看不见。`--out` 默认**拒绝覆盖**已存在的文件，
+     父目录不存在就报错（不自动建目录）。
+   * HTTP：`GET /api/export?format=&from=&to=&function=&bytes=&source=&max_functions=&limit=`。
+     正文就是导出的字节（可直接落盘），元信息走响应头
+     （`x-bitflip-format` / `-export-format-version` / `-items` / `-truncated` / `-warning-N`），
+     说明里的中文按 `%XX` 编码 —— HTTP 头是 ASCII，直接塞中文会被拒或静默丢弃，而那正好是
+     "降级不出现在界面上"。
+   * **查询参数名一律单词 + `deny_unknown_fields`。** 这不是风格：`serde_urlencoded`
+     **默认忽略不认识的字段**，所以 `/api/export?limit-bytes=1000` 会返回 200 和一份
+     **没被限制大小**的响应，而用户看不出来。实测踩到（第一版就叫 `limit-bytes`/`limit_bytes`），
+     现在写错的键返回 400 并列出可用参数。
+7. **测试与门禁**：
+   * `crates/bitflip-core/tests/m9_export.rs`：六种格式的端到端回归，钉住自述头、
+     `format_version`、`totals` 与数据条数一致、地址是定长 16 位 hex、`iat_slot` 未知写 `null`、
+     范围过滤真的减少条数、截断有账目且落在行边界（用 4 KiB 预算强制触发）、
+     超预算 JSON 报 `OverBudget` 且带数字、非 x86 的 AT&T 报错。fixture 缺失时**响亮失败**
+     （不跳过 —— 跳过会让绿灯说谎）。
+   * `crates/bitflip-arch/tests/att_matches_objdump.rs`：与 `objdump -M att` 对拍（见第 3 条）。
+   * `crates/bitflip-arch/src/render.rs` 单测：`[rax+rax*1]` 必须有 `+`、负位移、比例、
+     绝对地址不带 `+`（见第 4 条）。
+   * `scripts/smoke-export-http.ps1`：起**真实服务进程**打真 HTTP，46 项断言（脚本末尾会打条数）——
+     元数据是否活着穿过 HTTP 层、小预算是否真的标记了截断、写错的参数是否被拒、
+     非 x86 的 AT&T 是否 501、同一目标 Intel 是否 200。已接入 `preflight.ps1`
+     （缺少二进制或 fixture 时显式 SKIP 并给出生成命令）。
+     **它挡的正是单测挡不住的那一类**：核心函数返回的账目在 HTTP 层被丢掉的话，
+     客户端收到的是一个自信的 200。
+   * 全量：`cargo test --workspace` **904 passed / 0 failed / 5 ignored**（M9 之前是 876）。
+
+**未做（继续 M9 时要接上的）**：
+- 交付物 1、2：字节补丁编辑与写回（含 PE checksum / ELF 一致性校验、副本 + 原子替换 + 显式确认）
+  —— 验收标准 1、2 都挂在这里，且这是破坏性操作，硬约束"默认安全"必须先落地。
+- 交付物 4：差分视图（两个同族二进制的符号/函数/指令级差异）。
+- FlatBuffers 只读快照导出。当前 JSON 已经带 `format_version` 与 `producer`，外部工具能消费；
+  快照那一条要等"外部消费方是谁"明确之后再定形态（先定格式再找用户容易做成没人要的东西）。
+- 导出 JSON 的 **schema 快照测试**（现在只有结构与版本号断言，还没有把一份 schema 钉成快照）。
+- 浏览器目视确认：导出在 SPA 里**还没有入口**（现在只有 CLI 与 HTTP）。界面接入不在本批范围内。
 
 ### M10 · 未来 TODO 池（不承诺，按需排序）
 

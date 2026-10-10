@@ -135,6 +135,24 @@ try {
             Write-Host "--- SKIP (needs a release binary and the unstripped fixture; run:"
             Write-Host "          & .\scripts\cargo.ps1 build --release -p bitflip-cli; & .\scripts\gen-fixtures.ps1)"
         }
+
+        # M9: GET /api/export. Unit tests cover the core exporter, but they cannot
+        # see whether the honesty metadata SURVIVES the HTTP layer -- a dropped
+        # truncation flag turns an incomplete export into a confident 200. This
+        # runs the real binary and reads the real headers.
+        $exportTarget = Join-Path $repoRoot 'tests/fixtures/generated/m3-mingw-static.exe'
+        $exportArm = Join-Path $repoRoot 'tests/fixtures/generated/elf-aarch64.exe'
+        if ((Test-Path -LiteralPath $smokeBin) -and (Test-Path -LiteralPath $exportTarget) -and (Test-Path -LiteralPath $exportArm)) {
+            Invoke-Step -Name 'export HTTP smoke (M9)' -Action {
+                & (Join-Path $PSScriptRoot 'smoke-export-http.ps1') -Bin '.cargo-target/debug/bitflip-cli.exe' | Out-Host
+            } | Out-Null
+        }
+        else {
+            Write-Host ""
+            Write-Host "=== export HTTP smoke (M9)"
+            Write-Host "--- SKIP (needs the debug binary plus the m3-mingw-static and elf-aarch64 fixtures; run:"
+            Write-Host "          & .\scripts\cargo.ps1 build --workspace; & .\scripts\gen-fixtures.ps1)"
+        }
     }
 
     Write-Host ""
