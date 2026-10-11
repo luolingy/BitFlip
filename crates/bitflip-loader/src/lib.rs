@@ -113,7 +113,7 @@ pub enum ObjectKind {
     Coff,
     /// ELF（可执行 / `.so` / `.o`）。
     Elf,
-    /// Mach-O（仅识别，解析推迟到 M10）。
+    /// Mach-O（可执行 / `.dylib`；解析排期 M12，见 `docs/PLAN.md` 与 ADR-0017）。
     MachO,
     /// 未识别：按原始二进制处理。
     Raw,

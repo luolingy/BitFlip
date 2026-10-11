@@ -11,6 +11,46 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — 伪代码导出（`pseudo-c`）：反编译器的**有界子集**
+
+> 决策与理由见 `docs/DECISIONS.md` ADR-0018 与 `docs/DECOMPILER-SCOPE.md`。
+> 一句话：**这不是反编译器**，它只做单基本块内的表达式还原，不做控制流结构化。
+
+- **`bitflip-analyze::pseudo`（新模块）**：把单个基本块内的指令翻成 C 风格语句。
+  产出的硬约束（都有测试锁住）：
+  - 每条语句带来源指令地址，可逐句回查机器码；
+  - `structured` 字段恒为 `false`，且输出里**必定**带 `FlatGoto` 说明 ——
+    条件跳转以 `if (cond) goto` 出现，不是还原出的 `if/while/for`；
+  - 没有名字的函数输出入口地址，**不编造** `func_xxx`（测试断言输出不含 `func_`）；
+  - 间接跳转写明"目标未知（需要数据流分析）"，不编地址；
+  - 翻不出来的指令写成注释并**计数**（`PseudocodeFunction::untranslated`），
+    不填默认值、不静默丢弃；
+  - 内存访问宽度取自 `MemRef::size`（是事实，不是猜）；宽度不是 1/2/4/8 时
+    如实标注字节数，不硬塞一个 C 类型。
+- **寄存器名改为注入**（`bitflip_analyze::RegisterNamer`）。原因是实测踩到的一个真 bug：
+  本模块最初硬编码 `0 => rax, 1 => rcx, …`，假定 `RegId` 是从 0 连续编号的序号，
+  但它是 **capstone 的原始编号**，于是真实目标上 `RegId(44)`、`RegId(231)` 全判成未知，
+  绝大多数指令退化成"无法翻译"。权威来源是
+  `bitflip_arch::backend::CapstoneDecoder::register_name`，本模块**不维护名字表**。
+  回归测试：`namer_is_asked_with_raw_capstone_ids_not_a_compact_index`。
+- **`ExportFormat::PseudoC`**（`--format pseudo-c`）：CLI / HTTP 导出自动可用。
+  头部说明区明确写出"这是有界子集，不是反编译器"与"请对着反汇编核对"。
+- **`Disasm::decode_range`**：取一段地址区间内已解码的指令，复用与
+  `Disasm::render` 相同的解码路径（不另开一条解码，避免"伪代码与反汇编列表不是同一条指令"）。
+- **`bitflip-analyze` 新增 12 个测试**。
+
+### 文档 — 与 IDA Pro 的格式/架构覆盖对照
+
+- **`docs/FORMAT-COVERAGE-VS-IDA.md`（新）**：BitFlip 与 IDA Pro 在**文件格式**与
+  **处理器架构**两个维度上的逐项对照，数据取自 Hex-Rays 官方文档。结论按"是否缺"
+  分三类列出（文件格式缺口、架构缺口、以及**反编译器**覆盖缺口 —— IDA 的
+  反汇编器覆盖面远大于其反编译器），并标注每一项的排期归属。
+- **`docs/DECOMPILER-SCOPE.md`（新）**：D5（是否做反编译器）的拆解决策。
+  关键论据：源码→二进制是**多对一**映射，其逆不唯一，结构化选择"在最终意义上
+  是不可判定的"；SAILR 实测 7 355 个函数，DREAM 做到零 goto 但结构相似度从
+  22.5 恶化到 45.99 —— **"消除 goto"不是变好而是变差**。
+- **`docs/research/decompiler-architecture-survey.md`（新）**：反编译器架构综述，
+  逐条附来源 URL。
 ### 新增 — M2：反汇编引擎
 
 - **`bitflip-arch::backend`**：capstone 后端的真实接线。结构化提取

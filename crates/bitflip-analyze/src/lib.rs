@@ -16,6 +16,7 @@ mod frames;
 mod functions;
 mod job;
 mod jumptable;
+mod pseudo;
 mod scan;
 mod strings;
 mod xref;
@@ -52,6 +53,11 @@ pub use job::{
 pub use jumptable::{
     preferred_width, scan_jump_tables, EntryKind, EntryWidth, JumpTable, JumpTableScan,
     LOOKBACK_WINDOW, MAX_ENTRIES,
+};
+pub use pseudo::{
+    decompile_function, no_register_names, render_function_text, Pseudocode, PseudocodeBlock,
+    PseudocodeFunction, PseudocodeNote, PseudocodeStatement, RegisterNamer, MAX_STATEMENTS,
+    PSEUDO_FORMAT_VERSION,
 };
 pub use scan::{
     combine, control_flow_targets, scan_linear, scan_recursive, ScanCoverage, ScanOptions,

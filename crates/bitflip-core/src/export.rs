@@ -64,6 +64,11 @@ pub enum ExportFormat {
     JsonXrefs,
     /// 控制流图（Graphviz DOT）。
     DotCfg,
+    /// C 风格伪代码（**有界子集**：单基本块表达式视图，不做控制流结构化）。
+    ///
+    /// 见 `docs/DECOMPILER-SCOPE.md`：这不是反编译器，条件跳转以 `goto` 出现，
+    /// 不还原 if/while/for，不做类型推断。用户必须知道这一点才能正确理解输出。
+    PseudoC,
 }
 
 impl ExportFormat {
@@ -77,6 +82,7 @@ impl ExportFormat {
             Self::JsonSymbols => "json-symbols",
             Self::JsonXrefs => "json-xrefs",
             Self::DotCfg => "dot-cfg",
+            Self::PseudoC => "pseudo-c",
         }
     }
 
@@ -90,6 +96,7 @@ impl ExportFormat {
             Self::JsonSymbols,
             Self::JsonXrefs,
             Self::DotCfg,
+            Self::PseudoC,
         ]
     }
 
@@ -106,7 +113,10 @@ impl ExportFormat {
     /// 是否是文本（相对 JSON）格式。CLI 用它决定要不要给一个文件名默认值。
     #[must_use]
     pub const fn is_text(self) -> bool {
-        matches!(self, Self::AsmIntel | Self::AsmAtt | Self::DotCfg)
+        matches!(
+            self,
+            Self::AsmIntel | Self::AsmAtt | Self::DotCfg | Self::PseudoC
+        )
     }
 }
 
@@ -390,6 +400,10 @@ fn export_with_disasm_prebuilt(
             let analysis = session.analysis(&job)?;
             write_dot_cfg(&mut writer, &analysis, options, &meta, &mut notes)?
         }
+        ExportFormat::PseudoC => {
+            let analysis = session.analysis(&job)?;
+            write_pseudo_c(session, &mut writer, &analysis, options, &meta, &mut notes)?
+        }
     };
 
     let truncated = truncation_of(
@@ -665,6 +679,182 @@ fn write_asm(
         notes.push(format!("反汇编说明：{note}"));
     }
     Ok(written)
+}
+
+/// 头两行：格式版本与来源。伪代码与其他文本格式共用同一套溯源头，
+/// 这样"这份输出是谁生成的、针对哪个文件"在任何格式里都是同一处答案。
+fn pseudo_header(meta: &ExportMeta, options: &ExportOptions) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# bitflip-export v{} format={} target={} arch={} generated_at={}\n",
+        EXPORT_FORMAT_VERSION,
+        ExportFormat::PseudoC.as_str(),
+        meta.target,
+        meta.arch.as_deref().unwrap_or("unknown"),
+        meta.generated_at
+    ));
+    if let Some((from, to)) = options.range {
+        out.push_str(&format!("# range {} .. {}\n", hex16(from), hex16(to)));
+    }
+    if let Some(func) = options.function {
+        out.push_str(&format!("# function {}\n", hex16(func)));
+    }
+    out.push_str(&format!("# producer {}\n", meta.producer));
+    out
+}
+
+/// C 风格伪代码（有界子集）。
+///
+/// **这不是反编译器**，见 `docs/DECOMPILER-SCOPE.md`。输出遵守三条硬约束：
+///
+/// 1. **每条语句带来源指令地址** —— 用户能逐句回查机器码；
+/// 2. **不结构化** —— 条件跳转是 `goto`，不是 `if/while/for`；
+/// 3. **不猜** —— 编不出来的东西写注释并计数，不填默认值。
+///
+/// 关于架构：伪代码的表达式翻译目前只在 **x86_64** 上做过寄存器命名核对。
+/// 其他架构上寄存器名拿不到，模块会如实报告 `RegistersUnnamed` 并以编号显示 ——
+/// 那种输出仍然忠实（编号是真的），只是不好读。**我们不会为此编一套没核对过的
+/// 寄存器名**（错的寄存器名比编号更糟，CLAUDE.md §7）。
+fn write_pseudo_c(
+    session: &Session,
+    writer: &mut ExportWriter,
+    analysis: &TargetAnalysis,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let disasm = session.disassemble(crate::DisasmScanOptions::default())?;
+
+    // 寄存器名来自 capstone 后端，**不是**本层自己维护的表。
+    //
+    // `RegId` 是 capstone 的原始寄存器编号（不是从 0 连续排的序号）。
+    // 实测踩过：按"0=rax, 1=rcx…"写一张表，真实目标上 `RegId(44)`、
+    // `RegId(231)` 全判成未知，绝大多数指令退化成"无法翻译"。
+    // 权威来源是后端的 `register_name`，它的文档也明确了
+    // "查不到返回 None，调用方如实显示未识别寄存器"。
+    //
+    // 没有后端时解析器恒给 `None`，输出会如实标注"寄存器名未覆盖" —— **不猜**（§7）。
+    let renderer = disasm.renderer.clone();
+    let namer = |id: u16| -> Option<String> {
+        renderer
+            .as_ref()
+            .and_then(|r| r.register_name(bitflip_arch::RegId(id)))
+    };
+
+    writer.push_raw(&pseudo_header(meta, options));
+    writer.push_raw(
+        "# 说明：这是**有界子集**，不是反编译器。条件跳转以 goto 出现，\
+         未还原 if/while/for；未做类型推断。\n",
+    );
+    writer.push_raw("# 每条语句前的地址是它来自哪条指令 —— 请对着反汇编核对，不要直接相信。\n");
+
+    let mut selected: Vec<&crate::CfgWire> = analysis
+        .cfgs()
+        .filter(|cfg| {
+            let entry = u64::from_str_radix(&cfg.entry, 16).unwrap_or(0);
+            if let Some(func) = options.function {
+                return entry == func;
+            }
+            match options.range {
+                None => true,
+                Some((from, to)) => entry >= from && entry < to,
+            }
+        })
+        .collect();
+    selected.sort_by_key(|cfg| u64::from_str_radix(&cfg.entry, 16).unwrap_or(0));
+
+    let limit = options.max_functions;
+    let skipped = selected.len().saturating_sub(limit);
+    selected.truncate(limit);
+
+    let mut statements: u64 = 0;
+    let mut untranslated: u64 = 0;
+    let mut unnamed: u64 = 0;
+
+    for cfg in &selected {
+        let entry = u64::from_str_radix(&cfg.entry, 16).unwrap_or(0);
+
+        // 名字：只在 `named` 为真时采用。**不编造** `func_xxx`（§7）。
+        let name = analysis
+            .functions()
+            .iter()
+            .find(|f| u64::from_str_radix(&f.start, 16) == Ok(entry))
+            .filter(|f| f.named)
+            .map(|f| f.name.clone());
+        if name.is_none() {
+            unnamed += 1;
+        }
+
+        // 该函数的指令区间：取所有块的最小 start 与最大 end。
+        let Some(first) = cfg.blocks.first() else {
+            continue;
+        };
+        let from = cfg
+            .blocks
+            .iter()
+            .filter_map(|b| u64::from_str_radix(&b.start, 16).ok())
+            .min()
+            .unwrap_or(0);
+        let to = cfg
+            .blocks
+            .iter()
+            .filter_map(|b| u64::from_str_radix(&b.end, 16).ok())
+            .max()
+            .unwrap_or(0);
+        let _ = first;
+
+        let insns = disasm.decode_range(from, to);
+        let inner = bitflip_analyze::Cfg::build(&insns);
+        let code =
+            bitflip_analyze::decompile_function(entry, name.as_deref(), &insns, &inner, &namer);
+
+        statements += code.statement_count as u64;
+        for note in &code.notes {
+            if let bitflip_analyze::PseudocodeNote::Untranslated { count, .. } = note {
+                untranslated += *count as u64;
+            }
+        }
+
+        // 逐行推入而不是整块 `push_raw`：只有逐行才拿得到返回值，
+        // 而"是否被字节预算截断"必须让用户知道（§7），不能悄悄少给。
+        let text = bitflip_analyze::render_function_text(&code);
+        let mut blocked = false;
+        for line in text.lines() {
+            if !writer.push_line(line) {
+                blocked = true;
+                break;
+            }
+        }
+        if blocked {
+            notes.push(
+                "输出达到字节预算后停止：用 --from/--to 缩小地址范围，或调大 --limit-bytes"
+                    .to_string(),
+            );
+            break;
+        }
+    }
+
+    if skipped > 0 {
+        notes.push(format!(
+            "还有 {skipped} 个函数未导出（超过 --max-functions {limit}）：这是截断，不是「没有更多函数」"
+        ));
+    }
+    if unnamed > 0 {
+        notes.push(format!(
+            "有 {unnamed} 个函数在符号表里没有名字，输出里用入口地址代替 —— 未编造名称"
+        ));
+    }
+    if untranslated > 0 {
+        notes.push(format!(
+            "共 {untranslated} 条指令无法翻译成 C 语句（输出里是注释）：这些位置**没有**被猜成某个表达式"
+        ));
+    }
+    notes.push(
+        "伪代码是有界子集：条件跳转以 goto 出现、未做类型推断、未做控制流结构化。\
+         不要把它当作可编译的源码，也不要当作「已还原的逻辑」"
+            .to_string(),
+    );
+    Ok(statements)
 }
 
 /// 判定架构是否属于 x86 族（用 `TargetInfo::arch` 的规格字符串）。

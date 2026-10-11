@@ -392,6 +392,33 @@ impl Disasm {
         }
     }
 
+    /// 取一段地址区间内**已解码**的指令（`[from, to)`，按地址升序）。
+    ///
+    /// 这是给"需要结构化指令而不是渲染后文本"的消费者用的（当前只有伪代码导出）。
+    /// 复用与 [`Disasm::render`] 完全相同的解码路径：同一份 `decoder`、
+    /// 同一份字节读取，**不另开一条解码**——两条路径迟早会漂移，
+    /// 而漂移的表现会是"伪代码里的指令与反汇编列表里的不是同一条"。
+    ///
+    /// 解码失败的地址**不出现在结果里**：调用方要能区分"这里没有指令"与
+    /// "这里有指令但我解不出来"，所以不要用返回值判断覆盖情况，
+    /// 而应结合 [`Disasm::coverage`]。
+    #[must_use]
+    pub fn decode_range(&self, from: u64, to: u64) -> Vec<bitflip_arch::DecodedInsn> {
+        let mut out = Vec::new();
+        for (addr, len) in self.index.range(from, to) {
+            let Some(bytes) = self.space.read(addr, usize::from(len)) else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            if let Ok(insn) = self.decoder.decode_one(&bytes, addr) {
+                out.push(insn);
+            }
+        }
+        out
+    }
+
     /// 渲染单条指令。
     ///
     /// 解码失败或字节读不到时**不编造**内容：文本为 `<无法解码>`，
