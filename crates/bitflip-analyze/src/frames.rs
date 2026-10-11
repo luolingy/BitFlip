@@ -43,7 +43,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use bitflip_arch::{AbiSpec, CapstoneDecoder, DecodedInsn, Flow, Operand, RegId};
-use bitflip_loader::object::{PeUnwindInfo, UnwindEntry};
+use bitflip_loader::object::UnwindEntry;
 
 use crate::args::InsnRange;
 
@@ -154,9 +154,18 @@ pub fn scan_frames(
 
     // 展开表按入口地址建索引。线性查找在 5000 个函数 × 5000 条展开信息
     // 上是 2500 万次比较，不能接受。
-    let mut unwind_index: Vec<(u64, &PeUnwindInfo)> = unwind
+    //
+    // `filter` 只留"解码出细节"的条目：没解码的条目答不出帧大小，
+    // 留在索引里只会让下面的账目数字失去意义。
+    //
+    // 注意这里到下面 `infer_frame` 全程**不出现任何格式类型名** —— 只读
+    // `UnwindEntry` 的访问器。加一种格式的展开信息时，改动落在加载器那四个
+    // 访问器里，本文件不动（此前它 `use` 了 `PeUnwindInfo`，正是为了把这个
+    // 依赖去掉）。
+    let mut unwind_index: Vec<(u64, &UnwindEntry)> = unwind
         .iter()
-        .filter_map(|e| e.decoded.as_ref().map(|d| (e.begin, d)))
+        .filter(|entry| entry.decoded.is_some())
+        .map(|entry| (entry.begin, entry))
         .collect();
     unwind_index.sort_by_key(|(begin, _)| *begin);
 
@@ -227,7 +236,7 @@ pub fn scan_frames(
 }
 
 /// 在按入口排序的展开索引里查一个函数。
-fn lookup_unwind<'a>(index: &[(u64, &'a PeUnwindInfo)], entry: u64) -> Option<&'a PeUnwindInfo> {
+fn lookup_unwind<'a>(index: &[(u64, &'a UnwindEntry)], entry: u64) -> Option<&'a UnwindEntry> {
     let pos = index
         .binary_search_by_key(&entry, |(begin, _)| *begin)
         .ok()?;
@@ -325,7 +334,7 @@ impl PrologueScan {
 fn infer_frame(
     entry: u64,
     body: &[DecodedInsn],
-    unwind: Option<&PeUnwindInfo>,
+    unwind: Option<&UnwindEntry>,
     resolver: &NameResolver<'_>,
 ) -> FrameInference {
     let mut notes = Vec::new();
@@ -333,22 +342,26 @@ fn infer_frame(
     let prologue = scan_prologue(body, resolver);
     let prologue_frame_size = prologue.frame_size();
 
-    let unwind_frame_size = unwind.and_then(PeUnwindInfo::frame_size);
+    // 下面全程只用 `UnwindEntry` 的访问器，不碰任何格式类型 —— 换个格式
+    // （例如以后解码 ELF 的 CFI）这里一个字都不用改。
+    let unwind_frame_size = unwind.and_then(UnwindEntry::frame_size);
     let mut saved_registers: Vec<String> = unwind
-        .map(|d| {
-            d.saved_registers()
+        .map(|entry| {
+            entry
+                .saved_registers()
                 .into_iter()
                 .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default();
     let frame_pointer = unwind
-        .and_then(|d| d.frame_register.clone())
+        .and_then(UnwindEntry::frame_register)
+        .map(str::to_string)
         .or_else(|| prologue.frame_pointer.clone());
 
-    if let Some(d) = unwind {
-        for n in &d.notes {
-            notes.push(format!("展开信息：{n}"));
+    if let Some(entry) = unwind {
+        for note in entry.notes() {
+            notes.push(format!("展开信息：{note}"));
         }
     }
 
@@ -684,7 +697,17 @@ pub fn summarize_frames(inferences: &[FrameInference], abi: Option<&AbiSpec>) ->
 mod tests {
     use super::*;
     use bitflip_arch::{abi_for_spec, decoder_for, Arch, ArchSpec, Endian, Mode};
-    use bitflip_loader::object::PeUnwindOp;
+    // 测试要往分析层喂**某一种**解码过的展开信息，而目前只有 PE 的
+    // `UNWIND_INFO` 有解码器 —— 所以测试模块仍然 import 它。
+    //
+    // 这与生产代码是两件事：`frames.rs` 的非测试部分一个格式类型名都没有
+    // （只读 `UnwindEntry` 的访问器），格式差异收敛在加载器的访问器里。
+    // 测试需要真实数据，用真实格式造数据是对的；编一个"假的中性展开信息"
+    // 只会让测试自己证明自己。
+    //
+    // 下面 `unwind_accessors_read_the_decoded_detail` 那一条钉住"访问器读的就是
+    // 这里喂进去的东西"，所以将来 `decoded` 换形态时，测试会**立刻**指出来。
+    use bitflip_loader::object::{PeUnwindInfo, PeUnwindOp};
 
     fn x64() -> ArchSpec {
         ArchSpec::from_arch(Arch::X86_64, Mode::M64, Endian::Little)
@@ -756,6 +779,31 @@ mod tests {
             unwind_info: 0,
             decoded,
         }
+    }
+
+    /// 访问器读的就是 `decoded` 里的细节，且**区分"解码了但为 0"与"没有解码"**。
+    ///
+    /// 这一条是给将来的自己留的路标：`decoded` 迟早要从"只有 PE"变成多格式的
+    /// 枚举（ELF 的 CFI 解码），那时这四个访问器的实现要改，而分析层的调用处
+    /// 不该改。如果谁在改的过程中把 `Some(0)` 折成了 `None`，"不知道"就会被
+    /// 显示成"零字节"—— 那是最容易被当成正确答案的一类错，所以单独钉住。
+    #[test]
+    fn unwind_accessors_read_the_decoded_detail() {
+        let none = entry(0x1000, None);
+        assert_eq!(none.frame_size(), None, "没解码就是不知道，不是 0");
+        assert!(none.saved_registers().is_empty());
+        assert_eq!(none.frame_register(), None);
+        assert!(none.notes().is_empty());
+
+        let decoded = entry(0x1000, Some(unwind_with(0x38, &["rbx", "rbp"])));
+        assert_eq!(decoded.frame_size(), Some(0x38));
+        assert_eq!(decoded.saved_registers(), vec!["rbx", "rbp"]);
+        assert_eq!(decoded.frame_register(), None, "这里没设帧寄存器");
+        assert!(decoded.notes().is_empty());
+
+        // 解码了、但没有占栈的操作：帧大小是确定的 0，而不是"不知道"。
+        let leaf = entry(0x1000, Some(unwind_with(0, &[])));
+        assert_eq!(leaf.frame_size(), Some(0), "解码出的 0 是事实，不是未知");
     }
 
     // ── 前导扫描 ──

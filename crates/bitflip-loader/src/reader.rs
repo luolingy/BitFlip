@@ -64,6 +64,19 @@ pub enum ParseError {
     /// 数值转换溢出（例如 32 位偏移加到 64 位基址后越界）。
     #[error("数值溢出：{0}")]
     Overflow(String),
+    /// 这个对象类别**没有解析器**（不是文件的问题，是派发层没有对应实现）。
+    ///
+    /// 单独一个变体而不是复用 [`Self::Unsupported`]：后者说的是"文件里某个取值
+    /// 我们不支持"，得指向一个具体字段与数值；而这里压根没有字段可指 ——
+    /// 是"这一类目标该由谁处置"的问题。混用会让错误信息里出现一个编出来的
+    /// `value = 0`，那正是 CLAUDE.md §7 禁止的"用 0 冒充未知"。
+    #[error("对象格式 {kind} 没有解析器：{detail}")]
+    NoParser {
+        /// 对象类别短名（`pe` / `coff` / `elf` / `macho` / `raw`）。
+        kind: &'static str,
+        /// 该由谁处置。
+        detail: &'static str,
+    },
 }
 
 impl ParseError {
@@ -84,6 +97,7 @@ impl ParseError {
             Self::Unsupported { detail, .. } => format!("暂不支持：{detail}"),
             Self::Inconsistent(detail) => format!("文件结构自相矛盾：{detail}"),
             Self::Overflow(detail) => format!("地址或长度计算溢出：{detail}"),
+            Self::NoParser { detail, .. } => format!("没有可用的解析器：{detail}"),
         }
     }
 }

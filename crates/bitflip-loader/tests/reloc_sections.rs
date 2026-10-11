@@ -24,9 +24,8 @@
 
 use std::path::PathBuf;
 
-use bitflip_loader::elf;
+use bitflip_loader::format::{coff, elf, pe};
 use bitflip_loader::object::{Object, ObjectId};
-use bitflip_loader::{coff, pe};
 
 fn fixture(name: &str) -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

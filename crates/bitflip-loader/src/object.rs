@@ -412,7 +412,64 @@ pub struct UnwindEntry {
     /// `None` 表示该条目没有解码（ELF 的 `.eh_frame` 目前只给出函数
     /// 边界，没有 CFI 指令解码；PE 的 `.pdata` 若能解出就填上）。
     /// **不拿一个默认值冒充**：没有解码就是没有。
+    ///
+    /// 通用分析层（栈帧推导）**不要直接摸这个字段**，用下面那组访问器 ——
+    /// 理由见 [`UnwindEntry::frame_size`]。
     pub decoded: Option<PeUnwindInfo>,
+}
+
+/// 展开信息的**格式无关读法**。
+///
+/// # 为什么需要这一层，而不是让调用方去读 `decoded`
+///
+/// 栈帧推导（`bitflip-analyze::frames`）是通用分析层，它问的只有三件与格式无关的
+/// 事：帧多大、保存了哪些寄存器、帧指针是哪个。此前它直接 `use` 了
+/// `PeUnwindInfo`，于是**分析层知道 PE 的 opcode 怎么编码** —— 每加一种格式的
+/// 展开信息（例如 ELF 的 CFI 指令解码）都要回去改分析层，而分析层本来完全
+/// 不需要知道这些。这不是"格式层不够模块化"，是**接口**没把格式差异挡住。
+///
+/// 现在差异收敛到这四个方法里（它们与 `decoded` 同处一个 crate），分析层只读
+/// 这里的答案。`decoded` 仍然公开：格式层自己的测试与展示需要原始细节
+/// （PE 的 opcode 序列），拿它是对的 —— 通用层不该拿。
+///
+/// # 加新格式时要改哪里
+///
+/// `decoded` 变成多格式的枚举后，**改这四个方法就够**，调用方不动。
+impl UnwindEntry {
+    /// 展开信息给出的栈帧大小（字节）。
+    ///
+    /// `None` = 这一条没有解码出展开细节。注意 `Some(0)` 是"解码了，且帧大小为 0"
+    /// （叶子函数的常见形态），与 `None` 不是一回事 —— 把两者混起来会让
+    /// "不知道"显示成"零字节"。
+    #[must_use]
+    pub fn frame_size(&self) -> Option<u64> {
+        self.decoded.as_ref().and_then(PeUnwindInfo::frame_size)
+    }
+
+    /// 展开信息说保存了哪些非易失寄存器（按前导顺序）。
+    #[must_use]
+    pub fn saved_registers(&self) -> Vec<&str> {
+        self.decoded
+            .as_ref()
+            .map_or_else(Vec::new, PeUnwindInfo::saved_registers)
+    }
+
+    /// 展开信息说的帧寄存器（frame pointer）；`None` = 没有帧指针。
+    #[must_use]
+    pub fn frame_register(&self) -> Option<&str> {
+        self.decoded
+            .as_ref()
+            .and_then(|detail| detail.frame_register.as_deref())
+    }
+
+    /// 这一条展开信息自己的说明（未识别的操作等）。没有解码时为空。
+    #[must_use]
+    pub fn notes(&self) -> &[String] {
+        match &self.decoded {
+            Some(detail) => detail.notes.as_slice(),
+            None => &[],
+        }
+    }
 }
 
 /// PE `UNWIND_INFO` 解码结果（x64 展开信息）。

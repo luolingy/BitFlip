@@ -13,8 +13,9 @@
 //! `cargo-fuzz` 的目标（`fuzz/fuzz_targets/*.rs`）留作后续接入真 libFuzzer 时使用，
 //! 二者的断言集保持一致。
 
+use crate::format::{coff, elf, pe};
 use crate::object::ObjectId;
-use crate::{coff, elf, pe, ContainerKind, ObjectKind};
+use crate::{ContainerKind, ObjectKind};
 
 /// 确定性伪随机数发生器（xorshift64*）。
 ///

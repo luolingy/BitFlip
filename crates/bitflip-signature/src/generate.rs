@@ -245,13 +245,13 @@ fn slice_member(bytes: &[u8], offset: u64, size: u64) -> Option<&[u8]> {
 }
 
 /// 按格式解析一个对象。
+///
+/// 不是自己的派发实现，只是把 [`bitflip_loader::parse_object`] 的错误折成 `None` ——
+/// 签名生成要的是"这个文件能不能用"，不能用的原因各自由 [`collect_object`] 的统计
+/// 与 `notes` 交代。**绝不能在这里再写一份 `match kind`**：那正是把派发
+/// 复制成三份的老路。
 fn parse_object(kind: ObjectKind, bytes: &[u8], id: ObjectId) -> Option<Object> {
-    match kind {
-        ObjectKind::Coff => bitflip_loader::coff::parse(bytes, 0, id).ok(),
-        ObjectKind::Elf => bitflip_loader::elf::parse(bytes, 0, id).ok(),
-        ObjectKind::Pe => bitflip_loader::pe::parse(bytes, 0, id).ok(),
-        ObjectKind::MachO | ObjectKind::Raw => None,
-    }
+    bitflip_loader::parse_object(kind, bytes, 0, id).ok()
 }
 
 /// 从一个对象里收集签名，返回产出条数。

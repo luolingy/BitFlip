@@ -515,6 +515,37 @@ M8 的四个交付物到这里齐了。这两件是最后两件：一件让"多�
 
 并用另一条测试钉住"同一输入两次扫描结果完全一致"（确定性是正确性前提，
 不是性能指标）。
+### 变更 — 逆向核心模块化：通用层与格式层的边界
+
+改动的**行为变更量为零**，这一点有硬证据（见末尾）。这一节记的是"边界"本身，
+因为它决定了以后加一种格式要动哪些文件。
+
+- **`bitflip-loader` 新增 `format/`**：PE / COFF / ELF 各占一个子模块。
+  在这之前 `pe.rs`（2770 行）、`elf.rs`（1951 行）、`coff.rs`（584 行）与通用文件
+  平摊在 `src/` 下，"哪个是通用的、哪个是某个格式的"只能靠文件名猜。
+- **`format/pe` 按关注点拆成五个文件**（`mod`：映像骨架；`import`：导入/延迟导入/导出；
+  `reloc`：基址重定位；`unwind`：`.pdata` + `UNWIND_INFO`；`inspect`：.NET CLI 头与
+  COFF 符号表）。这是**纯搬移**，逐字节校验过。
+- **格式派发收敛到唯一入口 `bitflip_loader::parse_object`**。`match kind` 曾在
+  `bitflip-core::session`（打开目标、打开归档成员）与 `bitflip-signature::generate`
+  三处各写一遍 —— 漏改一处的后果是**静默的**：新格式会走进兜底分支，被报成
+  "不是可分析对象（识别为 X）"，看起来像识别出了问题。配套加了 `has_parser(kind)`：
+  调用方现在只回答两件事 —— 这个类别有没有解析器、失败怎么表述。
+- **`UnwindEntry` 新增四个格式无关访问器**（`frame_size` / `saved_registers` /
+  `frame_register` / `notes`）。此前 `bitflip-analyze::frames` 直接 `use PeUnwindInfo`，
+  于是通用分析层知道 PE 的 opcode 怎么编码；现在它一个格式类型名都不出现。
+  新增了 `ParseError::NoParser`，替掉"没有解析器"与"某个字段的取值不支持"混用
+  （后者要指向具体字段与数值，硬凑一个 `value = 0` 正是 §7 禁止的）。
+- **`format/elf` 与 `format/coff` 尚未内部拆分**。这不是遗漏而是取舍：拆分带来一层
+  跳转，只有文件大到需要导航时才划算；而且一次只搬一个文件，出问题能立刻定位。
+  ELF 的拆分与 PE 是同一类工作，单独一轮做。
+
+**"零行为变更"的证据**：把改动 stash 掉、用 HEAD 版本与改动版本对
+`m3-mingw-static.exe` / `elf-aarch64.exe` / 两个 diff fixture 各导出
+`asm-intel` / `asm-att` / `json-functions` / `json-symbols` / `dot-cfg` 共 20 项，
+去掉自述头里必然变化的时间戳后**逐字节相同**。这一条必须做：拆前拆后测试都绿是正常的，
+"测试没红"提供不了"只动了位置"的证据。
+
 ### 变更
 
 - `AppState` 新增 `with_session()`：整个 `Session` 交给服务层，

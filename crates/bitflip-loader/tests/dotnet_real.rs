@@ -9,8 +9,8 @@
 //! 看似指令、实则无意义的输出。用户最大的风险不是"识别不出 .NET"，而是
 //! **识别出来了却仍然给了反汇编**。
 
+use bitflip_loader::format::pe;
 use bitflip_loader::object::ObjectId;
-use bitflip_loader::pe;
 
 /// 系统上真实存在的 .NET 程序集。取不到就跳过并说明原因（不伪装成通过）。
 fn real_dotnet_assembly() -> Option<std::path::PathBuf> {

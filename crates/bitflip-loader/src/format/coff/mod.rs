@@ -1,9 +1,16 @@
 //! COFF 目标文件（`.obj`）解析。
 //!
-//! COFF 就是 PE 去掉 DOS 头与可选头之后的骨架，因此与 [`crate::pe`] 共用大部分
-//! 概念。单独成文件是因为入口完全不同：没有 `MZ`/`PE` 签名，直接从 COFF 文件头开始。
+//! COFF 就是 PE 去掉 DOS 头与可选头之后的骨架，因此与 [`super::pe`] 共用大部分
+//! 概念。单独成模块是因为入口完全不同：没有 `MZ`/`PE` 签名，直接从 COFF 文件头开始。
 //!
 //! M1 只做**识别与结构**（节表、符号表、重定位）；COFF 在 M2 与 PE 一起纳入对象层归一化。
+//!
+//! # 为什么还没有内部拆分
+//!
+//! 本节约 600 行 —— 比 PE 拆之前的 2770 行小一个量级，节名长名表（`/N`）与
+//! 解析主体也还没有到"读者要在两件事之间来回跳"的程度。拆分的代价是读者要多
+//! 一层跳转，收益在文件大到需要导航时才出现。等它长到那个体量再拆，届时按
+//! PE 的做法（逐字节搬移 + 守恒校验）走一遍。
 
 use bitflip_arch::{Arch, ArchSpec, Endian};
 
@@ -179,7 +186,11 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
 }
 
 /// 解析 `/NNN` 形式的长节名。
-pub(crate) fn resolve_section_name(
+///
+/// `pub(super)` = 只有 [`super::pe`] 用得到：PE 的节表与 COFF 的节表是同一张表的
+/// 同一套长名规则，PE 那边直接复用这里。**不提到通用层** —— 它要 `Reader` 与
+/// COFF 字符串表的偏移语义，与格式无关的对象模型不该知道这些。
+pub(super) fn resolve_section_name(
     reader: &Reader<'_>,
     name: &str,
     strtab_offset: Option<u64>,

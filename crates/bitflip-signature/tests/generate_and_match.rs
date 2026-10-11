@@ -19,9 +19,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use bitflip_loader::coff;
+use bitflip_loader::format::coff;
+use bitflip_loader::format::pe;
 use bitflip_loader::object::{Object, ObjectId};
-use bitflip_loader::pe;
 use bitflip_signature::matcher::{Matcher, TargetFunction};
 use bitflip_signature::pattern::PatternByte;
 use bitflip_signature::signature::DropReason;

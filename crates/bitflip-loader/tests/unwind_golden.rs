@@ -34,8 +34,8 @@
 
 use std::path::PathBuf;
 
+use bitflip_loader::format::pe::parse;
 use bitflip_loader::object::{ObjectId, PeUnwindOp};
-use bitflip_loader::pe::parse;
 
 fn fixture(name: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

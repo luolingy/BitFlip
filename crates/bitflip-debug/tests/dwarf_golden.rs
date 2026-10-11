@@ -27,9 +27,9 @@ fn load(path: &Path) -> Option<(Object, Vec<u8>)> {
     let guess = bitflip_loader::sniff_bytes(&bytes);
     let id = bitflip_loader::object::ObjectId::Plain;
     let object = match guess.object {
-        bitflip_loader::ObjectKind::Pe => bitflip_loader::pe::parse(&bytes, 0, id),
-        bitflip_loader::ObjectKind::Elf => bitflip_loader::elf::parse(&bytes, 0, id),
-        bitflip_loader::ObjectKind::Coff => bitflip_loader::coff::parse(&bytes, 0, id),
+        bitflip_loader::ObjectKind::Pe => bitflip_loader::format::pe::parse(&bytes, 0, id),
+        bitflip_loader::ObjectKind::Elf => bitflip_loader::format::elf::parse(&bytes, 0, id),
+        bitflip_loader::ObjectKind::Coff => bitflip_loader::format::coff::parse(&bytes, 0, id),
         _ => return None,
     }
     .ok()?;

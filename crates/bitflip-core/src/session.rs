@@ -950,17 +950,17 @@ impl Session {
         let bytes =
             std::fs::read(path).map_err(|error| format!("重新读取文件失败，无法解析：{error}"))?;
 
+        // 派发走 `bitflip_loader::parse_object` 这一个入口：新增格式时这里**不必改**
+        // （`kind =>` 兜底臂会自动跟上）。只有两种"没有解析器"的类别要单独说：
+        // 原始二进制由本模块合成对象，Mach-O 还没做。
         match guess.object {
-            ObjectKind::Elf => bitflip_loader::elf::parse(&bytes, 0, ObjectId::Plain)
-                .map_err(|error| format!("ELF 解析失败：{}", error.summary_zh())),
-            ObjectKind::Pe => bitflip_loader::pe::parse(&bytes, 0, ObjectId::Plain)
-                .map_err(|error| format!("PE 解析失败：{}", error.summary_zh())),
-            ObjectKind::Coff => bitflip_loader::coff::parse(&bytes, 0, ObjectId::Plain)
-                .map_err(|error| format!("COFF 解析失败：{}", error.summary_zh())),
             ObjectKind::Raw => Self::parse_raw(&bytes, guess, opts),
-            ObjectKind::MachO => {
-                Err("Mach-O 解析排期在 M10（见 docs/PLAN.md §1.3），当前只做识别".to_string())
-            }
+            ObjectKind::MachO => Err(format!(
+                "{} 解析排期见 docs/PLAN.md §1.3，当前只做识别",
+                guess.object.label_zh()
+            )),
+            kind => bitflip_loader::parse_object(kind, &bytes, 0, ObjectId::Plain)
+                .map_err(|error| format!("{} 解析失败：{}", kind.label_zh(), error.summary_zh())),
         }
     }
 
@@ -1185,20 +1185,19 @@ impl Session {
         // 可分析对象 —— 所以这里如实报"这个成员不是可分析对象"，
         // 而不是硬塞一个空对象让上层显示"分析完成但什么都没有"。
         let guess = bitflip_loader::sniff_bytes(slice);
-        let id = ObjectId::ArchiveMember(member.name.clone());
-        let object = match guess.object {
-            ObjectKind::Elf => bitflip_loader::elf::parse(slice, 0, id),
-            ObjectKind::Pe => bitflip_loader::pe::parse(slice, 0, id),
-            ObjectKind::Coff => bitflip_loader::coff::parse(slice, 0, id),
-            other => {
-                return Err(BitflipError::InvalidInput(format!(
-                    "成员 {:?} 不是可分析的对象（识别为 {}）：它可能是归档的元数据成员",
-                    member.name,
-                    other.label_zh()
-                )));
-            }
+        // 判据就是"这个类别有没有解析器"，而不是枚举 `Raw | MachO`：
+        // 归档里可能混有非对象成员（GNU 的长名表 `//`、符号索引 `/`、链接器成员的
+        // 元数据），它们本来就不该被当成可分析对象。用 `has_parser` 表达这层意思，
+        // 以后新增格式（比如 Mach-O 解析落地）时这里自动跟上，不必记得回来改。
+        if !bitflip_loader::has_parser(guess.object) {
+            return Err(BitflipError::InvalidInput(format!(
+                "成员 {:?} 不是可分析的对象（识别为 {}）：它可能是归档的元数据成员",
+                member.name,
+                guess.object.label_zh()
+            )));
         }
-        .map_err(|error| {
+        let id = ObjectId::ArchiveMember(member.name.clone());
+        let object = bitflip_loader::parse_object(guess.object, slice, 0, id).map_err(|error| {
             BitflipError::unavailable(format!(
                 "成员 {:?} 解析失败：{}",
                 member.name,

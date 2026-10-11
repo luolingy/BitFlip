@@ -10,14 +10,20 @@
 //! 本阶段（M0）实现的是**嗅探**：只读文件头与容器结构，给出可验证的识别结论，
 //! 不做完整解析（段/节/导入导出/符号在 M1）。做不到的地方明确记入 `notes`，
 //! 不猜、不留空白解释。
+//!
+//! # 通用层与格式层的分界
+//!
+//! 本模块（`object` / `reader` / `sniff` / `ehframe`）是**通用层**：对象模型、
+//! 带边界检查的读取器、识别结论、展开表。各格式的具体解析在 [`format`] 下 ——
+//! **在 `format/` 外面的代码不该出现格式类型名**，新增一种格式也不该改这些文件。
+//! 派发只有一个入口：[`parse_object`]。理由写在 `format/mod.rs` 与
+//! `parse_object` 的文档里（那里记录了这条边界是被什么错误撞出来的）。
 
 mod sniff;
 
-pub mod coff;
 pub mod ehframe;
-pub mod elf;
+pub mod format;
 pub mod object;
-pub mod pe;
 pub mod reader;
 
 #[cfg(test)]
@@ -25,6 +31,13 @@ mod fuzz;
 
 use bitflip_arch::{ArchSpec, Endian};
 use thiserror::Error;
+
+// 让 `parse_object` 的签名能直接写出返回类型。**刻意用私有 `use` 而不是 `pub use`**：
+// 调用方现在走 `bitflip_loader::object::Object` / `bitflip_loader::reader::ParseError`，
+// 那是既有的公开路径，没有理由为了少打几个字符再开一套别名（多一条路径就多一份
+// "该用哪个"的疑问，而两者的可见性还不一样）。
+use object::{Object, ObjectId};
+use reader::ParseError;
 
 pub use sniff::{sniff_bytes, sniff_file, SNIFF_WINDOW};
 
@@ -125,6 +138,67 @@ impl ObjectKind {
             Self::MachO => "Mach-O",
             Self::Raw => "原始二进制",
         }
+    }
+}
+
+/// 这个对象类别是否由本层直接解析。
+///
+/// `Raw` 是"用户指定按原始二进制处理"——没有头可读，由上层合成对象
+/// （见 `bitflip-core` 的 `parse_raw`）；`Mach-O` 目前只识别不解析。
+/// 两者都**不该**让 [`parse_object`] 返回一个空对象：那会让上层显示
+/// "分析完成但什么都没有"（CLAUDE.md §7）。
+#[must_use]
+pub const fn has_parser(kind: ObjectKind) -> bool {
+    matches!(kind, ObjectKind::Pe | ObjectKind::Coff | ObjectKind::Elf)
+}
+
+/// 解析一个对象：**格式派发的唯一入口**。
+///
+/// # 为什么这个函数必须只有一个
+///
+/// `match kind { Pe => pe::parse(..), Elf => elf::parse(..), Coff => coff::parse(..) }`
+/// 曾经在三个地方各写了一遍：核心层"打开目标"、核心层"打开归档成员"、签名生成器。
+/// 三份派发意味着**新增一种格式要记得改三处**，而漏掉一处的后果是静默的 ——
+/// 那个格式会走进兜底分支，被报成"不是可分析对象（识别为 X）"：
+/// 看起来像识别出了问题，实际是派发漏了。
+///
+/// 所以这不是"格式层不够模块化"，是**接口**不够模块化：每个调用方都在自己重新
+/// 实现"格式 → 解析器"的映射。派发收敛到这一处之后，调用方只回答两件事：
+/// 这个类别有没有解析器（[`has_parser`]）、失败怎么表述。
+///
+/// # 参数
+///
+/// `base` 只在解析**可重定位**目标（`.o` / `.obj`）时才需要非零值：那类文件的
+/// 节地址全是 0，要由调用方给一个基址才能建起地址空间。可执行映像的基址在文件头里，
+/// 给 `0` 即可（解析器会读自己的 `ImageBase` / 程序头）。
+///
+/// # Errors
+///
+/// 具体格式的解析失败原样返回该格式的 [`ParseError`]（调用方按需要包成
+/// "PE 解析失败：…" 这样的说明）；`Raw` / `MachO` 返回 [`ParseError::NoParser`]。
+///
+/// # Panics
+///
+/// 不会 panic。调用方漏了 [`has_parser`] 检查时，用户看到的是一条说明
+/// "这个格式没有解析器"的错误，而不是进程崩溃。
+pub fn parse_object(
+    kind: ObjectKind,
+    bytes: &[u8],
+    base: u64,
+    id: ObjectId,
+) -> Result<Object, ParseError> {
+    match kind {
+        ObjectKind::Pe => format::pe::parse(bytes, base, id),
+        ObjectKind::Coff => format::coff::parse(bytes, base, id),
+        ObjectKind::Elf => format::elf::parse(bytes, base, id),
+        ObjectKind::MachO => Err(ParseError::NoParser {
+            kind: kind.as_str(),
+            detail: "Mach-O 当前只做识别，解析未实现（见 docs/PLAN.md §1.3 的里程碑排期）",
+        }),
+        ObjectKind::Raw => Err(ParseError::NoParser {
+            kind: kind.as_str(),
+            detail: "原始二进制没有可解析的头，由上层按用户给的架构与基址合成对象",
+        }),
     }
 }
 
