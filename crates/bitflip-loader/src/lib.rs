@@ -55,7 +55,7 @@ pub enum LoaderError {
     },
     /// 目标是目录（例如 macOS `.app` bundle）。
     #[error(
-        "目标是目录而不是文件: {0} —— .app bundle 之类的容器解析排期在 M10（见 docs/PLAN.md）"
+        "目标是目录而不是文件: {0} —— .app bundle 之类的目录容器排期在 M12（见 docs/PLAN.md）"
     )]
     IsDirectory(String),
     /// 目标既不是文件也不是目录（设备、管道等）。
@@ -72,7 +72,11 @@ pub enum ContainerKind {
     Ar,
     /// Microsoft 静态库 `.lib`（ar 结构 + MSVC 长名/符号成员）。
     MsvcLib,
-    /// fat / universal 容器（Mach-O，解析推迟到 M10）。
+    /// fat / universal 容器（Mach-O，一个文件里多个架构切片）。
+    ///
+    /// 解析排期在 M12。这个变体从 M0 就存在，是因为**抽象要提前留出来**：
+    /// fat 与 ar 都是"一个文件多个对象"，但切片**没有名字**（只有架构），
+    /// 混进 `Ar` 会让"按名字找成员"这条既有逻辑带上一个说不通的空名字。
     Fat,
 }
 

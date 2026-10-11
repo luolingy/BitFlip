@@ -887,7 +887,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let err = sniff_file(dir.path()).expect_err("目录必须报错");
         assert!(matches!(err, LoaderError::IsDirectory(_)));
-        assert!(err.to_string().contains("M10"));
+
+        // 断言"用户能不能看出这是还没做的能力"，**不断言里程碑编号**。
+        //
+        // 这条测试原本写的是 `contains("M10")`，于是把 Mach-O 的排期从 M10
+        // 挪到 M12 时它红了 —— 而那次改动只改了文档与一句错误文案，没有任何行为变化。
+        // 编进测试里的里程碑编号是一个会随计划漂移的字符串，它一漂移，
+        // 测试就在报一个**与它想验证的东西无关**的失败（"目录应当报错"变成
+        // "文档里那个编号还没改"）。钉住意思，不钉住编号。
+        let message = err.to_string();
+        assert!(
+            message.contains("目录"),
+            "错误信息要说清目标是目录：{message}"
+        );
+        assert!(
+            message.contains("docs/PLAN.md"),
+            "错误信息要指向计划文档，用户才知道这是排期而不是故障：{message}"
+        );
 
         let missing = dir.path().join("nope.bin");
         let err = sniff_file(&missing).expect_err("不存在的文件必须报错");
