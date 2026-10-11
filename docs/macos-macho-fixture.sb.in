@@ -1,0 +1,252 @@
+;; BitFlip —— macOS 上跑 app/IPA 自动生成与测试所需的沙箱配置（SBPL）
+;;
+;; ============================================================================
+;; 这份文件是干什么的
+;; ============================================================================
+;;
+;; 在 macOS 上，"生成 Mach-O / .app / IPA 的测试 fixture"和"跑测试"这两件事都要
+;; 拉起**不受信的输入**与**一堆外部工具**（clang / ld / codesign / xcrun /
+;; hdiutil / unzip），而它们都要写盘。默认的 Seatbelt 策略要么什么都不给（工具
+;; 报权限错，你去猜是哪一个），要么给太多（`(allow default)`，等于没有沙箱）。
+;;
+;; 这里给的是**够用但不多给**的一份：一条一条列出为什么需要每个权限。
+;; 凡是"看起来该给但这份没给"的，都在末尾的 §已知不适用里写了原因 ——
+;; 那些条目不是遗漏。
+;;
+;; ============================================================================
+;; 前置事实（来自本仓库的实测，不是猜的）
+;; ============================================================================
+;;
+;; 1. **fixture 生成脚本目前是 Windows 专项的**，直接跑不起来，必须先做跨平台
+;;    改造。证据（`scripts/` 里硬编码的路径）：
+;;
+;;      gen-aarch64-cfg-fixture.ps1:52   $clang   = 'E:\LLVM\bin\clang.exe'
+;;      gen-ehframe-fixture.ps1:45       $clang   = 'E:\LLVM\bin\clang.exe'
+;;      gen-builtins-fixture.ps1:18      $gcc     = 'E:\mingw64\bin\gcc.exe'
+;;      gen-debug-fixture.ps1:66         $gcc     = Find-Tool 'gcc.exe' @('E:\mingw64\bin\gcc.exe')
+;;      gen-fixtures.ps1:177             Resolve-Tool -Name 'clang' -Candidates @('E:\LLVM\bin\clang.exe')
+;;      gen-diff-fixture.py:177          for base in (os.environ.get("LLVM_BIN"), r"E:\LLVM\bin")
+;;
+;;    因此下面的 §2 把改造所需的权限也列了出来（需要 `xcrun` 去问工具链在哪、
+;;    需要读 Xcode 目录），而不是只列"跑现成脚本"所需的权限。
+;;
+;; 2. **本仓库的约定：构建与缓存目录必须落在仓库内**（CLAUDE.md §3、ADR-0004）。
+;;    macOS 上同理：`CARGO_HOME`、`TMPDIR`、npm 缓存都指到仓库里，所以策略里
+;;    仓库目录必须是可写的。这不是为了方便，是因为默认位置（`~/.cargo`、
+;;    `/tmp`）在受限环境里写不进去，而工具报的错会指向完全无关的地方。
+;;
+;; 3. **本机（Windows）无法验证这份策略。** 沙箱配置写错了 macOS 是拒绝加载
+;;    整个沙箱，不是忽略这一条 —— 所以下面的写法按 SBPL 的语法来，但
+;;    **必须在 macOS 上验证过再投入使用**。§验证 一节给了命令。
+;;
+;; ============================================================================
+;; 怎么用
+;; ============================================================================
+;;
+;;   # 一次性：把 repo 路径换成实际路径（下面用 __REPO__ 占位）
+;;   sed -e "s|__REPO__|$PWD|g" \
+;;       -e "s|__TMP__|${TMPDIR:-/tmp}|g" \
+;;       docs/macos-macho-fixture.sb.in > /tmp/bitflip.sb
+;;
+;;   # 跑生成脚本（示例；脚本本身的前置改造见 §1）
+;;   sandbox-exec -f /tmp/bitflip.sb -- \
+;;       python3 scripts/gen-macho-fixture.py --out tests/fixtures/generated/x
+;;
+;;   # 跑测试
+;;   sandbox-exec -f /tmp/bitflip.sb -- cargo test --workspace
+;;
+;; 注意：`sandbox-exec` 已被 Apple 标记为 deprecated（`man sandbox-exec` 里有说明），
+;; 但它是 macOS 上唯一能加载自定义 SBPL 的入口，至今仍可用。要"更正统"的隔离，
+;; 用 `sandbox-exec` 包一层 + 在 CI 上另加容器 —— 不要指望 Swift/系统沙箱 API，
+;; 那些不让你传自定义策略。
+;;
+;; ============================================================================
+;; 语法
+;; ============================================================================
+;;
+;; SBPL 是 Scheme 方言：`(allow <操作> <谓词>)`。几个容易踩的点：
+;;
+;;   * `(subpath "/x")` 匹配整个子树；`(literal "/x")` 只匹配那一项；
+;;     `(regex #"^/x")` 用正则。**能写 subpath/literal 就别写 regex** ——
+;;     正则范围容易写宽，而它宽在哪不会报错，只会静默放行。
+;;   * `;;` 是注释（`;` 在本文件里也当注释用，但用 `;;` 是 SBPL 的惯例）。
+;;   * **（deny ...) 要写在 (allow default) 之后**才有效 —— 顺序有意义，
+;;     后面的规则覆盖前面的。这也是为什么本文件不写 `(allow default)`：
+;;     一旦写了，后面漏掉的每一项都变成"默认放行"，而那种策略看起来
+;;     和宽松策略一模一样。
+;;
+;; ============================================================================
+
+(version 1)
+
+;; ---------------------------------------------------------------------------
+;; 1. 进程：跑工具、起子进程
+;; ---------------------------------------------------------------------------
+;;
+;; 为什么需要：cargo 会拉起 rustc，rustc 会拉起 linker；生成脚本会拉起
+;; clang / ld / llvm-nm / llvm-objdump。任何一步没有 process-exec，
+;; 报的是"工具返回了非零退出码"，而不是"沙箱拒绝"——很容易查错方向。
+;;
+;; `process-fork` 是给 shell 管道用的：`clang ... | llvm-nm` 这类。
+(allow process-exec)
+(allow process-fork)
+(allow signal (target self))
+
+;; 允许子进程继承（cargo 通过它把环境变量交给 rustc）。
+(allow process-info-pidinfo)
+
+;; ---------------------------------------------------------------------------
+;; 2. 读取：工具链、仓库、系统
+;; ---------------------------------------------------------------------------
+;;
+;; 读权限给得比较宽，这是刻意的：读不到一个文件时，clang 报的是
+;; "file not found"，而**沙箱拒绝**和**文件真的不存在**在输出里长得一样。
+;; 排错成本远高于放行一点读权限的代价（读权限本身不改变系统状态）。
+(allow file-read*)
+
+;; `xcrun` 要找 SDK 与工具链，会遍历这些位置。不做 §1 的跨平台改造就不需要，
+;; 但改造时这是第一件会撞上的事。
+(allow file-read-metadata
+    (subpath "/Applications/Xcode.app")
+    (subpath "/Library/Developer")
+    (subpath "/usr/lib")
+    (subpath "/System/Library"))
+
+;; ---------------------------------------------------------------------------
+;; 3. 写入：只有几处，且都是仓库内或临时目录
+;; ---------------------------------------------------------------------------
+;;
+;; 为什么这么窄：写权限是这份策略里唯一会实际破坏东西的一项。构建产物写错地方
+;; 只是脏；写错到系统目录会真的弄坏机器。所以逐条列，不做"除了系统目录都能写"
+;; 这种反选（反选漏掉一项就是放行一个系统目录）。
+(allow file-write*
+    ;; 仓库本身：构建产物（.cargo-target）、生成的 fixture、冒烟日志。
+    (subpath "__REPO__")
+    ;; 临时目录：clang 的中间文件、链接器的响应文件、`mktemp` 的产物。
+    ;; 注意 macOS 的 TMPDIR 形如 /var/folders/xx/xxxxxxxx/T/，
+    ;; 只写 "/tmp" 是不够的 —— 很多工具用的是前者。
+    (subpath "__TMP__")
+    (subpath "/private/tmp")
+    (subpath "/private/var/tmp")
+    (literal "/dev/null")
+    (literal "/dev/stdout")
+    (literal "/dev/stderr")
+    ;; 子进程在某些情况下要写这个；不给会让 fork/exec 偶发失败。
+    (literal "/dev/dtracehelper"))
+
+;; `mach_msg` 要给：Xcode 工具（clang、ld、codesign）通过 Mach 端口跟
+;; 系统服务通信。不给的话报错是 "cannot allocate memory" 之类，完全指不到沙箱。
+(allow mach-lookup)
+
+;; ---------------------------------------------------------------------------
+;; 4. 网络：只允许本地回环
+;; ---------------------------------------------------------------------------
+;;
+;; 为什么不是 `(allow network*)`：cargo 需要一个本地 crates 代理
+;; （scripts/crates-proxy.mjs 监听 127.0.0.1:8765，见 ADR-0009），
+;; 而**真实下载应当发生在沙箱之外或受控步骤里** —— fixture 生成与测试
+;; 不该依赖网络，否则"测试通过"里混进了"当时网络正常"。
+;;
+;; 如果 macOS 上的 cargo 能直连 crates.io（本机的 libcurl/Schannel 问题在
+;; macOS 的 LibreSSL 后端上不存在），把下面改成 `(allow network*)` 或干脆
+;; 改走系统 cargo + 系统 CARGO_HOME 更省事。
+(allow network-bind (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
+
+;; ---------------------------------------------------------------------------
+;; 5. sysctl：工具链会读
+;; ---------------------------------------------------------------------------
+;;
+;; clang / ld / swiftc 启动时都会查系统信息（CPU 型号、页大小、OS 版本）。
+;; 不给的话报的是"无法查询架构"，看起来像工具链损坏。
+(allow sysctl-read)
+
+;; ---------------------------------------------------------------------------
+;; 6. 显式拒绝：这些不给，且写出来是为了让"没给"变成决定而不是遗漏
+;; ---------------------------------------------------------------------------
+;;
+;; 为什么要把拒绝写出来而不是省略：省略的规则和"忘了写"在文件里长得一样。
+;; 写出来之后，谁想放开某一条，就得先删掉这段并回答"为什么现在可以了"。
+;;
+;; 读用户的私密位置：fixture 生成与测试不需要，而一旦放开，"某个脚本把
+;; 路径拼错了"就可能把私密文件读进日志。
+(deny file-read* (subpath "__HOME__/.ssh"))
+(deny file-read* (subpath "__HOME__/.aws"))
+(deny file-read* (subpath "__HOME__/Library/Keychains"))
+;; 写用户配置：不给。工具的全局配置被沙箱里的运行改掉，下一次在沙箱外跑
+;; 行为就变了 —— 那是"错误地成功了"。
+(deny file-write* (subpath "__HOME__/.config"))
+(deny file-write* (subpath "__HOME__/.cargo"))
+(deny file-write* (subpath "__HOME__/.rustup"))
+;; 写整个 /usr 与 /System：给也不该写，写了一定是出事了。
+(deny file-write* (subpath "/usr") (subpath "/System") (subpath "/bin") (subpath "/sbin"))
+;; 设备与内核接口：不在本任务的必要权限里。
+(deny file-write* (subpath "/dev"))
+(deny device*)
+(deny iokit*)
+(deny ipc-posix-shm*)
+
+;; ============================================================================
+;; 已知不适用 / 这份策略**故意没给**的能力
+;; ============================================================================
+;;
+;; 以下每一条都是"跑 macOS app/IPA 流程时有人会想加"的，这里逐条说明为什么没加。
+;;
+;; 1. **不跑被分析的目标。** `(allow process-exec)` 给的是"跑工具链"，但本任务
+;;    只做**静态**分析（M12 的目标是解析 Mach-O，不是运行它）。要真的运行一个
+;;    从网上下来的 .app，需要多得多的权限（窗口服务器、AudioToolbox、
+;;    AppleEvents……），而那种权限组合等于放弃沙箱。用专用虚拟机。
+;;
+;; 2. **不做真正的代码签名。** `codesign` 能跑（它是普通进程），但它要访问
+;;    keychain 里的身份 —— 而上面已经 deny 了 Keychains。这是刻意的：
+;;    fixture 只需要**带签名结构的二进制**（`LC_CODE_SIGNATURE` 存在即可），
+;;    用 ad-hoc 签名（`codesign -s -`）就够，不需要开发者证书。
+;;    真需要证书的流程不该跑在沙箱里。
+;;
+;; 3. **不访问真实设备。** `ideviceinstaller` / `xcrun devicectl` 之类的真机
+;;    安装工具需要 USB 与 CoreDevice 服务，这里一并没有。设备相关的一切
+;;    只在专用机器上做。
+;;
+;; 4. **不写 /Library 与 /Applications。** 装 App 到系统位置是修改系统状态，
+;;    与"生成 fixture"无关。真需要时用专用虚拟机。
+;;
+;; 5. **不管 SIP 保护的位置。** 即使给了 file-write* 也写不进去，
+;;    SIP 在沙箱之上。别在策略里试图形容它。
+;;
+;; 6. **不承诺阻止所有侧信道。** Seatbelt 是访问控制，不是隔离内核。
+;;    要防恶意样本本身，用虚拟机 —— 这一条写在这里是为了不让人误以为
+;;    有了 .sb 文件就可以安全地喂任意样本。
+;;
+;; ============================================================================
+;; 验证（在 macOS 上做，本机 Windows 做不到）
+;; ============================================================================
+;;
+;; 策略写错时 macOS **拒绝加载整个沙箱**，报错形如：
+;;     sandbox-exec: <path>: <line>: syntax error
+;; 所以第一步是让它能加载：
+;;
+;;     sandbox-exec -f /tmp/bitflip.sb -- /usr/bin/true && echo "策略可加载"
+;;
+;; 第二步：确认它**真的在拦**，而不是"加载成功但什么都没生效"。
+;; 一条恒过的策略和一个正确的策略在正常使用中表现一样 —— 必须做负向验证：
+;;
+;;     # 应当失败：写仓库外的地方
+;;     sandbox-exec -f /tmp/bitflip.sb -- /bin/sh -c 'touch /opt/bitflip-probe' \
+;;       && echo "BAD: 不该成功" || echo "OK: 被拦住了"
+;;
+;;     # 应当成功：写仓库内
+;;     sandbox-exec -f /tmp/bitflip.sb -- /bin/sh -c "touch __REPO__/.probe" \
+;;       && echo "OK: 仓库内可写"
+;;
+;; 第三步：跑真实流程，并且**同时看数据层输出**（CLAUDE.md §7）——
+;; 只看到"命令没报错"说明不了 fixture 是对的：
+;;
+;;     sandbox-exec -f /tmp/bitflip.sb -- cargo test --workspace
+;;     sandbox-exec -f /tmp/bitflip.sb -- ./scripts/gen-fixtures-macos.sh
+;;     ls -l tests/fixtures/generated/          # 产物真的在
+;;     llvm-nm --print-size tests/fixtures/generated/macho-*.bin   # 内容真的是 Mach-O
+;;
+;; 最后：把 `__REPO__` / `__TMP__` / `__HOME__` 三个占位符替换掉再投入使用。
+;; 本文件保留占位符是有意的 —— 写死路径会让它在另一台机器上**静默地**
+;; 指向错误的位置（subpath 匹配不到任何东西时，表现是"什么都没被授权"，
+;; 而不是报错），那比拒绝加载更难查。

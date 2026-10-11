@@ -85,6 +85,31 @@ try {
         & (Join-Path $PSScriptRoot 'check-arch-layering.ps1') | Out-Host
     } | Out-Null
 
+    # The macOS sandbox profiles cannot be validated on this machine (no macOS),
+    # but two of their failure modes CAN be caught here -- and both are silent:
+    # unbalanced parens make sandbox-exec refuse the whole profile, and a
+    # leftover __REPO__ placeholder makes every subpath match nothing, which
+    # reports as "permission denied" somewhere unrelated. A profile that is
+    # quietly inert looks exactly like a profile that works.
+    #
+    # SKIP (not silently pass) when no profile exists yet.
+    $sandboxProfiles = @(Get-ChildItem -Path (Join-Path $repoRoot 'docs') -Filter '*.sb*' -File -ErrorAction SilentlyContinue)
+    $sandboxChecker = Join-Path $PSScriptRoot 'check-sandbox-profile.py'
+    if ($sandboxProfiles.Count -gt 0 -and (Test-Path -LiteralPath $sandboxChecker)) {
+        Invoke-Step -Name 'sandbox profile syntax (SBPL)' -Action {
+            foreach ($profile in $sandboxProfiles) {
+                & python $sandboxChecker $profile.FullName --allow-placeholders | Out-Host
+                if ($LASTEXITCODE -ne 0) { $global:LASTEXITCODE = 1; return }
+            }
+            $global:LASTEXITCODE = 0
+        } | Out-Null
+    }
+    else {
+        Write-Host ""
+        Write-Host "=== sandbox profile syntax (SBPL)"
+        Write-Host "--- SKIP (no docs/*.sb* profile, or check-sandbox-profile.py missing)"
+    }
+
     if (-not $SkipWeb) {
         $webDir = Join-Path $repoRoot 'web'
         $nodeModules = Join-Path $webDir 'node_modules'

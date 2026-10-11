@@ -40,6 +40,15 @@
   mingw gcc/ld/objdump、MSVC dumpbin、cmake 3.x、Python 3.12。
 - **WSL 只做轻量验证**（用户硬盘紧张）：不要在 WSL 里装重型工具链或跑全量构建。
   ELF 目标优先用 Windows 侧 `clang --target=... -c` 生成 object；需要链接产物时手动、按需在 WSL 里做一次。
+- **清理磁盘用 `scripts/clean.ps1`，不要手工删。** 它按 CLAUDE.md §3 的顺序来
+  （先 `deps/*.pdb`、再 `incremental/`、最后旧冒烟日志），带 `-WhatIf` 预演，
+  并且**不会**删 `deps/` 本体（那是 20 GB，删了要全量重编）。加这条是因为手工删
+  容易"顺手"把 deps 一起删掉，而那个代价比省下的空间大得多。
+
+  ```powershell
+  & .\scripts\clean.ps1 -WhatIf   # 先看要删什么
+  & .\scripts\clean.ps1           # 真删
+  ```
 
 ## 4. 工程约定
 

@@ -50,8 +50,23 @@ yarn-error.log*
 /.cargo-tmp/
 # 冒烟测试的输出（preflight 与 smoke-*.ps1 会写这里）
 /.smoke-logs/
-# 临时提交信息文件
+# 临时提交信息文件。
+#
+# `/.commit-msg.txt` 已经被忽略了，但实际写法五花八门（`temp-commit-msg.txt`、
+# `msg.txt`……），而**任何一个没被忽略的名字都会被 `git add -A` 顺手提交进去**
+# —— 提交信息副本躺在仓库里不是灾难，但它是一份没人维护的重复物。
+# 与其去猜下一个名字，不如把模式挡住。
 /.commit-msg.txt
+/commit-msg.txt
+/*-commit-msg.txt
+/commit-*.txt
+/msg.txt
+# 通用兜底：仓库根下的临时文件
+/*.tmp
+/*.bak
+/.probe-
+# macOS 的 .DS_Store 已在下文按文件名忽略（任意目录都覆盖）
+/_probe*
 
 # IDE / OS
 .idea/
