@@ -737,10 +737,7 @@ mod tests {
         assert!(t.contains("uint32_t"), "{t}");
         assert!(t.contains("rax + 0x10"), "{t}");
 
-        let m8 = bitflip_arch::MemRef {
-            size: 1,
-            ..m32
-        };
+        let m8 = bitflip_arch::MemRef { size: 1, ..m32 };
         assert!(mem_text(&m8, &test_namer).contains("uint8_t"));
 
         // 非标准宽度不得硬塞 C 类型。

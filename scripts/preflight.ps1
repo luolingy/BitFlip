@@ -85,6 +85,29 @@ try {
         & (Join-Path $PSScriptRoot 'check-arch-layering.ps1') | Out-Host
     } | Out-Null
 
+    # License gate. Three otherwise well-targeted crates (exe, dotnetdll,
+    # smali) are GPL, and adopting one would force this whole project
+    # open-sourced -- a defect that only surfaces at distribution time,
+    # long after the PR that added it. The checker is a DENY list run
+    # against the resolved tree from `cargo metadata`; it needs CARGO_HOME
+    # set the way cargo.ps1 sets it.
+    #
+    # The logic tests run first and are not optional: a license gate that
+    # only ever says "clean" is indistinguishable from one that does
+    # nothing. This one already had two real bugs -- an OR/AND split that
+    # mis-read "LGPL-2.1-or-later" as clean, and a false positive on r-efi.
+    $licenseChecker = Join-Path $PSScriptRoot 'check-licenses.py'
+    $licenseTests = Join-Path $PSScriptRoot 'test-check-licenses.py'
+    if (Test-Path -LiteralPath $licenseChecker) {
+        Invoke-Step -Name 'license gate logic' -Action {
+            & python $licenseTests
+        } | Out-Null
+        Invoke-Step -Name 'license gate (resolved tree)' -Action {
+            $env:CARGO_HOME = Join-Path $repoRoot '.cargo-home'
+            & python $licenseChecker
+        } | Out-Null
+    }
+
     # The macOS sandbox profiles cannot be validated on this machine (no macOS),
     # but two of their failure modes CAN be caught here -- and both are silent:
     # unbalanced parens make sandbox-exec refuse the whole profile, and a

@@ -11,6 +11,48 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — 依赖选型调研与许可证闸门
+
+> 回答"有没有现成的轮子补上架构/格式/反编译器的缺口，许可能不能接受"。
+> 完整结论见 `docs/DEPENDENCY-DECISIONS.md`，原始实测输出见
+> `docs/research/dependency-probe-evidence.md`。
+
+- **`scripts/check-licenses.py` + `scripts/test-check-licenses.py`（新）**：
+  依赖许可闸门，已接入 `scripts/preflight.ps1`。对 `cargo metadata` 的**已解析依赖树**
+  做 DENY 检查（GPL/LGPL/AGPL/SSPL）。用 DENY 而不是 ALLOW 列表是有意的：
+  ALLOW 列表会在第一次遇到写法差异（`MIT/Apache-2.0` 与 `MIT OR Apache-2.0`）时误报，
+  而**会误报的闸门会被关掉**，那比没有闸门更糟。
+  逻辑本身有 21 条测试锁住，因为"永远说干净"的闸门和"什么都没做"的闸门无法区分 ——
+  写这条闸门时确实踩了两个 bug：OR/AND 切分把 `LGPL-2.1-or-later` 误判为干净
+  （`\bOR\b` 会把 `-or-later` 切开），以及对 `r-efi` 的
+  `MIT OR Apache-2.0 OR LGPL-2.1-or-later` 误报（那一支可以选 MIT，不是违规）。
+- **当前依赖树 191 个 crate，零个受限许可。**
+- **`CLAUDE.md` §5** 补上许可检查步骤与此前三个"很对口但许可不可用"的轮子
+  （`exe` GPL-3.0、`dotnetdll` GPL-3.0+、`smali` GPL-3.0-only）。
+
+### 调研结论要点（供后续里程碑取用）
+
+- **架构扩展有现成轮子**：`wazabin-sleigh` + `-precompile` 已在**本机实测**
+  解出 x86_64 指令（MIT / MIT AND Apache-2.0）。Ghidra 的 SLEIGH 规范覆盖
+  **39 个语言**（含 Dalvik 与 JVM），远超 capstone 的 9 种。
+  保留意见：上游仓库极新（2026-08 创建、0 star），spec 在 `build.rs` 现场编译，
+  本机实测编译超过 10 分钟 —— 先做 spike，不要直接变成主路径。
+- **Mach-O 有现成轮子**：`object` 0.40（Apache-2.0 OR MIT）实测能解 fat/universal 头
+  （按规格合成 FAT_MAGIC，正确识别 x86_64 与 arm64 两个切片），
+  另有代码签名与 dyld cache 支持 —— 后两者 `goblin` 没有。
+  ⚠️ 但它的 README 明确写了**不适用于恶意样本分析**，与我们的用途冲突，
+  必须配套资源限额（理由与方案见 `docs/DEPENDENCY-DECISIONS.md` §2.3）。
+- **反编译器有轮子但会违反 §7**：`ghidra-decompiler`（Apache-2.0、纯 Rust，
+  本机实测可编译可运行、常量折叠正确）会输出 `func_0x00000000` 这种占位名，
+  且在带分支的输入上**静默丢掉整段逻辑**而不提示 —— 正是 §7 最怕的静默错误输出。
+  结论：先做隔离验证，不直接接入。
+- **`lief` 不是因为许可被否**：它的许可是干净的 Apache-2.0，
+  真正的问题是**构建期联网下载预编译二进制** + C++ FFI。这条理由必须记录，
+  否则将来会有人只看许可证再提一次。
+- **DEX 是唯一没有可用轮子的缺口**：`dex`（MIT）冻结于 2021，
+  `smali` 是 GPL 且是这一带最活跃的。建议 M11 先做"APK 解包 + 复用 ELF 路径"
+  （APK 就是 ZIP，`zip` 9.0.1 是 MIT 纯 Rust），DEX 单独排后。
+
 ### 新增 — 伪代码导出（`pseudo-c`）：反编译器的**有界子集**
 
 > 决策与理由见 `docs/DECISIONS.md` ADR-0018 与 `docs/DECOMPILER-SCOPE.md`。

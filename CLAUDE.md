@@ -78,8 +78,15 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 cargo bench --no-run          # 基准能编译
+python scripts/check-licenses.py          # 依赖许可闸门（需 CARGO_HOME）
 cd web && npm run typecheck   # SPA 起用后
 ```
+
+**新增依赖前先做许可检查。** GPL/LGPL/AGPL/SSPL 会传染整个产品，
+而这类缺陷只在**分发时**才暴露，离引入它的那个 PR 已经很远。
+已知三个"很对口但许可不可用"的轮子：`exe`（PE，GPL-3.0）、
+`dotnetdll`（.NET，GPL-3.0+）、`smali`（DEX，GPL-3.0-only）。
+选型结论见 `docs/DEPENDENCY-DECISIONS.md`。
 
 **入库守卫（每次 commit 前必做）**：
 
