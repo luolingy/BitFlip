@@ -731,17 +731,47 @@ impl Session {
         notes.extend(std::mem::take(&mut info.notes));
         info.notes = notes;
 
-        let (object, object_raw) = match Self::parse_target(&path, file_size, &guess, &opts) {
-            Ok(object) => {
-                let wire = ObjectInfo::from_object(&object);
-                (Some(wire), Some(Arc::new(object)))
-            }
-            Err(reason) => {
-                // 明确说明"为什么没有解析结果"，不留空白
-                info.notes.push(reason);
-                (None, None)
+        // 文件字节**只读一次**，解析与后续字节级查询共用。
+        //
+        // 早先这里读了两遍：`parse_target` 内部 `fs::read` 一遍用于解析，
+        // 下面判断"要留字节"时再 `fs::read` 一遍存进 session。对
+        // owo-terminal.exe（201 MiB）那是 402 MiB 的 I/O 加两次 201 MiB 的
+        // 分配，而两次拿到的是同一份数据。
+        //
+        // 读**之前**先看大小上限：超过上限的目标要明确拒绝，而不是先读
+        // 600 MiB 再拒绝。
+        //
+        // 仍未做到的优化：解析本身只需要文件头（实测这个目标的节表等等
+        // 全在偏移 0x3b0 以内），理论上只读前缀就够 `info` 用了。但
+        // `Session::bytes` 是 `Arc<[u8]>`，反汇编与成员分析需要完整的随机
+        // 访问，把它改成"按需读全量"要动 `self.bytes` 的所有读点。
+        // 见 docs/PERFORMANCE.md 里记的后续项与实测数字。
+        let full_bytes: Option<Vec<u8>> = if file_size > MAX_FULL_PARSE_BYTES {
+            None
+        } else {
+            match std::fs::read(&path) {
+                Ok(data) => Some(data),
+                Err(error) => {
+                    info.notes.push(format!(
+                        "读取文件字节失败（{error}），无法解析，反汇编与字节级查询将不可用"
+                    ));
+                    None
+                }
             }
         };
+
+        let (object, object_raw) =
+            match Self::parse_target(full_bytes.as_deref(), file_size, &guess, &opts) {
+                Ok(object) => {
+                    let wire = ObjectInfo::from_object(&object);
+                    (Some(wire), Some(Arc::new(object)))
+                }
+                Err(reason) => {
+                    // 明确说明"为什么没有解析结果"，不留空白
+                    info.notes.push(reason);
+                    (None, None)
+                }
+            };
 
         // 入口以**解析结果**为准。
         //
@@ -771,32 +801,25 @@ impl Session {
             info.summary = guess.summary_zh();
         }
 
-        // 读入完整字节：分析层需要按虚拟地址随机访问。
+        // 复用上面**已经读过一次**的字节，不再重新读盘。
         //
-        // 只在解析成功时才读 ——  解析失败的目标反汇编无从谈起，
-        // 没必要为一个"打不开的格式"占住文件大小的内存。
+        // 只在需要时才**保留**：解析失败的目标反汇编无从谈起，没必要为一个
+        // "打不开的格式"占住文件大小的内存。
         //
         // **归档是例外**：容器本身没有解析结果（`object_raw` 是 `None`，
         // 因为"可分析对象"是成员而不是容器），但成员级分析恰恰需要
-        // 容器字节才能按偏移切出成员。所以归档必须读。
+        // 容器字节才能按偏移切出成员。所以归档必须留。
         //
         // 这里曾经漏掉归档，后果是所有 `--member` 都被"数据区间超出文件
         // （0 字节）"挡回去 —— 一个功能看起来像没实现，其实是少了这一步读。
         let is_archive =
             guess.container == ContainerKind::Ar || guess.container == ContainerKind::MsvcLib;
         let bytes: Arc<[u8]> = if object_raw.is_some() || is_archive {
-            match std::fs::read(&path) {
-                Ok(data) => Arc::from(data),
-                Err(error) => {
-                    // 读失败不能让整个打开失败（嗅探与解析结论仍然有效），
-                    // 但必须让用户知道反汇编不可用
-                    info.notes.push(format!(
-                        "读取文件字节失败（{error}），反汇编与字节级查询将不可用"
-                    ));
-                    Arc::from(Vec::new())
-                }
-            }
+            full_bytes.map_or_else(|| Arc::from(Vec::new()), Arc::from)
         } else {
+            // 不需要就立刻释放：一个 200 MiB 的目标只做识别时，
+            // 没有理由把整份字节留到 session 生命周期结束。
+            drop(full_bytes);
             Arc::from(Vec::new())
         };
 
@@ -908,7 +931,7 @@ impl Session {
     /// 归档（`.a` / `.lib`）的成员解析属于 M5；对归档明确说明
     /// "sections 描述的是容器"而不是假装解析了成员。
     fn parse_target(
-        path: &Path,
+        bytes: Option<&[u8]>,
         file_size: u64,
         guess: &Guess,
         opts: &OpenOptions,
@@ -918,7 +941,7 @@ impl Session {
         // 嗅探只读文件前缀（8 MiB）是为了便宜：文件头与容器目录都在前面，
         // 读 100MB 去认一个格式是浪费。所以 `guess.file_truncated` 对**识别**
         // 来说只是"结论只覆盖前 8 MiB"的说明，不是"不许解析"的理由 ——
-        // 下面的 `std::fs::read` 会把整个文件读进来。
+        // 调用方会把整个文件读进来交给这里。
         //
         // 之前这里直接以 `file_truncated` 为由拒绝解析，后果是**任何大于 8 MiB
         // 的目标都拿不到解析结果，也就完全无法反汇编**（M2 的 100MB 验收标准
@@ -927,12 +950,19 @@ impl Session {
         //
         // 所以真正需要守的是**内存**上限，不是嗅探窗口。超过这个上限时仍然
         // 明确拒绝并说清原因，而不是悄悄给出不完整的结果（CLAUDE.md §7）。
-        if file_size > MAX_FULL_PARSE_BYTES {
-            return Err(format!(
-                "文件 {file_size} 字节超过完整解析上限 {} 字节：本次只做识别，不做解析与反汇编",
-                MAX_FULL_PARSE_BYTES
-            ));
-        }
+        //
+        // 注意字节由**调用方**读好传进来（只读一次，见 `open` 里的说明）。
+        // 这里的两种"没有字节"是分开说的：超过上限是一种结论，读盘失败是另一种。
+        let bytes = bytes.ok_or_else(|| {
+            if file_size > MAX_FULL_PARSE_BYTES {
+                format!(
+                    "文件 {file_size} 字节超过完整解析上限 {} 字节：本次只做识别，不做解析与反汇编",
+                    MAX_FULL_PARSE_BYTES
+                )
+            } else {
+                "读取文件字节失败，无法解析（详见识别结论里的说明）".to_string()
+            }
+        })?;
 
         if guess.container == ContainerKind::Ar || guess.container == ContainerKind::MsvcLib {
             // 归档容器本身不是可分析对象：sections/insns 描述的是**成员**的
@@ -947,19 +977,16 @@ impl Session {
             ));
         }
 
-        let bytes =
-            std::fs::read(path).map_err(|error| format!("重新读取文件失败，无法解析：{error}"))?;
-
         // 派发走 `bitflip_loader::parse_object` 这一个入口：新增格式时这里**不必改**
         // （`kind =>` 兜底臂会自动跟上）。只有两种"没有解析器"的类别要单独说：
         // 原始二进制由本模块合成对象，Mach-O 还没做。
         match guess.object {
-            ObjectKind::Raw => Self::parse_raw(&bytes, guess, opts),
+            ObjectKind::Raw => Self::parse_raw(bytes, guess, opts),
             ObjectKind::MachO => Err(format!(
                 "{} 解析排期见 docs/PLAN.md §1.3，当前只做识别",
                 guess.object.label_zh()
             )),
-            kind => bitflip_loader::parse_object(kind, &bytes, 0, ObjectId::Plain)
+            kind => bitflip_loader::parse_object(kind, bytes, 0, ObjectId::Plain)
                 .map_err(|error| format!("{} 解析失败：{}", kind.label_zh(), error.summary_zh())),
         }
     }
@@ -1405,6 +1432,32 @@ impl Session {
             .object_raw
             .as_ref()
             .ok_or_else(|| BitflipError::unavailable("目标未解析成功，无法分析"))?;
+
+        // 展开表在这一步才真正解码。
+        //
+        // # 为什么不在解析时就解
+        //
+        // `.pdata` 每个函数一条，实测 owo-terminal.exe 有 417,629 条，全部解开
+        // 要 1.2 秒。而 `info`（"打开看一下是什么"）一个字段都用不到 —— 它甚至
+        // 不反汇编。把解码放在分析路径上，`info` 就只付建表的价。
+        //
+        // # 为什么是 clone 而不是就地解
+        //
+        // `object_raw` 是 `Arc<Object>`，`&self` 拿不到可变引用；而 `Object`
+        // 本身也不持有文件字节。克隆一份专门给分析用是最小的改动面。
+        // 代价可控：这一条路径本来就要跑几百秒的函数识别，几十 MB 的克隆
+        // 是零头；反过来 `info` 省下的 1.2 秒是用户每次打开文件都付的。
+        //
+        // # 解了多少条不需要在这里额外记一条说明
+        //
+        // `scan_frames` 已经会如实报"展开表共 N 条，其中 M 条解码出帧细节"。
+        // 在这里再记一条只会重复，而且两处数字漂移时会互相矛盾。
+        let resolved = {
+            let mut object = (**object).clone();
+            object.resolve_unwind(&self.bytes, 0);
+            object
+        };
+        let object = &resolved;
 
         // 作业边界必须兜住 panic：分析器崩溃要转成错误，不能让进程退出
         // （CLAUDE.md §4）。

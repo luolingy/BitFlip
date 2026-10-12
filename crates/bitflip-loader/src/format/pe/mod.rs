@@ -49,8 +49,7 @@ use crate::ObjectKind;
 mod import;
 mod inspect;
 mod reloc;
-mod unwind;
-
+pub(crate) mod unwind;
 // 显式列出跨模块用到的函数，而不是写 `use import::*`：这些名字出现在 `parse`
 // 里的位置就是"PE 解析有哪几步"，读者一眼能看出依赖方向（本模块调度、子模块
 // 干活）。glob 导入会让"这个函数到底哪来的"变成要翻文件才知道的事。

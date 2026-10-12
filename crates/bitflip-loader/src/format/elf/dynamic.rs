@@ -83,6 +83,11 @@ pub(super) fn parse_eh_frame_entries(
             // 因此 decoded 一律 None —— 与 PE 的 UNWIND_INFO 解码保持一致，
             // 让上层能区分"这个函数没有展开信息"和"有展开信息但没解码"。
             decoded: None,
+            // `false` 而不是 `true`：这里**没有**可推迟的解码工作。
+            // ELF 的 CFI 解码是"M3 还没做"，不是"推迟到需要时做"—— 前者
+            // 是一条待实现的特性，后者是一个性能手段。把两者混起来会让
+            // `resolve_unwind` 白跑一遍，而且掩盖了"CFI 尚未实现"这个事实。
+            deferred: false,
         });
     }
 

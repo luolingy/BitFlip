@@ -2273,6 +2273,13 @@ fn build_arg_scan(
 /// 加载器已经解码成"帧大小 + 保存寄存器 + 帧指针"。ELF 的 `.eh_frame`
 /// 目前只解出函数边界、没有 CFI 指令解码，所以那部分 `decoded` 是
 /// `None` —— 扫描层会如实说明"帧大小只能靠前导扫描"，而不是假装有。
+///
+/// # 关于 `unwind` 是"已解码"还是"推迟解码"
+///
+/// 加载器**建表时不解码** `UNWIND_INFO`（一个 201 MiB 的 PE 有 41 万条，
+/// 全解开要 1.2 秒，而 `info` 一个字段都用不到）。所以调用本函数前，
+/// 调用方必须先经过 [`resolve_unwind_entries`]：那里会把每条推迟的条目
+/// 真正解出来，并把"解了多少条"如实记进 `notes`。
 fn build_frame_scan(
     disasm: &Disasm,
     functions: &[FunctionWire],

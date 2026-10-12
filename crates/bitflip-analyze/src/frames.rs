@@ -778,6 +778,9 @@ mod tests {
             end: begin + 0x100,
             unwind_info: 0,
             decoded,
+            // 测试直接给 `decoded`，不经过推迟解码那条路 —— 标 `false`
+            // 表示"这条是已定论的"，与加载器建表时的 `true` 区分开。
+            deferred: false,
         }
     }
 

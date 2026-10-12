@@ -311,6 +311,9 @@ mod tests {
             end: 0x1440,
             unwind_info: 0,
             decoded: None,
+            // 边界来自 begin/end，与 `decoded` 无关：即使这条还没解码，
+            // 它依然是一个有效的函数边界候选（`unwind_candidates` 正是这么用的）。
+            deferred: false,
         }];
         let cands = unwind_candidates(&entries);
         assert_eq!(cands.len(), 1);

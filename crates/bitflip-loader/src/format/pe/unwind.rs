@@ -60,9 +60,14 @@ pub(super) fn parse_pdata(
                 begin,
                 end,
                 unwind_info: info_va,
-                // 解码 UNWIND_INFO：帧大小与保存寄存器的权威来源。
-                // 解不出来就如实留 None —— 不拿默认值冒充（CLAUDE.md §7）。
-                decoded: parse_unwind_info(reader, object, info_va),
+                // **推迟**解码 UNWIND_INFO，理由见 `UnwindEntry::deferred`。
+                //
+                // 早先在这里直接 `parse_unwind_info(...)`，于是打开目标时就要把
+                // 每一条都解开。实测 owo-terminal.exe（201 MiB）有 417,629 条，
+                // 光这一步 1.2 秒 —— 而 `info` 与 `functions` 的路径一个字段都用不到。
+                // 真正的消费者是 `bitflip-analyze::frames::scan_frames`，它按需解。
+                decoded: None,
+                deferred: true,
             }
         })
         .collect())
@@ -84,7 +89,7 @@ pub(super) fn parse_pdata(
 /// 部分操作（ALLOC_LARGE / *_FAR / SAVE_NONVOL）**额外消耗后续槽位**，
 /// 而 `CountOfCodes` 把附加槽也数进去了 —— 遍历时必须跟着跳过，
 /// 否则会把附加数据当成独立操作码。
-pub(super) fn parse_unwind_info(
+pub(crate) fn parse_unwind_info(
     reader: &Reader<'_>,
     object: &Object,
     unwind_info_va: u64,

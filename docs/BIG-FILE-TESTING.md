@@ -69,9 +69,15 @@ cargo test -p bitflip-core --test big_file    # 约 30 秒
 | 文件 | 大小 | 实测 |
 | --- | --- | --- |
 | `C:\Windows\System32\MRT.exe` | 220 MB | `info` 1.9 s / `functions` 17.1 s |
+| `D:\owo-terminal\owo-terminal.exe` | 201 MB | **含 41.7 万函数的 PE**；`info` 改前 10.8 s、改后 **0.65 s**（见 `docs/PERFORMANCE.md`） |
 | `C:\Windows\System32\lxss\lib\libnvwgf2umx.so` | 97 MB | **大尺寸 ELF**，`info` 0.9 s |
 | `C:\Windows\System32\DriverStore\FileRepository\nvami.inf_amd64_*\nvrtum64.dll` | 111 MB | NVIDIA 运行时，段表复杂 |
 | `C:\Windows\System32\DriverStore\FileRepository\nvami.inf_amd64_*\nvoptix.dll` | 101 MB | 同上 |
+
+> **注意**：`info` 的耗时**不随文件大小线性增长**，而是随**函数数**增长 ——
+> 因为 `.pdata` 是按函数计的。`owo-terminal.exe`（201 MB / 42.5 万函数）与
+> `MRT.exe`（220 MB / 1,751 函数）大小接近，但函数数差 240 倍。
+> 评估性能时按函数数算，不要按文件大小算。
 
 优先用 `C:\Windows\System32\lxss\lib\` 下的 `.so` —— 路径短、权限宽松，
 而且补上了 PE 之外的 ELF 路径。

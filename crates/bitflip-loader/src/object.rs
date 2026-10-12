@@ -416,6 +416,41 @@ pub struct UnwindEntry {
     /// 通用分析层（栈帧推导）**不要直接摸这个字段**，用下面那组访问器 ——
     /// 理由见 [`UnwindEntry::frame_size`]。
     pub decoded: Option<PeUnwindInfo>,
+    /// 该条目的 `decoded` 是**推迟解码**的（还没有解），而不是"解了但没有细节"。
+    ///
+    /// # 为什么需要这个标志
+    ///
+    /// `.pdata` 在 64 位 PE 里每个函数一条记录。实测 owo-terminal.exe 有
+    /// **417,629** 条，而 `Session::open`（`info` 也走它）原本会把每一条的
+    /// `UNWIND_INFO` 全部解开 —— 1.2 秒，其中 `info` 一个字段都用不到。
+    ///
+    /// 于是改为：建表时只读 `begin`/`end`/`unwind_info` 三个 RVA（那才是
+    /// 函数边界需要的），`UNWIND_INFO` 留到调用方真的要问帧大小时再解。
+    ///
+    /// **`deferred` 与 `decoded: None` 必须分得开**（CLAUDE.md §7）：
+    /// 前者是"还没问"，后者是"问了但解不出来"。把两者混成一个 `None`，
+    /// 就是在用"未知"冒充"没有"，界面会把"尚未解码"显示成"这个函数没有
+    /// 展开信息"。
+    pub deferred: bool,
+}
+
+impl UnwindEntry {
+    /// 把这一条的展开细节真正解出来（如果之前是推迟的）。
+    ///
+    /// 需要 `reader` 是因为解码要读 `.rdata` 里的 `UNWIND_INFO` 字节，
+    /// 而对象模型本身不持有文件字节。
+    ///
+    /// 重复调用是廉价的：已经解过的直接返回。解不出来时把 `deferred`
+    /// 清掉并留下 `decoded = None` —— 那就是一个**确定的**"这一条没有
+    /// 展开细节"，之后不会再反复尝试。
+    pub fn resolve(&mut self, reader: &crate::reader::Reader<'_>, object: &Object) {
+        if !self.deferred {
+            return;
+        }
+        self.deferred = false;
+        self.decoded =
+            crate::format::pe::unwind::parse_unwind_info(reader, object, self.unwind_info);
+    }
 }
 
 /// 展开信息的**格式无关读法**。
@@ -441,9 +476,21 @@ impl UnwindEntry {
     /// `None` = 这一条没有解码出展开细节。注意 `Some(0)` 是"解码了，且帧大小为 0"
     /// （叶子函数的常见形态），与 `None` 不是一回事 —— 把两者混起来会让
     /// "不知道"显示成"零字节"。
+    ///
+    /// **推迟解码的条目在这里也返回 `None`**（它确实还没有答案）。调用方要
+    /// 区分"尚未解码"与"解不出来"，看 [`UnwindEntry::is_deferred`] —— 或者
+    /// 先调 [`UnwindEntry::resolve`] 让它变成确定的结论。
     #[must_use]
     pub fn frame_size(&self) -> Option<u64> {
         self.decoded.as_ref().and_then(PeUnwindInfo::frame_size)
+    }
+
+    /// 这一条是否**还没解码**（不是"解码失败"）。
+    ///
+    /// 存在的意义就是让"尚未解码"与"没有展开细节"分得开（CLAUDE.md §7）。
+    #[must_use]
+    pub const fn is_deferred(&self) -> bool {
+        self.deferred
     }
 
     /// 展开信息说保存了哪些非易失寄存器（按前导顺序）。
@@ -663,6 +710,59 @@ pub struct Object {
     /// 这是"诚实"的载体：任何没解析出来的东西都要在这里留下痕迹，
     /// 不能让 UI 呈现一个看起来完整但实际缺数据的视图（见 CLAUDE.md §7）。
     pub notes: Vec<String>,
+}
+
+impl Object {
+    /// 把**推迟解码**的展开条目真正解出来，返回解出了多少条。
+    ///
+    /// # 为什么要单独一步，而不是在解析时就解
+    ///
+    /// `.pdata` 在 64 位 PE 里每个函数一条记录。实测 `owo-terminal.exe`
+    /// （201 MiB）有 **417,629** 条，解析时全部解开要 **1.2 秒** —— 而
+    /// `info` / `functions` 的入口路径一个字段都用不到它们。真正的消费者只有
+    /// 栈帧视图（`bitflip-analyze::frames`）。
+    ///
+    /// 所以解析只建表（读三个 RVA，那才是函数边界要用的），解码推迟到
+    /// 确实要问帧大小时。本方法就是那个"确实要问"的时刻。
+    ///
+    /// # 诚实性
+    ///
+    /// - 返回"解出了多少条"而不是默默做完：调用方要把这个数字写进 `notes`，
+    ///   否则用户看到"帧大小只能靠前导扫描"却不知道为什么（CLAUDE.md §7）。
+    /// - 解不出来的条目保持 `decoded = None` 且 `deferred = false` —— 那是
+    ///   **确定的**"这条没有展开细节"，与"还没解"分得开。
+    /// - 重复调用只解没解过的，不会重复计费。
+    ///
+    /// # 参数
+    ///
+    /// `bytes` 是对象的**完整文件字节**（与 `parse_object` 传入的是同一份）。
+    /// `base` 是加载基址，要与解析时一致。
+    pub fn resolve_unwind(&mut self, bytes: &[u8], base: u64) -> usize {
+        let pending: Vec<usize> = self
+            .unwind
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.is_deferred())
+            .map(|(index, _)| index)
+            .collect();
+        if pending.is_empty() {
+            return 0;
+        }
+
+        let reader = crate::reader::Reader::with_base(bytes, base);
+        // `Reader` 借用了 `bytes`，而 `resolve` 需要 `&Object` —— 用 take/put
+        // 把 unwind 临时移出来，避免同时借 `self` 的可变与不可变。
+        let mut entries = std::mem::take(&mut self.unwind);
+        let mut decoded = 0usize;
+        for index in pending {
+            entries[index].resolve(&reader, self);
+            if entries[index].decoded.is_some() {
+                decoded += 1;
+            }
+        }
+        self.unwind = entries;
+        decoded
+    }
 }
 
 impl Object {

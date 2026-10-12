@@ -55,7 +55,47 @@ fn fixture(name: &str) -> PathBuf {
 
 fn load(name: &str) -> bitflip_loader::object::Object {
     let bytes = std::fs::read(fixture(name)).expect("读样本");
-    parse(&bytes, 0, ObjectId::Plain).expect("解析 PE")
+    let mut obj = parse(&bytes, 0, ObjectId::Plain).expect("解析 PE");
+    // 加载器**推迟**解码 `UNWIND_INFO`（见 `UnwindEntry::deferred`）：
+    // 一个 201 MiB 的 PE 有 41 万条，全部解开要 1.2 秒，而 `info` 一个字段
+    // 都用不到。本文件测的是**解码器本身**，所以这里显式解出来再断言 ——
+    // 这也正是分析层（`frames`）走的同一条路。
+    obj.resolve_unwind(&bytes, 0);
+    obj
+}
+
+/// 解析阶段**不**解码展开信息 —— 这是 `info` 快起来的直接原因。
+///
+/// 没有这条守卫的话，以后有人"顺手"把解码挪回 `parse` 里，性能会悄悄退回去，
+/// 而所有功能测试仍然是绿的（结果一样，只是慢）。性能特性也需要有人守着。
+#[test]
+fn parse_defers_unwind_decoding_until_asked() {
+    let bytes = std::fs::read(fixture("m3-mingw-static.exe")).expect("读样本");
+    let obj = parse(&bytes, 0, ObjectId::Plain).expect("解析 PE");
+
+    assert!(!obj.unwind.is_empty(), "MinGW PE 应当有 .pdata");
+    assert!(
+        obj.unwind
+            .iter()
+            .all(bitflip_loader::object::UnwindEntry::is_deferred),
+        "解析阶段不该解码任何一条展开信息"
+    );
+    assert!(
+        obj.unwind.iter().all(|e| e.decoded.is_none()),
+        "推迟的条目 decoded 必须是 None（不是解了但没有）"
+    );
+
+    // 解过之后就不再是推迟状态，且真的拿到了细节。
+    let mut obj = obj;
+    let decoded = obj.resolve_unwind(&bytes, 0);
+    assert_eq!(decoded, obj.unwind.len(), "所有条目都应能解出展开信息");
+    assert!(
+        obj.unwind.iter().all(|e| !e.is_deferred()),
+        "解过之后不该还标着推迟"
+    );
+
+    // 重复调用不再重复计费（幂等）。
+    assert_eq!(obj.resolve_unwind(&bytes, 0), 0, "第二次调用应当无事可做");
 }
 
 /// 大函数的前导：8 个 push + sub 0x58。期望值与反汇编逐条对上。
