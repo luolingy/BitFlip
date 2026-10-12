@@ -1119,6 +1119,13 @@ MSVC 修饰名反修饰、静态库 PDB。
 
 ### M11 · Android：APK / DEX / DEX-Family（用户要求"完全逆向"）
 
+> **实施设计已就绪**：`docs/APK-DEX-DESIGN.md`（分层、里程碑拆分、验收标准）
+> 与 `docs/research/dex-apk-format-reference.md`（字节级实现参考）。
+> 决策见 ADR-0019。**里程碑顺序按"价值/成本"排：先把 APK 容器做掉并复用
+> 既有 ELF 路径处理 `lib/*.so`（几乎零新代码），再上 DEX 结构模型。**
+> 本机已有两个真实 APK 样本可作实现验证集
+>（`C:\Users\Administrator\Downloads\ah-app-release.apk` / `base.apk`）。
+
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 
 **为什么单列一个里程碑而不是塞进 M10**：它引入的是一整套**新的执行模型**，不是

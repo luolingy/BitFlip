@@ -11,6 +11,30 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — APK / DEX 自研逆向核心的设计与格式参考
+
+- `docs/APK-DEX-DESIGN.md`（新）：M11 的分层、里程碑拆分与验收标准。
+- `docs/research/dex-apk-format-reference.md`（新）：字节级实现参考
+  （header/`map_list`/id 表/`class_data` diff/`code_item`/try-catch/指令表/
+  payload/AXML/arsc/签名块），含 13 项显式 `UNVERIFIED` 与实现陷阱。
+- ADR-0019（新）：DEX 解析器与 Dalvik 解码器**自研**（`smali` 是 GPL-3.0，
+  `dex` 2021 年冻结，`dalvik` 只是反汇编器 —— 没有可用的轮子）；
+  APK 容器用 `zip`（MIT）；**里程碑按价值/成本排，APK 容器先做**。
+
+**用真实样本纠正了三处范围假设**（样本：本机两个 APK，1867 / 1624 条目）：
+
+| 原以为 | 实测 | 影响 |
+| --- | --- | --- |
+| 现代 APK 用 v041 容器 DEX | **6 个 dex 全是 `dex\n035\0`、`header_size = 112`** | 砍掉 v041 分支（格式里最容易全错的一处） |
+| `.so` 可能未压缩、需对齐 | **全部 DEFLATE（37/37、20/20），STORED 为 0** | 必须解压；不做"直接 mmap `.so`"与 zipalign 校验 |
+| ABI 是 Soong 那 5 个 | 还有 legacy **`armeabi`** | ABI 名单要补 |
+
+同时确认 `.so` 是 `EM_AARCH64` 的 ELF64（**可直接复用既有 ELF 路径**）、
+`AndroidManifest.xml` 是二进制 XML（type `0x0003`）、`resources.arsc` 头与文档一致。
+
+**硬约束（实测而非推断）**：capstone 0.18 只有 18 个架构，**没有 Dalvik/ART** ——
+Dalvik 解码器必须自写（`Decoder` trait 只有 `spec()` + `decode_one()`，边界很窄）。
+
 ### 修复 — `info` 在大目标上慢一个数量级（10.8s → 0.65s）
 
 > 定位与实测数据见 `docs/PERFORMANCE.md`。

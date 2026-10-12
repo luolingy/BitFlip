@@ -84,6 +84,90 @@ Mach-O（含 `.app` bundle、dylib、fat/universal）列入 M10 TODO，不在主
 - 本机无 macOS 与 Android 运行环境：所有 fixture 必须在 Windows 上交叉生成；
   生成不了的部分**显式 SKIP 并给出生成命令**，不能静默变绿（CLAUDE.md §7）。
 
+### ADR-0019 · M11 的 DEX 走自研；APK 容器先做、native 库复用 ELF
+
+**状态**：已决（用户要求"研究自研 apk 逆向核心"）
+**日期**：2026-10
+
+**背景**：ADR-0017 把 APK/DEX 立为 M11，并明确"扩展方式必须在动 `Session`
+之前单独设计"。本次调研回答了那个"单独设计"，同时**用真实样本纠正了三处
+我原本会写错的范围假设**。
+
+**决策 1：DEX 解析器与 Dalvik 解码器都自研。**
+
+不是"选择自研"，是**没有可用的轮子**（`docs/DEPENDENCY-DECISIONS.md` §2.4）：
+
+| 候选 | 许可 | 不可用的原因 |
+| --- | --- | --- |
+| `smali` | **GPL-3.0-only** | 传染。已在 `check-licenses.py` 的 DENY 清单 |
+| `dex` | MIT | **2021-05-31 起冻结**；无 038+ 的 `call_site_ids`/`method_handles`，无 v041 |
+| `dalvik` | MIT OR Apache-2.0 | 只是反汇编器，**不建结构模型** |
+| `lief` | Apache-2.0（许可可接受） | 构建期下载预编译二进制 + C++ FFI；docs.rs 每版都构建失败 |
+
+APK 容器那层例外：用 `zip`（9.0.1，MIT，纯 Rust）。
+
+**决策 2：`Arch` 新增 `Dalvik`，并新增与 capstone **并列** 的 `DexDecoder` 后端。**
+
+这是硬约束而非偏好 —— **实测 capstone 0.18 的架构只有 18 个**
+（ARM/ARM64/MIPS/X86/PPC/SPARC/SYSZ/XCORE/M68K/TMS320C64X/M680X/EVM/MOS65XX/
+WASM/BPF/RISCV/SH/TRICORE），**没有 Dalvik/ART**。
+所幸边界很窄：`Decoder` trait 只有 `spec()` + `decode_one()`，`decode_many` 有默认实现。
+
+**决策 3：里程碑按"价值/成本"排，不按格式复杂度排 —— APK 容器先做。**
+
+理由是**成本差一个数量级**：APK 里 `lib/<abi>/*.so` 就是普通 ELF，
+而 ELF 路径**已经能用**。所以"能列出成员 + 解压 `.so` + 复用现有 ELF 路径"
+几乎零新解析代码，却立刻拿到 native 库的完整逆向能力；
+而 DEX 结构模型 + Dalvik 解码器是这条线上最大的一块。
+
+顺序：**M0（ZIP 容器 + native 库复用 ELF）→ M1（DEX 结构模型）→
+M2（Dalvik 解码器 + CFG）→ M3（AXML + arsc）**。
+
+**决策 4：v041 容器 DEX 不做，直到遇到真实样本。**
+
+**实测两个真实 APK（1867 / 1624 条目）的 6 个 dex 全部是 `dex\n035\0`、
+`header_size = 112`。** v041 里"所有 `*_off` 相对容器起点而非本 DEX 头"
+是整个格式里最容易全错的一处（单文件测试全绿、第二个 DEX 全错）。
+既然真实样本用不到，就不做 —— 但**解析器遇到 041 必须明确报"版本尚未支持"**，
+不能按 035 的规则错误解析（"说的就是真的"）。
+
+**决策 5：真实样本推翻的三处假设，记在这里防止以后又被"想当然"写回去。**
+
+| 原以为 | 实测 | 影响 |
+| --- | --- | --- |
+| 现代 APK 用 v041 容器 DEX | 全是 035 | 砍掉整个 v041 分支（决策 4） |
+| `extractNativeLibs=false` ⇒ `.so` 未压缩、需对齐 | **压缩方法全是 DEFLATE（37/37、20/20），STORED 为 0** | 必须解压；**不做**"从 APK 直接 mmap `.so`"这条路，也不做 zipalign 对齐校验 |
+| ABI 集合是 Soong 那 5 个 | 还有 legacy **`armeabi`** | ABI 名单要含 `armeabi`，未知目录名记 `notes` 而不是丢弃 |
+
+另外确认了 `.so` 是 `EM_AARCH64` 的 ELF64、`AndroidManifest.xml` 是二进制 XML
+（type `0x0003`）、`resources.arsc` 头与文档一致（`0x0002`/headerSize 12）。
+
+**需要新增的概念**（现有 `Object` 模型表达不了，详见
+`docs/APK-DEX-DESIGN.md` §4）：
+
+1. **合成地址空间**。DEX 没有虚拟地址：数据是文件偏移，代码是 code unit 索引。
+   仍用 `u64`（项目约定），但必须写明是**合成地址**，
+   且**反解函数要有单测** —— 否则用户看到 `0001000000001234` 会当成真实地址。
+2. **新的 CFG 边类型**：`SwitchCase { targets, keys }` 与 `ExceptionEdge`
+   （一个 try 块可有**多个** handler 目标）。
+3. **多 dex 的符号键**：`(dex_index, index)` 复合键（multidex 下同名类可能并存）。
+
+**明确不复用**：DEX 无栈帧（寄存器机），所以**不能**跑现有 `frames` 路径
+（`scan_frames` 依赖 `UnwindEntry` 与前导 `push/pop` 扫描，对 DEX 全部不适用）；
+也没有节权限 / `image_base` 概念，`analyze` 里"按 RVA 落在哪个节"的逻辑要对 DEX 短路。
+
+**约束**：
+
+- 结论里必须区分"**存在** v2 签名块"与"**已验证** v2 签名"；后者未实现，
+  按 §7 报 `NotYetImplemented`。不做重打包/重签名（同 ADR-0017）。
+- `.cdex` / `.vdex` / `.oat` 明确拒绝；**不要**写死网上抄来的 magic 字符串
+  （原文本次未取得，见参考文档 §10）。
+- 13 项 `UNVERIFIED` 在实现时必须落成"要么取原文验证、要么在结论里标未知"。
+- **样本量为 2 不等于"现网没有 041"**（两个样本可能同源）。
+
+**参考**：`docs/research/dex-apk-format-reference.md`（字节级实现参考）、
+`docs/APK-DEX-DESIGN.md`（分层与验收）。
+
 ### ADR-0004 · 构建工具：npm（不用 pnpm）；构建目录固定在 F:
 
 **状态**：已决
