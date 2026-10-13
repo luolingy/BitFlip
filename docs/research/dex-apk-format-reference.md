@@ -112,6 +112,13 @@ signature = sha1  (file[32 .. file_size))
 
 排序要求（解析器不必强制，但可做自检）：各 id 表按"对应字符串的 UTF-16 顺序"升序、无重复。
 
+> **实测修正**：规范写"必须升序"，但**真实上架 APK 就是不满足的**。
+> 本次在一个真实样本（`classes.dex`，8 800 484 字节）上实测到
+> `OutOfOrder { pool: StringIds }` —— `string_ids` 乱序。
+> 因此排序性检查的结论**只能写进 `notes`**：
+> **既不能据此拒绝文件，也不能静默丢掉这条信息。**
+> 别把"规范要求"直接当成"现网事实"，也不要反过来以为 ART 会拦下它。
+
 **`call_site_ids` / `method_handles` 只能通过 `map_list` 发现** —— ART 的
 `InitializeSectionsFromMapList()` 专门去 map 里找 `0x0007`/`0x0008`。
 忽略 map 的解析器会静默漏掉它们。

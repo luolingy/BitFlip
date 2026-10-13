@@ -1,24 +1,43 @@
-# 自研 APK / DEX 逆向核心 —— 设计
+# APK / DEX 逆向核心 —— 设计
 
 > 状态：**设计**（未实现）。字节约束见
-> [`docs/research/dex-apk-format-reference.md`](./research/dex-apk-format-reference.md)。
-> 相关：ADR-0019（本文）、`docs/DEPENDENCY-DECISIONS.md` §2.4。
+> [`docs/research/dex-apk-format-reference.md`](./research/dex-apk-format-reference.md)；
+> 现成库实测证据见
+> [`docs/research/apk-dex-library-survey.md`](./research/apk-dex-library-survey.md)。
+> 相关：ADR-0019（含更正）、`docs/DEPENDENCY-DECISIONS.md` §2.4。
+>
+> **更正**：本文初版标题是"**自研** APK / DEX 逆向核心"，§1 论证的是
+> "必须自研"。那个前提**错了**（见下），已改写。
 
-## 1. 为什么必须自研
+## 1. 用现成库，只自研缺口
 
-不是"选择自研"，是**没有可用的轮子**。三条路都堵着（结论已记录在
-`docs/DEPENDENCY-DECISIONS.md`，由 `scripts/check-licenses.py` 守着）：
+初版的论证是"没有可用的轮子"，依据是**点名试了几个猜到的 crate 名**。
+改成**搜索 crates.io 枚举**之后，可用的宽松许可库是有，而且实测能跑：
 
-| 候选 | 许可 | 为什么不能用 |
-| --- | --- | --- |
-| `smali` / `baksmali` | **GPL-3.0-only** | 传染整个产品。已进 `DENY` 清单 |
-| `dex` crate | MIT | **2021-05-31 起冻结**，不支持 038+ 的 `call_site_ids`/`method_handles`，也不支持 v041 |
-| `dalvik` crate | MIT OR Apache-2.0 | 只是**反汇编器**，不建结构模型（没有 class/field/method 表） |
-| `lief` | Apache-2.0（许可没问题） | 构建期下载预编译二进制 + C++ FFI，且 docs.rs 每个版本都构建失败 |
-| `exe` / `dotnetdll` | GPL-3.0 / GPL-3.0+ | deny-list |
+| 层 | 用什么 | 许可 | 实测结论 |
+| --- | --- | --- | --- |
+| APK 容器 | `zip`（或 `apk-info-zip` 抗畸形包） | MIT / Apache-2.0 | 解出的 `.so` 是 ELF64 `EM_AARCH64` |
+| 清单 / 资源 | `apk-info` / `apk-info-axml` | Apache-2.0 | 二进制清单还原成 29 392 字节 XML |
+| DEX 结构 + 解码 + CFG | `droidsaw-dex`（**只用事实层**） | BSD-3-Clause | 类数 7643 与手读 header 一致；解码 3000/3000 "恰好铺满" |
+| **native 库** | **既有 ELF 路径** | —— | APK 里的 `.so` 就是普通 ELF，零新代码 |
 
-**结论：DEX 解析器与 Dalvik 解码器都自己写。** APK 容器那层可以用 `zip`
-（9.0.1，MIT，纯 Rust，已过许可闸门）。
+**仍然成立的否决**（这几条不变，别因为"改了结论"就以为它们也翻了）：
+`smali` 是 GPL-3.0-only；`dex` 冻结在 2021；`dalvik` 不建结构模型；
+`lief` 构建期下载。错的是"所以没有轮子"这一步推论，不是这几条本身。
+
+**必须划清的一条线**：`droidsaw-dex` 的**反编译层不接入**。
+它的 `emit`/`emit_dex`/`sugar`/`r8_inversion` 做类型推断与 Java 源码生成，
+ADR-0018 已判定这类输出按定义就是推断，展示即违反 §7。
+好在这些是并列的公开模块，**只用 `parser`/`decode`/`cfg`/`xrefs`/`mutf8`/`opcodes`**。
+
+**引用现成库的条件**（都来自实测，不是形式条款）：
+
+1. 这两个库**极新**（首发 2026-04，下载 945/611），发布的 crate **不含测试**
+   （`exclude = ["/tests"]`）。所以**必须配项目自己的黄金测试** ——
+   对着真实 APK 断言类数/方法数/覆盖率等不变量，不能只信库的自述。
+2. 几个 crate 声明了许可但**没随包发 LICENSE 文件**；
+   Apache-2.0 的分发义务要求附原文。
+3. 新依赖必须过 `scripts/check-licenses.py`（两棵树已实跑：强著佐权 0）。
 
 ## 2. 真实样本实测（先看现实，再定范围）
 
@@ -91,11 +110,17 @@ APK 的成员是**有名字、格式各异**的，与 `Ar` 同构（只是成员
      `0001000000001234` 会以为是个真实地址；
    - UI 上显示时反解成"`classes2.dex` 内第 N 条指令"这种可读形式。
 
-4. **新的 CFG 边类型**。现有 CFG 只有 fallthrough / 条件 / 无条件。
+4. **要接进来的 CFG 边类型**。现有 CFG 只有 fallthrough / 条件 / 无条件。
    DEX 还需要：
-   - `SwitchCase { targets, keys }`（来自 `packed-switch-payload` / `sparse-switch-payload`）；
-   - `ExceptionEdge`（来自 `try_item` + `encoded_catch_handler`，**一个 try 块可有多个 handler**）；
+   - `SwitchCase` / `SwitchDefault`（来自 `packed-switch-payload` / `sparse-switch-payload`）；
+   - 异常边（来自 `try_item` + `encoded_catch_handler`，**一个 try 块可有多个 handler**）；
    - handler 入口是一种特殊的块入口（`move-exception` 只能在那里出现）。
+
+   **更正：这些不必自己造。** `droidsaw-dex` 的 `EdgeKind` 已经是
+   `FallThrough | Branch | SwitchCase(i32) | SwitchDefault |
+   ExceptionHandler(TypeIdx) | ExceptionCatchAll`，并带
+   `ExceptionRegion { start_addr, end_addr, handler_blocks }`。
+   要做的是**投影到项目的 CFG 表示**，不是新增语义。
 
 5. **多 dex 的符号键**。multidex 下同一个类名可能出现在不同 dex。
    符号 id 必须是 `(dex_index, index)` 复合键，不能只用 index。
@@ -112,13 +137,15 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 
 ## 5. 里程碑
 
-按"价值/成本"排序。**M0/M1 加起来就能覆盖 APK 逆向里很大一部分实际需求**
-（很多 app 的核心逻辑在 native 库里），而成本远低于 M2/M3。
+排期理由变了：**现在每一层都有现成库，所以不是"挑最便宜的做"，而是
+"按依赖顺序做"**。M0 仍排第一，因为它零新解析代码且立刻有用；
+但 M1/M2 的成本已经从"写一个解析器 + 一个解码器 + 一个 CFG 构造器"
+降到"**写适配层 + 验证**"。
 
-### M0 — APK 容器 + native 库复用 ELF（成本最低，价值最高）
+### M0 — APK 容器 + native 库复用 ELF
 
-1. `ContainerKind::Zip`：ZIP 解析（EOCD / central directory / local header）。
-   用 `zip` crate，不自己写 ZIP。
+1. `ContainerKind::Zip`：ZIP 解析。用 `zip`；若要抗畸形包（BadPack）
+   再加 `apk-info-zip`。
 2. 成员枚举：`members` 列出所有条目，标出 `classes*.dex`、`lib/<abi>/*.so`、
    `AndroidManifest.xml`、`resources.arsc`。
 3. **解压 `.so` 成员 → 走现有 ELF 路径**。这是本里程碑的核心收益。
@@ -129,40 +156,62 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
    结论必须区分"**存在** v2 块"与"**已验证** v2 签名" —— 后者未实现，
    按 §7 报 `NotYetImplemented`。
 
-**验收**：对 `ah-app-release.apk` 能列出 1867 个成员、37 个 `.so` 全部解析成
-ELF 对象（`EM_AARCH64`），并能对其中一个成员出函数清单。
+**验收**（本节已在探测工程里**预演通过**，见调查报告 §3）：
+对 `ah-app-release.apk` 列出 1867 个成员、37 个 `.so` 解出普通 ELF64
+（`EM_AARCH64`），并能对其中一个成员出函数清单。
 
 ### M1 — DEX 结构模型（不建 CFG）
 
-按参考文档 §1–§5 的顺序：`dex_header` → `map_list` → id 表（含 MUTF-8）
-→ `class_def`/`class_data` → `code_item` + 指令遍历。
+后端用 `droidsaw-dex` 的 `parser` 层 + `ids`/`mutf8`，**不自己写解析器**。
+真正要做的是**适配**：把它返回的带 `String` 的
+`ClassSummary`/`MethodSummary` 投影到项目的**列式 SoA 表示**与 interned
+字符串池（CLAUDE.md §4 禁止把每条指令物化成带 `String` 的对象）。
+**这个适配层才是本里程碑的主要工作量。**
 
 **不做**：CFG、数据流、注解、`debug_info`（各自的后续里程碑）。
 
-**验收**（不能只看绿灯，CLAUDE.md §7）：
-- fixture 按**规范字节**手工拼（**不要按解析器假设拼** —— §6.11 的教训），
-  另配真实样本；
-- 断言"所有 `code_item` 的指令遍历消耗的 code unit 数 **== `insns_size`**"
-  —— 这一条能抓出绝大多数宽度表 / payload / 对齐错误；
+**验收 —— 关键变化：验收对象是"库 + 我们的适配"**。
+因为库极新且发布包不含测试（§1 条件 1），**必须有自己的黄金测试**：
+
+- 断言"类数 == 手读 `header.class_defs_size`"（实测 7643:7643，可复现）；
+- 断言"**指令 ∪ payload 恰好铺满 `[0, insns_size)`**"，
+  `insns_size` 与 payload 长度都**按规范手算**，不读库的长度字段。
+  这条能抓出绝大多数宽度表 / payload / 对齐错误 ——
+  实测在 3000 个真实方法上 0 不吻合；
 - 断言"每条 `31t` 的分支目标正好指向一个合法 payload 起始 unit"；
 - 断言"每个 `try_item` 的 `handler_off` 正好落在某个 `encoded_catch_handler` 起点"；
-- 断言"符号数量 == `class_data` 四个 size 之和"。
+- 断言"符号数量 == `class_data` 四个 size 之和"；
+- **记录库报出的 `parse_errors`**：实测真实 APK 上就有一条
+  `OutOfOrder { pool: StringIds }`。这类"规范不符但 ART 容忍"的情形
+  只能写进 `notes`，**不能据此拒绝文件**，也不能静默丢掉；
+- grep 守卫：代码里**不出现** `droidsaw_dex::emit*` / `sugar` /
+  `r8_inversion` 的引用（§1 划的那条线）。
 
-**先用真实样本反推 fixture**：`ah-app-release.apk` 的 3 个 dex 是现成的实现验证集
-（8.8 MB / 10.4 MB / 6.0 MB）。
+**验证集**：`ah-app-release.apk` 的 3 个 dex 现成可用
+（8.8 / 10.4 / 6.0 MB，分别 7643 / 8833 / 6462 个类）。
 
-### M2 — Dalvik 解码器 + CFG
+### M2 — Dalvik 解码 + CFG
 
-`DexDecoder`（`Decoder` trait 实现）+ 指令文本渲染 + 新 CFG 边类型。
-渲染不能走 capstone 的助记符表（那是 `CapstoneDecoder` 独有的），
-所以 DEX 的 `Disasm.renderer` 必须是 `None` 或新增一个 DEX 渲染路径 ——
-**这一点要在动手前定**，因为 `Disasm.renderer` 的类型是
-`Option<Arc<CapstoneDecoder>>`，DEX 需要新的表达。
+用 `droidsaw-dex` 的 `decode` + `cfg`，**要写的是适配层**：
+
+- 把 `decode::parse_code_item` 的 `Instruction`
+  （`addr`/`Opcode`/`size`/`dst`/`src`/`literal`/`target`/`pool_idx`）
+  投影成项目的列式指令表示；
+- 把 `cfg::Cfg`（`EdgeKind` 已是 `FallThrough | Branch | SwitchCase(i32) |
+  SwitchDefault | ExceptionHandler(TypeIdx) | ExceptionCatchAll`，外加
+  `ExceptionRegion { start_addr, end_addr, handler_blocks }`）
+  投影成项目的 CFG 表示；
+- **指令文本渲染要单独解决**：`droidsaw-dex` 有 `Opcode::mnemonic()`，
+  但项目的 `Disasm.renderer` 类型是 `Option<Arc<CapstoneDecoder>>`，
+  DEX 走不进去。**这一点要在动手前定**（新增 DEX 渲染路径，或把 renderer
+  抽象成 trait）。这是本方案里唯一一处"现成库帮不上"的**结构**问题。
 
 ### M3 — AXML + resources.arsc
 
-`AndroidManifest.xml`（package/versionCode/versionName/minSdkVersion/debuggable
-/permissions/activities）+ 资源表。价值中等（元信息与字符串为主，不是代码逻辑）。
+用 `apk-info-axml`（或 `rusty-axml` / `resand`）。
+**实测已经能还原出 29 392 字节可读 XML**，含 package / versionCode /
+versionName / minSdk / targetSdk / permissions / activities / services /
+主 activity / 签名条目数。价值中等（元信息与字符串为主，不是代码逻辑）。
 
 ### 暂不排期
 
@@ -173,6 +222,10 @@ ELF 对象（`EM_AARCH64`），并能对其中一个成员出函数清单。
 - **重打包 APK 的修复**：只报告（checksum/signature 不一致写 `notes`），不修。
 
 ## 6. 已知陷阱（详见参考文档 §9，这里只列最容易全错的）
+
+现在这些陷阱主要**由 `droidsaw-dex` 处理**了，但**我们的黄金测试仍要盯着它们** ——
+理由就是 §1 条件 1：库极新，且发布的 crate 把 `tests/` 排除了，
+我们无法从制品验证它对这些边角的处理。**"库应该处理了"不是证据。**
 
 1. **`tries_size != 0` 隐含 4 字节对齐**（`insns_size` 为奇数时跳 2 字节 padding；
    `tries_size` 为奇数时 handler 列表末尾再补 1 字节）。这是"整体错位 2 字节"的头号来源。
@@ -190,10 +243,14 @@ ELF 对象（`EM_AARCH64`），并能对其中一个成员出函数清单。
    **"`0xff` = expanded opcode" 在 ART 里不存在**（`0xff` 是 `const-method-type`）。
    这两条流传很广，都别信。
 8. **不要信 `insns_size`**：用它之前先与实际字节数比对。
+9. **规范要求 ≠ 现网事实。** 实测一个真实上架 APK 的 `string_ids` **就是乱序的**
+   （`OutOfOrder { pool: StringIds }`）。所以排序性自检的结论只能进 `notes`，
+   **既不能据此拒绝文件，也不能静默丢掉**。
 
 ## 7. 本设计里仍未验证的（不许用默认值糊过去）
 
-参考文档 §10 有完整清单（13 项）。其中最影响**本设计**的三项：
+**第一类：格式本身的未知。** 参考文档 §10 有完整清单（13 项），
+其中最影响**本设计**的三项：
 
 1. **payload 必须 4 字节对齐**的规范原文未取得。实现上：期待对齐，
    未对齐记 `notes` 而**不拒绝文件**。
@@ -201,6 +258,18 @@ ELF 对象（`EM_AARCH64`），并能对其中一个成员出函数清单。
    按"UTF-8 + 保留代理对"处理最稳。
 3. **`.cdex`/`.vdex`/`.oat` 的 magic 原文未取得** → 只能按"magic 不匹配任一已知
    DEX 版本"报错，**不要**写死网上抄来的 magic 字符串。
+
+**第二类：新引入的依赖本身的未知**（这一类是本次改方案后**新增**的，
+必须写明，否则会被"库能跑"这件事掩盖）：
+
+4. **本次只验证了有限几条不变量**（类数一致、指令恰好铺满、CFG 边类型、
+   目录/清单字段），**没有逐字段核对全部输出**。例如
+   `access_flags` 语义、注解、`debug_info`、xrefs 都**没验**。
+5. **037–041 各版本的实际行为未验**（本次样本全是 035）。
+6. **`resand` / `rusty-axml` / `dex-parser-rust` / `apk-info-zip` / `droidsaw-apk`
+   本次没有实跑**，只有许可与 API 面调研。
+7. 这两个库**极新、产量异常**（见调查报告 §4 第 1 条）。这不构成"不能用"，
+   但构成"**必须自己验**"。
 
 另外：**本机两个 APK 都是 035 不等于"现网没有 041"**。样本量为 2，
 而且两个都可能来自同一时期的同一构建链。M0/M1 的实现要能在遇到 041 时

@@ -26,16 +26,23 @@
 | **Mach-O（含 fat）** | `object` 0.40 | Apache-2.0 OR MIT | **实测通过** | **用**，但要加资源限额（§2.3） |
 | Mach-O 代码签名 / dyld cache | `object` 0.40 | 同上 | 未实测（API 存在） | 用 |
 | Mach-O 深度签名（CMS） | `apple-codesign` | MPL-2.0 | 未实测 | **需你拍板**（MPL 是文件级 copyleft） |
-| APK（ZIP 容器） | `zip` 9.0.1 | MIT | 未实测 | 用 |
+| APK（ZIP 容器） | `zip` 9.0.2 | MIT | **实测通过** | 用 |
+| APK（抗畸形包 BadPack） | `apk-info-zip` | Apache-2.0 | 未实跑（API 存在） | 有需要时用 |
+| APK 清单/资源（AXML+ARSC） | `apk-info` / `apk-info-axml` | Apache-2.0 | **实测通过** | 用（§2.4） |
+| AXML / ARSC 读写 | `rusty-axml` / `resand` | Apache-2.0 | 未实跑 | 备选（§2.4） |
 | JVM class | `cafebabe` | 0BSD | 未实测 | 用 |
-| **DEX（M11 核心）** | —— | —— | —— | **没有可用的轮子，见 §2.4** |
+| **DEX（M11 核心）** | `droidsaw-dex` | **BSD-3-Clause** | **实测通过**（§2.4） | **用**，但**不引其反编译层** |
 | **架构扩展（9 → 40+）** | `wazabin-sleigh` + `-precompile` | MIT / MIT AND Apache-2.0 | **实测通过** | 用（有保留，见 §2.5） |
 | **反编译器** | `ghidra-decompiler` 2.1 | Apache-2.0 | **实测通过但违反 §7** | **先做隔离验证，不直接接**（§3） |
 | .NET / CIL | `dotscope` | Apache-2.0 | 未实测 | 有需要时用 |
 | DWARF | `gimli`（已在用） | MIT OR Apache-2.0 | —— | 保持 |
 | WASM | `wasmparser` | Apache-2.0 WITH LLVM-exception | 未实测 | 有需要时用 |
 
-**没有任何一个缺口是"必须自己从零写"的**，唯一接近的是 DEX。
+**没有任何一个缺口是"必须自己从零写"的。**
+
+> **更正**：本行初版写的是"唯一接近的是 DEX"。**那句是错的** ——
+> 见 §2.4 的更正记录：当时是**点名试了几个猜到的 crate 名**，而不是搜索
+> crates.io。改成搜索枚举后 `droidsaw-dex`（BSD-3-Clause）立刻浮出并实测可用。
 
 ## 2. 逐项说明
 
@@ -101,19 +108,55 @@ OK, 2 slice(s): cputype=U32(01000007) offset=0x1000 size=0x400
 无论选哪个，这条"为什么不用默认姿态"的**理由必须写进代码注释**，
 否则下一个人会以为是漏配了。
 
-### 2.4 DEX：没有可用的轮子（M11 的真实风险）
+### 2.4 DEX：**有**可用的轮子（此节结论曾被更正）
 
-- `dex`（MIT）是唯一像样的纯 Rust DEX 解析器（3,051 行），
-  但**冻结在 2021-05-31**。
-- `smali` 是这一带维护最活跃的（2026-08），但**每一个版本都是 GPL-3.0-only**，
-  直接出局。
-- `dalvik`（MIT OR Apache-2.0）还活着，但它是**反汇编器，不是容器解析器**。
-- `dex-parser` / `dexlib` / `dex-parser-rs` 等**不存在**（crates.io 404）。
+> **更正记录**：本节初版标题是"DEX：没有可用的轮子"，结论是"要么自己写，
+> 要么接手维护 `dex`"。**那个结论是错的**，错在方法：当时是**点名试了几个
+> 猜到的 crate 名**（`dex` / `dalvik` / `smali` / `dex-parser`），
+> 而不是**搜索** crates.io。改用搜索 API 枚举后结论翻转。
+> 教训：候选名要来自**枚举**，不是来自"我能想到的名字"。
 
-**结论**：DEX 要么自己写，要么接手维护 `dex`。
-**APK 本身是好消息**：它就是个 ZIP，`zip` 9.0.1 是 MIT 且纯 Rust。
-**建议**：M11 先做"APK 解包 + 复用已有 ELF 路径处理 `lib/*.so`"，
-这一段**完全不需要新轮子**；DEX 单独作为高风险子项排后。
+**仍然成立的否决**（这几条不变）：
+
+- `dex`（MIT）冻结在 2021-05-31，且无 038+ 的 `call_site_ids`/`method_handles`。
+- `smali` 每一个版本都是 **GPL-3.0-only**，直接出局（见 §4）。
+- `dalvik`（MIT OR Apache-2.0）是**反汇编器，不建结构模型**。
+
+**新发现的可用项（已实测，非仅读元数据）**：
+
+| crate | 许可 | 覆盖 |
+| --- | --- | --- |
+| `droidsaw-dex` 2.0.0 | **BSD-3-Clause** | DEX 解析 / 解码 / CFG / xrefs / MUTF-8 |
+| `droidsaw-apk` 2.0.0 | **BSD-3-Clause** | APK 容器 / 清单 / 签名 v1–v4 / native 库 |
+| `apk-info`（+`-zip`/`-axml`） 1.0.13 | **Apache-2.0** | APK 解析 / 自研 ZIP（抗 BadPack）/ AXML+ARSC |
+| `rusty-axml` 0.2.1 | **Apache-2.0** | AXML |
+| `resand` 0.3.0 | **Apache-2.0** | ARSC/AXML 读写 |
+| `dex-parser-rust` 1.3.0 | **MIT OR Apache-2.0** | DEX 解析（本次未实跑） |
+
+**实测结论**（样本：真实上架 APK，1867 条目）：
+
+- `droidsaw-dex`：类数 **7643 与手读 `header.class_defs_size` 一致**；
+  指令解码在 **3000/3000** 个真实方法上"**恰好铺满** `[0, insns_size)`"
+  （payload 区间按规范手算，`insns_size` 从原始字节手读）；
+  CFG 直接给出 `Branch`/`SwitchCase`/`ExceptionHandler`/`ExceptionCatchAll`
+  与 `ExceptionRegion`。
+- `apk-info`：条目数、ABI 名单、multidex **逐项与独立基准一致**；
+  二进制清单还原为 29 392 字节 XML。
+- 两棵依赖树的强著佐权 = **0**。
+
+**引用条件**（详见 `docs/research/apk-dex-library-survey.md` §4）：
+
+1. **`droidsaw-dex` 的反编译层（`emit`/`emit_dex`/`sugar`/`r8_inversion`）不接入。**
+   ADR-0018 已判定"类型推断 + Java 源码生成"按定义就是推断，展示即违反 §7。
+   只用 `parser`/`decode`/`cfg`/`xrefs`/`mutf8`/`opcodes` 这些事实抽取层。
+2. **这两个库极新**（首发 2026-04，下载 945/611），发布的 crate **不含测试**
+   （`exclude = ["/tests"]`）。必须配**项目自己的黄金测试**。
+3. 几个 crate **声明许可但没随包发 LICENSE 文件**；Apache-2.0 的分发义务
+   要求附原文，依赖前要从各自仓库取回。
+
+**APK 本身是好消息**：它就是个 ZIP。而且实测 `.so` 全是 DEFLATE，
+解出来就是普通 ELF64 —— "APK 解包 + 复用已有 ELF 路径处理 `lib/*.so`"
+这一段**确实不需要新轮子**，结论不变。
 
 ### 2.5 不要用的（含**理由**，因为许可是干净的）
 

@@ -84,34 +84,63 @@ Mach-O（含 `.app` bundle、dylib、fat/universal）列入 M10 TODO，不在主
 - 本机无 macOS 与 Android 运行环境：所有 fixture 必须在 Windows 上交叉生成；
   生成不了的部分**显式 SKIP 并给出生成命令**，不能静默变绿（CLAUDE.md §7）。
 
-### ADR-0019 · M11 的 DEX 走自研；APK 容器先做、native 库复用 ELF
+### ADR-0019 · M11：优先复用现成库、只自研缺口；APK 容器先做、native 库复用 ELF
 
-**状态**：已决（用户要求"研究自研 apk 逆向核心"）
+**状态**：已决（用户确认"如果 apk 可以使用现有的库减少工作量，也是可以的"）
 **日期**：2026-10
 
+> **更正**：本 ADR 的第一版写的是"**DEX 解析器与 Dalvik 解码器都必须自研**"，
+> 理由是"没有可用的轮子"。**那个前提是错的**。因为零实现曾基于旧文本起步，
+> 这里直接改写而不是再开一个 ADR 叠在上面 —— 留一份已知错误的决策在原地
+> 比改它更有害。
+
+**错在哪（值得记下来的方法论）**：旧文本的依据是**点名检查了三个已知 crate**
+（`dex` 冻结 / `dalvik` 只是反汇编器 / `smali` 是 GPL-3.0）后就归纳为
+"没有可用的"。改用 **crates.io 搜索 API 按关键词枚举**之后，
+`droidsaw-dex`（BSD-3-Clause，45k LoC）与 `apk-info`（Apache-2.0）立刻浮出，
+且**实测在真实 APK 上可用**。
+教训：**"我查过几个候选"不等于"没有候选"** —— 归纳结论必须写明搜索方式，
+否则一次三点采样会被当成普查结论沿用下去。
+
+证据：`docs/research/apk-dex-library-survey.md`（含实测数字与复现命令）。
+
 **背景**：ADR-0017 把 APK/DEX 立为 M11，并明确"扩展方式必须在动 `Session`
-之前单独设计"。本次调研回答了那个"单独设计"，同时**用真实样本纠正了三处
-我原本会写错的范围假设**。
+之前单独设计"。本次调研回答了那个"单独设计"，同时**用真实样本纠正了
+三处我原本会写错的范围假设**。
 
-**决策 1：DEX 解析器与 Dalvik 解码器都自研。**
+**决策 1：能用现成库的地方用现成库；只自研真正的缺口。**
 
-不是"选择自研"，是**没有可用的轮子**（`docs/DEPENDENCY-DECISIONS.md` §2.4）：
+旧的候选表（`smali` GPL-3.0 / `dex` 冻结 / `dalvik` 不建模型 / `lief` 构建期下载）
+里每一条的否决理由**依然成立**，所以那三个不能用仍然是对的 ——
+错的是"因此没有可用轮子"这一步推论。真正的可用项：
 
-| 候选 | 许可 | 不可用的原因 |
-| --- | --- | --- |
-| `smali` | **GPL-3.0-only** | 传染。已在 `check-licenses.py` 的 DENY 清单 |
-| `dex` | MIT | **2021-05-31 起冻结**；无 038+ 的 `call_site_ids`/`method_handles`，无 v041 |
-| `dalvik` | MIT OR Apache-2.0 | 只是反汇编器，**不建结构模型** |
-| `lief` | Apache-2.0（许可可接受） | 构建期下载预编译二进制 + C++ FFI；docs.rs 每版都构建失败 |
+| crate | 许可 | 覆盖 | 实测结论 |
+| --- | --- | --- | --- |
+| `droidsaw-dex` | **BSD-3-Clause** | `parser`/`decode`/`cfg`/`xrefs`/`mutf8`/`opcodes` | 类数 7643 **与手读 header 一致**；解码在 **3000/3000** 个真实方法上"恰好铺满 `[0,insns_size)`"；CFG 直接产出我要的边类型 |
+| `apk-info`（+`-zip`/`-axml`） | **Apache-2.0** | 容器 / 清单 / 资源 / 签名检测 / ABI | 1867 条目、ABI 名单、multidex **逐项与独立基准一致**；二进制清单还原成 29 392 字节 XML |
+| `zip` | MIT | ZIP | 已在选型结论里；解出的 `.so` 是 ELF64 `EM_AARCH64` |
 
-APK 容器那层例外：用 `zip`（9.0.1，MIT，纯 Rust）。
+两棵依赖树的许可闸门都实跑过：强著佐权 **0**
+（唯一朴素正则命中的 `r-efi` 是 `MIT OR Apache-2.0 OR LGPL-2.1-or-later`
+这类**析取式**许可，按 MIT/Apache 使用即无著佐权义务）。
 
-**决策 2：`Arch` 新增 `Dalvik`，并新增与 capstone **并列** 的 `DexDecoder` 后端。**
+**决策 2：`Arch` 新增 `Dalvik`，新增与 capstone 并列的 DEX 解码后端 ——
+但"新增后端"不等于"自己写后端"。**
 
-这是硬约束而非偏好 —— **实测 capstone 0.18 的架构只有 18 个**
+后端必须独立这一点是**硬约束**：实测 capstone 0.18 的架构只有 18 个
 （ARM/ARM64/MIPS/X86/PPC/SPARC/SYSZ/XCORE/M68K/TMS320C64X/M680X/EVM/MOS65XX/
 WASM/BPF/RISCV/SH/TRICORE），**没有 Dalvik/ART**。
-所幸边界很窄：`Decoder` trait 只有 `spec()` + `decode_one()`，`decode_many` 有默认实现。
+所幸边界很窄：`Decoder` trait 只有 `spec()` + `decode_one()`
+（`decode_many` 有默认实现），而 `droidsaw-dex` 的
+`decode::parse_code_item` 已经给出带 `addr`/`Opcode`/`size`/`target`/`pool_idx`
+的指令流。**要写的是适配层（转成项目的列式 SoA 表示），不是解码器本身。**
+
+**决策 2b：`droidsaw-dex` 的反编译层不接入。**
+
+它的 `emit`/`emit_dex`/`sugar`/`r8_inversion`（约占一半体积）做**类型推断与
+Java 源码生成**。ADR-0018 已判定这类输出按定义就是推断，直接展示违反 §7。
+好在这些是**并列的公开模块**，切得开：只用事实抽取层
+（`parser`/`decode`/`cfg`/`xrefs`/`mutf8`/`opcodes`），反编译层不引。
 
 **决策 3：里程碑按"价值/成本"排，不按格式复杂度排 —— APK 容器先做。**
 
@@ -148,8 +177,12 @@ M2（Dalvik 解码器 + CFG）→ M3（AXML + arsc）**。
 1. **合成地址空间**。DEX 没有虚拟地址：数据是文件偏移，代码是 code unit 索引。
    仍用 `u64`（项目约定），但必须写明是**合成地址**，
    且**反解函数要有单测** —— 否则用户看到 `0001000000001234` 会当成真实地址。
-2. **新的 CFG 边类型**：`SwitchCase { targets, keys }` 与 `ExceptionEdge`
-   （一个 try 块可有**多个** handler 目标）。
+2. **要接进来的 CFG 边类型**：`SwitchCase`/`SwitchDefault`（来自 payload）与
+   异常边（一个 try 块可有**多个** handler 目标）。
+   **更正：这些不必自己造** —— `droidsaw-dex` 的 `EdgeKind` 已经是
+   `FallThrough | Branch | SwitchCase(i32) | SwitchDefault | ExceptionHandler(TypeIdx) | ExceptionCatchAll`，
+   并带 `ExceptionRegion { start_addr, end_addr, handler_blocks }`。
+   要做的是**投影到项目的 CFG 表示**，不是新增语义。
 3. **多 dex 的符号键**：`(dex_index, index)` 复合键（multidex 下同名类可能并存）。
 
 **明确不复用**：DEX 无栈帧（寄存器机），所以**不能**跑现有 `frames` 路径
@@ -158,12 +191,25 @@ M2（Dalvik 解码器 + CFG）→ M3（AXML + arsc）**。
 
 **约束**：
 
+- **引用现成库的代价必须写在明处**（本次实测结论，细节见调查报告 §4）：
+  - `droidsaw-*` **极新**（首发 2026-04，总下载 945/611），且从 0.1.0 的
+    0 行到 1.0.0 的 43 333 行只隔 6 周。**本次只验证了有限几条不变量，
+    没有逐字段核对全部输出**。因此：新依赖必须配**项目自己的黄金测试**
+    （对着真实 APK 断言类数/方法数/覆盖率等不变量），不能只信库的自述。
+  - 发布的 crate **不含测试**（`exclude = ["/tests"]`），所以"179 个测试"
+    这类说法**无法从制品验证** —— 引用时不得把它当证据。
+  - `apk-info*` / `rusty-axml` / `dex-parser-rust` **声明了许可但没随包发
+    LICENSE 文件**。Apache-2.0 的分发义务要求附许可原文，
+    真要依赖就得从各自仓库取回 LICENSE 并随产品分发。
+  - `droidsaw-apk` 为签名验证引入 `rsa`/`p256`/`ecdsa`/`cms`。若只需要
+    "检测签名块存在"，优先用 `apk-info-zip::signature`，避免背这套依赖。
 - 结论里必须区分"**存在** v2 签名块"与"**已验证** v2 签名"；后者未实现，
   按 §7 报 `NotYetImplemented`。不做重打包/重签名（同 ADR-0017）。
 - `.cdex` / `.vdex` / `.oat` 明确拒绝；**不要**写死网上抄来的 magic 字符串
   （原文本次未取得，见参考文档 §10）。
 - 13 项 `UNVERIFIED` 在实现时必须落成"要么取原文验证、要么在结论里标未知"。
 - **样本量为 2 不等于"现网没有 041"**（两个样本可能同源）。
+- **新依赖必须过 `scripts/check-licenses.py`**（两棵树本次已实跑：强著佐权 0）。
 
 **参考**：`docs/research/dex-apk-format-reference.md`（字节级实现参考）、
 `docs/APK-DEX-DESIGN.md`（分层与验收）。

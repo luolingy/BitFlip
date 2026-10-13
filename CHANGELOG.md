@@ -11,6 +11,45 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 更正 — M11 改为复用现成库（推翻上一条的"DEX 必须自研"）
+
+上一条记录说"DEX 解析器与 Dalvik 解码器都自己写"。**那个结论错了**，
+本次实测后改写。新增 `docs/research/apk-dex-library-survey.md` 记录证据。
+
+**错在方法**：当时的依据是**点名试了几个猜到的 crate 名**
+（`dex`/`dalvik`/`smali`），而不是**搜索** crates.io。
+改用 crates.io 搜索 API 枚举后立刻找到可用项。教训：候选名要来自枚举，
+不是来自"我能想到的名字"。
+
+**实测结论**（样本：真实上架 APK，1867 条目、3 个 dex、37 个 `.so`）：
+
+| crate | 许可 | 实测 |
+| --- | --- | --- |
+| `droidsaw-dex` 2.0.0 | BSD-3-Clause | 类数 **7643 与手读 header 一致**；指令解码在 **3000/3000** 个真实方法上"恰好铺满 `[0,insns_size)`"；CFG 直接给出 `SwitchCase`/`ExceptionHandler` 等边类型 |
+| `apk-info` 1.0.13 | Apache-2.0 | 条目数 / ABI 名单 / multidex **逐项与独立基准一致**；二进制清单还原为 29 392 字节 XML |
+| `zip` 9.0.2 | MIT | 解出的 `.so` 是 ELF64 `EM_AARCH64` |
+
+两棵依赖树实跑许可闸门：强著佐权 **0**。
+
+**仍然成立的否决**（别以为一起翻了）：`smali` 是 GPL-3.0-only；
+`dex` 冻结在 2021；`dalvik` 不建结构模型；`lief` 构建期下载。
+错的只是"因此没有可用轮子"这一步推论。
+
+**划清的一条线**：`droidsaw-dex` 的**反编译层**
+（`emit`/`emit_dex`/`sugar`/`r8_inversion`）**不接入** ——
+ADR-0018 已判定"类型推断 + Java 源码生成"按定义就是推断，展示即违反 §7。
+只用 `parser`/`decode`/`cfg`/`xrefs`/`mutf8`/`opcodes` 这些事实抽取层。
+
+**顺带纠正一处参考文档**：规范写 `string_ids` 必须升序，
+但实测**真实上架 APK 就是乱序的**（`OutOfOrder { pool: StringIds }`）。
+所以这类检查只进 `notes`，既不拒绝文件也不静默丢掉。
+
+**这次也纠正了我自己的一个错误**：第一版覆盖率检查把
+`fill-array-data` 的长度算成 `4 + data.len()*element_width/2`，
+得到 9/3000 不吻合，一度像是库的 bug。停查后确认是**我重复计了
+`element_width`**（`data` 存的就是原始字节）。改对后归零。
+过程记在调查报告 §2.2，因为"差点把自己的 bug 报成别人的"值得留痕。
+
 ### 新增 — APK / DEX 自研逆向核心的设计与格式参考
 
 - `docs/APK-DEX-DESIGN.md`（新）：M11 的分层、里程碑拆分与验收标准。

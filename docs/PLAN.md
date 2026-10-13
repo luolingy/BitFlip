@@ -48,7 +48,7 @@
 | RISC-V 32/64 | M6+ | capstone |
 | MIPS | M6+ | capstone |
 | wasm32 | M10 | 自研/第三方（非承诺） |
-| Dalvik 字节码（DEX） | **M11** | 自研。**不是机器码**：基于寄存器、无栈帧、无重定位，需要字节码解码器这一概念 |
+| Dalvik 字节码（DEX） | **M11** | 用 `droidsaw-dex`（BSD-3-Clause），**不引其反编译层**。**不是机器码**：基于寄存器、无栈帧、无重定位，需要"字节码解码器"这一概念 |
 | Mach-O 的 x86_64 / ARM64 | **M12** | **不需要新后端** —— 两种架构 M2/M5 已有，缺的只是 ABI 映射 |
 
 **多架构能力要求**：同一份分析流程不得出现 `if arch == x86` 分支散落各处——
@@ -1119,10 +1119,14 @@ MSVC 修饰名反修饰、静态库 PDB。
 
 ### M11 · Android：APK / DEX / DEX-Family（用户要求"完全逆向"）
 
-> **实施设计已就绪**：`docs/APK-DEX-DESIGN.md`（分层、里程碑拆分、验收标准）
-> 与 `docs/research/dex-apk-format-reference.md`（字节级实现参考）。
-> 决策见 ADR-0019。**里程碑顺序按"价值/成本"排：先把 APK 容器做掉并复用
-> 既有 ELF 路径处理 `lib/*.so`（几乎零新代码），再上 DEX 结构模型。**
+> **实施设计已就绪**：`docs/APK-DEX-DESIGN.md`（分层、里程碑拆分、验收标准）、
+> `docs/research/dex-apk-format-reference.md`（字节级实现参考）、
+> `docs/research/apk-dex-library-survey.md`（现成库实测证据）。
+> 决策见 ADR-0019。**每一层都有现成库**（APK 容器 `zip`/`apk-info`、
+> 清单资源 `apk-info-axml`、DEX `droidsaw-dex`），所以工作重点是
+> **写适配层 + 自己的黄金测试**，不是从零写解析器。
+> 顺序：先把 APK 容器做掉并复用既有 ELF 路径处理 `lib/*.so`（几乎零新代码），
+> 再上 DEX 结构模型。
 > 本机已有两个真实 APK 样本可作实现验证集
 >（`C:\Users\Administrator\Downloads\ah-app-release.apk` / `base.apk`）。
 
