@@ -77,6 +77,46 @@ pub enum ParseError {
         /// 该由谁处置。
         detail: &'static str,
     },
+    /// **容器目录不在给定的字节范围内** —— 我只看了文件的一部分。
+    ///
+    /// # 为什么必须与 [`Self::Truncated`] / [`Self::OutOfBounds`] 分开
+    ///
+    /// 那两个说的是"**文件本身**坏了"，用户该去重新下载或检查文件。
+    /// 这一个说的是"**我给解析器的字节不够**"，文件很可能是完好的 ——
+    /// 成员好好地躺在后面，只是不在我拿到的这段里。
+    ///
+    /// 最典型的触发场景就是 ZIP/APK：它的中央目录在**文件末尾**，而嗅探
+    /// 只读前 8 MiB。把一个 31 MB 的 APK 的前缀交给 ZIP 解析器，两种错误
+    /// 都会得到"读不出成员"这个结果。若混成一个错误，用户会去修一个
+    /// 根本没坏的文件 —— 这正是 CLAUDE.md §7 要求区分的情形：
+    /// **"跳过"与"失败"必须分得开**。
+    #[error("容器目录不在给定范围内：{what}（本段 {actual:#x} 字节）")]
+    DirectoryNotInRange {
+        /// 要找的目录名（例如 `ZIP 中央目录结束记录`）。
+        what: &'static str,
+        /// 本次实际拿到的字节数。
+        actual: u64,
+    },
+    /// 这类用法我们**还没实现**（不是文件坏了，也不是某个字段取值不认识）。
+    ///
+    /// # 为什么不复用 [`Self::Unsupported`]
+    ///
+    /// `Unsupported` 的形状是"**某个字段**取了一个我们不认识的**值**"
+    /// （`e_machine = 0x1234`），所以它要求两个字段：`what` 与 `value`。
+    /// 而这里说的是"整类用法还没做" —— 比如 ZIP64、加密条目、
+    /// DEX 的 v041 版本 —— **没有哪个字段的值能代表它**。
+    ///
+    /// 硬套 `Unsupported` 就得编一个 `value`，错误信息里会出现一个
+    /// 用户去文件里根本找不到的取值。这正是 CLAUDE.md §7 禁止的
+    /// "用 0 冒充未知"。所以单独一个变体，`detail` 直接说清是什么、
+    /// 以及计划的里程碑。
+    #[error("暂不支持这个{what}：{detail}")]
+    NotSupported {
+        /// 是什么类别的用法（`ZIP 容器特性` / `DEX 版本` …）。
+        what: &'static str,
+        /// 具体是什么、什么时候做。
+        detail: String,
+    },
 }
 
 impl ParseError {
@@ -98,6 +138,11 @@ impl ParseError {
             Self::Inconsistent(detail) => format!("文件结构自相矛盾：{detail}"),
             Self::Overflow(detail) => format!("地址或长度计算溢出：{detail}"),
             Self::NoParser { detail, .. } => format!("没有可用的解析器：{detail}"),
+            Self::DirectoryNotInRange { what, .. } => format!(
+                "没有读到{what}：这段字节里不含容器目录（文件本身可能完好，\
+                 只是本次只看了其中一部分）"
+            ),
+            Self::NotSupported { detail, .. } => format!("暂不支持：{detail}"),
         }
     }
 }

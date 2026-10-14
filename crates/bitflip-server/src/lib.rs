@@ -610,10 +610,30 @@ struct MembersResponse {
 struct MemberWire {
     /// 成员名（已尽量解析长名表）。
     name: String,
-    /// 成员数据在容器里的文件偏移。
-    offset: u64,
+    /// 成员数据在容器里的文件偏移；**未知时为 `null`**。
+    ///
+    /// # 为什么不是 `u64`
+    ///
+    /// ZIP 成员的数据起点记在**本地头**里（中央目录只记本地头的位置），
+    /// 本地头对不上时这个值根本算不出来。用 `0` 冒充会给出一个**合法**偏移，
+    /// 前端拿去对照十六进制会白找一场（§7：拿不到就说拿不到）。
+    ///
+    /// 对 ar / MSVC `.lib` 成员这个字段恒非空 —— 它们是内联的。
+    offset: Option<u64>,
     /// 成员数据长度。
+    ///
+    /// 注意：ZIP 成员这里是**压缩后**大小（来自中央目录）；解压后的大小在
+    /// `uncompressed_size`。两者不同时前端必须说清楚，否则会看着一个
+    /// 195 KB 的 `.so` 报出与实际反汇编对不上的数字。
     size: u64,
+    /// 成员**解压后**的长度；内联成员为 `null`（没有这一层）。
+    ///
+    /// 可能为 `0` 且不代表"空文件"：写了 data descriptor 的 ZIP 条目
+    /// 其长度在本地头里是空的。前端不要把 `0` 当成确定的长度。
+    uncompressed_size: Option<u64>,
+    /// 成员内容怎么取：`"inline"`（文件里就是裸字节）或 `"container"`
+    /// （要经容器取出，可能压缩）。
+    storage: &'static str,
     /// 成员数据是否超出嗅探窗口。
     truncated: bool,
     /// 成员是否**可以**被当作独立对象分析。
@@ -646,6 +666,8 @@ async fn members(State(state): State<AppState>) -> Response {
             name: m.name.clone(),
             offset: m.offset,
             size: m.size,
+            uncompressed_size: m.storage.uncompressed_size(),
+            storage: m.storage.as_str(),
             truncated: m.truncated,
             analyzable: state.member_session(&m.name).is_ok(),
         })

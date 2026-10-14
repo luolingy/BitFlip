@@ -53,6 +53,14 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# ZIP/APK 容器（M11 的 M0）。**刻意关掉 default**：默认集会一次拉进
+# aes-crypto / bzip2 / deflate64 / lzma / ppmd / zstd / xz 七套解压后端与
+# 时间库，而 APK 成员实测只有 stored 与 deflate 两种（37/37、20/20 全是
+# deflate，见 docs/research/apk-dex-library-survey.md）。
+# 后端选 `-zlib-rs` 而不是 `-zlib`：前者是纯 Rust，不引入 C 工具链依赖，
+# 保持"单文件可执行"的交付形态。`deflate-flate2` 会带上 `_deflate-any`，
+# 所以这一个 feature 就够读，不需要 `deflate`（那个还会拉 zopfli，只用于写）。
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # 仅测试用
 tempfile = "3"

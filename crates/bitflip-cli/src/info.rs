@@ -127,11 +127,21 @@ fn print_human(info: &TargetInfo, session: &Session) {
         println!();
         println!("归档成员（最多显示 20 个）");
         for member in members.iter().take(20) {
+            // 偏移可能是未知（ZIP 成员的数据起点在本地头里，本地头对不上就没有）。
+            // 显示"偏移未知"而不是 `0x00000000` —— 后者是个**合法**偏移，
+            // 用户拿去对照十六进制会白找一场（§7：不用 0 冒充未知）。
+            let offset = member
+                .offset
+                .map_or_else(|| "偏移未知".to_string(), |o| format!("偏移 {o:#010x}"));
             println!(
-                "  {:>10} 字节  偏移 {:#010x}  {}{}",
+                "  {:>10} 字节  {offset}  {}{}{}",
                 member.size,
-                member.offset,
                 member.name,
+                if member.storage.is_inline() {
+                    String::new()
+                } else {
+                    format!("  [{}]", member.storage.label_zh())
+                },
                 if member.truncated {
                     "（超出嗅探窗口）"
                 } else {

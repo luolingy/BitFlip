@@ -214,6 +214,14 @@ pub struct GenerationStats {
     pub truncated_members: u64,
     /// 归档里被跳过的元数据成员个数（符号索引、长名表 —— 不是对象）。
     pub metadata_members: u64,
+    /// ZIP/APK 容器里被跳过的成员个数（成员是压缩的，签名生成还没走解压这条路）。
+    ///
+    /// # 为什么不并进 `unparsable_objects`
+    ///
+    /// "解析失败"与"这条路还没实现"是两件事（CLAUDE.md §7）：前者说文件有问题、
+    /// 用户该换一个输入；后者说工具还没做、等里程碑。合并计数会让用户拿着一个
+    /// **完全正常**的 APK 去查自己的文件到底哪里坏了。
+    pub compressed_members: u64,
     /// 前缀因为"尾部是对齐填充"而被截短的条数（签名仍可用，只是证据变少）。
     pub padding_trimmed: u64,
     /// 解析失败的对象个数。
@@ -271,6 +279,12 @@ impl GenerationStats {
         }
         if self.metadata_members > 0 {
             parts.push(format!("跳过的元数据成员 {} 个", self.metadata_members));
+        }
+        if self.compressed_members > 0 {
+            parts.push(format!(
+                "跳过的压缩容器成员 {} 个（ZIP/APK 成员的解压尚未接入签名生成）",
+                self.compressed_members
+            ));
         }
         if self.padding_trimmed > 0 {
             parts.push(format!(

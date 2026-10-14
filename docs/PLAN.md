@@ -1130,6 +1130,25 @@ MSVC 修饰名反修饰、静态库 PDB。
 > 本机已有两个真实 APK 样本可作实现验证集
 >（`C:\Users\Administrator\Downloads\ah-app-release.apk` / `base.apk`）。
 
+**进展 · M0（2026-10-14，据实记录）**：APK 容器层与 `lib/*.so` 复用已完成。
+
+* 新增 `ContainerKind::Zip` + `crates/bitflip-loader/src/format/zip/`（枚举、
+  按 index 取成员、解压、APK 角色标注、签名**存在性**）。解析全部交给 `zip` 9.0.2
+  （关掉默认特性，只留 deflate + 纯 Rust 后端）。
+* 自己写的只有两处**不参与解析**的核对：`find_eocd`（把"我只看了文件的一部分"
+  与"文件坏了"分开报）与 `count_central_records`（挡非 ZIP64 成员数**回绕**导致的
+  静默少给）。
+* 实测 `ah-app-release.apk`（31.5 MB）：成员 **1867** 个与独立基准一致；
+  `functions --member lib/x86_64/libBugly_Native.so` → **493 个函数**；
+  `symbol ... --member` 把 `JNI_OnLoad` 定位到成员内 `0xa330`。
+* **未做（没有冒充完成）**：逐成员的对齐诊断（`localHeaderOffset % 4`、
+  `.so` 偏移的 4096/16384 对齐、ELF `p_align`）。逐条状态见
+  `docs/APK-DEX-DESIGN.md` 的"M0 完成情况"表。
+* **发现一个既有阻断**：`capstone` 0.14.0 反汇编 ARM64 的 `MRS`/`MSR` 时
+  **abort 进程**（`docs/research/capstone-arm64-abort.md`）。对裸 `.so` 同样复现，
+  与本次改动无关；但 aarch64 是 Android 主 ABI，**不修它 M11 的价值就少一半**。
+
+
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 
 **为什么单列一个里程碑而不是塞进 M10**：它引入的是一整套**新的执行模型**，不是

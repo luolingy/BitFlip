@@ -32,6 +32,7 @@
 //! | [`pe`] | PE32/PE32+（exe/dll/sys） | 已按关注点拆成 `mod` / `import` / `reloc` / `unwind` / `inspect` |
 //! | [`coff`] | COFF 目标文件（`.obj`） | 单文件。节名解析（`/N` 长名表）与解析主体同处一文件，尚未拆开 |
 //! | [`elf`] | ELF32/64（exe/`.so`/`.o`） | 单文件（约 1950 行）。内部拆分未做 —— 见下 |
+//! | [`zip`] | ZIP 容器（APK / JAR / XAPK 外壳） | 单文件。**只做容器层**：成员枚举与按需取出 |
 //!
 //! ELF 的内部拆分**故意没和 PE 一起做**：PE 那一次是纯粹的搬移（逐字节校验过），
 //! 一次只搬一个文件，出问题时能立刻定位。ELF 的拆分是同一类工作，单独一轮做，
@@ -40,3 +41,4 @@
 pub mod coff;
 pub mod elf;
 pub mod pe;
+pub mod zip;

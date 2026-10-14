@@ -15,10 +15,37 @@
 //! `init`），所以答案必须带上成员名，否则用户拿着地址也不知道去哪看。
 
 use anyhow::Context;
-use bitflip_core::{ArchiveMember, OpenOptions, Session};
+use bitflip_core::{ApkRole, ArchiveMember, OpenOptions, Session};
 use serde_json::json;
 
 use crate::cli::{FunctionsArgs, MembersArgs, SymbolArgs};
+
+/// 若目标容器是 ZIP，给出成员的 APK 角色说明；否则空串。
+///
+/// # 为什么只在 ZIP 上显示
+///
+/// [`ApkRole`] 是 **APK 的命名约定**知识。对 ar / MSVC `.lib` 的成员名，
+/// 同一个函数照样会返回结论，但那些结论没有依据 —— 无条件显示等于把
+/// "按 APK 约定猜的" 说成 "识别出来的"，正是 §7 禁止的。
+///
+/// `Other` 也返回空串：绝大多数成员（图片、字体、配置）都落到 `Other`，
+/// 给它们逐行标一个"其他"只是噪声。**注意这意味着"没有标注" ≠ "不重要"**，
+/// 表头的角色列只标出 APK 的那几个固定位置。
+fn apk_role_hint(is_zip: bool, name: &str) -> String {
+    if !is_zip {
+        return String::new();
+    }
+    match ApkRole::of(name) {
+        ApkRole::Other => String::new(),
+        ApkRole::Dex(ordinal) => {
+            ordinal.map_or_else(|| "  [主 dex]".to_string(), |n| format!("  [dex 序号 {n}]"))
+        }
+        ApkRole::NativeLib(abi) => format!("  [原生库 {abi}]"),
+        ApkRole::Manifest => "  [二进制清单]".to_string(),
+        ApkRole::ResourceTable => "  [资源表]".to_string(),
+        ApkRole::Signature => "  [v1 签名文件]".to_string(),
+    }
+}
 
 /// `members`：列出归档成员。
 pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
@@ -37,6 +64,9 @@ pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
                     "name": m.name,
                     "offset": m.offset,
                     "size": m.size,
+                    // APK 角色（按名字判定，"other" 表示不符合 APK 的那几个
+                    // 固定位置 —— **不是**"这个成员没用"）。
+                    "role": ApkRole::of(&m.name).as_str(),
                     // 逐成员的"内容未读全"标记。这是降级信息，
                     // 必须出现在输出里（CLAUDE.md §7）。
                     "truncated": m.truncated,
@@ -81,19 +111,51 @@ pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
         }
     );
     println!();
-    println!("{:>10}  {:>12}  名字", "大小", "偏移");
+    println!("{:>10}  {:>14}  {:>8}  名字", "大小", "偏移", "存储");
+    // 角色标注只在**容器成员**上给：`ApkRole` 是 APK 的命名约定知识，
+    // 对 ar / MSVC `.lib` 的内联成员名没有依据。
+    //
+    // 判据用 `storage` 而不是比对"容器短名是不是 zip"：ZIP 成员恒为 `Container`、
+    // ar / `.lib` 成员恒为 `Inline`（见 `MemberStorage` 的说明），两者一一对应。
+    // 用结构判据就不必依赖一个字符串巧合，也就不会因为改个短名而悄悄失准。
+    let show_role = members.iter().any(|m| !m.storage.is_inline());
     for member in members {
+        // 偏移可能是"未知"：ZIP 成员的数据起点在**本地头**里（中央目录只记
+        // 本地头的位置），本地头对不上就算不出来。显示"未知"而不是 `0x0`
+        // —— `0` 是个合法偏移，用户拿去对照十六进制会白找一场（§7）。
+        let offset = member
+            .offset
+            .map_or_else(|| "未知".to_string(), |o| format!("{o:#x}"));
+        // "存储"列：内联成员直接可切片；容器成员给**原始方法号**
+        // （号码是能拿去查 APPNOTE 的线索，比"其他"有用）。
+        let storage = member
+            .storage
+            .method()
+            .map_or_else(|| "内联".to_string(), |m| format!("方法 {m}"));
         println!(
-            "{:>10}  {:#012x}  {}{}",
+            "{:>10}  {:>14}  {:>8}  {}{}{}",
             member.size,
-            member.offset,
+            offset,
+            storage,
             member.name,
+            apk_role_hint(show_role, &member.name),
             if member.truncated {
                 "  （超出嗅探窗口，内容未完整读取）"
             } else {
                 ""
             }
         );
+    }
+
+    println!();
+    println!("存储列  内联：文件里就是成员裸字节，可直接解析（ar / MSVC .lib）");
+    println!("        方法 N：成员存于容器内，取内容要经容器（ZIP：0=stored 不压缩，8=deflate）");
+    println!("偏移列  未知：容器目录指向的本地头对不上，数据起点算不出来 —— 不是偏移 0");
+    if show_role {
+        println!("角色标注  **按成员名**判定的 APK 固定位置（不解压、不解析）：只标出");
+        println!("          classes*.dex / lib/<abi>/*.so / 清单 / 资源表 / v1 签名文件。");
+        println!("          没有标注 ≠ 成员没用（绝大多数成员本来就不在这几个位置）；");
+        println!("          标了也只说明名字符合约定，不说明内容真是那个格式。");
     }
 
     if !session.info().notes.is_empty() {
@@ -393,8 +455,16 @@ fn report_member_hit(
         return Ok(());
     }
     println!("找到    归档成员 {}", member.name);
-    println!("偏移    {:#x}", member.offset);
+    // 偏移未知时明确说"未知"，不打印 `0x0` —— 那是个合法偏移，会误导（§7）。
+    println!(
+        "偏移    {}",
+        member.offset.map_or_else(
+            || "未知（容器目录指向的本地头对不上）".to_string(),
+            |o| format!("{o:#x}")
+        )
+    );
     println!("大小    {} 字节", member.size);
+    println!("存储    {}", member.storage.label_zh());
     println!(
         "用法    bitflip-cli functions {} --member {}",
         session.info().path,

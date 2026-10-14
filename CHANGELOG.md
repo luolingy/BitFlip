@@ -11,6 +11,73 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — M11 的 M0：ZIP/APK 容器 + `.so` 直接复用 ELF 通路
+
+M0 的目标是"先把壳打开"，**不做** DEX：识别 ZIP 容器、枚举成员、把
+`lib/<abi>/*.so` 交给已有的 ELF 解析与反汇编通路。
+
+**新增依赖**：`zip` 9.0.2（MIT）。刻意**关掉**默认特性 —— 默认会拉进
+aes-crypto / bzip2 / deflate64 / lzma / ppmd / zstd / xz / time，而 APK 实测
+只用方法 0（stored）与 8（deflate）。用 `deflate-flate2-zlib-rs` 这个纯 Rust 后端，
+避免引入 C 工具链、保住单文件可执行。`zip` **没有** `build.rs`，不像 `lief`
+那样在构建期联网。
+
+**设计上改动过的两个判断**（都是被实测推翻的，记在这里免得又改回去）：
+
+1. **`MemberStorage` 的分法从"压缩了没有"改成"怎么取内容"**。
+   `Plain` / `Compressed` 这个分法逼出一个说不通的格子：ZIP 里方法 0 的成员
+   按它算"可直接切片"，可它的数据起点**不在中央目录里**（中央目录只记本地头
+   的位置），要另外解析本地头才算得出来。一格语义依赖另一处解析的结果，
+   就是分法错了。改成 `Inline` / `Container` 后 ar / `.lib` 恒为 `Inline`、
+   ZIP 恒为 `Container`（无论方法号），每个格子都自洽。
+
+2. **`ArchiveMember::offset` 从 `u64` 改成 `Option<u64>`**。
+   实测（读 `zip` 源码确认）：`ZipFileEntry::data_start()` 只是一个由
+   reader 填的 `OnceCell`，走纯元数据枚举时**恒为 `None`** —— 也就是说
+   ZIP 的数据偏移在元数据这条路上根本拿不到。既然拿不到，就用 `None` 报出来，
+   不能用 `0`（§7：拿不到就说拿不到）。
+
+**自己写的只有两处，且都不参与解析**（解析全部交给 `zip` crate）：
+
+* `find_eocd`：从文件末尾往前找中央目录结束记录。它存在的唯一目的是把
+  ["我只看了文件的一部分"] 与 ["文件坏了"] 分开报。`zip` crate 对这两种情形
+  都会返回一个"无效归档"类的错误，不先分这一刀，用户会去修一个没坏的文件。
+* `count_central_records`：走一遍中央目录数**实际**条数。非 ZIP64 的结束记录里
+  成员数字段是 16 位，一个真有 65538 个成员的文件会**回绕**成 2 ——
+  照单全收就会"只列出 2 个成员且不报截断"，界面完全看不出少了东西。
+
+**新增错误变体**：`ParseError::DirectoryNotInRange`（"没读到容器目录"，
+与 `Truncated` / `OutOfBounds` 刻意分开）与 `ParseError::NotSupported`
+（"这个用法还没支持"；不能复用 `Unsupported`，那要一个真实的 `value`，
+凑一个 `0` 进去就是 §7 禁止的）。
+
+**签名只报存在性**。v1 看 `META-INF/*.SF`，v2/v3 看中央目录之前那块。
+类型名与字段名一律避开 `valid` / `verified`，只有 `present` ——
+"存在签名块"与"签名有效"是两件事。v2/v3 的判据是**结构自洽**而不是只比 16 字节
+魔数：最初只比魔数，结果"最后一个成员的数据正好以这 16 字节结尾"的文件会被误判，
+单测随手构造一个就复现了。
+
+**真实 APK 实测**（`ah-app-release.apk`，31.5 MB，`com.weavi.ahh` 1.6.3）：
+
+| 项 | 结果 |
+| --- | --- |
+| 成员枚举 | 1867 个，与独立基准一致 |
+| 存储 | 全部方法 8（deflate），`offset` 全部算出（本地头解析成功） |
+| 签名存在性 | v1 与 v2/v3 **都存在**（未校验有效性） |
+| `functions --member lib/x86_64/libBugly_Native.so` | 解压 → ELF → 反汇编，**493 个函数**、1 个导入桩 |
+| `symbol ... --member lib/x86_64/...` | `JNI_OnLoad` 定位到成员内 `0xa330` |
+
+**同一轮发现、但属于既有问题（不是本次引入）**：`capstone` 0.14.0 在
+`src/arch/arm64.rs:70` 用 `mem::transmute::<Arm64Reg, Arm64Sysreg>` 转换
+MRS/MSR 操作数，遇到超出 `Arm64Sysreg` 取值范围的寄存器号会触发 Rust 的枚举
+有效性检查，**非展开 panic → 直接 abort**。对裸 `.so` 与 APK 成员**同样复现**，
+即与本次改动无关；且 0.14.0（2026-01-04 发布）已是 crates.io 最新版本，
+没有可升级的修好版本。影响面很大：aarch64 是 Android 的主 ABI，
+ARM64 的 `.so` 目前**任何**反汇编都会中止进程。这条同时违反 CLAUDE.md §4
+"分析器崩溃必须转成错误而不是进程退出"（abort 连 `catch_unwind` 都兜不住）。
+细节与处置建议见 `docs/research/capstone-arm64-abort.md`。
+
+
 ### 更正 — M11 改为复用现成库（推翻上一条的"DEX 必须自研"）
 
 上一条记录说"DEX 解析器与 Dalvik 解码器都自己写"。**那个结论错了**，

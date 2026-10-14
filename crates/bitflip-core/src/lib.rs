@@ -38,9 +38,21 @@ pub use export::{
     FormatVersions, Truncation, DEFAULT_EXPORT_BYTE_LIMIT, EXPORT_FORMAT_VERSION,
 };
 
+/// 一并重新导出 APK 成员角色：它由**成员名**判定（纯字符串，不读字节），
+/// 嵌入方要在成员列表里标出 `classes*.dex` / `lib/<abi>/*.so` 就得用它。
+///
+/// 与上面两条同理：不给嵌入方一个"被迫依赖 `bitflip-loader`"的理由。
+/// 但要注意它的**适用前提**（见 `ApkRole` 的文档）：它只表示"名字符合 APK 的
+/// 命名约定"，既不表示"这就是 APK"，也不表示"内容是那个格式"。
+pub use bitflip_loader::ApkRole;
 /// 重新导出归档成员描述：它是 [`Session::members`] / [`Session::member_session`]
 /// 的返回类型，嵌入方（如 CLI）要用它做成员选择而不必直接依赖 `bitflip-loader`。
 pub use bitflip_loader::ArchiveMember;
+/// 一并重新导出成员存储方式：它是 [`ArchiveMember::storage`] 的类型，
+/// 嵌入方要判断"这个成员是内联还是得向容器要"就得能看到它。
+/// 不导出的话，消费方只能被迫去依赖 `bitflip-loader` —— 那正是上面那条
+/// 重新导出想避免的事（核心层的公开 API 是对外契约，载体在这里）。
+pub use bitflip_loader::MemberStorage;
 pub use session::{
     AnalysisSummary, ExportInfo, ImportInfo, ObjectInfo, OpenOptions, RelocInfo, SectionInfo,
     SegmentInfo, Session, SymbolInfo, TargetInfo, INFO_FORMAT_VERSION, MAX_FULL_PARSE_BYTES,

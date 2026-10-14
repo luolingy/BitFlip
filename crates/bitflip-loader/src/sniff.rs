@@ -8,7 +8,7 @@ use std::path::Path;
 
 use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
 
-use crate::{ArchiveMember, ContainerKind, Guess, LoaderError, ObjectKind};
+use crate::{ArchiveMember, ContainerKind, Guess, LoaderError, MemberStorage, ObjectKind};
 
 /// 单次嗅探读取的字节上限（8 MiB）：足够覆盖任何正常文件头与常见归档目录，
 /// 又不至于为了一次识别把 GB 级固件读进内存。
@@ -132,6 +132,11 @@ fn sniff_inner(bytes: &[u8], depth: u8) -> Guess {
         sniff_elf(bytes, &mut g);
     } else if bytes.starts_with(b"!<arch>\n") {
         sniff_ar(bytes, &mut g, depth);
+    } else if looks_like_zip(bytes) {
+        // 排在 COFF/Mach-O 之前：ZIP 的判据是偏移 0 的四字节签名，很硬；
+        // 而 `looks_like_coff` 看的是 machine 字段，不该有机会把
+        // `PK\x03\x04` 当成某种 COFF。
+        sniff_zip(bytes, &mut g);
     } else if is_fat_container(bytes) {
         sniff_fat(bytes, &mut g);
     } else if bytes.len() >= 2 && bytes[0] == b'M' && bytes[1] == b'Z' {
@@ -150,6 +155,64 @@ fn sniff_inner(bytes: &[u8], depth: u8) -> Guess {
     }
 
     g
+}
+
+// ── ZIP / APK ───────────────────────────────────────────────────────────────
+
+/// ZIP 本地文件头签名（APPNOTE §4.3.7）。非空 ZIP 的第一个成员头就在偏移 0。
+const ZIP_LOCAL_MAGIC: &[u8; 4] = b"PK\x03\x04";
+/// 中央目录结束记录签名（APPNOTE §4.3.16）。**空** ZIP 只有这个，没有本地头。
+const ZIP_EOCD_MAGIC: &[u8; 4] = b"PK\x05\x06";
+/// 跨卷（spanned）标记（APPNOTE §4.3.10）。也可能是文件的第一条记录。
+const ZIP_SPANNED_MAGIC: &[u8; 4] = b"PK\x07\x08";
+
+/// 这个前缀看起来是 ZIP 吗。
+fn looks_like_zip(bytes: &[u8]) -> bool {
+    bytes.starts_with(ZIP_LOCAL_MAGIC)
+        || bytes.starts_with(ZIP_EOCD_MAGIC)
+        || bytes.starts_with(ZIP_SPANNED_MAGIC)
+}
+
+/// 认一个 ZIP 容器（APK / JAR / XAPK 外壳）。
+///
+/// # 这里**只**认容器，**不**枚举成员
+///
+/// 这是与 [`sniff_ar`] 最重要的一处不同，也是本函数刻意"少做一件事"的原因。
+///
+/// ZIP 的成员清单在**文件末尾**的中央目录里。而本函数拿到的字节可能只是
+/// 前 [`SNIFF_WINDOW`] 字节（[`sniff_file`] 就只读这么多）—— 对一个 31 MB 的
+/// APK，8 MiB 前缀里**根本没有**中央目录。
+///
+/// 在这种前缀上"试着找中央目录"然后报告"没找到成员"，会让两个完全不同的
+/// 事实看起来一样：
+/// * "这个 ZIP 是空的"（真的没有成员）；
+/// * "我没看全"（成员在那儿，只是不在我拿到的这段里）。
+///
+///   两者混成一个结论正是 CLAUDE.md §7 禁止的失败模式。
+///
+/// 所以分工写死：
+/// * **这里**只回答"是不是 ZIP"，看偏移 0 的签名就够，前缀足够；
+/// * **成员枚举**交给 [`crate::list_zip_members`]，调用方在**手握完整字节**
+///   时调用它（`bitflip-core` 的 `Session::open` 就是这么做的）。
+///
+/// 因此：`sniff_bytes` 对一个完整 APK 也**不会**给出成员列表，这是设计，
+/// 不是缺陷。要成员就走 `list_zip_members`。
+fn sniff_zip(bytes: &[u8], g: &mut Guess) {
+    g.container = ContainerKind::Zip;
+    // `object` 保持默认的 `Raw`：容器本身不是可分析对象（同 ar）。
+    // `summary_zh` 对非 `Plain` 容器不会打印 `object`，所以这里不是"忘了填"。
+
+    if bytes.starts_with(ZIP_EOCD_MAGIC) {
+        g.notes.push(
+            "ZIP 容器：偏移 0 就是中央目录结束记录，说明这是个没有任何成员的 ZIP".to_string(),
+        );
+    } else {
+        g.notes.push(
+            "ZIP 容器：成员清单保存在**文件末尾**的中央目录里，\
+             不在这段前缀内。完整成员列表要在读取完整字节后单独枚举"
+                .to_string(),
+        );
+    }
 }
 
 // ── ELF ─────────────────────────────────────────────────────────────────────
@@ -630,10 +693,15 @@ fn sniff_ar(bytes: &[u8], g: &mut Guess, depth: u8) {
 
         let end = data_off.saturating_add(data_size);
         g.members.push(ArchiveMember {
+            // ar 没有成员索引这回事：位置就是定义，取内容靠 offset。
+            index: g.members.len(),
             name,
-            offset: data_off as u64,
+            offset: Some(data_off as u64),
             size: data_size as u64,
             truncated: end > bytes.len(),
+            // ar 的成员就是裸字节：成员头里写着长度，数据紧随其后，
+            // 没有压缩这一层，所以能直接按偏移切片。
+            storage: MemberStorage::Inline,
             payload: is_payload_member,
         });
 
@@ -828,7 +896,10 @@ mod tests {
 
         // 成员偏移必须能在原文件里精确定位到成员数据
         for m in &g.members {
-            assert!(m.offset + m.size <= archive.len() as u64, "{m:?}");
+            // ar 的成员是内联的：偏移**必须**有值，`None` 是错的。
+            let offset = m.offset.expect("ar 成员必然有数据偏移");
+            assert!(offset + m.size <= archive.len() as u64, "{m:?}");
+            assert!(m.storage.is_inline(), "ar 成员应标记为内联：{m:?}");
         }
     }
 

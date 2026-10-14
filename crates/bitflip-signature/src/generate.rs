@@ -185,7 +185,14 @@ pub fn generate(inputs: &[ArchiveInput<'_>]) -> Generated {
                         stats.truncated_members += 1;
                         continue;
                     }
-                    let Some(slice) = slice_member(input.bytes, member.offset, member.size) else {
+                    // 内联成员**必然**有数据偏移（ar/.lib 的成员头里就写着长度）。
+                    // 用 `let ... else` 而不是 `unwrap`：真出现 `None` 说明容器
+                    // 解析自相矛盾，按"不可解析"计数即可，不必让整个生成崩掉。
+                    let Some(offset) = member.offset else {
+                        stats.unparsable_objects += 1;
+                        continue;
+                    };
+                    let Some(slice) = slice_member(input.bytes, offset, member.size) else {
                         stats.unparsable_objects += 1;
                         continue;
                     };
@@ -197,6 +204,24 @@ pub fn generate(inputs: &[ArchiveInput<'_>]) -> Generated {
                         }
                         None => stats.unparsable_objects += 1,
                     }
+                }
+            }
+            ContainerKind::Zip => {
+                // APK/ZIP 的成员是**压缩**的，取内容要先解压 —— 签名生成这条路
+                // 还没接（M11 的 M0 只做到"容器 + 成员枚举 + `.so` 走 ELF 路径"）。
+                //
+                // 但**不能静默跳过**：一个完全正常的 APK 若被无声略过，报告里
+                // 看起来就像"本来就没什么可产出的"，用户会以为签名生成跑完了（§7）。
+                //
+                // 单列一个计数而不是并进 `unparsable_objects`：用户的 APK 没坏，
+                // 只是工具还没做。合并会让他去查自己的文件哪里有问题。
+                match bitflip_loader::list_zip_members(input.bytes) {
+                    Ok(listing) => {
+                        stats.compressed_members +=
+                            listing.members.iter().filter(|m| m.payload).count() as u64;
+                    }
+                    // 连成员都列不出来，那才是这个输入本身读不了。
+                    Err(_) => stats.unparsable_objects += 1,
                 }
             }
             _ => {

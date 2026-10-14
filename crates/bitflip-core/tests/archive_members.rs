@@ -362,7 +362,7 @@ fn member_address_space_starts_from_zero() {
         "成员里最低的函数地址是 {lowest:#x}（成员 {}，容器偏移 {:#x}）——\
          这看起来像是把容器偏移当成了成员内的地址",
         member.name,
-        member.offset
+        member.offset.expect("ar 成员是内联的，必然有数据偏移")
     );
 }
 
@@ -382,15 +382,14 @@ fn member_session_reads_the_member_bytes_not_the_container() {
     let container = std::fs::read(fixture("libelf-multi.a")).expect("读容器");
     assert_eq!(&container[..8], b"!<arch>\n", "容器应以 ar 魔数开头");
 
-    let start = member.offset as usize;
+    let start = member.offset.expect("ar 成员是内联的，必然有数据偏移") as usize;
     let expected = &container[start..start + 64];
 
     // 成员自己的 ELF 头：魔数必须是 ELF，而容器同一位置是 ar 成员头
     assert_eq!(
         &expected[..4],
         b"\x7fELF",
-        "容器 offset {:#x} 处应是成员 {:?} 的 ELF 头",
-        member.offset,
+        "容器 offset {start:#x} 处应是成员 {:?} 的 ELF 头",
         member.name
     );
 

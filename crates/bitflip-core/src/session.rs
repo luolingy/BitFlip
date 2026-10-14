@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bitflip_analyze::{JobHandle, NullSink, StageId, StringOptions};
 use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
 use bitflip_loader::object::{Object, ObjectId};
-use bitflip_loader::{sniff_file, ContainerKind, Guess, ObjectKind};
+use bitflip_loader::{sniff_file, ContainerKind, Guess, MemberStorage, ObjectKind};
 use bitflip_project::ProjectStore;
 use bitflip_signature::{signature_arch, Matcher, SignatureSet};
 use serde::Serialize;
@@ -475,11 +475,20 @@ impl TargetInfo {
         }
     }
 
-    /// 是否为归档容器（ar / MSVC `.lib`）。
+    /// 是否为**容器**（ar / MSVC `.lib` / ZIP）：可分析的单位是它的成员。
+    ///
+    /// 名字保留 `is_archive` 而不是改成 `is_container`：ZIP 本来就是个归档格式，
+    /// "archive" 涵盖它没有歧义；而改名要动 CLI / server / export 五处调用点
+    /// 和一个公开契约，收益对不上。**含义**在这里写清楚就够了。
+    ///
+    /// 加 ZIP 是必须的：`Session::bytes` 要不要留整份文件、`--member` 能不能用、
+    /// 界面该不该说"容器本身没有可反汇编的代码"，都由这一个判断决定。
+    /// 漏掉 ZIP 的后果是成员分析拿不到容器字节，看起来像功能没实现。
     #[must_use]
     pub fn is_archive(&self) -> bool {
         self.container == ContainerKind::Ar.as_str()
             || self.container == ContainerKind::MsvcLib.as_str()
+            || self.container == ContainerKind::Zip.as_str()
     }
 
     /// 是否已识别出对象格式（非 raw）。
@@ -600,6 +609,72 @@ pub struct Session {
     analysis: std::sync::OnceLock<Result<Arc<TargetAnalysis>, String>>,
 }
 
+/// 把 ZIP/APK 的成员清单填进 `guess`（M11 的 M0）。
+///
+/// # 为什么必须由调用方在**读完完整字节之后**调用，且必须在 `from_guess` 之前
+///
+/// ZIP 的中央目录在**文件末尾**，而嗅探只读了前 `SNIFF_WINDOW` 字节 ——
+/// 对 31 MB 的 APK 就是"前缀里根本没有中央目录"。所以成员只能在完整字节
+/// 到手之后才能枚举。
+///
+/// 而成员数与摘要（`TargetInfo::from_guess` 里的 `member_count` 与
+/// `summary_zh`）是**在那里一次性定稿**的。顺序错了（枚举晚于 `from_guess`），
+/// 界面会永久停在"成员清单未枚举"，用户看到的是"文件在那儿、成员却数不出来"。
+/// `open` 里那两处的相对顺序是硬约束，不是因为写法方便。
+///
+/// # 失败不是打开失败
+///
+/// 枚举失败时容器**已经被识别为 ZIP**，那本身是有价值的结论。所以这里只把
+/// 原因按 §7 记进 `notes`（会显示在界面上），不让整个打开失败。
+fn fill_zip_members(guess: &mut Guess, bytes: Option<&[u8]>, file_size: u64) {
+    let Some(bytes) = bytes else {
+        // 完整字节没拿到（超上限，或读盘失败）。前一种由本函数说清后果，
+        // 后一种的原因已经在 `open` 里记过，这里只说"成员因此没列出"。
+        guess.notes.push(if file_size > MAX_FULL_PARSE_BYTES {
+            format!(
+                "文件 {file_size} 字节超过完整解析上限 {MAX_FULL_PARSE_BYTES} 字节：\
+                 未读取完整字节，**成员清单未枚举**（成员数未知）"
+            )
+        } else {
+            "未取得完整字节，**成员清单未枚举**（成员数未知）".to_string()
+        });
+        return;
+    };
+
+    match bitflip_loader::list_zip_members(bytes) {
+        Ok(listing) => {
+            guess.members = listing.members;
+            guess.members_truncated = listing.truncated;
+            guess.notes.extend(listing.notes);
+
+            // 签名的**存在性**必须与"已验证"分得开（§7）。这里不新增结构化
+            // 字段（那要动 wire 契约 `INFO_FORMAT_VERSION`），而是把两句
+            // 话说在同一个句子里 —— 只报"存在"，并当场写明"未校验"，
+            // 免得被断章取义成"签名没问题"。
+            if listing.signature.apk_signing_block_present {
+                guess.notes.push(
+                    "检测到 APK Signing Block（v2/v3 签名块）**存在**：\
+                     仅检测存在性，**未校验签名有效性**（校验属于后续里程碑）"
+                        .to_string(),
+                );
+            }
+            if listing.signature.v1_present {
+                guess.notes.push(
+                    "检测到 v1（JAR signing）签名文件 `META-INF/*.SF` **存在**：\
+                     仅检测存在性，**未校验签名有效性**（校验属于后续里程碑）"
+                        .to_string(),
+                );
+            }
+        }
+        Err(error) => {
+            guess.notes.push(format!(
+                "成员清单枚举失败：{} —— 容器已识别为 ZIP，但成员未列出",
+                error.summary_zh()
+            ));
+        }
+    }
+}
+
 impl Session {
     /// 打开目标：检查路径、嗅探格式，并做一次完整解析。
     ///
@@ -712,6 +787,55 @@ impl Session {
         }
 
         let file_size = std::fs::metadata(&path).map_or(guess.sniffed_bytes as u64, |m| m.len());
+
+        // 文件字节**只读一次**，解析与后续字节级查询共用。
+        //
+        // 早先这里读了两遍：`parse_target` 内部 `fs::read` 一遍用于解析，
+        // 下面判断"要留字节"时再 `fs::read` 一遍存进 session。对
+        // owo-terminal.exe（201 MiB）那是 402 MiB 的 I/O 加两次 201 MiB 的
+        // 分配，而两次拿到的是同一份数据。
+        //
+        // 读**之前**先看大小上限：超过上限的目标要明确拒绝，而不是先读
+        // 600 MiB 再拒绝。
+        //
+        // 仍未做到的优化：解析本身只需要文件头（实测这个目标的节表等等
+        // 全在偏移 0x3b0 以内），理论上只读前缀就够 `info` 用了。但
+        // `Session::bytes` 是 `Arc<[u8]>`，反汇编与成员分析需要完整的随机
+        // 访问，把它改成"按需读全量"要动 `self.bytes` 的所有读点。
+        // 见 docs/PERFORMANCE.md 里记的后续项与实测数字。
+        //
+        // # 为什么这段读比早先版本更靠前（在 `TargetInfo::from_guess` 之前）
+        //
+        // ZIP/APK 逼出来的顺序约束：它的成员清单在**文件末尾**的中央目录里，
+        // 而嗅探只读了前 8 MiB（`SNIFF_WINDOW`），**枚举不到任何成员**。
+        // 成员只能在完整字节到手之后才能列出来。
+        //
+        // 而 `member_count` 与摘要（`summary_zh`）都是在 `from_guess` 里
+        // 一次性定下来的。读盘若不提前，枚举就只能在 `from_guess` **之后**
+        // 做，界面会永久停在"成员清单未枚举 / 成员 0" —— 对 31 MB 的 APK
+        // 就是"文件明明在那儿、成员也数得出来，界面却说没有"。
+        //
+        // 提前读盘不改变 I/O 行为：这段读**本来就是无条件执行的**（只受上限
+        // 约束），原来只是晚了几十行。
+        let full_bytes: Option<Vec<u8>> = if file_size > MAX_FULL_PARSE_BYTES {
+            None
+        } else {
+            match std::fs::read(&path) {
+                Ok(data) => Some(data),
+                Err(error) => {
+                    guess.notes.push(format!(
+                        "读取文件字节失败（{error}），无法解析，反汇编与字节级查询将不可用"
+                    ));
+                    None
+                }
+            }
+        };
+
+        // ZIP/APK：现在才够条件枚举成员（中央目录在文件末尾）。
+        if guess.container == ContainerKind::Zip {
+            fill_zip_members(&mut guess, full_bytes.as_deref(), file_size);
+        }
+
         let mut info = TargetInfo::from_guess(&path, file_size, &guess);
         // 覆盖说明同时**并入 `guess.notes`**：后续 `parse_target` 与
         // 分析层看到的是 `guess`，它们也该知道这些结论是用户强制的。
@@ -730,35 +854,6 @@ impl Session {
         let mut notes = override_notes;
         notes.extend(std::mem::take(&mut info.notes));
         info.notes = notes;
-
-        // 文件字节**只读一次**，解析与后续字节级查询共用。
-        //
-        // 早先这里读了两遍：`parse_target` 内部 `fs::read` 一遍用于解析，
-        // 下面判断"要留字节"时再 `fs::read` 一遍存进 session。对
-        // owo-terminal.exe（201 MiB）那是 402 MiB 的 I/O 加两次 201 MiB 的
-        // 分配，而两次拿到的是同一份数据。
-        //
-        // 读**之前**先看大小上限：超过上限的目标要明确拒绝，而不是先读
-        // 600 MiB 再拒绝。
-        //
-        // 仍未做到的优化：解析本身只需要文件头（实测这个目标的节表等等
-        // 全在偏移 0x3b0 以内），理论上只读前缀就够 `info` 用了。但
-        // `Session::bytes` 是 `Arc<[u8]>`，反汇编与成员分析需要完整的随机
-        // 访问，把它改成"按需读全量"要动 `self.bytes` 的所有读点。
-        // 见 docs/PERFORMANCE.md 里记的后续项与实测数字。
-        let full_bytes: Option<Vec<u8>> = if file_size > MAX_FULL_PARSE_BYTES {
-            None
-        } else {
-            match std::fs::read(&path) {
-                Ok(data) => Some(data),
-                Err(error) => {
-                    info.notes.push(format!(
-                        "读取文件字节失败（{error}），无法解析，反汇编与字节级查询将不可用"
-                    ));
-                    None
-                }
-            }
-        };
 
         let (object, object_raw) =
             match Self::parse_target(full_bytes.as_deref(), file_size, &guess, &opts) {
@@ -812,8 +907,12 @@ impl Session {
         //
         // 这里曾经漏掉归档，后果是所有 `--member` 都被"数据区间超出文件
         // （0 字节）"挡回去 —— 一个功能看起来像没实现，其实是少了这一步读。
-        let is_archive =
-            guess.container == ContainerKind::Ar || guess.container == ContainerKind::MsvcLib;
+        //
+        // **ZIP 同理，而且更必须**：它的成员是压缩的，取成员内容要拿容器字节
+        // 去解压；不留字节，`--member lib/arm64-v8a/*.so` 就直接无从下手。
+        let is_archive = guess.container == ContainerKind::Ar
+            || guess.container == ContainerKind::MsvcLib
+            || guess.container == ContainerKind::Zip;
         let bytes: Arc<[u8]> = if object_raw.is_some() || is_archive {
             full_bytes.map_or_else(|| Arc::from(Vec::new()), Arc::from)
         } else {
@@ -928,8 +1027,8 @@ impl Session {
 
     /// 按嗅探结论选择解析器。
     ///
-    /// 归档（`.a` / `.lib`）的成员解析属于 M5；对归档明确说明
-    /// "sections 描述的是容器"而不是假装解析了成员。
+    /// 容器（`.a` / `.lib` / ZIP）**本身**不是可分析对象：能反汇编的是成员。
+    /// 对它们明确说明"sections 描述的是容器"而不是假装解析了成员。
     fn parse_target(
         bytes: Option<&[u8]>,
         file_size: u64,
@@ -974,6 +1073,19 @@ impl Session {
             return Err(format!(
                 "这是归档容器（{count} 个成员）：容器本身没有可反汇编的代码。\
                  请用 `members` 列出成员，再用 `--member <名字>` 指定要分析的成员"
+            ));
+        }
+
+        if guess.container == ContainerKind::Zip {
+            // ZIP/APK 同理，但要说清"容器里装的是什么" —— APK 的成员是
+            // dex / `.so` / 清单 / 资源，**可分析的是其中的成员**，
+            // 而且 M0 阶段能直接分析的是 ELF 成员（`.so`）。
+            // 不把这条说清楚，用户会以为"APK 打不开"是工具坏了。
+            let count = guess.members.len();
+            return Err(format!(
+                "这是 ZIP/APK 容器（{count} 个成员）：容器本身没有可反汇编的代码。\
+                 请用 `members` 列出成员，再用 `--member <名字>` 指定要分析的成员；\
+                 其中 `lib/<abi>/*.so` 是原生库，可直接按 ELF 分析"
             ));
         }
 
@@ -1171,8 +1283,10 @@ impl Session {
         name: &str,
     ) -> Result<(Self, bitflip_loader::ArchiveMember), BitflipError> {
         if !self.info.is_archive() {
+            // 保留"归档"这个词（测试按它断言），同时把可用的容器列全 ——
+            // 只提 .a / .lib 会让 APK 用户以为这条路走不通。
             return Err(BitflipError::InvalidInput(format!(
-                "目标不是归档（{}），无法按成员分析：--member 只对 .a / .lib 有意义",
+                "目标不是归档（{}），无法按成员分析：--member 只对 .a / .lib / .apk 有意义",
                 self.guess.container.label_zh()
             )));
         }
@@ -1195,17 +1309,66 @@ impl Session {
             .ok_or_else(|| BitflipError::not_found(format!("归档成员 {name:?}")))?
             .clone();
 
-        let start = usize::try_from(member.offset).unwrap_or(usize::MAX);
-        let len = usize::try_from(member.size).unwrap_or(usize::MAX);
-        let end = start
-            .checked_add(len)
-            .ok_or_else(|| BitflipError::InvalidInput(format!("成员 {name:?} 的偏移+长度溢出")))?;
-        let Some(slice) = self.bytes.get(start..end) else {
-            return Err(BitflipError::InvalidInput(format!(
-                "成员 {name:?} 的数据区间 {start:#x}..{end:#x} 超出文件（{} 字节）",
-                self.bytes.len()
-            )));
+        // ── 取得成员内容 ────────────────────────────────────────────────
+        //
+        // 两条路，由 `MemberStorage` 决定（见 `bitflip_loader::MemberStorage`）：
+        //   * `Inline`    —— ar / MSVC `.lib`：`offset..offset+size` 就是内容；
+        //   * `Container` —— ZIP/APK：内容在容器里，可能压缩过，按 `index` 去要。
+        //
+        // 早先这里只有切片一条路，于是 APK 的成员会被当成"裸字节"去解析
+        // —— 拿到的其实是 deflate 流，嗅探只会说"未识别"。
+        // 那正是设计文档里 M0 要避免的失败模式：**看起来跑通了，其实什么都没识别**。
+        let content: Arc<[u8]> = match member.storage {
+            MemberStorage::Inline => {
+                // 内联成员**必须**有偏移：`None` 会让切片无从下手。
+                // 走到这里说明容器解析自相矛盾，如实报出来，不要静默取 0。
+                let Some(offset) = member.offset else {
+                    return Err(BitflipError::InvalidInput(format!(
+                        "成员 {:?} 标记为内联，却没有数据偏移 —— 容器解析结果自相矛盾",
+                        member.name
+                    )));
+                };
+                let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                let len = usize::try_from(member.size).unwrap_or(usize::MAX);
+                let end = start.checked_add(len).ok_or_else(|| {
+                    BitflipError::InvalidInput(format!("成员 {name:?} 的偏移+长度溢出"))
+                })?;
+                let slice = self.bytes.get(start..end).ok_or_else(|| {
+                    BitflipError::InvalidInput(format!(
+                        "成员 {name:?} 的数据区间 {start:#x}..{end:#x} 超出文件（{} 字节）",
+                        self.bytes.len()
+                    ))
+                })?;
+                Arc::from(slice)
+            }
+            MemberStorage::Container { .. } => {
+                // 判据用**容器类别**而不是压缩方法号：能不能向容器要内容，
+                // 是容器的属性（它有没有目录、能不能按 index 定位），
+                // 不是"这个方法号压没压缩"的属性。
+                if self.guess.container != ContainerKind::Zip {
+                    return Err(BitflipError::InvalidInput(format!(
+                        "成员 {:?} 需要经容器取出，但当前容器是 {} —— \
+                         容器解析结果自相矛盾",
+                        member.name,
+                        self.guess.container.label_zh()
+                    )));
+                }
+                // 解压在这里发生。注意 `self.bytes` 是**整个** APK，
+                // 而 `member.index` 是中央目录下标 —— 两者都不依赖成员偏移，
+                // 所以本地头损坏的成员也能走到这里。
+                let data = bitflip_loader::read_zip_member(&self.bytes, member.index).map_err(
+                    |error| {
+                        BitflipError::unavailable(format!(
+                            "成员 {:?} 取出失败：{}",
+                            member.name,
+                            error.summary_zh()
+                        ))
+                    },
+                )?;
+                Arc::from(data)
+            }
         };
+        let slice: &[u8] = &content;
 
         // 成员自身的格式：归档里可能混有非对象成员（GNU 的长名表 `/`、
         // 符号索引 `//`、链接器成员的元数据），它们本来就不该被当成
@@ -1238,7 +1401,16 @@ impl Session {
         // 路径保留"容器#成员"的形式：工程库按目标定位，这个字符串让
         // 用户一眼看出分析的是哪个成员，也让哈希天然分开（内容不同）。
         let path = PathBuf::from(format!("{}#{}", self.path.display(), member.name));
-        let info = TargetInfo::from_guess(&path, member.size, &guess);
+        // 成员大小用**实际拿到的字节数**，而不是容器目录里的声明值。
+        //
+        // 对 ZIP 这不是同一回事：`member.size` 是**压缩后**大小，
+        // 用它当 `file_size` 会得到"这个 .so 只有 195 KB"这种与反汇编结果
+        // 对不上的数字（真实的 `libBugly_Native.so` 解压后就是 195200 字节，
+        // 但界面若报压缩后大小就会明显偏小且无法解释）。
+        //
+        // 对 ar 的完整成员两者相等，只有被截断的成员会不同 —— 那时用实际
+        // 字节数也更诚实：我们分析的确实是那一段。
+        let info = TargetInfo::from_guess(&path, slice.len() as u64, &guess);
         // 调试信息按成员各自读：每个成员是独立的编译单元，行表也是各自的。
         // 先读再构造（object 随后会被移进 Arc）。
         let debug = Arc::new(bitflip_debug::read_target(None, &object, slice));
@@ -1254,7 +1426,7 @@ impl Session {
                 // （成员就是编译单元，函数没有大小、剥离后一无所有）。
                 signatures: self.signatures.clone(),
                 debug,
-                bytes: Arc::from(slice),
+                bytes: content,
                 hash: std::sync::OnceLock::new(),
                 analysis: std::sync::OnceLock::new(),
             },
