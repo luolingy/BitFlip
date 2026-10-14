@@ -205,6 +205,17 @@ fn format_operand_att(cs: &Capstone, op: &Operand) -> String {
                 format!("{name},{} ${amount}", kind.as_str())
             }
         }
+        // AArch64 专有操作数：AT&T 没有对应用法（本项目的 AT&T 只对 x86 族
+        // 实现，非 x86 目标由调用方**明确拒绝**，不会走到这里）。直接复用
+        // Intel 侧的渲染，免得两处各写一份、将来改一处忘一处。
+        Operand::SysReg(_)
+        | Operand::Pstate(_)
+        | Operand::Barrier(_)
+        | Operand::Prefetch(_)
+        | Operand::SysOp(_)
+        | Operand::FpImm(_)
+        | Operand::Svcr(_)
+        | Operand::SmeIndex => format_operand(cs, op),
     }
 }
 
@@ -273,6 +284,13 @@ fn format_mem_att(cs: &Capstone, mem: &MemRef) -> String {
         inner.push_str(&index);
         inner.push(',');
         inner.push_str(&mem.scale.to_string());
+        // AT&T 同样没有索引扩展的写法。AArch64 走 AT&T 会被调用方明确拒绝
+        // （非 x86 不支持），所以这里正常到不了 —— 但真到了也要把扩展写出来，
+        // 不能变成一处静默丢失。
+        if let Some(kind) = mem.index_extend {
+            inner.push(',');
+            inner.push_str(kind.as_str());
+        }
     }
 
     format!("{disp}({inner})")
@@ -322,13 +340,77 @@ fn format_operand(cs: &Capstone, op: &Operand) -> String {
                 format!("{name}, {} #{amount}", kind.as_str())
             }
         }
+        Operand::SysReg(sysreg) => format_sysreg(sysreg.raw),
+        Operand::Pstate(field) => field.as_str().to_string(),
+        Operand::Barrier(option) => option.as_str().to_string(),
+        // capstone 目前从不给这个值（见 `Operand::Prefetch` 的说明），
+        // 所以真实输出是 `<prefetch:?>`；`Some` 分支留给它补上字段之后。
+        Operand::Prefetch(Some(op)) => op.as_str().to_string(),
+        Operand::Prefetch(None) => "<prefetch:?>".to_string(),
+        Operand::SysOp(op) => format!("<sys_op:{}>", op.raw),
+        Operand::FpImm(bits) => format_fp_imm(*bits),
+        Operand::Svcr(mode) => mode.as_str().to_string(),
+        Operand::SmeIndex => "<sme_index>".to_string(),
     }
+}
+
+/// 系统寄存器的规范写法：`s3_3_c13_c0_2`。
+///
+/// ## 为什么不查名字表
+///
+/// 想显示成 `TPIDR_EL0` 就得有一张名字表（capstone 的 `arm64_sysreg` 有
+/// 近千个具名编码）。我们不抄那张表，两个理由：
+///
+/// 1. **抄表等于把"我们以为的"当事实**（CLAUDE.md §6.11）。表的唯一权威在
+///    capstone 的 C 头文件里，抄一遍就多一处会漂移的副本，而且抄错了没人知道。
+/// 2. **ARM 已经给每个编码定义了规范写法**，不查表也完全精确：
+///    `S<op0>_<op1>_C<CRn>_<CRm>_<op2>`。拿它去查 ARM 手册或 capstone 的
+///    头文件都能对上，信息一点没少。
+///
+/// 拼写与 capstone 自己的格式化函数一致（`AArch64SysReg_genericRegisterString`，
+/// `arch/AArch64/AArch64BaseInfo.c`），全小写 —— 这样输出和 capstone/LLVM 系
+/// 反汇编器对得上，便于逐条对拍。
+///
+/// **已知差异**：`llvm-objdump` 对它**认识**的编码会打名字（`TPIDR_EL0`、
+/// `DAIF` 等），我们一律打规范编码形式。这是有意的取舍，不是遗漏；
+/// 对拍时按"同一个编码"换算即可。
+fn format_sysreg(raw: u32) -> String {
+    // 字段宽度与取法来自 ARM 的定义，也是 capstone 那个函数的取法：
+    // op0[15:14] op1[13:11] CRn[10:7] CRm[6:3] op2[2:0]。
+    //
+    // 超过 16 位说明上游给的不是这个字段。那就**别装**成它是 —— 把原值
+    // 如实打出来并标明，而不是截断后打一个看着对的编码（§7）。
+    if raw > u32::from(u16::MAX) {
+        return format!("<sysreg:{raw:#x}>");
+    }
+
+    let op0 = (raw >> 14) & 0x3;
+    let op1 = (raw >> 11) & 0x7;
+    let crn = (raw >> 7) & 0xf;
+    let crm = (raw >> 3) & 0xf;
+    let op2 = raw & 0x7;
+
+    format!("s{op0}_{op1}_c{crn}_c{crm}_{op2}")
+}
+
+/// 浮点立即数（`fmov s0, #1.0`）。
+///
+/// 载荷是 IEEE-754 双精度的原始位 —— 不做任何转换，也不四舍五入。
+/// 用 `{value:?}` 而不是 `{value}`：后者会把 `1.0` 打成 `1`，
+/// 在汇编文本里和整数立即数就分不开了。
+fn format_fp_imm(bits: u64) -> String {
+    format!("#{:?}", f64::from_bits(bits))
 }
 
 /// 渲染内存操作数（Intel 语法）：`[base+index*scale+disp]`。
 ///
 /// 组分之间的 `+` 不是可选的排版偏好。真值来自 objdump `-M intel`：
 /// `0f 1f 44 00 00` 是 `nop DWORD PTR [rax+rax*1+0x0]`。
+///
+/// AArch64 的索引扩展（`[x9, w8, sxtw #3]`）在 Intel 语法里没有对应写法，
+/// 所以约定为附在索引项后面：`[x9+w8*8, sxtw]`。**移位量不另写** ——
+/// `*8` 与 ARM 的 `#3` 是同一个数（`scale == 1 << 移位量`），
+/// 而扩展本身（有符号还是无符号）只有 `sxtw` 这个词能表达，不能省。
 fn format_mem(cs: &Capstone, mem: &MemRef) -> String {
     // Intel 风格的内存操作数是一个**算术式**，不是若干片段拼起来的词表：
     // 组分之间必须有 `+` 运算符。这里曾经把 base 与 index 各 push 一个片段、
@@ -349,6 +431,12 @@ fn format_mem(cs: &Capstone, mem: &MemRef) -> String {
         // 一致：这样"有没有比例"这件事在文本里一眼可见，不用去数寄存器位置。
         expr.push('*');
         expr.push_str(&mem.scale.to_string());
+        // AArch64 的索引扩展附在索引项后面，见本函数文档。
+        // 不能省：`sxtw` 与 `uxtw` 在索引为负时算出的有效地址不同。
+        if let Some(kind) = mem.index_extend {
+            expr.push_str(", ");
+            expr.push_str(kind.as_str());
+        }
     }
 
     // disp == 0 且已有组分时省略（也不写 `+0x0`）—— 保留既有的、更短的

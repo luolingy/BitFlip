@@ -1101,6 +1101,7 @@ mod tests {
                     disp: 0,
                     size: 4,
                     write: false,
+                    index_extend: None,
                 }),
             ],
             &[1, 0],

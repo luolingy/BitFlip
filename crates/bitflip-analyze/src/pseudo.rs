@@ -474,6 +474,17 @@ fn lvalue(op: &Operand, namer: RegisterNamer<'_>) -> Result<String, String> {
         Operand::Imm(v) => Err(format!("立即数 {v} 不能作为赋值目标")),
         Operand::PcRelative(d) => Err(format!("PC 相对项 {d} 不能作为赋值目标")),
         Operand::Shifted { .. } => Err("带移位修饰的操作数不能作为赋值目标".to_string()),
+        // AArch64 的这几类都不是存储单元：系统寄存器是**操作的对象**（要经
+        // `mrs`/`msr` 搬），屏障/预取/SVCR 是选择项，SME 索引是地址计算。
+        // 如实拒绝，不要硬当成左值编一个赋值出来。
+        Operand::SysReg(_)
+        | Operand::Pstate(_)
+        | Operand::Barrier(_)
+        | Operand::Prefetch(_)
+        | Operand::SysOp(_)
+        | Operand::FpImm(_)
+        | Operand::Svcr(_)
+        | Operand::SmeIndex => Err("这一类操作数不能作为赋值目标".to_string()),
     }
 }
 
@@ -510,6 +521,22 @@ fn expr_one(op: &Operand, addr: u64, namer: RegisterNamer<'_>) -> Result<String,
             };
             Ok(format!("({r} {k} {amount})"))
         }
+        // AArch64 的几类"不是普通操作数"的操作数。这里**保留它们**并写出
+        // 显式占位（与 `condition_text` 的 `flags` 同一路数），而不是丢掉 ——
+        // 丢掉会让 `dc civac, x0` 的伪代码看起来像一条完整的指令，
+        // 而读者无从知道少了东西（CLAUDE.md §7）。
+        //
+        // `__` 前缀是刻意的：一眼看出这是占位，不是真实符号。
+        Operand::SysReg(sysreg) => Ok(format!("__sysreg({:#x})", sysreg.raw)),
+        Operand::Pstate(field) => Ok(format!("__pstate({})", field.as_str())),
+        Operand::Barrier(option) => Ok(format!("__barrier({})", option.as_str())),
+        Operand::Prefetch(Some(op)) => Ok(format!("__prefetch({})", op.as_str())),
+        Operand::Prefetch(None) => Ok("__prefetch(?)".to_string()),
+        Operand::SysOp(op) => Ok(format!("__sys_op({})", op.raw)),
+        // 浮点立即数本身就是一个合法的 C 字面量，直接给值。
+        Operand::FpImm(bits) => Ok(format!("{:?}", f64::from_bits(*bits))),
+        Operand::Svcr(mode) => Ok(format!("__svcr({})", mode.as_str())),
+        Operand::SmeIndex => Ok("__sme_index".to_string()),
     }
 }
 
@@ -732,6 +759,7 @@ mod tests {
             disp: 0x10,
             size: 4,
             write: false,
+            index_extend: None,
         };
         let t = mem_text(&m32, &test_namer);
         assert!(t.contains("uint32_t"), "{t}");

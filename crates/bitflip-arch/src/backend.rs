@@ -435,6 +435,18 @@ fn convert(
         }
     }
 
+    // 助记符字符串下面要用两处：判断"这条跳转是否有两个后继"，以及区分
+    // aarch64 的 `ARM64_OP_SYS` 那个**一物两用**的字段（见下）。
+    // 只取一次，避免两处各判一遍不一致。
+    let mnemonic_str = insn.mnemonic().unwrap_or("");
+
+    // MRS/MSR 的**系统寄存器编码**与 IC/DC/AT/TLBI 的**子操作**共用 capstone
+    // 的 `ARM64_OP_SYS` 一个字段（C 端一物两用：`printMRSSystemRegister` 与
+    // `printMSRSystemRegister` 都往上写原始编码，见 third-party/capstone/PATCH.md）。
+    // 两种载荷的取值范围不重叠，但**不靠取值范围猜** —— 靠指令本身区分：
+    // 只有 `mrs` / `msr` 的 `Sys` 载荷是系统寄存器编码。
+    let sys_holds_sysreg = matches!(mnemonic_str, "mrs" | "msr");
+
     // 操作数与直接目标。间接跳转/调用没有静态目标（`target` 保持 `None`）——
     // 这里**不猜**目标，跳转表解析是 M3 的工作。
     let mut target = None;
@@ -446,7 +458,13 @@ fn convert(
                 convert_x86_operand(&op, is_jump || is_call, &mut operands, &mut target);
             }
             ArchOperand::Arm64Operand(op) => {
-                convert_arm64_operand(&op, is_jump || is_call, &mut operands, &mut target);
+                convert_arm64_operand(
+                    &op,
+                    is_jump || is_call,
+                    sys_holds_sysreg,
+                    &mut operands,
+                    &mut target,
+                );
             }
             ArchOperand::ArmOperand(op) => {
                 convert_arm_operand(&op, is_jump || is_call, &mut operands, &mut target);
@@ -455,6 +473,21 @@ fn convert(
             // 宁可少给字段，也不要给错的字段。流程语义仍然是对的。
             _ => {}
         }
+    }
+
+    // capstone 的 AArch64 detail 不给 `prfm` / `prfum` 的预取操作数
+    // （证据见 `Operand::Prefetch` 与 docs/research/capstone-prefetch-operand.md），
+    // 但那个操作数位置确实存在，而且是**第一个**（`prfm <prfop>, <地址>`）。
+    // 这里如实补一个"位置在、值拿不到"的占位 —— 不补的话输出是 `prfm [x1]`，
+    // 少了一个操作数却读起来像一条完整指令（CLAUDE.md §7）。
+    //
+    // 只在 capstone 没给值时才补，所以将来它补上这个字段时这里不会重复。
+    if matches!(mnemonic_str, "prfm" | "prfum")
+        && !operands
+            .iter()
+            .any(|op| matches!(op, crate::insn::Operand::Prefetch(_)))
+    {
+        operands.insert(0, crate::insn::Operand::Prefetch(None));
     }
 
     let flow = if is_ret {
@@ -471,7 +504,7 @@ fn convert(
         // 导入桩识别（要判 `conditional: false` 的间接跳转）一个都匹配不到。
         // "目标未知"已经由 `target: None` 如实表达，不需要借用 conditional。
         Flow::Branch {
-            conditional: is_conditional_jump(insn.mnemonic().unwrap_or("")),
+            conditional: is_conditional_jump(mnemonic_str),
         }
     } else if is_trap {
         Flow::Trap
@@ -609,6 +642,8 @@ fn convert_x86_operand(
                 disp: mem.disp(),
                 size: op.size,
                 write: false,
+                // x86 的 SIB 只给索引一个比例，没有"扩展"这个概念。
+                index_extend: None,
             }));
         }
         _ => {}
@@ -616,9 +651,24 @@ fn convert_x86_operand(
 }
 
 /// arm64 操作数。
+///
+/// ## 这个 `match` 是**穷尽**的（没有 `_` 兜底），这是有意的
+///
+/// 之前这里是 `_ => {}`，把 10 类操作数**静默丢掉**：系统寄存器、PState、
+/// 屏障选项、预取操作、IC/DC/AT/TLBI 子操作、浮点立即数、C-IMM、SVCR、
+/// SME 索引。后果不是"少了个字段"，而是**输出一条不存在的指令**：
+/// `mrs x19, TPIDR_EL0` 显示成 `mrs x19`，`msr TPIDR_EL0, x19` 显示成
+/// `msr x19` —— 后者语法正确、语义完全不同，读者完全看不出少了东西
+/// （CLAUDE.md §7：降级要写在界面上）。
+///
+/// 去掉兜底之后，capstone 将来新增操作数类型会变成**编译错误**，而不是
+/// 又一次静默丢失。这比"记得回来补"可靠。
+///
+/// `sys_holds_sysreg` 用来解开 `ARM64_OP_SYS` 的一物两用，见 `convert`。
 fn convert_arm64_operand(
     op: &capstone::arch::arm64::Arm64Operand,
     is_control_flow: bool,
+    sys_holds_sysreg: bool,
     operands: &mut Vec<crate::insn::Operand>,
     target: &mut Option<u64>,
 ) {
@@ -646,17 +696,175 @@ fn convert_arm64_operand(
             }
         }
         Arm64OperandType::Mem(mem) => {
+            // 索引寄存器必须带出来。
+            //
+            // 这里长期写着 `index: None`，把索引**整个丢掉**。真实目标里
+            // 76% 的内存操作数带索引（195 KB 的 `libBugly_Native.so` 上，
+            // llvm-objdump 报的 7467 个内存操作数里 5664 个带索引），
+            // 于是 `ldr x0, [x1, x2]` 显示成 `ldr x0, [x1]` ——
+            // 少一个寄存器，读起来却完全像一条正常指令（CLAUDE.md §7）。
+            //
+            // 修饰（`lsl #3` / `sxtw #2`）在 capstone 里挂在**操作数**上
+            // （`op.shift` / `op.ext`），不在 `mem` 里，所以从 `op` 取。
+            let (index, scale, index_extend) = arm64_index(&mem, op);
+
             operands.push(crate::insn::Operand::Mem(crate::insn::MemRef {
                 base: opt_reg(mem.base()),
-                index: None,
-                scale: 1,
+                index,
+                scale,
                 disp: i64::from(mem.disp()),
                 size: 0,
                 write: false,
+                index_extend,
             }));
         }
-        _ => {}
+        Arm64OperandType::Fp(value) => {
+            // 浮点立即数。存**原始位**而不是 `f64`：`Operand` 要能 `Eq`，
+            // 而 `f64` 不是（见 `Operand::FpImm` 的文档）。
+            operands.push(crate::insn::Operand::FpImm(value.to_bits()));
+        }
+        Arm64OperandType::Cimm(value) => {
+            // C-IMM 是"复杂立即数"（逻辑立即数等）。渲染上与普通立即数
+            // 没有区别（都是 `#0x...`），所以归到同一个变体，不另立门户。
+            operands.push(crate::insn::Operand::Imm(value));
+            if is_control_flow {
+                *target = Some(value as u64);
+            }
+        }
+        // `RegMrs` / `RegMsr` 只在 capstone **没能**给这个编码命名时出现
+        // （给得出名字时它走 `ARM64_OP_SYS`，见 third-party/capstone/PATCH.md）。
+        // 两种情况载荷都是原始编码，所以合并处理。
+        Arm64OperandType::RegMrs(raw) | Arm64OperandType::RegMsr(raw) => {
+            operands.push(crate::insn::Operand::SysReg(crate::insn::SysRegRef { raw }));
+        }
+        Arm64OperandType::Pstate(field) => {
+            if let Some(field) = pstate_field(field) {
+                operands.push(crate::insn::Operand::Pstate(field));
+            }
+        }
+        Arm64OperandType::Sys(value) => {
+            let raw = value as u32;
+            if sys_holds_sysreg {
+                // `mrs` / `msr`：这个字段装的是**系统寄存器编码**。
+                operands.push(crate::insn::Operand::SysReg(crate::insn::SysRegRef { raw }));
+            } else {
+                // `sys` / `dc` / `ic` / `at` / `tlbi`：装的是**子操作**。
+                // 名字还没补，渲染层会如实打出未识别标记（不丢）。
+                operands.push(crate::insn::Operand::SysOp(crate::insn::SysOpRef { raw }));
+            }
+        }
+        Arm64OperandType::Prefetch(value) => {
+            // 走到这里说明 capstone **确实**给了值（见 `Operand::Prefetch` 的
+            // 说明：当前版本它从不给）。`None` 表示它报的是 `INVALID`，
+            // 那也照样把位置留下 —— "这里有个操作数"本身就是信息。
+            operands.push(crate::insn::Operand::Prefetch(prefetch_op(value)));
+        }
+        Arm64OperandType::Barrier(value) => {
+            if let Some(option) = barrier_option(value) {
+                operands.push(crate::insn::Operand::Barrier(option));
+            }
+        }
+        Arm64OperandType::SVCR(value) => {
+            if let Some(mode) = svcr_mode(value) {
+                operands.push(crate::insn::Operand::Svcr(mode));
+            }
+        }
+        // SME 的索引操作数：我们**不知道**它的 ARM 写法，所以如实标记，
+        // 不去猜一个格式（§6.11）。ARMv9 SME 目前不会出现在 Android 目标里。
+        Arm64OperandType::SMEIndex(_) => {
+            operands.push(crate::insn::Operand::SmeIndex);
+        }
+        // capstone 明确说这个位置没有操作数 —— 没有东西可渲染。
+        // 这不是丢数据，所以这里可以（也应该）什么都不做。
+        Arm64OperandType::Invalid => {}
     }
+}
+
+/// PState 字段：capstone 的枚举 → 我们的。
+///
+/// 取值与拼写来自 capstone 的 `arm64_pstate`（`arm64.h` 里带显式数值），
+/// 不是我们自己编号的。`match` 穷尽、无 `_` 兜底：capstone 加成员会编译报错。
+///
+/// 返回 `None` 表示 capstone 报的是 `INVALID` —— 那是"这里没有值"，
+/// 不是"我们有值但丢了"。
+fn pstate_field(field: capstone::arch::arm64::Arm64Pstate) -> Option<crate::insn::PstateField> {
+    use crate::insn::PstateField as Ours;
+    use capstone::arch::arm64::Arm64Pstate as Cs;
+
+    Some(match field {
+        Cs::ARM64_PSTATE_SPSEL => Ours::Spsel,
+        Cs::ARM64_PSTATE_DAIFSET => Ours::DaifSet,
+        Cs::ARM64_PSTATE_DAIFCLR => Ours::DaifClr,
+        Cs::ARM64_PSTATE_PAN => Ours::Pan,
+        Cs::ARM64_PSTATE_UAO => Ours::Uao,
+        Cs::ARM64_PSTATE_DIT => Ours::Dit,
+        Cs::ARM64_PSTATE_INVALID => return None,
+    })
+}
+
+/// 内存屏障选项：capstone 的枚举 → 我们的。取值来自 `arm64_barrier_op`。
+fn barrier_option(
+    value: capstone::arch::arm64::Arm64BarrierOp,
+) -> Option<crate::insn::BarrierOption> {
+    use crate::insn::BarrierOption as Ours;
+    use capstone::arch::arm64::Arm64BarrierOp as Cs;
+
+    Some(match value {
+        Cs::ARM64_BARRIER_OSHLD => Ours::Oshld,
+        Cs::ARM64_BARRIER_OSHST => Ours::Oshst,
+        Cs::ARM64_BARRIER_OSH => Ours::Osh,
+        Cs::ARM64_BARRIER_NSHLD => Ours::Nshld,
+        Cs::ARM64_BARRIER_NSHST => Ours::Nshst,
+        Cs::ARM64_BARRIER_NSH => Ours::Nsh,
+        Cs::ARM64_BARRIER_ISHLD => Ours::Ishld,
+        Cs::ARM64_BARRIER_ISHST => Ours::Ishst,
+        Cs::ARM64_BARRIER_ISH => Ours::Ish,
+        Cs::ARM64_BARRIER_LD => Ours::Ld,
+        Cs::ARM64_BARRIER_ST => Ours::St,
+        Cs::ARM64_BARRIER_SY => Ours::Sy,
+        Cs::ARM64_BARRIER_INVALID => return None,
+    })
+}
+
+/// 预取操作：capstone 的枚举 → 我们的。取值来自 `arm64_prefetch_op`。
+fn prefetch_op(value: capstone::arch::arm64::ArmPrefetchOp) -> Option<crate::insn::PrefetchOp> {
+    use crate::insn::PrefetchOp as Ours;
+    use capstone::arch::arm64::ArmPrefetchOp as Cs;
+
+    Some(match value {
+        Cs::ARM64_PRFM_PLDL1KEEP => Ours::Pldl1Keep,
+        Cs::ARM64_PRFM_PLDL1STRM => Ours::Pldl1Strm,
+        Cs::ARM64_PRFM_PLDL2KEEP => Ours::Pldl2Keep,
+        Cs::ARM64_PRFM_PLDL2STRM => Ours::Pldl2Strm,
+        Cs::ARM64_PRFM_PLDL3KEEP => Ours::Pldl3Keep,
+        Cs::ARM64_PRFM_PLDL3STRM => Ours::Pldl3Strm,
+        Cs::ARM64_PRFM_PLIL1KEEP => Ours::Plil1Keep,
+        Cs::ARM64_PRFM_PLIL1STRM => Ours::Plil1Strm,
+        Cs::ARM64_PRFM_PLIL2KEEP => Ours::Plil2Keep,
+        Cs::ARM64_PRFM_PLIL2STRM => Ours::Plil2Strm,
+        Cs::ARM64_PRFM_PLIL3KEEP => Ours::Plil3Keep,
+        Cs::ARM64_PRFM_PLIL3STRM => Ours::Plil3Strm,
+        Cs::ARM64_PRFM_PSTL1KEEP => Ours::Pstl1Keep,
+        Cs::ARM64_PRFM_PSTL1STRM => Ours::Pstl1Strm,
+        Cs::ARM64_PRFM_PSTL2KEEP => Ours::Pstl2Keep,
+        Cs::ARM64_PRFM_PSTL2STRM => Ours::Pstl2Strm,
+        Cs::ARM64_PRFM_PSTL3KEEP => Ours::Pstl3Keep,
+        Cs::ARM64_PRFM_PSTL3STRM => Ours::Pstl3Strm,
+        Cs::ARM64_PRFM_INVALID => return None,
+    })
+}
+
+/// `SMSTART` / `SMSTOP` 的模式：capstone 的枚举 → 我们的。
+fn svcr_mode(value: capstone::arch::arm64::Arm64SvcrOp) -> Option<crate::insn::SvcrMode> {
+    use crate::insn::SvcrMode as Ours;
+    use capstone::arch::arm64::Arm64SvcrOp as Cs;
+
+    Some(match value {
+        Cs::ARM64_SVCR_SVCRSM => Ours::Sm,
+        Cs::ARM64_SVCR_SVCRZA => Ours::Za,
+        Cs::ARM64_SVCR_SVCRSMZA => Ours::SmZa,
+        Cs::ARM64_SVCR_INVALID => return None,
+    })
 }
 
 /// 取 AArch64 操作数的移位/扩展修饰，返回（类型, 移位量）。
@@ -667,23 +875,40 @@ fn arm64_modifier(
     op: &capstone::arch::arm64::Arm64Operand,
 ) -> Option<(crate::insn::ShiftKind, u32)> {
     use crate::insn::ShiftKind;
-    use capstone::arch::arm64::{Arm64Extender, Arm64Shift};
+    use capstone::arch::arm64::Arm64Shift;
 
-    // 先看移位字段。`Lsl(3)` 表示 `lsl #3`。
-    match op.shift {
-        Arm64Shift::Lsl(n) => return Some((ShiftKind::Lsl, n)),
-        Arm64Shift::Lsr(n) => return Some((ShiftKind::Lsr, n)),
-        Arm64Shift::Asr(n) => return Some((ShiftKind::Asr, n)),
-        Arm64Shift::Ror(n) => return Some((ShiftKind::Ror, n)),
+    // 移位字段。`Lsl(3)` 表示 `lsl #3`。
+    let shift = match op.shift {
+        Arm64Shift::Lsl(n) => Some((ShiftKind::Lsl, n)),
+        Arm64Shift::Lsr(n) => Some((ShiftKind::Lsr, n)),
+        Arm64Shift::Asr(n) => Some((ShiftKind::Asr, n)),
+        Arm64Shift::Ror(n) => Some((ShiftKind::Ror, n)),
         // MSL（masking shift left）在 AArch64 汇编里写作 `lsl`；保留原样会让
         // 用户对着外部工具对不上，所以按 LLVM 的显示走 Lsl。
-        Arm64Shift::Msl(n) => return Some((ShiftKind::Lsl, n)),
-        // `Invalid` 不是错误，是"这条指令没有移位修饰"，继续看扩展字段。
-        Arm64Shift::Invalid => {}
+        Arm64Shift::Msl(n) => Some((ShiftKind::Lsl, n)),
+        // `Invalid` 不是错误，是"这条指令没有移位修饰"。
+        Arm64Shift::Invalid => None,
+    };
+
+    // **扩展优先**：`shift` 与 `ext` 是两个独立字段，但同一条指令上可能
+    // 同时有值 —— `add x0, x1, w2, sxtw #2` 就是 `ext=SXTW` + `shift=Lsl(2)`。
+    // 那时正确的文本是 `w2, sxtw #2`（扩展 + 移位量），而不是 `w2, lsl #2`：
+    // 后者把**符号扩展悄悄换成了逻辑左移**，结果完全不同。
+    //
+    // 早先的版本在 `shift` 分支上直接 `return`，正是丢掉了这种情况下的扩展。
+    if let Some(kind) = arm64_extender(op.ext) {
+        return Some((kind, shift.map_or(0, |(_, n)| n)));
     }
 
-    // 再看扩展字段。
-    let kind = match op.ext {
+    shift
+}
+
+/// AArch64 的 `ext` 字段 → 扩展类型。`Invalid`（及将来新增的未知值）返回 `None`。
+fn arm64_extender(ext: capstone::arch::arm64::Arm64Extender) -> Option<crate::insn::ShiftKind> {
+    use crate::insn::ShiftKind;
+    use capstone::arch::arm64::Arm64Extender;
+
+    Some(match ext {
         Arm64Extender::ARM64_EXT_UXTB => ShiftKind::Uxtb,
         Arm64Extender::ARM64_EXT_UXTH => ShiftKind::Uxth,
         Arm64Extender::ARM64_EXT_UXTW => ShiftKind::Uxtw,
@@ -692,12 +917,49 @@ fn arm64_modifier(
         Arm64Extender::ARM64_EXT_SXTH => ShiftKind::Sxth,
         Arm64Extender::ARM64_EXT_SXTW => ShiftKind::Sxtw,
         Arm64Extender::ARM64_EXT_SXTX => ShiftKind::Sxtx,
-        // `ARM64_EXT_INVALID` 与 `ARM64_EXT_*` 里将来的新值都落到这里。
-        // 返回 `None` 就是**如实表示"没有可渲染的修饰"**；
+        // `ARM64_EXT_INVALID` 与将来新增的未知值：如实表示"没有可渲染的修饰"，
         // 而不是硬编一个默认值假装认识。
-        _ => return None,
+        Arm64Extender::ARM64_EXT_INVALID => return None,
+    })
+}
+
+/// 取 AArch64 内存操作数的（索引寄存器, 有效比例, 索引修饰）。
+///
+/// AArch64 的索引形式是 `[Xn, Wm, <extend> #s]` 或 `[Xn, Xm, lsl #s]`：
+/// **扩展**与**移位量**是两件不同的事，`scale` 只承载后者（有效比例），
+/// 扩展另由 `MemRef::index_extend` 承载 —— 因为 `sxtw #2` 与 `lsl #2`
+/// 在索引为负时算出的有效地址不同。
+fn arm64_index(
+    mem: &capstone::arch::arm64::Arm64OpMem,
+    op: &capstone::arch::arm64::Arm64Operand,
+) -> (
+    Option<crate::insn::RegId>,
+    u8,
+    Option<crate::insn::ShiftKind>,
+) {
+    // 没有索引寄存器时，修饰字段即使有值也无处可挂（`mem.index()` 用
+    // `RegId(0)` = `ARM64_REG_INVALID` 表示"没有索引"，由 `opt_reg` 过滤）。
+    let Some(index) = opt_reg(mem.index()) else {
+        return (None, 1, None);
     };
-    Some((kind, 0))
+
+    let Some((kind, amount)) = arm64_modifier(op) else {
+        return (Some(index), 1, None);
+    };
+
+    // 比例是 `1 << 移位量`。AArch64 索引的移位量只可能是 0..4；
+    // 越界说明我们理解错了这个字段，那就**不编**一个比例出来 ——
+    // 比例保持 1，修饰仍原样带在 `index_extend` 里，信息不丢。
+    let scale = if amount < 8 { 1u8 << amount } else { 1 };
+
+    if kind == crate::insn::ShiftKind::Lsl {
+        // 纯左移：比例已经表达了它，不需要再记修饰。
+        (Some(index), scale, None)
+    } else {
+        // 扩展（正常情况），或者索引位置上不该出现的移位类型。
+        // 两种都原样带出来 —— 宁可渲染层多打一个词，也不静默丢掉修饰。
+        (Some(index), scale, Some(kind))
+    }
 }
 
 /// arm（AArch32）操作数。

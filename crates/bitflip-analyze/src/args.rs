@@ -369,6 +369,7 @@ mod tests {
                 disp,
                 size: 8,
                 write,
+                index_extend: None,
             })],
             reads: RegSet::new(),
             writes: RegSet::new(),

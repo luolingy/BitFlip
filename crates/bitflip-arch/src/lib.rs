@@ -23,7 +23,8 @@ pub use abi::{abi_for_spec, AbiSpec, ReturnAddress};
 pub use backend::{BackendError, CapstoneDecoder, DecoderBackend};
 pub use decode::{decoder_for, Abi, DecodeError, Decoder, UnsupportedDecoder};
 pub use insn::{
-    ConditionCode, DecodedInsn, Flow, MemRef, MnemonicId, Operand, RegId, RegSet, ShiftKind,
+    BarrierOption, ConditionCode, DecodedInsn, Flow, MemRef, MnemonicId, Operand, PrefetchOp,
+    PstateField, RegId, RegSet, ShiftKind, SvcrMode, SysOpRef, SysRegRef,
 };
 pub use padding::{padding_len, supports_padding};
 pub use plt::{plt_stub, supports_plt_stub, PltStub};
@@ -31,4 +32,8 @@ pub use render::{flow_label, format_insn, format_insn_with, text_style, TextStyl
 pub use types::{Arch, ArchSpec, Endian, Mode};
 
 /// 本 crate 的公共 API 版本。跨 crate 契约变化时提升。
-pub const ARCH_API_VERSION: u32 = 1;
+///
+/// 2：`MemRef` 增加 `index_extend`（AArch64 索引扩展），
+///    `Operand` 增加 AArch64 的系统寄存器/PState/屏障/预取/系统操作/
+///    浮点立即数/SVCR/SME 索引，并修掉内存索引被整个丢掉的问题。
+pub const ARCH_API_VERSION: u32 = 2;

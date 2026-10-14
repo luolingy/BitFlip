@@ -437,6 +437,7 @@ mod tests {
                 disp,
                 size,
                 write: false,
+                index_extend: None,
             })],
         )
     }
@@ -591,6 +592,7 @@ mod tests {
                     disp: 0,
                     size: 4,
                     write: false,
+                    index_extend: None,
                 })],
             ),
             insn(
@@ -602,6 +604,7 @@ mod tests {
                     disp: 0,
                     size: 4,
                     write: false,
+                    index_extend: None,
                 })],
             ),
         ];

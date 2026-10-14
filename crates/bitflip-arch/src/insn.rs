@@ -157,6 +157,15 @@ pub struct MemRef {
     pub index: Option<RegId>,
     /// 索引比例（1/2/4/8）。
     pub scale: u8,
+    /// 索引寄存器的**扩展修饰**（AArch64 的 `sxtw` / `uxtw` 等）。
+    ///
+    /// 为什么不并进 `scale`：x86 的 SIB 只能给索引一个比例，而 AArch64 还能
+    /// 对索引做符号/零扩展 —— `[x9, w8, sxtw #3]` 与 `[x9, w8, lsl #3]`
+    /// 在索引为负时**有效地址不同**，不是"同一个东西的两种写法"。
+    ///
+    /// `scale` 仍然是**有效比例**（`1 << 移位量`）；这个字段只回答
+    /// "扩展是有符号还是无符号"。x86 上恒为 `None`。
+    pub index_extend: Option<ShiftKind>,
     /// 位移（已按符号扩展）。
     pub disp: i64,
     /// 访问宽度（字节）。
@@ -196,6 +205,271 @@ pub enum Operand {
         /// 移位量（位）。
         amount: u32,
     },
+    /// AArch64 系统寄存器：`mrs x19, TPIDR_EL0` 的第二个操作数。
+    SysReg(SysRegRef),
+    /// AArch64 PState 字段：`msr DAIFSet, #0x2` 的 `DAIFSet`。
+    Pstate(PstateField),
+    /// AArch64 内存屏障选项：`dsb sy` 的 `sy`。
+    ///
+    /// `dsb` / `dsb sy` / `dsb ish` 是**三条不同的屏障**，丢掉这个操作数
+    /// 等于把"全系统屏障"显示成一条语义不明、但看起来合法的指令。
+    Barrier(BarrierOption),
+    /// AArch64 预取操作：`prfm pldl1keep, [x1]` 的 `pldl1keep`。
+    ///
+    /// ## 为什么是 `Option`，而且现在只会是 `None`
+    ///
+    /// capstone 的 AArch64 detail **从不为预取操作数赋值**：`AArch64InstPrinter.c`
+    /// 会写 `BARRIER`/`CIMM`/`FP`/`IMM`/`MEM`/`PSTATE`/`REG`/`REG_MRS`/
+    /// `SME_INDEX`/`SVCR`/`SYS` 十一种，唯独没有 `ARM64_OP_PREFETCH`
+    /// （它只出现在 `arm64.h` 的枚举和 `cstool` 里）。所以 `prfm` 的 detail
+    /// 里只有那个内存操作数。
+    ///
+    /// 但**操作数位置确实存在**（`prfm` 的第一操作数就是 prfop），所以建模成
+    /// "位置在、值拿不到"：渲染层打 `<prefetch:?>`，而不是输出看着完整的
+    /// `prfm [x1]`（CLAUDE.md §7：拿不到就说拿不到）。
+    ///
+    /// 证据、以及"从指令第 5 位取 prfop"的可选方案，见
+    /// `docs/research/capstone-prefetch-operand.md`。
+    /// 若将来 capstone 补上这个字段，`Some` 分支自动生效，渲染层不用改。
+    Prefetch(Option<PrefetchOp>),
+    /// AArch64 系统指令的子操作：`dc civac, x0` 的 `civac`、
+    /// `tlbi vmalle1` 的 `vmalle1`（IC/DC/AT/TLBI 四族）。
+    ///
+    /// ## 为什么它现在渲染成"未识别"
+    ///
+    /// capstone 把这四族的子操作合并成一个 **210 个成员**的枚举
+    /// （`arm64_sys_op`：TLBI 164 / DC 28 / AT 14 / IC 3）。本版本**还没有**
+    /// 把这 210 个名字落成表，所以渲染层如实打出 `<sys_op:22>` 这样的标记，
+    /// 而不是把操作数丢掉。
+    ///
+    /// 丢掉会怎样：`dc civac, x0` 变成 `dc x0` —— 一条语法正确、但**不存在**
+    /// 的指令。用户看不出这里少了东西，这正是 CLAUDE.md §7 禁止的失败模式。
+    ///
+    /// 补名字的地方就在这个变体：把 `SysOpRef` 换成"名字 + 原始值"即可，
+    /// 渲染层跟着改一处。
+    SysOp(SysOpRef),
+    /// AArch64 浮点立即数（`fmov s0, #1.0`）。
+    ///
+    /// 载荷是 IEEE-754 双精度的**原始位**而不是 `f64`：这个枚举要能
+    /// `Eq`/`Hash`（下游按值比较指令），而 `f64` 不是 `Eq`。
+    /// 用位也顺带保证了"原样保留"，不做任何转换。
+    FpImm(u64),
+    /// AArch64 `SMSTART` / `SMSTOP` 的模式。
+    Svcr(SvcrMode),
+    /// AArch64 SME 的索引操作数（`za`/`zv` 的 `[x0, #0]` 形式）。
+    ///
+    /// 我们**不知道**它的 ARM 写法，所以只标记、不编造（§6.11：照自己的
+    /// 猜测拼格式，错了会静悄悄地错）。ARMv9 SME 在 Android 目标里目前
+    /// 不会出现，因此这里有意不建模。
+    SmeIndex,
+}
+
+/// AArch64 系统寄存器引用（`mrs` / `msr` 的目标）。
+///
+/// 载荷是**原始编码**，不是"查表得到的名字"。原因见 `render.rs` 的
+/// `format_sysreg`：ARM 为每一个编码都定义了规范写法
+/// （`S<op0>_<op1>_C<CRn>_<CRm>_<op2>`），所以这个编码本身就是完整的、
+/// 可查的表示，不需要（也不应该）再抄一张上千条的名字表进来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SysRegRef {
+    /// 指令里那个 16 位系统寄存器字段（`(word >> 5) & 0xffff`）。
+    ///
+    /// 类型是 `u32` 而不是 `u16`：万一上游给的字段比 16 位宽，我们要能
+    /// **如实**把它带出来，而不是截断（截断是把数据悄悄改掉）。
+    /// 渲染层对超出 16 位的值会打上明确标记，见 `format_sysreg`。
+    pub raw: u32,
+}
+
+/// AArch64 的 IC/DC/AT/TLBI 子操作引用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SysOpRef {
+    /// capstone 的 `arm64_sys_op` 判别值。
+    ///
+    /// 保留它是为了让"未识别"这件事**可追查**：拿着这个数能直接对上
+    /// capstone 的头文件（`.cargo-home/.../capstone-sys-0.18.0/capstone/
+    /// include/capstone/arm64.h` 的 `arm64_sys_op`）。
+    pub raw: u32,
+}
+
+/// AArch64 PState 字段（`msr` 的目标）。
+///
+/// 拼写按 ARM 汇编的**大小写**（`DAIFSet` 不是 `DAIFSET`）—— 与
+/// LLVM/GNU as 一致，便于逐条对拍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PstateField {
+    /// 栈指针选择。
+    Spsel,
+    /// 置位 `DAIF` 的屏蔽位。
+    DaifSet,
+    /// 清零 `DAIF` 的屏蔽位。
+    DaifClr,
+    /// 特权访问禁止。
+    Pan,
+    /// 非特权访问覆盖。
+    Uao,
+    /// 数据独立定时。
+    Dit,
+}
+
+impl PstateField {
+    /// ARM 汇编里的写法。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spsel => "SPSel",
+            Self::DaifSet => "DAIFSet",
+            Self::DaifClr => "DAIFClr",
+            Self::Pan => "PAN",
+            Self::Uao => "UAO",
+            Self::Dit => "DIT",
+        }
+    }
+}
+
+/// AArch64 内存屏障选项（`dsb` / `dmb` / `isb` 的操作数）。
+///
+/// 取值与拼写来自 capstone 的 `arm64_barrier_op`（头文件 arm64.h 里带
+/// 显式数值），不是我们自己编号的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BarrierOption {
+    /// 外部共享域，仅读屏障。
+    Oshld,
+    /// 外部共享域，仅写屏障。
+    Oshst,
+    /// 外部共享域，读写屏障。
+    Osh,
+    /// 非共享域，仅读。
+    Nshld,
+    /// 非共享域，仅写。
+    Nshst,
+    /// 非共享域，读写。
+    Nsh,
+    /// 内部共享域，仅读。
+    Ishld,
+    /// 内部共享域，仅写。
+    Ishst,
+    /// 内部共享域，读写（多核 SMP 上最常用）。
+    Ish,
+    /// 仅读。
+    Ld,
+    /// 仅写。
+    St,
+    /// 全系统（最强）。
+    Sy,
+}
+
+impl BarrierOption {
+    /// ARM 汇编里的写法。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Oshld => "oshld",
+            Self::Oshst => "oshst",
+            Self::Osh => "osh",
+            Self::Nshld => "nshld",
+            Self::Nshst => "nshst",
+            Self::Nsh => "nsh",
+            Self::Ishld => "ishld",
+            Self::Ishst => "ishst",
+            Self::Ish => "ish",
+            Self::Ld => "ld",
+            Self::St => "st",
+            Self::Sy => "sy",
+        }
+    }
+}
+
+/// AArch64 预取操作（`prfm` / `prfum` 的操作数）。
+///
+/// 拼写与取值来自 capstone 的 `arm64_prefetch_op`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PrefetchOp {
+    /// 预取到 L1，数据会再次使用。
+    Pldl1Keep,
+    /// 预取到 L1，数据只用一次（流式）。
+    Pldl1Strm,
+    /// 预取到 L2，会再次使用。
+    Pldl2Keep,
+    /// 预取到 L2，流式。
+    Pldl2Strm,
+    /// 预取到 L3，会再次使用。
+    Pldl3Keep,
+    /// 预取到 L3，流式。
+    Pldl3Strm,
+    /// 取指令到 L1，会再次使用。
+    Plil1Keep,
+    /// 取指令到 L1，流式。
+    Plil1Strm,
+    /// 取指令到 L2，会再次使用。
+    Plil2Keep,
+    /// 取指令到 L2，流式。
+    Plil2Strm,
+    /// 取指令到 L3，会再次使用。
+    Plil3Keep,
+    /// 取指令到 L3，流式。
+    Plil3Strm,
+    /// 为写预取到 L1，会再次使用。
+    Pstl1Keep,
+    /// 为写预取到 L1，流式。
+    Pstl1Strm,
+    /// 为写预取到 L2，会再次使用。
+    Pstl2Keep,
+    /// 为写预取到 L2，流式。
+    Pstl2Strm,
+    /// 为写预取到 L3，会再次使用。
+    Pstl3Keep,
+    /// 为写预取到 L3，流式。
+    Pstl3Strm,
+}
+
+impl PrefetchOp {
+    /// ARM 汇编里的写法。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pldl1Keep => "pldl1keep",
+            Self::Pldl1Strm => "pldl1strm",
+            Self::Pldl2Keep => "pldl2keep",
+            Self::Pldl2Strm => "pldl2strm",
+            Self::Pldl3Keep => "pldl3keep",
+            Self::Pldl3Strm => "pldl3strm",
+            Self::Plil1Keep => "plil1keep",
+            Self::Plil1Strm => "plil1strm",
+            Self::Plil2Keep => "plil2keep",
+            Self::Plil2Strm => "plil2strm",
+            Self::Plil3Keep => "plil3keep",
+            Self::Plil3Strm => "plil3strm",
+            Self::Pstl1Keep => "pstl1keep",
+            Self::Pstl1Strm => "pstl1strm",
+            Self::Pstl2Keep => "pstl2keep",
+            Self::Pstl2Strm => "pstl2strm",
+            Self::Pstl3Keep => "pstl3keep",
+            Self::Pstl3Strm => "pstl3strm",
+        }
+    }
+}
+
+/// AArch64 `SMSTART` / `SMSTOP` 的模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SvcrMode {
+    /// 只切流式 SVE 模式。
+    Sm,
+    /// 只切 ZA 存储。
+    Za,
+    /// 两者一起。
+    SmZa,
+}
+
+impl SvcrMode {
+    /// ARM 汇编里的写法。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sm => "sm",
+            Self::Za => "za",
+            Self::SmZa => "smza",
+        }
+    }
 }
 
 /// 移位/扩展类型（AArch64 的 `LSL/LSR/ASR/ROR` 与 `UXTB` 系列）。

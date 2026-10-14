@@ -50,21 +50,76 @@ capstone 认不出编码时才出现**（认得出时走 `ARM64_OP_SYS`），所
 它钉的是**那 4 个字节**（`ce af 03 d5`）而不是样本文件 —— §0.2 禁止二进制样本
 入库，而单条指令的解码不依赖上下文，4 个字节就够复现。
 
-**仍未修（同一子系统，另一件事）**：`bitflip-arch` 的 `convert_arm64_operand`
-有个 `_ => {}` 兜底，把系统寄存器 / PState / 屏障 / 预取这几类操作数整个丢掉。
+**同一子系统的后续修复**：上面那个 `_ => {}` 兜底（以及内存索引恒为
+`None`）是**另一件事**，已在下节修掉。
+
+### 修复 — aarch64 操作数被静默丢掉（系统寄存器 / 屏障 / 预取 / 内存索引）
+
+**问题**：`bitflip-arch` 的 `convert_arm64_operand` 末尾是 `_ => {}`，
+把 10 类操作数整个丢掉；同一函数里内存操作数还写死了 `index: None`。
 指令文本是按我们自己的操作数表拼的（`render.rs` 刻意不复用 capstone 的
-`op_str`），于是输出里直接少操作数，而且**看不出来**：
+`op_str`），所以丢操作数在输出里**看不出来** —— 不 panic、不报错，只是少给数据：
 
-| llvm-objdump | BitFlip |
+| llvm-objdump（真值） | 修复前 | 修复后 |
+| --- | --- | --- |
+| `mrs x19, TPIDR_EL0` | `mrs x19` | `mrs x19, s3_3_c13_c0_2` |
+| `msr TPIDR_EL0, x19` | `msr x19` | `msr s3_3_c13_c0_2, x19` |
+| `dsb sy` | `dsb` | `dsb sy` |
+| `tlbi vmalle1` | `tlbi` | `tlbi <sys_op:153>` |
+| `prfm pldl1keep, [x1]` | `prfm [x1]` | `prfm <prefetch:?>, [x1]` |
+| `ldr x0, [x1, x2]` | `ldr x0, [x1]` | `ldr x0, [x1+x2*1]` |
+
+第一行是这里最坏的一格：`msr x19` 语法正确、语义是**另一条指令**，
+读者没有任何线索能发现少了东西。
+
+**修法**（全在我们自己的代码里，没有再动 vendored 的 capstone）：
+
+1. `convert_arm64_operand` 的 `match` 改成**穷举** capstone 的
+   `Arm64OperandType`，只有 `Invalid` 是空分支。以后 capstone 新增操作数
+   种类时会直接编译不过（`E0004`），而不是继续静默丢 —— 本次改完确实报了
+   两处 `E0004`，那正是想要的效果。
+2. `Operand` 增加 8 个变体（`SysReg` / `Pstate` / `Barrier` / `Prefetch` /
+   `SysOp` / `FpImm` / `Svcr` / `SmeIndex`），`MemRef` 增加 `index_extend`。
+   `ARCH_API_VERSION` 1 → 2。
+3. 渲染层补上对应文本；拿不到的用**显式标记**。
+
+**顺带查出的第二个缺陷（同一处代码，独立成因）**：`arm64_modifier` 在
+`op.shift` 有值时就 `return`，把同一条指令的 `op.ext` 整个丢掉。capstone 对
+`sxtw` 形式的索引与操作数会**同时**填这两个字段（`[x9, w8, sxtw #3]` →
+`shift=Lsl(3)` + `ext=SXTW`），于是**有符号扩展被静默渲染成逻辑左移** ——
+索引为负时算出的有效地址不同。受影响的有两条路径：带扩展的内存索引，
+和 `add x0, x1, w2, sxtw #2` 这类带扩展的寄存器操作数。修法是扩展优先、
+移位量照带。
+
+**刻意记下的两处"与 llvm-objdump / IDA 不同"**（是选择，不是缺陷）：
+
+* **系统寄存器用 ARM 的规范编码形式**（`s3_3_c13_c0_2`）而不是名字
+  （`TPIDR_EL0`）。名字表上千条、只能从 capstone 的 bindgen 输出里抄，
+  正是 §6.11 警告的做法；规范形式信息一点没少，可查、可逆。
+* **IC/DC/AT/TLBI 的子操作名未补**，渲染成 `<sys_op:192>` 这类标记（括号里是
+  capstone 的判别值）。补名是一张 210 条的表，属后续工作；现在宁可显示
+  "我认不出"，也不显示一个**编出来的**名字（§7）。
+
+`prfm` 的预取类型是另一类：**capstone 自己就不给这个操作数**。它的
+`ARM64_OP_PREFETCH` 枚举从未被赋值，`AArch64InstPrinter.c` 给 11 种操作数
+建了 detail，唯独漏了预取。所以这不是我们丢的，建模成"位置在、值拿不到"，
+渲染 `<prefetch:?>`。证据、复核命令、以及可选的"从指令第 `[4:0]` 位取
+`prfop`"方案见 `docs/research/capstone-prefetch-operand.md`。
+
+**验证**（真值一律取自 `E:\LLVM\bin\llvm-objdump.exe`，不是我们自己的输出）：
+
+| 项 | 结果 |
 | --- | --- |
-| `mrs x19, TPIDR_EL0` | `mrs x19` |
-| `msr TPIDR_EL0, x19` | `msr x19` |
-| `dsb sy` | `dsb` |
-| `tlbi vmalle1` | `tlbi` |
-| `prfm pldl1keep, [x1]` | `prfm [x1]` |
+| 195 KB 的 `libBugly_Native.so`：llvm-objdump 认定的索引内存操作数 | 147 处，**逐个地址**核对我们全部带上了索引（0 处遗漏） |
+| 探针 `probe_idx.o`（13 条，覆盖 `sxtw`/`uxtw`/`lsl`/无修饰 + 各类移位） | 逐条与 llvm-objdump 一致 |
+| 探针 `probe_ops.o`（系统寄存器 / PState / 屏障 / IC/DC/AT/TLBI / 预取 / `fmov` / C-IMM） | 逐条一致，差异只在我们**刻意标记**的那两处 |
+| `ret` 这类无操作数指令 | 不会凭空多出操作数（防"补过头"） |
 
-`msr x19` 读起来像一条**合法的另一条指令**，不是"明显缺了一块"。
-属于 §7「降级要写在界面上」，另行处理。
+**没做的**：真实样本上没做**反向**普查（我们给了索引、objdump 没给的情况）。
+探针里有对照组，但 147 那个数字只证明了"不漏"，不证明"不多"。
+
+回归测试：`crates/bitflip-arch/tests/arm64_operand_kinds.rs`（6 条）。
+字节序列硬编在测试里（§0.2 不许入库样本），真值文本逐条抄自 llvm-objdump。
 
 ### 新增 — M11 的 M0：ZIP/APK 容器 + `.so` 直接复用 ELF 通路
 
