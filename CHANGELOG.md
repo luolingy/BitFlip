@@ -11,6 +11,61 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 修复 — aarch64 反汇编会中止进程（vendored `capstone` + 一处补丁）
+
+**问题**：`capstone` 0.14.0 在 `src/arch/arm64.rs` 里把 capstone C 端给的
+**原始**系统寄存器编码 `mem::transmute` 成 `Arm64Sysreg`。那个枚举是稀疏的
+`#[repr(u32)]`（只有 `0` 与 49k~62k 段里那些具名编码），而 C 端
+（`printMRSSystemRegister`，AArch64InstPrinter.c）**不校验**就写 `op.reg = Val`。
+于是任何它没命名的编码都会让 transmute 构造非法枚举值 —— 那是**非展开** panic：
+进程直接 abort（退出码 `0xC0000409`），`catch_unwind` **在原理上**接不住。
+
+实测：真实上架 APK 里的 `lib/arm64-v8a/libBugly_Native.so` 跑 `functions` /
+`symbol` / `export` **一律中止进程**；同一个库的 x86_64 版本正常出 493 个函数。
+差别只在架构。aarch64 是 Android 主 ABI，不修这条，M11 的核心收益对大多数
+真实 APK 都拿不到。**上游没有修好的版本可升**（0.14.0 就是 crates.io 最新）。
+
+**修法**：vendored 一份 `capstone` 0.14.0 到 `third-party/capstone/`，
+根 `Cargo.toml` 用 `[patch.crates-io]` 指过去。改动只有 3 处、约 20 行：
+把"I don't know 的原始编码"**如实保留为 `u32`**，不再伪装成枚举。
+理由与升级步骤见 `third-party/capstone/PATCH.md`。
+
+**为什么不用"越界就退化成 `INVALID`"**：那是静默丢数据（§7）；而且合法性判断
+需要一张上千条的编码表，只能从 `capstone-sys` 的 bindgen 输出里抄，
+正是 §6.11 警告的"照自己的假设拼表"。调查中还查明 **`ARM64_OP_REG_MRS` 只在
+capstone 认不出编码时才出现**（认得出时走 `ARM64_OP_SYS`），所以这个变体的语义
+本来就是"未映射的编码"，用枚举当载荷才是那个说不通的设计。
+
+**验证**（含反向验证，见 `docs/research/capstone-arm64-abort.md`）：
+
+| 项 | 结果 |
+| --- | --- |
+| 补丁后：同一个 `.so` | `functions` → 退出码 0，**495 个函数** |
+| 补丁后：同一个 `.so` 的 `export` | 退出码 0，42 901 条指令 |
+| 补丁后：APK 的 aarch64 成员 | `symbol JNI_OnLoad` → `0xa4f8` |
+| x86_64 成员 | 493 个函数，与改动前一致 |
+| **撤掉补丁** | 编译期哨兵报 `error[E0308]`；重新构建的 CLI 再跑那个 `.so` → **又回到 `0xC0000409`** |
+
+回归测试：`crates/bitflip-arch/tests/arm64_sysreg_operand.rs`（5 条）。
+它钉的是**那 4 个字节**（`ce af 03 d5`）而不是样本文件 —— §0.2 禁止二进制样本
+入库，而单条指令的解码不依赖上下文，4 个字节就够复现。
+
+**仍未修（同一子系统，另一件事）**：`bitflip-arch` 的 `convert_arm64_operand`
+有个 `_ => {}` 兜底，把系统寄存器 / PState / 屏障 / 预取这几类操作数整个丢掉。
+指令文本是按我们自己的操作数表拼的（`render.rs` 刻意不复用 capstone 的
+`op_str`），于是输出里直接少操作数，而且**看不出来**：
+
+| llvm-objdump | BitFlip |
+| --- | --- |
+| `mrs x19, TPIDR_EL0` | `mrs x19` |
+| `msr TPIDR_EL0, x19` | `msr x19` |
+| `dsb sy` | `dsb` |
+| `tlbi vmalle1` | `tlbi` |
+| `prfm pldl1keep, [x1]` | `prfm [x1]` |
+
+`msr x19` 读起来像一条**合法的另一条指令**，不是"明显缺了一块"。
+属于 §7「降级要写在界面上」，另行处理。
+
 ### 新增 — M11 的 M0：ZIP/APK 容器 + `.so` 直接复用 ELF 通路
 
 M0 的目标是"先把壳打开"，**不做** DEX：识别 ZIP 容器、枚举成员、把

@@ -1,4 +1,17 @@
-# `capstone` 0.14.0 的 aarch64 反汇编会**中止进程**（既有问题，非本次引入）
+# `capstone` 0.14.0 的 aarch64 反汇编会**中止进程**（既有问题）
+
+> **状态：已修（2026-10-14）。** 修法是 vendored 一份本地副本 + 一处补丁：
+> `third-party/capstone/`，`[patch.crates-io]` 指过去，
+> 详见 `third-party/capstone/PATCH.md`。
+>
+> 本文保留原始调查记录（现象、机理、复现、影响面）作为**为什么要有那个 fork**
+> 的依据。文末的"处置选项"与"待办"按实际情况更新过。
+>
+> **仍未修的是相邻问题**（同一子系统，但另一件事）：`bitflip-arch` 的
+> `convert_arm64_operand` 有个 `_ => {}` 兜底，把系统寄存器 / PState / 屏障 /
+> 预取这几类操作数整个丢掉，导致渲染出的指令文本**缺操作数**，
+> 而且缺得**看不出来**（`msr x19` 读起来像一条合法的另一条指令）。
+> 这属于 §7「降级要写在界面上」，见文末。
 
 > 发现于 M11 的 M0 验证过程（用真实 APK 的 `lib/arm64-v8a/*.so` 试反汇编）。
 > 记录在这里是因为它**与 ZIP/APK 改动无关**，但对"APK 里的 `.so` 能不能分析"
@@ -91,24 +104,77 @@ Rust 对枚举做有效性检查，遇到非法判别式就调 `panic!`，而且
 - 该 crate 的 `capstone-sys` 是绑定层，`arch/arm64.rs` 属于纯 Rust 封装，
   问题在这一层，换 `capstone-sys` 版本解决不了。
 
-## 处置选项
+## 处置选项（已按实际选择更新）
 
-| 方案 | 代价 | 说明 |
-| --- | --- | --- |
-| **A. `[patch.crates-io]` 本地补一份** | 低（改动约 20 行），但要维护 fork | 把那两处 `transmute` 换成可失败转换；越界时给出**原始号码**而不是猜。缺点：以后每次升级 `capstone` 都要重新套一次 |
-| **B. 不用 capstone 反汇编 aarch64** | 高 | 得另找解码器，且 `docs/DEPENDENCY-DECISIONS.md` 的选型链要重做 |
-| **C. 先在调用层把 abort 变成可报错** | 中 | 把 aarch64 反汇编放到子进程里，父进程看退出码 —— 代价是跨进程边界，与"单文件可执行、零外部依赖"的目标有摩擦 |
-| **D. 暂时禁用 aarch64 反汇编并明确报错** | 低 | 至少不再 abort：`info` 仍然工作，`functions` 返回 `NotYetImplemented`。诚实但没有产出 |
+| 方案 | 结果 |
+| --- | --- |
+| **A. `[patch.crates-io]` 本地补一份** | ✅ **选了这条**，2026-10-14 落地。改动 3 处、约 20 行，见 `third-party/capstone/PATCH.md` |
+| B. 不用 capstone 反汇编 aarch64 | ❌ 否掉：要另找解码器并重做选型链，代价与收益不成比例 |
+| C. 把 aarch64 反汇编放进子进程 | ❌ 否掉：跨进程边界与"单文件可执行、零外部依赖"直接冲突，而且只是把 abort 挪个地方 |
+| D. 禁用 aarch64 反汇编并报 `NotYetImplemented` | ❌ 否掉：A 的代价比 D 还小，没必要先降级 |
 
-**建议 A + D 一起做**：A 解决根因（本地补一份，改动很小），
-D 作为 A 落地前的过渡（把"进程死掉"换成"明确说这个架构的反汇编暂不可用"）。
-在任何情况下**不要**让 abort 留在里面 —— 它对 `serve` 是致命的。
+**方案 A 的一个设计选择**（当时留作待办的那条）：越界编码**原样保留为 `u32`**，
+而不是退化成 `ARM64_SYSREG_INVALID`。两个理由：
+
+1. 退化成 `INVALID` 是**静默丢数据**（§7）。原始编码能反查 capstone 的表、
+   能对上 ARM 手册的编码字段；变成 `INVALID` 就查无可查。
+2. 合法性判断需要一张上千条的编码表，而那张表只能从 `capstone-sys` 的
+   bindgen 输出里抄 —— §6.11 的教训正是"照自己的假设拼表，错了会静悄悄错"。
+
+调查过程中还查明了一件事，它让这个选择更站得住：**`ARM64_OP_REG_MRS` 只在
+capstone 认不出编码时才出现**（认得出时走 `ARM64_OP_SYS`）。也就是说这个变体
+的语义本来就是"未映射的系统寄存器编码"，用 `Arm64Sysreg` 当载荷才是那个
+说不通的设计。
+
+## 已做的验证（含反向验证）
+
+| 验证 | 结果 |
+| --- | --- |
+| 打补丁前：真实 `lib/arm64-v8a/libBugly_Native.so` | `functions` → 退出码 `0xC0000409`，`arm64.rs:70`，`invalid value 0x1d7e`，`non-unwinding panic. aborting.` |
+| 打补丁后：同一个 `.so` | `functions` → 退出码 0，**495 个函数** |
+| 打补丁后：同一个 `.so` 的 `export` | 退出码 0，42 901 条指令 |
+| 打补丁后：APK 里的 aarch64 成员 | `symbol JNI_OnLoad --member lib/arm64-v8a/...` → `0xa4f8` |
+| x86_64 成员未被影响 | 493 个函数，与改动前一致 |
+| **反向验证**：把补丁撤掉后重新构建 | 编译期哨兵报 `error[E0308]`；构建出的 CLI 再跑那个 `.so` → 又回到 `0xC0000409`。**证明测试与补丁都在真的起作用**，不是绿灯说谎 |
+
+回归测试在 `crates/bitflip-arch/tests/arm64_sysreg_operand.rs`（5 条）。
+它钉的是**那 4 个字节**（`ce af 03 d5`）而不是样本文件 —— §0.2 禁止二进制样本入库，
+而单条指令的解码不依赖上下文，4 个字节就够复现。
 
 ## 待办
 
-- [ ] 评估方案 A 的具体补丁写法（越界时退化成 `Invalid` 还是保留原始号码？
-      前者会让 `MRS` 操作数静默丢失，后者要改 `Arm64OperandType` 的形状 ——
-      倾向保留原始号码，因为 §7 要求"拿不到就说拿不到"而不是悄悄少给）。
-- [ ] 补一条**真实样本**回归测试：拿一个含 `MRS`/`MSR` 的 aarch64 `.so`
-      跑反汇编，断言"不中止"。样本按 CLAUDE.md §0.2 由 `tests/fixtures` 脚本生成。
-- [ ] 检查 `bitflip-arch` 里对 aarch64 的调用点，确认没有别的地方绕开这道坎。
+- [x] 方案 A 的补丁写法 —— 见上面的设计选择。
+- [x] 回归测试 —— `crates/bitflip-arch/tests/arm64_sysreg_operand.rs`，
+      并用"撤掉补丁必须变红"反向验证过。
+- [x] 检查 `bitflip-arch` 的 aarch64 调用点 —— 顺带查出**相邻问题**，见下。
+
+## 仍未做：相邻问题（`bitflip-arch` 把操作数丢了）
+
+`crates/bitflip-arch/src/backend.rs` 的 `convert_arm64_operand` 有个 `_ => {}`
+兜底，`RegMrs` / `RegMsr` / `Pstate` / `Sys` / `Prefetch` / `Barrier` 全落在里面。
+而指令文本是**按我们自己的操作数表拼的**（`render.rs` 刻意不复用 capstone 的
+`op_str`），所以这些操作数在输出里直接消失：
+
+| 地址 | llvm-objdump | BitFlip |
+| --- | --- | --- |
+| 0 | `mrs x19, TPIDR_EL0` | `mrs x19` |
+| 4 | `msr TPIDR_EL0, x19` | `msr x19` |
+| 0x10 | `msr DAIFSet, #0x2` | `msr 0x2` |
+| 0x18 | `dsb sy` | `dsb` |
+| 0x20 | `dc civac, x0` | `dc x0` |
+| 0x24 | `tlbi vmalle1` | `tlbi` |
+| 0x28 | `prfm pldl1keep, [x1]` | `prfm [x1]` |
+
+`msr x19` 不只是"不全"——它读起来像一条**合法的另一条指令**。用户照这个读会
+把语义搞错，而且没有任何标记提示"这里少了东西"。这属于 §7「降级要写在界面上」，
+与 capstone 的 abort 是两件事。
+
+（另有一条上游行为，不打算碰：capstone 的 C 端把**未知**的 MSR 也标成
+`ARM64_OP_REG_MRS`（`AArch64InstPrinter.c:2297`），而已知的 MSR 目标走
+`ARM64_OP_SYS`，Rust 端读成 `Sys(Arm64SysOp)` —— 字段被一物两用，
+值对类型错。详见 `third-party/capstone/PATCH.md`。）
+
+修复这条要在 `bitflip-arch` 里给这几类操作数补上渲染，并**给系统寄存器起名**
+（capstone 的 C 表是唯一权威，`cs_reg_name` 对系统寄存器编码不适用）。
+那是一个独立改动，需要单独定做法。
+

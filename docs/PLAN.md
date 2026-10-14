@@ -1144,9 +1144,17 @@ MSVC 修饰名反修饰、静态库 PDB。
 * **未做（没有冒充完成）**：逐成员的对齐诊断（`localHeaderOffset % 4`、
   `.so` 偏移的 4096/16384 对齐、ELF `p_align`）。逐条状态见
   `docs/APK-DEX-DESIGN.md` 的"M0 完成情况"表。
-* **发现一个既有阻断**：`capstone` 0.14.0 反汇编 ARM64 的 `MRS`/`MSR` 时
-  **abort 进程**（`docs/research/capstone-arm64-abort.md`）。对裸 `.so` 同样复现，
-  与本次改动无关；但 aarch64 是 Android 主 ABI，**不修它 M11 的价值就少一半**。
+* **既有阻断已修**：`capstone` 0.14.0 反汇编 ARM64 的 `MRS`/`MSR` 时
+  **abort 进程**（非展开 panic，`catch_unwind` 兜不住）。对裸 `.so` 同样复现，
+  与 M0 改动无关；但 aarch64 是 Android 主 ABI，**不修它 M11 的价值就少一半**。
+  已用 vendored 副本 + 一处补丁修掉（`third-party/capstone/`，见其 `PATCH.md`
+  与 `docs/research/capstone-arm64-abort.md`）。修后同一个 `.so` 出 **495 个函数**，
+  APK 里 aarch64 成员的 `JNI_OnLoad` 定位到 `0xa4f8`；已做反向验证
+  （撤掉补丁则编译期哨兵报错、重新构建的 CLI 又回到 abort）。
+* **仍未做（同一子系统，另一件事）**：`bitflip-arch` 的 `convert_arm64_operand`
+  有个 `_ => {}` 兜底，会把系统寄存器 / PState / 屏障 / 预取这几类操作数丢掉，
+  于是渲染出的指令文本**少操作数且看不出来**（`msr x19` 读起来像一条合法的
+  另一条指令）。属 §7「降级要写在界面上」，另行处理。
 
 
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。

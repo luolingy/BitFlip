@@ -26,6 +26,7 @@
 | **Mach-O（含 fat）** | `object` 0.40 | Apache-2.0 OR MIT | **实测通过** | **用**，但要加资源限额（§2.3） |
 | Mach-O 代码签名 / dyld cache | `object` 0.40 | 同上 | 未实测（API 存在） | 用 |
 | Mach-O 深度签名（CMS） | `apple-codesign` | MPL-2.0 | 未实测 | **需你拍板**（MPL 是文件级 copyleft） |
+| **指令解码（已在用）** | `capstone` 0.14.0 | MIT | **实测会 abort → 已本地补一份** | 用（vendored，见 §6） |
 | APK（ZIP 容器） | `zip` 9.0.2 | MIT | **实测通过** | 用 |
 | APK（抗畸形包 BadPack） | `apk-info-zip` | Apache-2.0 | 未实跑（API 存在） | 有需要时用 |
 | APK 清单/资源（AXML+ARSC） | `apk-info` / `apk-info-axml` | Apache-2.0 | **实测通过** | 用（§2.4） |
@@ -250,3 +251,55 @@ void func_0x00000000(void)
   这是代理指标，不等价。
 - 子 agent 报告的 404 列表、`pdb` 的仓库归属等，我**未逐条复核**。
 - `dotscope`、`clsmta`、`cildec` 等 .NET 轮子只看过元数据，**源码未读**。
+
+## 6. 指令解码：`capstone` 的一处本地补丁（vendored）
+
+**这是唯一一个"已经在用、但必须改一行才安全"的依赖。** 其余结论要么是
+"拿来就能用"，要么是"别用"。
+
+### 问题
+
+`capstone` 0.14.0（**crates.io 最新**，2026-01-04 发布，没有更新的修好版本）
+在 `src/arch/arm64.rs` 里把 capstone C 端给的**原始**系统寄存器编码
+`mem::transmute` 成 `Arm64Sysreg`。那个枚举是稀疏的 `#[repr(u32)]`
+（只有 `0` 与 49k~62k 段里那些具名编码），而 C 端
+（`printMRSSystemRegister`，`AArch64InstPrinter.c`）**不校验**就写
+`op.reg = Val`。于是任何它没命名的编码都会让 transmute 构造非法枚举值 ——
+那是**非展开** panic：进程直接 abort（退出码 `0xC0000409`），
+`catch_unwind` 在原理上接不住。
+
+实测影响：真实上架 APK 里的 `lib/arm64-v8a/libBugly_Native.so` 跑
+`functions` / `symbol` / `export` **一律中止进程**；同一库的 x86_64 版本正常。
+aarch64 是 Android 主 ABI，所以这条直接挡住 M11 的核心收益。
+
+### 处置
+
+vendored 一份到 `third-party/capstone/`（MIT，保留 `LICENSE`），
+根 `Cargo.toml` 用 `[patch.crates-io]` 指过去。改动 3 处、约 20 行：
+把原始编码**如实保留为 `u32`**，不再伪装成枚举。
+
+**为什么不用"越界就退化成 `ARM64_SYSREG_INVALID`"**：
+① 那是静默丢数据（§7）；② 合法性判断需要一张上千条的编码表，只能从
+`capstone-sys` 的 bindgen 输出里抄，正是 §6.11 警告的"照自己的假设拼表"。
+
+调查中还查明 **`ARM64_OP_REG_MRS` 只在 capstone 认不出编码时才出现**
+（认得出时走 `ARM64_OP_SYS`），所以这个变体的语义本来就是"未映射的编码" ——
+用枚举当载荷才是那个说不通的设计。
+
+### 维护义务（这条与 §1 里"用"的那些不同）
+
+- 升级 `capstone` 时必须重套或撤销补丁，判断依据是
+  `Arm64OperandType::RegMrs` 的载荷是否还是 `Arm64Sysreg`。
+- 完整说明、升级步骤与验证命令：`third-party/capstone/PATCH.md`。
+- 回归测试：`crates/bitflip-arch/tests/arm64_sysreg_operand.rs`（5 条，
+  含编译期哨兵；已用"撤掉补丁必须变红"反向验证过）。
+- 原始调查记录：`docs/research/capstone-arm64-abort.md`。
+
+### 同一次调查里发现、但**不在**这个补丁范围内的
+
+`bitflip-arch` 的 `convert_arm64_operand` 有 `_ => {}` 兜底，把系统寄存器 /
+PState / 屏障 / 预取这几类操作数整个丢掉；而指令文本是按我们自己的操作数表
+拼的（`render.rs` 刻意不复用 capstone 的 `op_str`），于是输出**少了操作数且
+看不出来**（`mrs x19, TPIDR_EL0` 渲染成 `mrs x19`，`msr TPIDR_EL0, x19`
+渲染成 `msr x19` —— 后者读起来像一条合法的另一条指令）。
+属于 §7「降级要写在界面上」，另行处理。

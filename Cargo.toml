@@ -79,3 +79,21 @@ all = { level = "warn", priority = -1 }
 lto = "thin"
 codegen-units = 1
 panic = "unwind"
+
+# `capstone` 0.14.0 的 aarch64 操作数转换会**中止进程**，这里用本地副本替换。
+#
+# 问题：`src/arch/arm64.rs` 把 capstone 给的原始系统寄存器编码
+# `mem::transmute` 成 `Arm64Sysreg`。该枚举是稀疏的 `#[repr(u32)]`
+# （只有 0 与 49k~62k 段那些具名编码），而 capstone 的 C 端
+# （`printMRSSystemRegister`，AArch64InstPrinter.c）**不校验**就写
+# `op.reg = Val`。于是任何它没命名的编码都会让 transmute 构造出非法枚举值
+# —— 那是**非展开** panic：进程直接 abort。
+#
+# 为什么必须修：aarch64 是 Android 主 ABI，而 abort 连 §4 要求的
+# `catch_unwind` 都兜不住（非展开 panic 直接进 abort，栈不回退）。
+# 实测：真实上架 APK 里的 `lib/arm64-v8a/*.so` 一律中止进程。
+# 上游没有更新的版本可用（0.14.0 就是 crates.io 最新）。
+#
+# 修法与升级步骤见 third-party/capstone/PATCH.md。
+[patch.crates-io]
+capstone = { path = "third-party/capstone" }
