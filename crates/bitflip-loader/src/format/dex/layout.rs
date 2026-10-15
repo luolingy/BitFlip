@@ -83,6 +83,10 @@ pub enum LayoutProblemKind {
     PayloadUnreadable,
     /// 库给的某个载荷地址与它自己的指令地址撞在同一码元上。
     PayloadCollidesWithInstruction,
+    /// 31t 分支目标不是匹配类型的 payload 起始码元，或与库解码的目标不一致。
+    InvalidPayloadTarget,
+    /// 一个载荷没有任何 31t 指令指向它。
+    OrphanPayload,
 }
 
 impl LayoutProblemKind {
@@ -94,6 +98,8 @@ impl LayoutProblemKind {
             Self::Overrun => "overrun",
             Self::PayloadUnreadable => "payload-unreadable",
             Self::PayloadCollidesWithInstruction => "payload-collides-with-instruction",
+            Self::InvalidPayloadTarget => "invalid-payload-target",
+            Self::OrphanPayload => "orphan-payload",
         }
     }
 }
@@ -144,6 +150,11 @@ fn read_u16(bytes: &[u8], off: usize) -> Option<u16> {
 fn read_u32(bytes: &[u8], off: usize) -> Option<u32> {
     let raw: [u8; 4] = bytes.get(off..off.checked_add(4)?)?.try_into().ok()?;
     Some(u32::from_le_bytes(raw))
+}
+
+fn read_i32(bytes: &[u8], off: usize) -> Option<i32> {
+    let raw: [u8; 4] = bytes.get(off..off.checked_add(4)?)?.try_into().ok()?;
+    Some(i32::from_le_bytes(raw))
 }
 
 /// 码元地址 → 字节偏移。**只有这一处做这个换算**（两处换算必然漂移）。
@@ -309,6 +320,74 @@ pub fn check_code_item_layout(bytes: &[u8], code_off: u32) -> Result<LayoutCheck
                 header.insns_size
             ),
         });
+    }
+
+    // 31t 的目标独立从原始字节手算：opcode + signed i32 相对码元偏移。
+    // 规格 §10.2：fill-array-data=0x26、packed-switch=0x2b、sparse-switch=0x2c。
+    let mut targeted_payloads = std::collections::BTreeSet::new();
+    for insn in &code.instructions {
+        let Some(raw_off) = byte_off(insns_base, insn.addr) else {
+            continue;
+        };
+        let Some(opcode) = read_u16(bytes, raw_off).map(|word| word & 0x00ff) else {
+            continue;
+        };
+        let expected_ident = match opcode {
+            0x26 => IDENT_FILL_ARRAY_DATA,
+            0x2b => IDENT_PACKED_SWITCH,
+            0x2c => IDENT_SPARSE_SWITCH,
+            _ => continue,
+        };
+        let Some(relative) = raw_off.checked_add(2).and_then(|off| read_i32(bytes, off)) else {
+            problems.push(LayoutProblem {
+                at: insn.addr,
+                kind: LayoutProblemKind::InvalidPayloadTarget,
+                detail: "31t 指令的 32 位相对目标读不全".to_string(),
+            });
+            continue;
+        };
+        let target_i64 = i64::from(insn.addr) + i64::from(relative);
+        let Ok(target) = u32::try_from(target_i64) else {
+            problems.push(LayoutProblem {
+                at: insn.addr,
+                kind: LayoutProblemKind::InvalidPayloadTarget,
+                detail: format!("31t 目标 {target_i64} 超出 u32 码元地址范围"),
+            });
+            continue;
+        };
+        let target_off = byte_off(insns_base, target);
+        let ident_matches = target_off
+            .and_then(|off| read_u16(bytes, off))
+            .is_some_and(|ident| ident == expected_ident);
+        if !code.payloads.contains_key(&target) || !ident_matches {
+            problems.push(LayoutProblem {
+                at: insn.addr,
+                kind: LayoutProblemKind::InvalidPayloadTarget,
+                detail: format!(
+                    "31t opcode {opcode:#04x} 的目标码元 {target} 不是匹配 ident {expected_ident:#06x} 的 payload 起点"
+                ),
+            });
+        }
+        if insn.target != Some(target) {
+            problems.push(LayoutProblem {
+                at: insn.addr,
+                kind: LayoutProblemKind::InvalidPayloadTarget,
+                detail: format!(
+                    "原始字节算出的 31t 目标是 {target}，库给出的 target 是 {:?}",
+                    insn.target
+                ),
+            });
+        }
+        targeted_payloads.insert(target);
+    }
+    for payload_addr in code.payloads.keys() {
+        if !targeted_payloads.contains(payload_addr) {
+            problems.push(LayoutProblem {
+                at: *payload_addr,
+                kind: LayoutProblemKind::OrphanPayload,
+                detail: "没有任何 31t 指令指向这个 payload".to_string(),
+            });
+        }
     }
 
     // 库报了、地图里却走不到的项：说明它给的地址与长度互相矛盾。

@@ -1241,9 +1241,9 @@ MSVC 修饰名反修饰、静态库 PDB。
   0 处不吻合**（debug 下两个 `--ignored` 测试一起 55 秒）。7334 个
   抽象/native 方法没有字节码，如实计数、不计入检查。设计文档写的门槛是
   "3000 个真实方法上 0 不吻合"，这次覆盖面是它的 47 倍。
-* **仍未做**：另两条验收（`31t` 目标落在 payload 起始、`try_item.handler_off`
-  落在 `encoded_catch_handler` 起点）要 CFG 与异常表，属于 M2a 的下一步；
-  解码投影与渲染函数同样还没做。
+* **仍未做**：`31t` 分支目标落在匹配类型 payload 起始、孤儿 payload 检查已由
+  `check_code_item_layout` 一并完成；`try_item.handler_off` 落在
+  `encoded_catch_handler` 起点仍待 CFG/异常表实现。解码投影与渲染函数也还没做。
 
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 

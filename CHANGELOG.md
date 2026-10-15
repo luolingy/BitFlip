@@ -11,6 +11,14 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — DEX 31t 分支目标与 payload 交叉校验（M2a）
+
+布局校验现还会从原始字节读取 `fill-array-data` / `packed-switch` /
+`sparse-switch` 的 signed 32-bit 相对目标，验证目标是相应类型 payload 的起点，
+payload ident 与 opcode 匹配，并与依赖库给出的 `target` 对拍；未被引用的孤儿
+payload 也会报告。真实 APK 三个 dex 上 **143486 个带字节码方法、2406 个载荷
+全部通过**。`try_item.handler_off` 对应 handler 起点的验收仍未完成。
+
 ### 新增 — DEX 码元布局校验：指令 ∪ 载荷必须恰好铺满（M11 的 M2a 第一步）
 
 **能力**：`bitflip_loader::check_code_item_layout(bytes, code_off)` —— 对任一方法
