@@ -244,6 +244,25 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 
 ### M2 — Dalvik 解码 + CFG
 
+> **本节要求"动手前定"的那件事已定：ADR-0020。** 结论：**DEX 的视图自成一类**，
+> 不把 `Disasm` 泛化成 trait。理由是 `Disasm` 的五格里有四格
+> （`AddrSpace` / `InsnIndex` / 扫描种子 / 覆盖率统计）对 DEX 根本不成立：
+> 只把最后一格（`renderer`）换成 trait，会造出一个"看起来能装 DEX、
+> 实际静默产出无意义结论"的类型 —— 与 M1 拒绝把 DEX 塞进 `parse_object`
+> 是同一条理由。下面那条"渲染要单独解决"因此有了答案：**渲染不需要走进
+> `Disasm`**，DEX 侧自己有一个视图类型 + 自己的 `render_insn`。
+>
+> **拆成两段推进（据实记录，免得"看起来完成了"）**：
+>
+> * **M2a（事实层，先做）**：解码投影 + CFG 投影 + 渲染函数 + 黄金测试，
+>   全部落在 DEX 侧，**不碰 `bitflip-core`**。并补齐 M1 推迟的三条验收
+>   （"指令 ∪ 载荷恰好铺满 `[0, insns_size)`"、"`31t` 目标落在 payload 起始"、
+>   "`try_item` 的 `handler_off` 落在 `encoded_catch_handler` 起点"）——
+>   它们本来就要解码宽度，属于这一段。
+> * **M2b（接产品，后做）**：CLI/导出怎么呈现 DEX 视图（新子命令，还是
+>   `--member classes.dex` 自动切视图）。ADR-0020 明确把这一条留到 M2a 之后，
+>   依据是"用户在命令行上想表达什么"。
+
 用 `droidsaw-dex` 的 `decode` + `cfg`，**要写的是适配层**：
 
 - 把 `decode::parse_code_item` 的 `Instruction`

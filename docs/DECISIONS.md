@@ -214,6 +214,50 @@ M2（Dalvik 解码器 + CFG）→ M3（AXML + arsc）**。
 **参考**：`docs/research/dex-apk-format-reference.md`（字节级实现参考）、
 `docs/APK-DEX-DESIGN.md`（分层与验收）。
 
+### ADR-0020 · DEX 视图自成一类：不把 `Disasm` 泛化成 trait
+
+**状态**：已决（M11 的 M2 **动手前**定；`docs/APK-DEX-DESIGN.md` §M2 要求的那个决定）
+
+**背景**：设计文档把 DEX 指令文本的渲染列为"本方案里唯一一处现成库帮不上的
+**结构**问题"，并给了两条路：（A）新增 DEX 渲染路径；（B）把渲染器抽象成 trait
+（`bitflip-core` 的 `Disasm.renderer` 现在是 `Option<Arc<CapstoneDecoder>>`）。
+
+**决定**：选（A），而且不是"在渲染处并列一条 DEX 分支"，而是**DEX 的视图自成一类**
+（视图类型与它自己的 `render_insn` 都放在 DEX 侧），`Disasm` 保持只有机器码一种形态。
+
+**依据 —— 先看 `Disasm` 由什么构成，再看 trait 能不能表达**：
+
+| `Disasm` 的组成部分 | 对 DEX 是否成立 |
+|---|---|
+| `AddrSpace`（由段/节映射出的线性地址空间） | **不成立**：DEX 没有段权限、没有 `image_base`；一条方法的字节码在 `code_item` 里，按 16 位码元寻址 |
+| `InsnIndex`（全空间稀疏指令索引，按地址） | **不成立**：DEX 的指令天然按"方法"分组，地址是方法内偏移 |
+| 扫描种子（入口点 / 导出 / 函数符号） | **不成立**：DEX 没有这些，代码入口在 `class_data` 里 |
+| `ScanCoverage` / `ScanStats`（可达 vs 仅线性） | **语义不成立**：Dalvik 不需要"猜哪里是代码" |
+| `renderer: Option<Arc<CapstoneDecoder>>` | 不成立，但这**只是最后一格** |
+
+**关键理由**：把 `renderer` 换成 trait 只能让**最后一格**对 DEX 成立，前四格照样不成立。
+那正是"让类型看起来能装 DEX、实际产出无意义结论"的做法 —— 与 M1 拒绝把 DEX 塞进
+`parse_object`（`ObjectKind::Dex` 的 `arch` 恒为 `None`）是同一条理由。
+**泛化一个不成立的抽象比拒绝它更危险**：后者在调用处报错，前者会静默产出。
+
+**代价对比**：
+
+- （B）要改 `bitflip-core` 的公开 API（`Disasm`，而 CLAUDE.md §4 明确它是对外契约，
+  改动要记 CHANGELOG 并考虑兼容），换到的只是"能调用"，不是"结论正确"；
+- （A）的代价是 CLI/导出层将来要认两种视图。但那个分叉本来就存在 ——
+  "反汇编一个 `.so`"与"列出一个 DEX 的方法"是**两件事**，不是一件事的两种参数。
+  所以它不是新增复杂度，而是不再假装两者是同一种东西。
+
+**什么时候重新评估**：若出现**第三种**非机器码格式（.NET IL、WASM 字节码…）也要接进来，
+那时该抽象的是"**扫描 + 视图**"这一层（`AddrSpace` / `InsnIndex` / 种子三者构成的接口），
+而不是渲染器。届时依据来自两个真实需求，而不是一个想象中的。
+
+**本 ADR 不定的事**（不在这里假装定好）：DEX 视图在 CLI/导出里**怎么呈现**
+（新子命令，还是 `--member classes.dex` 自动切换视图）留到 M2 实现末尾 ——
+依据是"用户在命令行上想表达什么"，现在还没有证据。
+
+**参考**：`docs/APK-DEX-DESIGN.md` §M2、ADR-0019。
+
 ### ADR-0004 · 构建工具：npm（不用 pnpm）；构建目录固定在 F:
 
 **状态**：已决
