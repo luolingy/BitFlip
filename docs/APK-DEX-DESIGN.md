@@ -185,6 +185,35 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 
 ### M1 — DEX 结构模型（不建 CFG）
 
+> **完成情况（据实记录，2026-10-14）**：已落地，代码在
+> `crates/bitflip-loader/src/format/dex/`，入口 `bitflip_loader::parse_dex_structure`；
+> 测试在 `crates/bitflip-loader/tests/dex_structure.rs`（合成样本，永远跑）
+> 与 `dex_library_boundary.rs`（grep 守卫）。
+>
+> * **实现路径与本节的设想有一处不同（说明理由）**：不是投影 `api::ClassSummary` /
+>   `MethodSummary`，而是直接用 `parser` + `ids` + `decode::parse_class_data`。
+>   原因是本节引用的那条约束本身：`api` 层返回的是**已经物化成 `String` 的**
+>   摘要，投影时必然先付一次 `String` 分配、再去重；而 `class_defs` /
+>   `class_data` 本来就是**索引**，直接用它们才真正满足"列式 + 不物化字符串"。
+>   连带的收益是"字段清单"也拿得到 —— `api::list_methods` 只给方法。
+> * **验收项：已完成** —— 类数 == **手读**的 `class_defs_size`（真实样本
+>   7643:7643）、六个池"声明 == 实际"、符号数 == `class_data` 四个 size 之和、
+>   库的 `parse_errors` 逐条进 `notes`、grep 守卫（比本节要求更严：还断言
+>   "库只能被适配层引用"与"适配层确实用了库的事实层"）。
+> * **验收项：推迟到 M2** —— 本节列的"指令 ∪ payload 恰好铺满 `[0, insns_size)`"、
+>   "`31t` 目标落在 payload 起始 unit"、"`try_item` 的 `handler_off` 落在
+>   `encoded_catch_handler` 起点"三条**都要解码指令与 payload 宽度**，而解码是
+>   M2 的交付物。M1 不做，也不假装做了。
+> * **实测修正一处本节的说法**：`parse_errors` 在真实样本上不是"一条"而是
+>   **3 个 dex 里有 2 个**各有 `OutOfOrder { pool: StringIds }`
+>   （`classes.dex` @ `0x10589`、`classes2.dex` @ `0xffd0`）。
+> * **性能**：`classes.dex`（8.8 MB / 7643 类）release 下 1.2 s，其中库的
+>   `DexFile::parse` 占 1174 ms、我们的 `class_data` 循环 29 ms；
+>   debug 下约 70 s/dex（**是 debug 开销，不是 O(n²)** —— 这一点先被怀疑过，
+>   被 release 数字否掉了）。
+> * **仍未做**：解析预算（`Budget`）未接；DEX 还没接进 CLI/UI；
+>   交叉引用/调用图/反编译未做。逐条状态另见 `docs/PLAN.md` 的 M11 · M1 段。
+
 后端用 `droidsaw-dex` 的 `parser` 层 + `ids`/`mutf8`，**不自己写解析器**。
 真正要做的是**适配**：把它返回的带 `String` 的
 `ClassSummary`/`MethodSummary` 投影到项目的**列式 SoA 表示**与 interned

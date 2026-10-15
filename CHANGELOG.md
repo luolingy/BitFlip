@@ -11,6 +11,41 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — DEX（Dalvik Executable）结构模型（M11 的 M1）
+
+**能力**：`.dex` 文件（以及 APK 里的 `classes*.dex`）现在能被**如实列出结构**：
+版本、六个池（`string_ids` / `type_ids` / `proto_ids` / `field_ids` / `method_ids` /
+`class_defs`）的**头声明数量与实际解析数量**、类/字段/方法三张列式表
+（含静态/实例、直接/虚、`code_off`、`SourceFile`、继承关系），以及一份 `notes`。
+
+**边界（明确写在这里，避免被读成"能反编译了"）**：
+
+- **不建 CFG、不解码字节码、不反编译** —— 那是 M2 及其后的里程碑。
+- **不是机器码对象模型**：DEX 没有机器架构、没有段权限、没有 `image_base`，
+  所以它**不走** `parse_object`，`ObjectKind::Dex` 的 `arch` 恒为 `None`
+  （不用占位枚举冒充）。
+- **不接依赖库的推断层**：只使用 `droidsaw-dex` 的 `parser` / `ids` / `decode`
+  这些事实层模块；`emit*` / `sugar` / `r8_inversion` / `optimize` / `emulator` /
+  `xrefs` / `types` 等一律不引用，并有 grep 守卫
+  （`crates/bitflip-loader/tests/dex_library_boundary.rs`）防止后来者无意接上。
+- **违规但不致命的东西要看得见**：依赖库把"规范不符但 ART 容忍"处记进
+  `parse_errors`，我们逐条抄进 `notes`。实测真实 APK 的 3 个 dex 中**有 2 个**
+  的 `string_ids` 乱序（违反规范排序要求）—— 既不因此拒绝文件，也不隐瞒。
+- **DEX 尚未接进 CLI/UI**：模型与黄金测试先落地，接界面排在 M2 之后。
+
+**测试**：合成样本（按规范逐字段拼出的最小合规 DEX，含 Adler-32 / SHA-1 /
+`map_list` / `class_data` / `code_item`，断言"合规样本零 notes"）+
+`#[ignore]` 的真实 APK 黄金测试（三个 dex 共 22938 类；`class_defs_size`
+与手读值 7643:7643 逐一对齐）。
+
+**性能（实测，含一次被数字否掉的假设）**：`classes.dex`（8.8 MB / 7643 类）
+release 下 **1.2 s**，其中依赖库的 `DexFile::parse` 占 1174 ms、我们的
+`class_data` 循环只占 **29 ms**；同一条路径在 debug 下约 70 s/dex，
+**是 debug 构建的开销，不是算法问题**（先怀疑 O(n²)，release 数字否掉了它）。
+
+**未做（据实记）**：`insns_size` 的"指令 ∪ 载荷恰好铺满"验收推迟到 M2；
+解析预算（`Budget`）未接；交叉引用/调用图/反编译未做。
+
 ### 修复 — aarch64 反汇编会中止进程（vendored `capstone` + 一处补丁）
 
 **问题**：`capstone` 0.14.0 在 `src/arch/arm64.rs` 里把 capstone C 端给的

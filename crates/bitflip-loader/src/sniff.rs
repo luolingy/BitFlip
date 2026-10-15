@@ -8,6 +8,7 @@ use std::path::Path;
 
 use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
 
+use crate::format;
 use crate::{ArchiveMember, ContainerKind, Guess, LoaderError, MemberStorage, ObjectKind};
 
 /// 单次嗅探读取的字节上限（8 MiB）：足够覆盖任何正常文件头与常见归档目录，
@@ -130,6 +131,8 @@ fn sniff_inner(bytes: &[u8], depth: u8) -> Guess {
 
     if bytes.starts_with(b"\x7fELF") {
         sniff_elf(bytes, &mut g);
+    } else if format::dex::looks_like_dex(bytes) {
+        sniff_dex(bytes, &mut g);
     } else if bytes.starts_with(b"!<arch>\n") {
         sniff_ar(bytes, &mut g, depth);
     } else if looks_like_zip(bytes) {
@@ -212,6 +215,84 @@ fn sniff_zip(bytes: &[u8], g: &mut Guess) {
              不在这段前缀内。完整成员列表要在读取完整字节后单独枚举"
                 .to_string(),
         );
+    }
+}
+
+// ── DEX ─────────────────────────────────────────────────────────────────────
+
+/// DEX 头的规范长度（Dalvik 规范 §3.1：`header_size` 固定 `0x70`）。
+const DEX_HEADER_SIZE: usize = 0x70;
+/// 魔数里版本号的三位：`dex\n` + 版本 + NUL。
+const DEX_VERSION_RANGE: std::ops::Range<usize> = 4..7;
+/// `string_ids_size` 在头里的偏移。
+const DEX_STRING_IDS_SIZE_OFF: usize = 0x38;
+/// `field_ids_size`。
+const DEX_FIELD_IDS_SIZE_OFF: usize = 0x50;
+/// `method_ids_size`。
+const DEX_METHOD_IDS_SIZE_OFF: usize = 0x58;
+/// `class_defs_size`。
+const DEX_CLASS_DEFS_SIZE_OFF: usize = 0x60;
+
+/// 认一个 DEX（Dalvik Executable）。
+///
+/// # 这里**只**读头，不建结构模型
+///
+/// 与 [`sniff_zip`] 同样的分工：嗅探只回答"是不是 DEX、哪个版本、头里声明了
+/// 多少东西"，**结构模型**（类/字段/方法的实际清单）要完整字节，交给
+/// [`crate::parse_dex_structure`]。两个函数给的数字含义也不同：这里是
+/// **头声明的**，那里是**实际解析出的**，对不上时后者会明确报出来。
+///
+/// # `arch` 刻意留 `None`
+///
+/// DEX 是寄存器机**字节码**，没有机器架构。填一个"DEX 架构"会让人以为
+/// 后面能按它反汇编 —— 那是 M11 的 M2（且走另一条通路，见
+/// [`crate::format::dex`] 开头那段"为什么不复用机器码对象模型"）。
+/// 拿不到就说拿不到，不用一个占位枚举冒充。
+fn sniff_dex(bytes: &[u8], g: &mut Guess) {
+    g.container = ContainerKind::Plain;
+    g.object = ObjectKind::Dex;
+
+    if bytes.len() < DEX_HEADER_SIZE {
+        g.notes.push(format!(
+            "DEX 头被截断（{} 字节，规范要求 {DEX_HEADER_SIZE}）",
+            bytes.len()
+        ));
+        return;
+    }
+
+    let version = String::from_utf8_lossy(&bytes[DEX_VERSION_RANGE]);
+    g.notes.push(format!("DEX 版本 {version}"));
+    g.notes.push(
+        "DEX 是 Dalvik 寄存器机字节码，没有机器架构 —— \
+         它的类/方法/字段清单在结构模型里（parse_dex_structure），不走反汇编通路"
+            .to_string(),
+    );
+
+    // 计数逐字照抄头里的字段。读不到就整条不写 —— 不填 0（§7）。
+    let counts = [
+        ("类", DEX_CLASS_DEFS_SIZE_OFF),
+        ("方法", DEX_METHOD_IDS_SIZE_OFF),
+        ("字段", DEX_FIELD_IDS_SIZE_OFF),
+        ("字符串", DEX_STRING_IDS_SIZE_OFF),
+    ];
+    let rendered: Vec<String> = counts
+        .iter()
+        .filter_map(|(label, off)| {
+            read_u32(bytes, *off, Endian::Little).map(|n| format!("{label} {n} 个"))
+        })
+        .collect();
+    if !rendered.is_empty() {
+        g.notes.push(format!(
+            "头里声明：{}（这是头声明的数量，不是解析后的实际数量）",
+            rendered.join("、")
+        ));
+    }
+    if counts
+        .iter()
+        .any(|(_, off)| read_u32(bytes, *off, Endian::Little).is_none())
+    {
+        g.notes
+            .push("部分计数读不出来（头在这段字节之外），没有用 0 代替".to_string());
     }
 }
 
@@ -1059,5 +1140,40 @@ mod tests {
         assert_eq!(g.object, ObjectKind::Elf);
         assert_eq!(g.sniffed_bytes, 64);
         assert!(!g.file_truncated);
+    }
+
+    #[test]
+    fn sniff_dex_reads_header_counts_without_inventing_an_arch() {
+        let mut dex = vec![0u8; 0x70];
+        dex[..8].copy_from_slice(b"dex\n035\0");
+        dex[0x38..0x3c].copy_from_slice(&123u32.to_le_bytes()); // string_ids_size
+        dex[0x50..0x54].copy_from_slice(&45u32.to_le_bytes()); // field_ids_size
+        dex[0x58..0x5c].copy_from_slice(&67u32.to_le_bytes()); // method_ids_size
+        dex[0x60..0x64].copy_from_slice(&89u32.to_le_bytes()); // class_defs_size
+
+        let g = sniff_bytes(&dex);
+        assert_eq!(g.container, ContainerKind::Plain);
+        assert_eq!(g.object, ObjectKind::Dex);
+        assert_eq!(
+            g.arch, None,
+            "DEX 是寄存器机字节码，没有机器架构：不能填一个占位值冒充"
+        );
+
+        let joined = g.notes.join("\n");
+        assert!(joined.contains("DEX 版本 035"), "{joined}");
+        assert!(joined.contains("类 89 个"), "{joined}");
+        assert!(joined.contains("方法 67 个"), "{joined}");
+        assert!(joined.contains("字段 45 个"), "{joined}");
+        assert!(joined.contains("字符串 123 个"), "{joined}");
+    }
+
+    #[test]
+    fn a_truncated_dex_header_says_truncated_instead_of_reporting_zero_counts() {
+        let g = sniff_bytes(b"dex\n035\0");
+        assert_eq!(g.object, ObjectKind::Dex);
+        let joined = g.notes.join("\n");
+        assert!(joined.contains("截断"), "{joined}");
+        // 关键：不能出现"类 0 个"这种东西 —— 那是拿 0 冒充"没读到"。
+        assert!(!joined.contains("类 0 个"), "{joined}");
     }
 }

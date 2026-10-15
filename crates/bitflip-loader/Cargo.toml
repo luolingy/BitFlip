@@ -12,10 +12,15 @@ categories.workspace = true
 
 [dependencies]
 bitflip-arch = { workspace = true }
+droidsaw-dex = { workspace = true }
 thiserror = { workspace = true }
 zip = { workspace = true }
 
 [dev-dependencies]
+# DEX 合成样本要按规范自己算 `header.signature`（SHA-1）。**刻意用同一个 crate**：
+# `droidsaw-dex` 用的就是 `sha1` 0.11，两个"另一个实现"之间的差异会变成
+# 一条难查的假失败。它不是新增依赖 —— 已经在传递依赖里，许可闸门早已覆盖。
+sha1 = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

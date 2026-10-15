@@ -62,9 +62,27 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # 所以这一个 feature 就够读，不需要 `deflate`（那个还会拉 zopfli，只用于写）。
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+# DEX 解析（M11 的 M1）。BSD-3-Clause —— 与三个"很对口但许可不可用"的轮子
+# （exe / dotnetdll / **smali**）不同：smali 正好是 DEX 那条 GPL-3.0-only，
+# 它一被否掉，"自研 DEX 解析器"就成了当时的唯一出路；换成这个之后自研的
+# 动因消失（ADR-0019 已就此更正：错在没先搜 crates.io 就下了"必须自研"的结论）。
+#
+# **只用它的事实层**（`parser` / `ids` / `decode`）。它的 `emit*` / `sugar` /
+# `r8_inversion` 是反编译与推断 —— 接进来等于把"推断"混进"事实"，
+# 而 BitFlip 的立身之本就是"说的就是真的"（CLAUDE.md §7）。
+# 这条线不是口头约定，有 grep 守卫：
+# crates/bitflip-loader/tests/dex_library_boundary.rs。
+#
+# 构建期安不安全：它的 `build.rs` 只读**本 crate 内**的文件做锁步校验，
+# 不联网、不写外部路径（`lief` 就是因为在构建期下载才被否掉的）。
+droidsaw-dex = "2"
+
 # 仅测试用
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+# DEX 合成样本要按规范算 `header.signature`（SHA-1）。版本与 `droidsaw-dex`
+# 用它的一致，免得同一个哈希算法在依赖图里出现两份实现。
+sha1 = "0.11"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

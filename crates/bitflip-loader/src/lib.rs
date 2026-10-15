@@ -52,6 +52,14 @@ pub use format::zip::{
     ZipListing,
 };
 
+// DEX 结构模型的对外入口。与 `list_zip_members` 同样的理由重命名：`format::dex::parse`
+// 单独看很清楚，提到 crate 根上就只剩一个 `parse` —— 而这里已经有一个
+// `parse_object` 了，两个 `parse*` 摆在一起分不出谁吃 DEX、谁吃机器码对象。
+pub use format::dex::{
+    parse as parse_dex_structure, DexClass, DexCountMismatches, DexCounts, DexDeclaredSizes,
+    DexField, DexHeaderFacts, DexMethod, DexParseError, DexStructure,
+};
+
 /// 解析层错误。
 #[derive(Debug, Error)]
 pub enum LoaderError {
@@ -141,6 +149,13 @@ pub enum ObjectKind {
     Coff,
     /// ELF（可执行 / `.so` / `.o`）。
     Elf,
+    /// DEX（Dalvik Executable；APK 里的 `classes*.dex`）。
+    ///
+    /// **有解析器，但不在 [`parse_object`] 这条路里**：DEX 是寄存器机字节码，
+    /// 没有机器架构、没有段权限、没有 `image_base`，套进机器码对象模型会
+    /// 产出一堆"看起来正常、实际无意义"的结论。它的结构模型在
+    /// [`crate::format::dex`]，入口是 [`crate::parse_dex_structure`]。
+    Dex,
     /// Mach-O（可执行 / `.dylib`；解析排期 M12，见 `docs/PLAN.md` 与 ADR-0017）。
     MachO,
     /// 未识别：按原始二进制处理。
@@ -155,6 +170,7 @@ impl ObjectKind {
             Self::Pe => "pe",
             Self::Coff => "coff",
             Self::Elf => "elf",
+            Self::Dex => "dex",
             Self::MachO => "macho",
             Self::Raw => "raw",
         }
@@ -167,17 +183,24 @@ impl ObjectKind {
             Self::Pe => "PE",
             Self::Coff => "COFF 目标文件",
             Self::Elf => "ELF",
+            Self::Dex => "DEX（Dalvik 字节码）",
             Self::MachO => "Mach-O",
             Self::Raw => "原始二进制",
         }
     }
 }
 
-/// 这个对象类别是否由本层直接解析。
+/// 这个对象类别能不能解析成**机器码对象模型**（即能不能走 [`parse_object`]）。
+///
+/// 名字只回答这一个问题，**不回答"我们支不支持这个格式"** —— 这两件事在 DEX
+/// 上正好分开了：DEX 有解析器（[`crate::format::dex`]），但它不产生 `Object`
+/// （没有机器架构、没有段权限、没有 `image_base`），所以这里仍然是 `false`。
+/// 让它为 `true` 只会在调用方那里变成一次必然失败的调用，而失败的时机
+/// 还离"谁该为此负责"很远。
 ///
 /// `Raw` 是"用户指定按原始二进制处理"——没有头可读，由上层合成对象
 /// （见 `bitflip-core` 的 `parse_raw`）；`Mach-O` 目前只识别不解析。
-/// 两者都**不该**让 [`parse_object`] 返回一个空对象：那会让上层显示
+/// 这几种都**不该**让 [`parse_object`] 返回一个空对象：那会让上层显示
 /// "分析完成但什么都没有"（CLAUDE.md §7）。
 #[must_use]
 pub const fn has_parser(kind: ObjectKind) -> bool {
@@ -223,6 +246,12 @@ pub fn parse_object(
         ObjectKind::Pe => format::pe::parse(bytes, base, id),
         ObjectKind::Coff => format::coff::parse(bytes, base, id),
         ObjectKind::Elf => format::elf::parse(bytes, base, id),
+        ObjectKind::Dex => Err(ParseError::NoParser {
+            kind: kind.as_str(),
+            detail: "DEX 不做机器码对象模型（没有机器架构、没有段权限、没有 image_base）—— \
+                     它的结构模型在 format::dex，入口是 parse_dex_structure；\
+                     接进反汇编/CFG 流水线是 M11 的后续里程碑（见 docs/APK-DEX-DESIGN.md）",
+        }),
         ObjectKind::MachO => Err(ParseError::NoParser {
             kind: kind.as_str(),
             detail: "Mach-O 当前只做识别，解析未实现（见 docs/PLAN.md §1.3 的里程碑排期）",
