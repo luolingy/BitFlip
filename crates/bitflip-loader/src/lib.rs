@@ -55,6 +55,10 @@ pub use format::zip::{
 // DEX 结构模型的对外入口。与 `list_zip_members` 同样的理由重命名：`format::dex::parse`
 // 单独看很清楚，提到 crate 根上就只剩一个 `parse` —— 而这里已经有一个
 // `parse_object` 了，两个 `parse*` 摆在一起分不出谁吃 DEX、谁吃机器码对象。
+pub use format::dex::layout::{
+    check_code_item_layout, payload_width_units, CodeHeaderFacts, LayoutCheck, LayoutProblem,
+    LayoutProblemKind,
+};
 pub use format::dex::{
     parse as parse_dex_structure, DexClass, DexCountMismatches, DexCounts, DexDeclaredSizes,
     DexField, DexHeaderFacts, DexMethod, DexParseError, DexStructure,

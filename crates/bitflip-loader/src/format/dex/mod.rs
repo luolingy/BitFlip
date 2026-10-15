@@ -35,6 +35,12 @@
 //! 这些**逐条抄进** [`DexStructure::notes`]，不合并、不排序、不吞掉：
 //! 它们是"这份文件不完全规范"的证据，而"库没报错"不等于"文件规范"。
 
+/// `code_item` 布局校验：指令 ∪ 载荷是否**恰好铺满** `[0, insns_size)`。
+///
+/// 这是唯一一条能独立于库去验证库的宽度表的检查（只借它的地址，
+/// 长度一律按规范从原始字节重算）。
+pub mod layout;
+
 use thiserror::Error;
 
 use droidsaw_dex::decode::parse_class_data;
@@ -54,6 +60,34 @@ pub enum DexParseError {
     /// `droidsaw-dex` 拒绝了这份文件。
     #[error("DEX 解析失败: {source}")]
     Dex {
+        /// 库的原始错误。
+        #[source]
+        source: DexError,
+    },
+    /// 这个方法没有字节码：`code_off == 0`（抽象方法 / `native` 方法）。
+    ///
+    /// 与"字节码为空"是两件事，所以单列一类。
+    #[error("这个方法没有字节码（code_off = 0）")]
+    NoCode,
+    /// `code_off` 超出本机可寻址范围（32 位目标上才可能发生）。
+    #[error("code_off={off:#x} 超出本机可寻址范围")]
+    CodeOff {
+        /// 原始的 `code_off`。
+        off: u32,
+    },
+    /// `code_item` 的 16 字节头读不全。
+    ///
+    /// **不补 0 假装读到了**：头都读不出来时，"布局校验通过"毫无意义。
+    #[error("code_item 头读不全（code_off={off:#x}）")]
+    Header {
+        /// 原始的 `code_off`。
+        off: u32,
+    },
+    /// 某个方法的 `code_item` 读不下去。
+    #[error("code_item 解析失败（code_off={off:#x}）: {source}")]
+    CodeItem {
+        /// 原始的 `code_off`。
+        off: u32,
         /// 库的原始错误。
         #[source]
         source: DexError,

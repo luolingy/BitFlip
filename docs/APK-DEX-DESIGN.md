@@ -200,10 +200,13 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 >   7643:7643）、六个池"声明 == 实际"、符号数 == `class_data` 四个 size 之和、
 >   库的 `parse_errors` 逐条进 `notes`、grep 守卫（比本节要求更严：还断言
 >   "库只能被适配层引用"与"适配层确实用了库的事实层"）。
-> * **验收项：推迟到 M2** —— 本节列的"指令 ∪ payload 恰好铺满 `[0, insns_size)`"、
->   "`31t` 目标落在 payload 起始 unit"、"`try_item` 的 `handler_off` 落在
->   `encoded_catch_handler` 起点"三条**都要解码指令与 payload 宽度**，而解码是
->   M2 的交付物。M1 不做，也不假装做了。
+> * **验收项：第一条已补上，另两条待补** —— 本节列的"指令 ∪ payload 恰好铺满
+>   `[0, insns_size)`"、"`31t` 目标落在 payload 起始 unit"、"`try_item` 的
+>   `handler_off` 落在 `encoded_catch_handler` 起点"三条**都要解码指令与 payload
+>   宽度**，而解码是 M2 的交付物。M1 当时不做，也不假装做了；
+>   **第一条已于 2026-10-14 补上**（`format/dex/layout.rs`，只借库的地址、
+>   长度按规范从原始字节重算；真实样本上 **143486 个方法 0 处不吻合**）。
+>   另两条要 CFG 与异常表，属 M2a 后续。
 > * **实测修正一处本节的说法**：`parse_errors` 在真实样本上不是"一条"而是
 >   **3 个 dex 里有 2 个**各有 `OutOfOrder { pool: StringIds }`
 >   （`classes.dex` @ `0x10589`、`classes2.dex` @ `0xffd0`）。

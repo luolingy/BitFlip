@@ -656,3 +656,97 @@ fn the_real_apk_dex_files_agree_with_their_headers() {
         println!("  note: {note}");
     }
 }
+
+/// M1 验收里被推迟的**第一条**：指令 ∪ 载荷必须**恰好铺满** `[0, insns_size)`。
+///
+/// 为什么这条非跑真实字节码不可：它是唯一一条**能独立于库验证库的宽度表**的检查 ——
+/// 只借库给的地址，长度一律按规范从原始字节重算。宽度表里错一个码元，
+/// 后面所有指令的地址就全错位，这里就会报洞或越界；而用库的长度去验证库的长度，
+/// 无论库错得多离谱都会"通过"。
+///
+/// 代价：三个 dex 上共约 14 万个带字节码的方法，每个都要解析一次 `code_item`。
+/// debug 下要跑几分钟（M1 记过：析构 `DexFile::parse` 才是大头，这条更贵）。
+///
+/// 样本不在就**失败**（不是悄悄跳过）：既然有人显式要跑这条测试，
+/// "样本没找到"就是它必须报告的那个事实。
+#[ignore = "需要本机真实 APK（32MB）；用 --ignored 手动跑"]
+#[test]
+fn every_real_methods_code_units_are_exactly_tiled_by_instructions_and_payloads() {
+    let path = sample_apk();
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("读不到真实样本 {}: {e}", path.display()));
+    let listing = bitflip_loader::list_zip_members(&bytes).expect("列出 APK 成员");
+
+    let mut dex_members: Vec<_> = listing
+        .members
+        .iter()
+        .filter(|m| m.name.ends_with(".dex"))
+        .collect();
+    dex_members.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut checked_methods = 0usize;
+    let mut checked_payloads = 0usize;
+    let mut without_code = 0usize;
+    let mut problems: Vec<String> = Vec::new();
+
+    for member in &dex_members {
+        let raw = bitflip_loader::read_zip_member(&bytes, member.index)
+            .unwrap_or_else(|e| panic!("取出 {} 失败: {e}", member.name));
+        let dex = bitflip_loader::parse_dex_structure(&raw)
+            .unwrap_or_else(|e| panic!("解析 {} 失败: {e}", member.name));
+
+        for method in &dex.methods {
+            if !method.has_code() {
+                // 抽象 / native 方法本来就没有字节码：如实计数，不算跳过失败。
+                without_code += 1;
+                continue;
+            }
+            let check = bitflip_loader::check_code_item_layout(&raw, method.code_off)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{}: class_idx={} method_idx={} code_off={:#x} 布局校验失败: {e}",
+                        member.name, method.class_index, method.method_idx, method.code_off
+                    )
+                });
+            checked_methods += 1;
+            checked_payloads += check.payloads;
+            if !check.is_exact() {
+                for p in &check.problems {
+                    problems.push(format!(
+                        "{}: class_idx={} method_idx={} code_off={:#x} 码元 {} [{}] {}",
+                        member.name,
+                        method.class_index,
+                        method.method_idx,
+                        method.code_off,
+                        p.at,
+                        p.kind.as_str(),
+                        p.detail
+                    ));
+                }
+            }
+        }
+    }
+
+    println!(
+        "  检查了 {checked_methods} 个方法的码元布局（含 {checked_payloads} 个载荷）；\
+         {without_code} 个方法没有字节码（抽象/native，如实计数不计入检查）"
+    );
+
+    // 设计文档写的验收门槛是"在 3000 个真实方法上 0 不吻合"。真实样本上我们
+    // 检查的是全部带字节码的方法（远多于 3000），所以先钉住"确实检查到了量"。
+    assert!(
+        checked_methods >= 3000,
+        "只检查到 {checked_methods} 个方法，样本不对或过滤条件错了"
+    );
+    assert!(
+        problems.is_empty(),
+        "{} 个方法的布局不吻合（最多列 10 条）：\n{}",
+        problems.len(),
+        problems
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
