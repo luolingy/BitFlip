@@ -1404,6 +1404,18 @@ IPA（ZIP 容器）  →  .app（目录容器）  →  Mach-O 可执行文件  �
   是**机器速度依赖**（`cargo test --workspace` 因此在本机不是全绿）。
   正确修法是让这条用例不再依赖"30 万个单元格能在 5s 内跑完"（缩小数组，
   或显式调大该用例的执行时限），属 M7 范围的待办。**不要靠调 `--test-threads` 绕过。**
+- **已知红灯（据实记录，2026-10-14，M2a 期间发现）**：
+  `crates/bitflip-analyze/tests/callgraph_scale.rs` 的两条
+  （`ten_thousand_function_graph_builds_without_blowing_the_stack`、
+  `strongly_connected_components_survives_a_deep_chain`）在本机**失败**，
+  报的是 `1 万函数建图用了 N ms，太慢` / `SCC 太慢` —— 它们是**墙钟预算断言**
+  （阈值 3000 ms，见该文件 `assert!(elapsed.as_millis() < 3_000)`），不是正确性断言。
+  实测：本轮 M2a 改动在时 3864 / 4082 ms；**把 M2a 整轮 revert 掉复跑，仍然失败且更慢
+  （4909 ms）** —— 所以**与本轮改动无关**，是机器速度/负载依赖（同上面那条）。
+  注意 `bitflip-analyze` **确实依赖** `bitflip-loader`（不是"依赖图上碰不到"），
+  所以这类"是不是我的改动弄慢的"问题必须像上面那样**撤掉再跑一次**才算证据。
+  正确修法：这两条应当断言**算法性质**（例如边数/分量数/遍历次数），
+  或者把预算改成按机器标定的相对值，而不是写死 3000 ms。属 M2/M9 范围的待办。
 
 ### 5.3 UI/UX 原则
 
