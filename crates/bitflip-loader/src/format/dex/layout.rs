@@ -176,13 +176,18 @@ fn try_and_handlers_offsets(
     Some((tries_base, handlers_base))
 }
 
+/// DEX uleb128：最多 5 字节；第五字节只能携带 u32 剩余的 4 个有效位。
 fn read_uleb128(bytes: &[u8], mut pos: usize) -> Option<(u32, usize)> {
     let start = pos;
     let mut value = 0u32;
-    for shift in (0..35).step_by(7) {
+    for index in 0..5u32 {
         let byte = *bytes.get(pos)?;
         pos = pos.checked_add(1)?;
-        value |= u32::from(byte & 0x7f).checked_shl(shift)?;
+        let payload = byte & 0x7f;
+        if index == 4 && (payload > 0x0f || byte & 0x80 != 0) {
+            return None;
+        }
+        value |= u32::from(payload).checked_shl(index * 7)?;
         if byte & 0x80 == 0 {
             return Some((value, pos.checked_sub(start)?));
         }
@@ -190,25 +195,34 @@ fn read_uleb128(bytes: &[u8], mut pos: usize) -> Option<(u32, usize)> {
     None
 }
 
+/// DEX sleb128 i32：最多 5 字节，且第五字节只能是合法符号扩展。
 fn read_sleb128(bytes: &[u8], mut pos: usize) -> Option<(i32, usize)> {
     let start = pos;
-    let mut value = 0i64;
-    let mut shift = 0u32;
-    loop {
+    let mut value = 0u32;
+    for index in 0..5u32 {
         let byte = *bytes.get(pos)?;
         pos = pos.checked_add(1)?;
-        value |= i64::from(byte & 0x7f).checked_shl(shift)?;
-        shift = shift.checked_add(7)?;
-        if byte & 0x80 == 0 {
-            if shift < 64 && byte & 0x40 != 0 {
-                value |= (!0i64) << shift;
+        let payload = byte & 0x7f;
+        if index == 4 {
+            // i32 的第五字节有效载荷只有低四位；余下位必须是它们的符号扩展。
+            let sign_extension = if payload & 0x08 == 0 { 0x00 } else { 0x70 };
+            if byte & 0x80 != 0 || payload & 0x70 != sign_extension {
+                return None;
             }
-            return Some((i32::try_from(value).ok()?, pos.checked_sub(start)?));
         }
-        if shift >= 35 {
-            return None;
+        value |= u32::from(payload).checked_shl(index * 7)?;
+        if byte & 0x80 == 0 {
+            let used_bits = (index + 1) * 7;
+            if byte & 0x40 != 0 && used_bits < 32 {
+                value |= (!0u32) << used_bits;
+            }
+            return Some((
+                i32::from_le_bytes(value.to_le_bytes()),
+                pos.checked_sub(start)?,
+            ));
         }
     }
+    None
 }
 
 /// 返回每个 encoded_catch_handler 起点相对 list 起点的字节偏移。
@@ -616,6 +630,45 @@ mod tests {
         }
         out.extend_from_slice(&data);
         out
+    }
+
+    #[test]
+    fn variable_length_integers_are_bounded_and_reject_overflow() {
+        assert_eq!(
+            read_uleb128(&[0xff, 0xff, 0xff, 0xff, 0x0f], 0),
+            Some((u32::MAX, 5))
+        );
+        assert_eq!(read_uleb128(&[0x80; 6], 0), None);
+        assert_eq!(read_uleb128(&[0xff, 0xff, 0xff, 0xff, 0x10], 0), None);
+        assert_eq!(
+            read_sleb128(&[0xff, 0xff, 0xff, 0xff, 0x07], 0),
+            Some((i32::MAX, 5))
+        );
+        assert_eq!(read_sleb128(&[0x80; 6], 0), None);
+        assert_eq!(read_sleb128(&[0xff, 0xff, 0xff, 0xff, 0x08], 0), None);
+    }
+
+    #[test]
+    fn odd_insns_size_adds_the_specified_two_byte_try_padding() {
+        // code_item: 16-byte header, 3 code units (6 bytes), then 2-byte padding,
+        // one 8-byte try_item and a handler list beginning at the returned offset.
+        let mut bytes = vec![0u8; 140];
+        let (tries_base, handlers_base) = try_and_handlers_offsets(100, 3, 1).unwrap();
+        assert_eq!((tries_base, handlers_base), (124, 132));
+        bytes[handlers_base] = 1; // one handler
+        bytes[handlers_base + 1] = 1; // size=1 typed catch
+        bytes[handlers_base + 2] = 0; // type_idx=0
+        bytes[handlers_base + 3] = 0; // handler_addr=0
+        assert_eq!(
+            encoded_handler_starts(&bytes, handlers_base)
+                .unwrap()
+                .get(&1),
+            Some(&0)
+        );
+        // Without the spec padding, the reader sees the zeroed try_item bytes as
+        // a valid empty list. Pin that this is a different interpretation, not a
+        // parser error: omitting the spec padding shifts the list origin by 2 bytes.
+        assert_eq!(encoded_handler_starts(&bytes, 130), Some(BTreeMap::new()));
     }
 
     #[test]

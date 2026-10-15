@@ -18,8 +18,9 @@
 payload ident 与 opcode 匹配，并与依赖库给出的 `target` 对拍；未被引用的孤儿
 payload 也会报告。新增 `try_item.handler_off` 校验：按规范重新遍历
 `encoded_catch_handler_list`，核对原始偏移必须正好落在 handler 起点，并与库映射的
-handler index 对拍。真实 APK 三个 dex 上 **143486 个带字节码方法、2406 个载荷，
-所有布局、目标与 handler 偏移检查全部通过**。
+handler index 对拍。ULEB128/SLEB128 按 DEX 的 32 位规则限五字节，拒绝溢出与无效的
+第五字节。真实 APK 三个 dex 上 **143486 个带字节码方法、2406 个载荷，所有布局、
+目标与 handler 偏移检查全部通过**；合成测试覆盖异常表偏移、padding 和损坏编码。
 
 ### 新增 — DEX 码元布局校验：指令 ∪ 载荷必须恰好铺满（M11 的 M2a 第一步）
 
@@ -37,9 +38,8 @@ handler index 对拍。真实 APK 三个 dex 上 **143486 个带字节码方法�
 0 处不吻合**；7334 个抽象 / `native` 方法没有字节码，如实计数、不计入检查。
 设计文档写的验收门槛是"3000 个真实方法上 0 不吻合"，这次覆盖面是它的 47 倍。
 
-**未做（据实记）**：另两条 M1 验收（`31t` 目标落在 payload 起始、
-`try_item.handler_off` 落在 `encoded_catch_handler` 起点）要 CFG 与异常表，
-属 M2a 后续；解码投影与渲染函数同样还没做。
+**未做（据实记）**：M1 的三条布局验收现已补齐；Dalvik 指令列式投影与渲染函数
+仍待实现。
 
 ### 新增 — DEX（Dalvik Executable）结构模型（M11 的 M1）
 
