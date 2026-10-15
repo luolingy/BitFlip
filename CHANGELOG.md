@@ -16,8 +16,10 @@
 布局校验现还会从原始字节读取 `fill-array-data` / `packed-switch` /
 `sparse-switch` 的 signed 32-bit 相对目标，验证目标是相应类型 payload 的起点，
 payload ident 与 opcode 匹配，并与依赖库给出的 `target` 对拍；未被引用的孤儿
-payload 也会报告。真实 APK 三个 dex 上 **143486 个带字节码方法、2406 个载荷
-全部通过**。`try_item.handler_off` 对应 handler 起点的验收仍未完成。
+payload 也会报告。新增 `try_item.handler_off` 校验：按规范重新遍历
+`encoded_catch_handler_list`，核对原始偏移必须正好落在 handler 起点，并与库映射的
+handler index 对拍。真实 APK 三个 dex 上 **143486 个带字节码方法、2406 个载荷，
+所有布局、目标与 handler 偏移检查全部通过**。
 
 ### 新增 — DEX 码元布局校验：指令 ∪ 载荷必须恰好铺满（M11 的 M2a 第一步）
 

@@ -87,6 +87,8 @@ pub enum LayoutProblemKind {
     InvalidPayloadTarget,
     /// 一个载荷没有任何 31t 指令指向它。
     OrphanPayload,
+    /// try_item 的 handler_off 未落在原始 encoded_catch_handler 起点。
+    InvalidHandlerOffset,
 }
 
 impl LayoutProblemKind {
@@ -100,6 +102,7 @@ impl LayoutProblemKind {
             Self::PayloadCollidesWithInstruction => "payload-collides-with-instruction",
             Self::InvalidPayloadTarget => "invalid-payload-target",
             Self::OrphanPayload => "orphan-payload",
+            Self::InvalidHandlerOffset => "invalid-handler-offset",
         }
     }
 }
@@ -155,6 +158,81 @@ fn read_u32(bytes: &[u8], off: usize) -> Option<u32> {
 fn read_i32(bytes: &[u8], off: usize) -> Option<i32> {
     let raw: [u8; 4] = bytes.get(off..off.checked_add(4)?)?.try_into().ok()?;
     Some(i32::from_le_bytes(raw))
+}
+
+fn try_and_handlers_offsets(
+    code_base: usize,
+    insns_size: u32,
+    tries_size: u16,
+) -> Option<(usize, usize)> {
+    let insns_bytes = usize::try_from(insns_size).ok()?.checked_mul(2)?;
+    let mut tries_base = code_base
+        .checked_add(CODE_ITEM_HEADER_SIZE)?
+        .checked_add(insns_bytes)?;
+    if insns_size % 2 == 1 {
+        tries_base = tries_base.checked_add(2)?;
+    }
+    let handlers_base = tries_base.checked_add(usize::from(tries_size).checked_mul(8)?)?;
+    Some((tries_base, handlers_base))
+}
+
+fn read_uleb128(bytes: &[u8], mut pos: usize) -> Option<(u32, usize)> {
+    let start = pos;
+    let mut value = 0u32;
+    for shift in (0..35).step_by(7) {
+        let byte = *bytes.get(pos)?;
+        pos = pos.checked_add(1)?;
+        value |= u32::from(byte & 0x7f).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some((value, pos.checked_sub(start)?));
+        }
+    }
+    None
+}
+
+fn read_sleb128(bytes: &[u8], mut pos: usize) -> Option<(i32, usize)> {
+    let start = pos;
+    let mut value = 0i64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(pos)?;
+        pos = pos.checked_add(1)?;
+        value |= i64::from(byte & 0x7f).checked_shl(shift)?;
+        shift = shift.checked_add(7)?;
+        if byte & 0x80 == 0 {
+            if shift < 64 && byte & 0x40 != 0 {
+                value |= (!0i64) << shift;
+            }
+            return Some((i32::try_from(value).ok()?, pos.checked_sub(start)?));
+        }
+        if shift >= 35 {
+            return None;
+        }
+    }
+}
+
+/// 返回每个 encoded_catch_handler 起点相对 list 起点的字节偏移。
+fn encoded_handler_starts(bytes: &[u8], list_base: usize) -> Option<BTreeMap<usize, usize>> {
+    let (count, count_len) = read_uleb128(bytes, list_base)?;
+    let mut pos = list_base.checked_add(count_len)?;
+    let mut starts = BTreeMap::new();
+    for index in 0..usize::try_from(count).ok()? {
+        starts.insert(pos.checked_sub(list_base)?, index);
+        let (size, size_len) = read_sleb128(bytes, pos)?;
+        pos = pos.checked_add(size_len)?;
+        let typed_count = usize::try_from(size.unsigned_abs()).ok()?;
+        for _ in 0..typed_count {
+            let (_, type_len) = read_uleb128(bytes, pos)?;
+            pos = pos.checked_add(type_len)?;
+            let (_, addr_len) = read_uleb128(bytes, pos)?;
+            pos = pos.checked_add(addr_len)?;
+        }
+        if size <= 0 {
+            let (_, catch_all_len) = read_uleb128(bytes, pos)?;
+            pos = pos.checked_add(catch_all_len)?;
+        }
+    }
+    Some(starts)
 }
 
 /// 码元地址 → 字节偏移。**只有这一处做这个换算**（两处换算必然漂移）。
@@ -228,6 +306,81 @@ pub fn check_code_item_layout(bytes: &[u8], code_off: u32) -> Result<LayoutCheck
     })?;
 
     let mut problems = Vec::new();
+
+    // 规范 §4.5.12：有 try_item 时，insns_size 为奇数则在 try_item 数组前补 2 字节，
+    // 使 try_item 起点保持 4 字节对齐。然后每个 try_item 为 8 字节，后接
+    // encoded_catch_handler_list。handler_off 是相对 list 起点的字节偏移。
+    if header.tries_size > 0 {
+        if let Some((try_items_base, handlers_base)) =
+            try_and_handlers_offsets(code_base, header.insns_size, header.tries_size)
+        {
+            let handler_starts = encoded_handler_starts(bytes, handlers_base);
+            match handler_starts {
+                Some(starts) => {
+                    for i in 0..usize::from(header.tries_size) {
+                        let Some(item_off) =
+                            i.checked_mul(8).and_then(|n| try_items_base.checked_add(n))
+                        else {
+                            problems.push(LayoutProblem {
+                                at: 0,
+                                kind: LayoutProblemKind::InvalidHandlerOffset,
+                                detail: "try_item 偏移计算溢出".to_string(),
+                            });
+                            break;
+                        };
+                        let Some(handler_off) =
+                            item_off.checked_add(6).and_then(|off| read_u16(bytes, off))
+                        else {
+                            problems.push(LayoutProblem {
+                                at: 0,
+                                kind: LayoutProblemKind::InvalidHandlerOffset,
+                                detail: format!("第 {i} 个 try_item 的 handler_off 读不全"),
+                            });
+                            continue;
+                        };
+                        let offset = usize::from(handler_off);
+                        if let Some(&expected_index) = starts.get(&offset) {
+                            match code.tries.get(i) {
+                                Some(lib_try) if lib_try.handler_idx == expected_index => {}
+                                Some(lib_try) => problems.push(LayoutProblem {
+                                    at: lib_try.start_addr,
+                                    kind: LayoutProblemKind::InvalidHandlerOffset,
+                                    detail: format!(
+                                        "原始 handler_off={offset} 对应 index={expected_index}，库给出 index={}",
+                                        lib_try.handler_idx
+                                    ),
+                                }),
+                                None => problems.push(LayoutProblem {
+                                    at: 0,
+                                    kind: LayoutProblemKind::InvalidHandlerOffset,
+                                    detail: format!("第 {i} 个原始 try_item 在库解析结果中缺失"),
+                                }),
+                            }
+                        } else {
+                            problems.push(LayoutProblem {
+                                at: 0,
+                                kind: LayoutProblemKind::InvalidHandlerOffset,
+                                detail: format!(
+                                    "第 {i} 个 try_item 的 handler_off={offset} 未落在任何 encoded_catch_handler 起点"
+                                ),
+                            });
+                        }
+                    }
+                }
+                None => problems.push(LayoutProblem {
+                    at: 0,
+                    kind: LayoutProblemKind::InvalidHandlerOffset,
+                    detail: "encoded_catch_handler_list 无法按规范完整遍历".to_string(),
+                }),
+            }
+        } else {
+            problems.push(LayoutProblem {
+                at: 0,
+                kind: LayoutProblemKind::InvalidHandlerOffset,
+                detail: "try_item / handler list 偏移计算溢出".to_string(),
+            });
+        }
+    }
 
     // 库给的起点地图：码元 → 指令长度。
     let mut insn_at: BTreeMap<u32, u8> = BTreeMap::new();
@@ -463,6 +616,23 @@ mod tests {
         }
         out.extend_from_slice(&data);
         out
+    }
+
+    #[test]
+    fn encoded_handler_offsets_are_relative_to_the_list_and_match_real_starts() {
+        // count=2；handler 0 从 list+1 开始，size=1 + (type=1, addr=2)；
+        // handler 1 从 list+4 开始，size=0 表示 catch-all，addr=3。
+        let bytes = [2, 1, 1, 2, 0, 3];
+        let starts = encoded_handler_starts(&bytes, 0).expect("完整 handler list");
+        assert_eq!(starts.get(&1), Some(&0));
+        assert_eq!(starts.get(&4), Some(&1));
+        assert!(!starts.contains_key(&2)); // 不能把 handler 内容里的字节误当起点
+    }
+
+    #[test]
+    fn a_truncated_encoded_handler_list_is_not_accepted() {
+        // count=1，handler 声明一个 typed catch，但 type/address 都缺失。
+        assert_eq!(encoded_handler_starts(&[1, 1], 0), None);
     }
 
     #[test]

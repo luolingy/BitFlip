@@ -1238,12 +1238,19 @@ MSVC 修饰名反修饰、静态库 PDB。
   全错位，会报洞或越界。反过来，用库的长度去验证库的长度，库错得多离谱都
   "通过"（这正是 §6.11 那条教训的同一形状）。
 * 真实样本实测：**143486 个带字节码的方法（含 2406 个载荷）全部恰好铺满，
-  0 处不吻合**（debug 下两个 `--ignored` 测试一起 55 秒）。7334 个
+  0 处不吻合**（debug 下真实 APK 黄金测试约 43–61 秒，随当前覆盖检查项而异）。7334 个
   抽象/native 方法没有字节码，如实计数、不计入检查。设计文档写的门槛是
   "3000 个真实方法上 0 不吻合"，这次覆盖面是它的 47 倍。
-* **仍未做**：`31t` 分支目标落在匹配类型 payload 起始、孤儿 payload 检查已由
-  `check_code_item_layout` 一并完成；`try_item.handler_off` 落在
-  `encoded_catch_handler` 起点仍待 CFG/异常表实现。解码投影与渲染函数也还没做。
+* **31t 与 payload 的交叉校验也已完成**：原始 opcode（`0x26/0x2b/0x2c`）和
+  signed 32-bit 相对目标独立计算，要求目标为匹配 ident 的 payload 起点，并与
+  库的 `target` 对拍；每个 payload 还必须至少被一条 31t 引用。上述同一批
+  **143486 个真实方法、2406 个载荷全通过**。
+* **try/handler 偏移验收也已完成**：从原始字节按规范计算 `insns` 末尾、奇数长度
+  padding、`try_item[]` 和 handler list 的偏移；限制 5 字节的 ULEB/SLEB 遍历
+  `encoded_catch_handler_list`，收集每个 handler 的真实起点。每个磁盘
+  `handler_off` 必须命中起点，并与库提供的 handler index 一一对拍。真实 APK
+  全部通过；合成单测覆盖多个 handler、list 相对偏移及截断输入。
+* **仍未做**：Dalvik 解码投影（列式指令表）与指令文本渲染函数。
 
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 

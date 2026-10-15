@@ -209,7 +209,9 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 >   **第二条也已于 2026-10-14 补上**（同一布局校验器：31t 目标按原始 opcode 与
 >   signed offset 手算，校验 payload 起点及匹配 ident，并对拍库的 `target`；真实样本
 >   143486 个方法、2406 个载荷全部通过）。另有孤儿 payload 检查（每个载荷都必须
->   有 31t 指令引用）。最后一条 `try_item.handler_off` 要解析异常表，仍属 M2a 后续。
+>   有 31t 指令引用）。**第三条也已于 2026-10-14 补上**：从原始字节遍历
+>   handler list，确认每个 `handler_off` 命中真实 handler 起点，并与库映射的 index
+>   对拍；真实 APK 通过，合成测试覆盖多 handler 与截断输入。
 > * **实测修正一处本节的说法**：`parse_errors` 在真实样本上不是"一条"而是
 >   **3 个 dex 里有 2 个**各有 `OutOfOrder { pool: StringIds }`
 >   （`classes.dex` @ `0x10589`、`classes2.dex` @ `0xffd0`）。
