@@ -11,6 +11,38 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — DEX 服务端端点 `/api/dex/*` 与网页 DEX 视图（M2b 完成）
+
+M2b 的"界面"部分落地：CLI 之后，服务端与网页都能看 DEX 了。
+
+- **四个端点**（`GET /api/dex/inputs|classes|class|method`，`crates/bitflip-server/src/dex.rs`）：
+  **独立端点族**，不塞进 `/api/sections` / `/api/insns` —— DEX 没有段表、没有线性地址，
+  硬塞进去前端会拿到"看起来正常、实际没意义"的数据（与 ADR-0020 同一条理由）。
+  四个端点都**要求显式 `member`**：合并多个 DEX 的类列表之后，界面上就分不清第 5000 个类
+  是哪个文件里的。`/api/dex/classes` 支持 `offset`/`limit`/`search`（大小写不敏感的子串）——
+  混淆过的标识（`L_COROUTINE/…;`）没法靠手打找到。响应带 `server_api_version` 与
+  `format_version`（`DEX_FORMAT_VERSION`），缺失值一律 `null`，降级写在 `notes` 里。
+- **解析结果按成员名 memo，失败也 memo**：真实 `classes.dex` 是 7643 类 / 53906 方法，
+  "点一次类就重解析一次"会让视图完全不可用；"失败不缓存"则会让每次刷新重跑一次完整失败解析。
+- **错误口径**：缺 `member` / 成员名不存在 / 参数名拼错 → 400（`deny_unknown_fields`，
+  拼错不会被静默忽略）；类或方法不存在 → 404，且**写法不对**（`Foo` / `bar`）时额外给
+  smali 写法提示 —— "写法不对"与"写法对但找不到"必须分得开。`code_off == 0` 是**合法的 200**：
+  `has_code: false` + 一句说明，不是错误。
+- **分页越界也要说**：空页必须写明"offset 越过末尾"，否则它看起来和"这个 DEX 里没有类"
+  一模一样（第一版只在 `total > offset + shown` 时写说明，`offset` 超出末尾时正好不满足，
+  于是静默空页 —— 被测试抓出来的）。
+- **网页 DEX 视图**（`web/src/DexView.tsx`）：多个 `classes*.dex` **按文件名分标签页**
+  （复用既有 `tabs`/`tab`/`tab-active` 样式），每个标签页下只挂**它自己**的容错记录
+  （降级跟着来源走）。类列表（搜索 + 分页）→ 类详情（字段 / 方法）→ 方法详情
+  （分页指令表 + **整个方法**的文本 CFG）。"无字节码"在界面上写清是抽象 / `native` 方法的
+  合法结论，不是给一张空表；`unresolved_edge_targets > 0` 用告警色。
+- **验证**：`crates/bitflip-server/tests/dex_api.rs`（8 条合成样本 + 1 条 `#[ignore]` 真实
+  APK，样本与 loader/CLI 共用 `dex_fixture.rs`）；`scripts/smoke-dex-http.ps1` 起真进程打真
+  APK 的 38 项断言全过，含"内嵌 SPA 里真的有 DEX 视图"（`/assets/app.js` 含
+  `/api/dex/classes`、`app.css` 含 `.dex-cfg`）—— rust-embed 把前端编进二进制，
+  "源码里有"与"二进制会服务它"是两件事。该脚本需要本机真实 APK，故**不接入
+  `preflight.ps1`**（preflight 必须在没有该样本的机器上照样全绿），手动跑、样本缺失即失败。
+
 ### 新增 — `bitflip dex` 子命令：列 DEX 的类、看方法的指令与文本 CFG（M2b 第一步）
 
 CLI 新增 `bitflip-cli dex <APK|.dex>`。呈现方式由用户 2026-10-16 定案为**独立子命令**，

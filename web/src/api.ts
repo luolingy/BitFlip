@@ -897,6 +897,190 @@ export async function fetchMemberFunctions(
   );
 }
 
+// ── DEX（M2b / M11） ──────────────────────────────────────────────────────
+//
+// 四个端点都要求显式指定 `member`（看哪个 DEX）。这不是麻烦，而是必须：
+// 合并三个 DEX 的类列表之后，界面上分不清第 5000 个类是哪个文件里的。
+//
+// 这里**不用 `requestOrNull`**：无目标时后端给的是 400 + 一句能读的中文
+// （"没有打开目标" / "目标里没有以 .dex 结尾的成员"），把它变成 `null` 会
+// 让界面只能显示"空的"，而用户看不出是"没有 DEX"还是"我们没做"（§7）。
+
+/** 一个 DEX 输入（APK 里的一个 `classes*.dex`）。对应 `bitflip-server` 的 `InputWire`。 */
+export interface DexInputWire {
+  /** 成员名（标签页的标题）。 */
+  name: string;
+  /** APK 命名约定下的角色标签；不适用时为 `null`。 */
+  role: string | null;
+  /** 原始字节长度（解压后）。 */
+  size: number;
+  class_count: number;
+  method_count: number;
+  method_count_with_code: number;
+  /** 这个 DEX 解析时的容错记录（只说这一个文件的事）。 */
+  notes: string[];
+}
+
+/** DEX 输入列表。对应 `GET /api/dex/inputs`。 */
+export interface DexInputsResponse {
+  server_api_version: number;
+  format_version: number;
+  target: string;
+  inputs: DexInputWire[];
+  notes: string[];
+}
+
+/** 类列表里的一项。对应 `bitflip-server` 的 `ClassRefWire`。 */
+export interface DexClassRefWire {
+  /** smali 描述符（`Lcom/Foo;`）。 */
+  descriptor: string;
+  /** 短名（`Foo`）；拿不到时为 `null`。 */
+  short_name: string | null;
+  method_count: number;
+  methods_with_code: number;
+}
+
+/** 类列表。对应 `GET /api/dex/classes`。 */
+export interface DexClassesResponse {
+  server_api_version: number;
+  format_version: number;
+  member: string;
+  /** 匹配 `search` 的类总数（**分页前**）。 */
+  total: number;
+  offset: number;
+  limit: number;
+  classes: DexClassRefWire[];
+  notes: string[];
+}
+
+/** 类的字段。对应 `bitflip-server` 的 `FieldWire`。 */
+export interface DexFieldWire {
+  name: string;
+  type_descriptor: string | null;
+  access_flags: number;
+  is_static: boolean;
+}
+
+/** 方法引用（不含指令）。对应 `bitflip-server` 的 `MethodRefWire`。 */
+export interface DexMethodRefWire {
+  /** smali 风格标识（`Lcom/Foo;->bar(I)V`）。 */
+  signature: string;
+  name: string;
+  access_flags: number;
+  is_direct: boolean;
+  /** `code_item` 偏移（定长 16 位十六进制）；没有字节码时为 `null`。 */
+  code_off: string | null;
+  /** 是否有字节码。`false` 是**合法结论**（抽象 / native 方法）。 */
+  has_code: boolean;
+}
+
+/** 类详情。对应 `GET /api/dex/class`。 */
+export interface DexClassResponse {
+  server_api_version: number;
+  format_version: number;
+  member: string;
+  descriptor: string;
+  short_name: string | null;
+  superclass: string | null;
+  source_file: string | null;
+  fields: DexFieldWire[];
+  methods: DexMethodRefWire[];
+  notes: string[];
+}
+
+/** 一条 DEX 指令。对应 `bitflip-server` 的 `InsnWire`。 */
+export interface DexInsnWire {
+  /** 方法内码元地址（定长 16 位十六进制）。 */
+  address: string;
+  /** 原始 opcode 字节（不是地址，所以是数字）。 */
+  opcode: number;
+  /** 渲染文本（`0000: return-void`）。 */
+  text: string;
+}
+
+/** 方法详情（指令 + 文本 CFG）。对应 `GET /api/dex/method`。 */
+export interface DexMethodResponse {
+  server_api_version: number;
+  format_version: number;
+  member: string;
+  signature: string;
+  code_off: string | null;
+  has_code: boolean;
+  registers_size: number | null;
+  ins_size: number | null;
+  outs_size: number | null;
+  /** 指令总数（分页前）。 */
+  instruction_count: number;
+  offset: number;
+  limit: number;
+  instructions: DexInsnWire[];
+  /** 符号解析是否开启（后端当前恒为 `true`）。 */
+  symbols: boolean;
+  /** 已知缺口（如 call-site）的操作数个数；**整个方法**，不是本页。 */
+  unsupported_operands: number;
+  /** 异常（索引越界等）的操作数个数；**整个方法**，不是本页。 */
+  unavailable_operands: number;
+  /** 整个方法的 CFG 文本（不随指令分页）。 */
+  cfg_text: string;
+  block_count: number;
+  edge_count: number;
+  /** 连不上的边目标个数；**不为 0 时必须显示**。 */
+  unresolved_edge_targets: number;
+  notes: string[];
+}
+
+/** 取本次目标的 DEX 输入列表（标签页的数据源）。 */
+export function fetchDexInputs(token: string | null): Promise<DexInputsResponse> {
+  return request<DexInputsResponse>("/api/dex/inputs", token);
+}
+
+/** 取某个 DEX 的类列表（可过滤、可分页）。 */
+export function fetchDexClasses(
+  token: string | null,
+  member: string,
+  options: { offset?: number; limit?: number; search?: string } = {},
+): Promise<DexClassesResponse> {
+  const params = new URLSearchParams({ member });
+  if (options.offset !== undefined && options.offset > 0) {
+    params.set("offset", String(options.offset));
+  }
+  if (options.limit !== undefined) {
+    params.set("limit", String(options.limit));
+  }
+  const search = options.search?.trim();
+  if (search) {
+    params.set("search", search);
+  }
+  return request<DexClassesResponse>(`/api/dex/classes?${params.toString()}`, token);
+}
+
+/** 取一个类的详情（字段与方法）。 */
+export function fetchDexClass(
+  token: string | null,
+  member: string,
+  descriptor: string,
+): Promise<DexClassResponse> {
+  const params = new URLSearchParams({ member, descriptor });
+  return request<DexClassResponse>(`/api/dex/class?${params.toString()}`, token);
+}
+
+/** 取一个方法的指令与文本 CFG。 */
+export function fetchDexMethod(
+  token: string | null,
+  member: string,
+  signature: string,
+  options: { offset?: number; limit?: number } = {},
+): Promise<DexMethodResponse> {
+  const params = new URLSearchParams({ member, signature });
+  if (options.offset !== undefined && options.offset > 0) {
+    params.set("offset", String(options.offset));
+  }
+  if (options.limit !== undefined) {
+    params.set("limit", String(options.limit));
+  }
+  return request<DexMethodResponse>(`/api/dex/method?${params.toString()}`, token);
+}
+
 /** 取调用图。
  *
  * 不传 `entry` 取全图（大目标会被服务端截断并说明）；传 `entry`

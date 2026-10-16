@@ -89,3 +89,31 @@ pub fn read_member(session: &Session, name: &str) -> Result<Arc<[u8]>, BitflipEr
     }
     Ok(bytes)
 }
+
+/// 成员名按 **APK 命名约定**扮演的角色，给**人看**的中文短标签。
+///
+/// `None` 表示"这个名字不属于 APK 的那几个固定位置"（绝大多数成员都是这样：
+/// 图片、字体、配置）—— **不是**"这个成员没用"。
+///
+/// 与 [`crate::ApkRole`] 的分工：那边给**稳定短名**（`"dex"` / `"manifest"`，
+/// 走 wire 用），这里给**中文标签**（给人看）。放在 core 而不是各自实现，
+/// 是因为同一条信息会同时出现在命令行与网页上：两处各写一份，迟早出现
+/// "命令行说主 dex、网页说 dex 1"这种不一致，而这种不一致没有人会去汇报。
+///
+/// # 为什么只认名字
+///
+/// 这是**命名约定**知识，不是内容识别：`classes.dex` 里装的到底是不是 DEX，
+/// 要真去解析才知道（见 [`read_member`]）。所以调用方只该在确实按 APK 约定
+/// 解释成员名时用它 —— 拿这个标签去描述一个 ar / `.lib` 的成员是**无依据的**。
+#[must_use]
+pub fn apk_role_label(name: &str) -> Option<String> {
+    match crate::ApkRole::of(name) {
+        crate::ApkRole::Dex(None) => Some("主 dex".to_string()),
+        crate::ApkRole::Dex(Some(ordinal)) => Some(format!("dex 序号 {ordinal}")),
+        crate::ApkRole::NativeLib(abi) => Some(format!("原生库 {abi}")),
+        crate::ApkRole::Manifest => Some("二进制清单".to_string()),
+        crate::ApkRole::ResourceTable => Some("资源表".to_string()),
+        crate::ApkRole::Signature => Some("v1 签名文件".to_string()),
+        crate::ApkRole::Other => None,
+    }
+}

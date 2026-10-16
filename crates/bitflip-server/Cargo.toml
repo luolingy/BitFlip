@@ -26,6 +26,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tower = { workspace = true }
+# DEX 合成样本要按规范算 `header.signature`（SHA-1）。已在传递依赖里，
+# 许可闸门早已覆盖；用 `sha1` 而不是自己写一份实现（见 loader 侧同一处注释）。
+sha1 = { workspace = true }
 
 [lints]
 workspace = true

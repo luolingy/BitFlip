@@ -172,7 +172,8 @@ COFF 没有。
 
 | 要加的东西 | 落点 | 是否需要改通用层 |
 |-----------|------|------------------|
-| DEX 给 CLI / 服务端用 | `bitflip_core::dex`（新模块：原样重导出 loader 的 DEX 入口、`Session::member_bytes` 按成员名取原始字节、名字判据 `is_dex_member_name`） | 否。`ObjectKind::Dex` 仍无解析器、`parse_object` 仍拒绝 DEX、`Disasm` 未改；cli/server 也不需要新增 loader 依赖 |
+| DEX 给 CLI / 服务端用 | `bitflip_core::dex`（新模块：原样重导出 loader 的 DEX 入口、`Session::member_bytes` 按成员名取原始字节、名字判据 `is_dex_member_name`、APK 角色标签 `apk_role_label`） | 否。`ObjectKind::Dex` 仍无解析器、`parse_object` 仍拒绝 DEX、`Disasm` 未改；cli/server 也不需要新增 loader 依赖 |
+| HTTP 出口 | `bitflip-server/src/dex.rs`（`/api/dex/{inputs,classes,class,method}` + 按成员名的解析 memo） | 否。`AppState` 只多了一个缓存字段与两个取值方法；没有动 `/api/sections` / `/api/insns` 的形状 |
 
 **判据仍然是**："format/ 外面要改的文件越少，边界划得越对"。上表里被标"是"的四处
 都是**容器与执行模型**层面的扩展（那是通用层的正当职责），没有一处是"因为某个格式

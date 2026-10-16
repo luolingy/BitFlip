@@ -33,20 +33,14 @@ use crate::cli::{FunctionsArgs, MembersArgs, SymbolArgs};
 /// 表头的角色列只标出 APK 的那几个固定位置。
 ///
 /// `dex` 子命令也用它标出"这是第几个 dex"（那边同样是 ZIP 容器里的成员）。
+///
+/// 标签文字本身来自 `bitflip_core::dex::apk_role_label` —— 网页端显示的是同一句话，
+/// 两处各写一份会慢慢分叉，而那种不一致没有人会去汇报。
 pub(crate) fn apk_role_hint(is_zip: bool, name: &str) -> String {
     if !is_zip {
         return String::new();
     }
-    match ApkRole::of(name) {
-        ApkRole::Other => String::new(),
-        ApkRole::Dex(ordinal) => {
-            ordinal.map_or_else(|| "  [主 dex]".to_string(), |n| format!("  [dex 序号 {n}]"))
-        }
-        ApkRole::NativeLib(abi) => format!("  [原生库 {abi}]"),
-        ApkRole::Manifest => "  [二进制清单]".to_string(),
-        ApkRole::ResourceTable => "  [资源表]".to_string(),
-        ApkRole::Signature => "  [v1 签名文件]".to_string(),
-    }
+    bitflip_core::dex::apk_role_label(name).map_or_else(String::new, |label| format!("  [{label}]"))
 }
 
 /// `members`：列出归档成员。

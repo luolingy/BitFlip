@@ -297,6 +297,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "thiserror",
  "tokio",

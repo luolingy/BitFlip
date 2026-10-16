@@ -1,10 +1,13 @@
 # APK / DEX 逆向核心 —— 设计
 
-> 状态：**设计**（未实现）。字节约束见
+> 状态：**M2a（事实层）与 M2b（接产品：CLI + 服务端 + 网页）已实现**，
+> 见 §4.4 的状态块。仍未做：AXML / `resources.arsc`（M3）、v041 容器 DEX、
+> ODEX/VDEX、覆盖率引导模糊测试与长时间 soak。
+> 字节约束见
 > [`docs/research/dex-apk-format-reference.md`](./research/dex-apk-format-reference.md)；
 > 现成库实测证据见
 > [`docs/research/apk-dex-library-survey.md`](./research/apk-dex-library-survey.md)。
-> 相关：ADR-0019（含更正）、`docs/DEPENDENCY-DECISIONS.md` §2.4。
+> 相关：ADR-0019（含更正）、ADR-0020、`docs/DEPENDENCY-DECISIONS.md` §2.4。
 >
 > **更正**：本文初版标题是"**自研** APK / DEX 逆向核心"，§1 论证的是
 > "必须自研"。那个前提**错了**（见下），已改写。
@@ -290,6 +293,30 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 >   但 DEX **不进对象模型** —— `ObjectKind::Dex` 仍然没有解析器、
 >   `parse_object` 仍然拒绝 DEX、`Disasm` 一行未改。
 >   **仍未做**：服务端 `/api/dex*` 与网页端"按 DEX 文件名分 tab"的界面。
+> * **M2b 服务端 + 网页（已完成 2026-10-16，同日第二轮）**：上面那句"仍未做"
+>   已经做完。
+>   * **服务端**：`GET /api/dex/{inputs,classes,class,method}`，独立端点族，
+>     不塞进 `/api/sections` / `/api/insns`（同 ADR-0020 的理由：DEX 没有段表、
+>     没有线性地址，硬塞会让前端拿到"看起来正常、实际没意义"的数据）。
+>     四个端点都要求显式 `member`：合并多个 DEX 的列表会让前端分不清第 5000 个
+>     类是哪个文件里的。`/api/dex/classes` 提供 `offset`/`limit`/`search`
+>     （大小写不敏感的子串），因为混淆过的 `L_COROUTINE/…;` 没法手打。
+>     解析结果按成员名 memo（**失败也 memo**）：真实 `classes.dex` 是 7643 类 /
+>     53906 方法，每点一次类就重解析一次会让视图完全不可用。
+>   * **网页**：新增 `DEX` 视图（`web/src/DexView.tsx`），按**文件名**分标签页，
+>     每个标签页下挂**它自己**的容错说明（降级跟着来源走，不合成一条总说明）；
+>     类列表可搜索可分页 → 类详情（字段 / 方法）→ 方法详情（分页指令表 +
+>     整个方法的文本 CFG）。`无字节码` 是合法结论，界面上写清是抽象/`native`，
+>     而不是给一张空表；`unresolved_edge_targets > 0` 用告警色。
+>   * **验证**：`crates/bitflip-server/tests/dex_api.rs`（8 条合成样本 +
+>     1 条 `#[ignore]` 真实 APK）与 `scripts/smoke-dex-http.ps1`（38 项断言，
+>     对着真实 APK 起真进程，含"内嵌 SPA 里真的有 DEX 视图"这一条 ——
+>     rust-embed 把前端编进二进制，"源码里有"与"二进制会服务它"是两件事）。
+>     实测：3 个 DEX（7643 / 8833 / 6462 类），类列表 `total=7643`、
+>     `search=Activity` 命中 160；`L_COROUTINE/ArtificialStackFrames;-><init>()V`
+>     2 条指令 / 1 块 / 0 边，`unsupported=0 unavailable=0`。
+>   * **本轮仍未做**：CLI 侧的 `--list-classes` / `--search`（服务端已有，
+>     CLI 还没有）、DEX 进 `export`、覆盖率引导模糊测试、长时间 soak。
 
 用 `droidsaw-dex` 的 `decode`，**要写的是适配层**：
 

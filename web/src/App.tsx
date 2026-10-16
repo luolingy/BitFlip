@@ -18,6 +18,7 @@ import {
 import { DisassemblyView } from "./DisassemblyView";
 import { FunctionsView, HexView, StringsView, XrefsView } from "./AnalysisViews";
 import { MembersView } from "./MembersView";
+import { DexView } from "./DexView";
 import { ScriptConsole } from "./ScriptConsole";
 import {
   ArgScanView,
@@ -54,6 +55,7 @@ type ViewId =
   | "strings"
   | "hex"
   | "members"
+  | "dex"
   | "call-graph"
   | "code-map"
   | "jump-tables"
@@ -81,6 +83,10 @@ const NAV_SECTIONS: readonly {
   { id: "hex", title: "十六进制", milestone: "M3", hint: "原始字节视图", ready: true },
   // M5：归档成员树。静态库/动态库是 M5 的目标，成员列表是进入它们的入口。
   { id: "members", title: "归档成员", milestone: "M5", hint: "静态库/归档的成员与按成员分析", ready: true },
+  // M2b：APK 里的 classes*.dex。它与"归档成员"是同一类入口（先进容器，
+  // 再钻进一个成员），但 DEX 里的单位是类而不是机器码函数，所以是独立视图
+  // （ADR-0020：不把 DEX 塞进反汇编视图）。
+  { id: "dex", title: "DEX", milestone: "M2b", hint: "APK 里的 classes*.dex：类、方法、指令与文本 CFG", ready: true },
   // M6：函数间的关系与"这段字节是什么"。
   { id: "call-graph", title: "调用图", milestone: "M6", hint: "谁调用了谁，含未解析的间接调用", ready: true },
   { id: "code-map", title: "数据/代码", milestone: "M6", hint: "判定结论、置信度与依据", ready: true },
@@ -108,6 +114,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   strings: "字符串",
   hex: "十六进制",
   members: "归档成员",
+  dex: "DEX（APK / classes*.dex）",
   "call-graph": "调用图",
   "code-map": "数据/代码判定",
   "jump-tables": "跳转表",
@@ -309,6 +316,8 @@ export function App() {
             <HexView token={token} initialAddress={focus} />
           ) : view === "members" ? (
             <MembersView token={token} onNavigate={navigate} />
+          ) : view === "dex" ? (
+            <DexView token={token} />
           ) : view === "call-graph" ? (
             <CallGraphView token={token} onNavigate={navigate} />
           ) : view === "code-map" ? (

@@ -1439,3 +1439,64 @@ button:not(:disabled):hover {
   border-color: rgba(214, 158, 46, 0.45);
   cursor: help;
 }
+/* ── DEX 视图（M2b） ─────────────────────────────────────────────────────
+   标签页沿用 .tabs / .tab / .tab-active：多个 classes*.dex 用一个可见的
+   标签条分开，而不是下拉框 —— 用户要能一眼看到"这个 APK 里有几个 dex"。
+   这里只补 DEX 特有的几处（搜索行、翻页行、CFG 文本块）。 */
+
+.dex-tabs {
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.dex-search .input {
+  flex: 1 1 240px;
+  min-width: 180px;
+}
+
+.dex-search input[type="text"] {
+  font-family: var(--mono);
+}
+
+/* 翻页行：与内容左对齐，按钮之间留出间距（左边缘对齐表格首列）。 */
+.dex-pager {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0 4px;
+}
+
+.dex-pager .tab:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 详情里的小节标题：比正文重一点，但不要和视图标题抢。 */
+.dex-subtitle {
+  margin: 18px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* CFG 是等宽文本块：必须能横滚，不能把块注释折行折到看不出来。 */
+.dex-cfg {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-raised);
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* 指令表里的文本列不要换行：一条指令就是一行。 */
+.dex-insn-table .data-table td {
+  white-space: pre;
+}
+
+/* "有缺口"的计数用告警色：0 与非 0 必须一眼分得开。 */
+.dex-warn {
+  color: var(--warn);
+}

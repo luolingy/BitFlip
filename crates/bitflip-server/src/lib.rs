@@ -11,6 +11,7 @@
 //! 令牌与 Origin 是**同时**生效的两道门，不是二选一。
 
 mod assets;
+mod dex;
 pub mod script;
 
 use std::collections::BTreeSet;
@@ -83,6 +84,13 @@ pub struct AppState {
     /// 惰性而不是在 `serve` 时预先算：用户可能只想看段表，
     /// 不该为此付出一次 100MB 扫描的代价。
     disasm: Arc<std::sync::OnceLock<Result<Arc<bitflip_core::Disasm>, String>>>,
+    /// DEX 输入缓存（M2b），按成员名/文件名索引。
+    ///
+    /// 与 `disasm` 的 `OnceLock` 不同：一个 APK 可以有多个 DEX，所以这里是一张
+    /// **按名字的 memo 表**。真实 `classes.dex` 的解析是秒级工作（7000+ 类、
+    /// 5 万+ 方法），点开一个类就重解析一次会让 DEX 视图完全不可用。
+    /// 失败也缓存：畸形 DEX 不会因为多刷新几次就变得能解析。
+    dex: Arc<dex::DexCache>,
     /// 脚本运行器（M7，单槽）。
     ///
     /// 放在 `AppState` 里而不是每个请求各建一个：取消端点必须能找到
@@ -103,6 +111,7 @@ impl AppState {
             parsed: None,
             session: None,
             disasm: Arc::new(std::sync::OnceLock::new()),
+            dex: Arc::new(dex::DexCache::default()),
             script: Arc::new(script::ScriptRunner::new(bitflip_script::Limits {
                 timeout: script::DEFAULT_TIMEOUT,
             })),
@@ -216,6 +225,43 @@ impl AppState {
             .as_ref()
             .map(Arc::clone)
             .ok_or_else(|| "本次会话没有打开目标".to_string())
+    }
+
+    /// 本次会话的全部 DEX 输入（逐个解析，结果进缓存）。
+    ///
+    /// # Errors
+    ///
+    /// 没有目标、目标里没有 DEX 成员、某个成员读不出来或解析失败。
+    pub(crate) fn dex_inputs(&self) -> Result<Vec<Arc<dex::DexEntry>>, String> {
+        let session = self.session()?;
+        let names = dex::input_names(&session)?;
+        names
+            .into_iter()
+            .map(|(name, _)| self.dex_entry(&name))
+            .collect()
+    }
+
+    /// 取一个 DEX 输入（解析一次后缓存；**失败也缓存**）。
+    ///
+    /// 失败也缓存是因为"一个畸形的 DEX 不会因为用户多刷新几次就变得能解析"，
+    /// 重试只会把每次点标签页都变成一次完整的失败解析。
+    ///
+    /// # Errors
+    ///
+    /// 缓存锁中毒，或该输入的读取 / 解析失败。
+    pub(crate) fn dex_entry(&self, name: &str) -> Result<Arc<dex::DexEntry>, String> {
+        let mut cache = self
+            .dex
+            .lock()
+            .map_err(|_| "DEX 缓存锁中毒（上一次解析在持锁时 panic）".to_string())?;
+        if let Some(cached) = cache.get(name) {
+            return cached.clone();
+        }
+        let loaded = self
+            .session()
+            .and_then(|session| dex::load_input(&session, name));
+        cache.insert(name.to_string(), loaded.clone());
+        loaded
     }
 
     /// 取反汇编（惰性建立，只成功建立一次）。
@@ -423,6 +469,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hex", get(hex))
         .route("/api/export", get(export))
         .route("/api/diff", get(diff))
+        // ── M2b：DEX（APK / .dex） ──
+        // 独立的端点族，不塞进 `/api/sections` / `/api/insns`：DEX 没有段表、
+        // 没有线性地址，硬塞会让前端拿到"看起来正常、实际没意义"的数据（ADR-0020）。
+        // 每个端点都要求显式指定 `member`：合并多个 DEX 的列表会让前端分不清
+        // 第 5000 个类是哪个文件里的（网页端按文件名分标签页）。
+        .route("/api/dex/inputs", get(dex::inputs))
+        .route("/api/dex/classes", get(dex::classes))
+        .route("/api/dex/class", get(dex::class))
+        .route("/api/dex/method", get(dex::method))
         // 标注是**主数据**，可读可写可删；写路径不触发重新分析。
         .route(
             "/api/annotations",

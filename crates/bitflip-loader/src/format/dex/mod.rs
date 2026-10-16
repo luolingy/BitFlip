@@ -699,7 +699,10 @@ impl DexStructure {
         (0..self.classes.len()).find(|i| self.class_descriptor(*i) == Some(descriptor))
     }
 
-    /// 类的字段：`(下标, 名字, 类型描述符, access_flags, 是否静态)`。
+    /// 类的字段在 [`Self::fields`] 里的下标列表（静态在前、实例在后）。
+    ///
+    /// 每个下标可以拿到 [`DexField`]（含 `access_flags` 与 `is_static`）、
+    /// 名字 [`Self::field_name`]、类型描述符 [`Self::field_type_descriptor`]。
     #[must_use]
     pub fn class_fields(&self, class: usize) -> Vec<usize> {
         self.classes
