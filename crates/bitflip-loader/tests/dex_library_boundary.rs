@@ -57,7 +57,6 @@ const FORBIDDEN: &[&str] = &[
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
-
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -132,6 +131,47 @@ fn the_library_is_confined_to_one_adapter_directory() {
     );
 }
 
+/// 拒绝库的 smali 渲染器。**理由与上面那条不同**，所以清单与措辞都分开：
+/// 它不是"推断"，而是"拿不到就写占位符"。
+///
+/// 实测（`droidsaw-dex` 2.0 的 `src/smali.rs`）：类型/字段引用取不到时写 `"?"`，
+/// 字符串引用取不到时写 `"<invalid>"`。CLAUDE.md §7 明令禁止用默认值冒充结果 ——
+/// 读的人分不出"文件里就是 `?`"和"我们没解析出来"；我们的渲染路径在解析不出来时
+/// 保留可数的池索引，并把失败数交回调用方。
+///
+/// 另一层代价：`fmt_instruction` 对每条指令返回一个 `String`（§4 的 SoA 取向），
+/// 且签名带 `&DexFile`，会把库的池类型带进渲染调用面。
+const FORBIDDEN_OUTPUT: &[&str] = &["droidsaw_dex::smali"];
+
+#[test]
+fn the_libraries_placeholder_output_is_not_used() {
+    let hits = files_mentioning_the_library();
+    let mut violations = Vec::new();
+
+    for (path, text) in &hits {
+        let rel = path
+            .strip_prefix(crate_root())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for needle in FORBIDDEN_OUTPUT {
+            if text.contains(needle) {
+                violations.push(format!("{rel} 引用了 {needle}"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "不许把库的渲染器接到用户输出上，下列引用越界了：\n  {}\n\
+         理由不是「库做不到」，而是它在解析失败时静默写问号 / <invalid> 之类的\
+         占位符（CLAUDE.md §7：拿不到就说拿不到，不许用默认值冒充结果）。\
+         我们自己的 `format::dex::view` 渲染路径在解析不出符号时保留可数的池索引，\
+         并把失败数交回调用方 —— 要显示符号就在那里做。见 ADR-0020 的 2026-10-15 更正。",
+        violations.join("\n  ")
+    );
+}
+
 #[test]
 fn the_inference_and_rewriting_modules_are_never_referenced() {
     let hits = files_mentioning_the_library();
@@ -159,6 +199,29 @@ fn the_inference_and_rewriting_modules_are_never_referenced() {
          并把每一条结论的置信度与依据写出来。",
         violations.join("\n  ")
     );
+}
+
+/// 自检：禁用清单不能是空的，而且每条都必须真的能命中 —— 否则清单写错了前缀
+/// 就会变成一条恒真的绿灯（"没匹配到"与"没有违规"长得一模一样，CLAUDE.md §7）。
+#[test]
+fn the_forbidden_lists_actually_match() {
+    for (name, list) in [
+        ("FORBIDDEN", FORBIDDEN),
+        ("FORBIDDEN_OUTPUT", FORBIDDEN_OUTPUT),
+    ] {
+        assert!(!list.is_empty(), "{name} 是空的，守卫等于没写");
+        for needle in list {
+            assert!(
+                needle.starts_with("droidsaw_dex::"),
+                "{name} 里的 {needle} 没有 crate 前缀，容易误伤普通词"
+            );
+            let synthetic = format!("use {needle}::whatever;");
+            assert!(
+                synthetic.contains(needle),
+                "{name} 里的 {needle} 匹配不到带这个前缀的代码"
+            );
+        }
+    }
 }
 
 #[test]

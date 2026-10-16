@@ -287,8 +287,11 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
   规则与用例见 `crates/bitflip-loader/tests/dex_cfg.rs`。
 - **指令文本渲染走 DEX 独立路径**：`view::render_instructions` 使用
   `Opcode::mnemonic()` 并写入调用者复用的 buffer；寄存器、分支与 pool 引用以
-  稳定数值显示。此处不解析符号名，避免把视图渲染与库私有池生命周期耦合；
-  该选择落实 ADR-0020，不修改 `Disasm` 或 `bitflip-core`。
+  稳定数值显示。该选择落实 ADR-0020，不修改 `Disasm` 或 `bitflip-core`。
+  注意库**有** smali 渲染器（`smali::fmt_instruction` / `DexFile::emit_smali`），
+  我们不用它，理由不是"库做不到"，而是它在解析失败时写 `"?"` / `"<invalid>"`
+  占位符（§7 禁止：读的人分不出"文件里就是 `?`"和"我们没解析出来"），且每条指令
+  返回一个 `String`、签名里带 `&DexFile`。详见 ADR-0020 的 2026-10-15 更正。
 
 ### M3 — AXML + resources.arsc
 

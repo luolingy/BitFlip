@@ -11,6 +11,20 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 更正 — 库其实有 smali 渲染器；我们不用它的理由要换
+
+`docs/DECISIONS.md` 的 ADR-0020 **背景**照抄了设计文档当时的说法：DEX 指令文本渲染是
+"本方案里唯一一处现成库帮不上的结构问题"。**这句话与事实不符** —— `droidsaw-dex` 2.0
+有 `smali::fmt_instruction` 与 `DexFile::emit_smali`，都能直接产出（含符号解析的）smali。
+
+ADR 的决定不变（DEX 视图自成一类、不泛化 `Disasm`），但理由更正为**实测事实**：
+库的渲染器在拿不到符号时静默写 `?` / `<invalid>` 占位符，正是 CLAUDE.md §7 禁止的
+"用默认值冒充结果"；其次它每条指令返回一个 `String`、签名里带 `&DexFile`。
+
+配套加了守卫 `the_libraries_placeholder_output_is_not_used`（清单与措辞都与"推断类
+模块"那条分开：**理由不同，就不能共用一个说法**），并加了自检
+`the_forbidden_lists_actually_match`，防止清单写错前缀后变成恒真绿灯。
+
 ### 修复 — 载荷之后的 DEX 指令曾整段漏出 CFG（M2a）
 
 `CodeItem.instructions` 里没有 payload 的条目，指令地址列表因此会出现断口。
