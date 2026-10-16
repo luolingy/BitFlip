@@ -321,6 +321,12 @@ pub enum DexViewError {
         #[source]
         source: droidsaw_dex::DexError,
     },
+    /// `code_off == 0`：规范里这个方法**没有字节码**（抽象 / `native`）。
+    ///
+    /// 与 [`super::check_code_item_layout`] 的同名判断保持一致：偏移 0 在真实 DEX 里
+    /// 是文件头的 `magic`，把它当 `code_item` 解析只会得到一堆假行。
+    #[error("code_off = 0：这个方法没有字节码（抽象 / native）")]
+    NoCode,
     #[error("instruction index {0} is out of range")]
     InstructionIndex(usize),
     #[error("inconsistent DEX column lengths")]
@@ -337,7 +343,13 @@ pub enum DexViewError {
 }
 
 /// Decode and project one `code_item` into DEX-specific SoA and CFG columns.
+///
+/// `code_off == 0` 是规范里的"没有字节码"哨兵值（抽象 / `native` 方法），
+/// 返回 [`DexViewError::NoCode`]，与 [`super::check_code_item_layout`] 一致。
 pub fn project_method(bytes: &[u8], code_off: u32) -> Result<DexMethodView, DexViewError> {
+    if code_off == 0 {
+        return Err(DexViewError::NoCode);
+    }
     let code = parse_code_item(bytes, code_off)
         .map_err(|source| DexViewError::Parse { code_off, source })?;
     project_code_item(&code)
@@ -1229,12 +1241,20 @@ fn build_cfg(code: &CodeItem) -> Result<DexCfgView, DexViewError> {
             let Some(next) = insn.addr.checked_add(u32::from(insn.size)) else {
                 break;
             };
+            // 游标**必须真前进**。宽度为 0 的"指令"不是规范里的东西（每条指令至少占
+            // 1 个码元），但 `project_code_item` 收的是调用方给的 `CodeItem`：那种输入下
+            // `index_of[next]` 会指回游标自己，地址表无限增长 —— 公开 API 挂死/OOM 是
+            // 不可接受的。到这儿收块，覆盖不到的部分交给跨表对账去报，不静默。
+            if next <= insn.addr {
+                break;
+            }
             if leaders.binary_search(&next).is_ok() {
                 break;
             }
             match index_of.get(&next) {
-                Some(&next_index) => cursor = next_index,
-                None => break,
+                // 地址表是调用方给的，顺序不保证递增；只允许往前走。
+                Some(&next_index) if next_index > cursor => cursor = next_index,
+                _ => break,
             }
         }
         let block_id = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
