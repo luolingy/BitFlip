@@ -619,6 +619,125 @@ impl DexMethodView {
         problems.extend(self.cfg.consistency_problems());
         problems
     }
+
+    /// 跨表对账：指令列与 CFG 是否**互相印证**。**空 = 两张表讲同一件事**。
+    ///
+    /// `consistency_problems` 只能查每张表自己的列对齐；它查不出"CFG 少了半个方法"
+    /// 这种错 —— 那种错在列长度上完全合法。这里的规则跨表：
+    ///
+    /// 1. 块里的指令地址**恰好**等于指令列，顺序相同、不重不漏；
+    /// 2. 每个块内部地址连续（`addr[i+1] == addr[i] + width[i]`）；
+    /// 3. 每个块的首地址等于它自己的 `block_starts`；
+    /// 4. 边目标、前驱、异常 handler 块号都落在块数范围内。
+    ///
+    /// 第 1 条是关键：指令列来自库的解码，而指令列本身又被
+    /// `layout::check_code_item_layout` 用**另一条独立实现**（我们从原始字节按规范走）
+    /// 对拍过。于是这条检查把"我们的 CFG"和"原始字节"间接连了起来 —— 中间任何一环
+    /// 漏掉一条指令，这里就会响。
+    #[must_use]
+    pub fn cross_check_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let instructions = &self.instructions;
+        let cfg = &self.cfg;
+
+        if cfg.block_instruction_addresses != instructions.addresses {
+            problems.push(format!(
+                "块里的指令地址（{} 条）与指令列（{} 条）不一致",
+                cfg.block_instruction_addresses.len(),
+                instructions.addresses.len()
+            ));
+        }
+
+        // 地址 → 宽度；用于"块内是否连续"。
+        let width_of: BTreeMap<u32, u8> = instructions
+            .addresses
+            .iter()
+            .copied()
+            .zip(instructions.widths.iter().copied())
+            .collect();
+
+        for (index, block_id) in cfg.block_ids.iter().enumerate() {
+            let Some(begin) = cfg.block_instruction_offsets.get(index).copied() else {
+                break;
+            };
+            let Some(end) = cfg.block_instruction_offsets.get(index + 1).copied() else {
+                break;
+            };
+            let Some(addresses) = cfg.block_instruction_addresses.get(begin..end) else {
+                break;
+            };
+            let Some(&start) = cfg.block_starts.get(index) else {
+                break;
+            };
+            if addresses.first() != Some(&start) {
+                problems.push(format!("块 {block_id} 的首指令不是它的起点 {start}"));
+            }
+            for pair in addresses.windows(2) {
+                let [previous, next] = pair else { continue };
+                match width_of
+                    .get(previous)
+                    .copied()
+                    .and_then(|width| previous.checked_add(u32::from(width)))
+                {
+                    Some(expected) if expected == *next => {}
+                    Some(expected) => problems.push(format!(
+                        "块 {block_id} 内 {previous} → {next} 不连续（按宽度应为 {expected}）"
+                    )),
+                    None => problems.push(format!("块 {block_id} 内地址 {previous} 没有对应宽度")),
+                }
+            }
+        }
+
+        let block_count = cfg.block_ids.len();
+        for (index, target) in cfg.edge_targets.iter().enumerate() {
+            if usize::try_from(*target).map_or(true, |target| target >= block_count) {
+                problems.push(format!("第 {index} 条边的目标块 {target} 越界"));
+            }
+        }
+        for predecessor in &cfg.predecessors {
+            if usize::try_from(*predecessor).map_or(true, |from| from >= block_count) {
+                problems.push(format!("前驱列里有越界的块号 {predecessor}"));
+            }
+        }
+        for (index, region) in cfg.exception_regions.iter().enumerate() {
+            for block in region.handler_blocks.iter().flatten() {
+                if usize::try_from(*block).map_or(true, |block| block >= block_count) {
+                    problems.push(format!("异常区间 {index} 的 handler 块号 {block} 越界"));
+                }
+            }
+        }
+        // 前驱列必须是边列的反向：每条边都要出现在目标块的前驱里。
+        for (edge_index, target) in cfg.edge_targets.iter().enumerate() {
+            let Ok(target) = usize::try_from(*target) else {
+                continue;
+            };
+            if target >= block_count {
+                continue;
+            }
+            let from = cfg
+                .edge_offsets
+                .partition_point(|&end| end <= edge_index)
+                .saturating_sub(1);
+            let Ok(from) = u32::try_from(from) else {
+                continue;
+            };
+            let (Some(&begin), Some(&end)) = (
+                cfg.predecessor_offsets.get(target),
+                cfg.predecessor_offsets.get(target + 1),
+            ) else {
+                break;
+            };
+            let Some(range) = cfg.predecessors.get(begin..end) else {
+                break;
+            };
+            if !range.contains(&from) {
+                problems.push(format!(
+                    "第 {edge_index} 条边（块 {from} → 块 {target}）没有出现在前驱列"
+                ));
+            }
+        }
+        problems
+    }
 }
 
 fn write_operand_separator(output: &mut String, has_operand: &mut bool) {
@@ -770,9 +889,22 @@ fn build_cfg(code: &CodeItem) -> Result<DexCfgView, DexViewError> {
         }
     };
 
+    // 上一条指令的结束地址，用来发现指令列里的断口（见循环里的说明）。
+    let mut previous_end: Option<u32> = None;
+
     for insn in &code.instructions {
         let next = insn.addr.checked_add(u32::from(insn.size));
         let mnemonic = insn.op.mnemonic();
+        // **断点后的一条必然另起一块。** 指令列里并不是处处连续：payload（switch /
+        // fill-array-data）夹在指令之间，它们在 `instructions` 里没有对应项。若不在
+        // 断口处另起一块，"载荷之后那一段"就没有任何块覆盖 —— 真跑起来会静默丢掉
+        // 整段指令（`cross_check_problems` 就是为此加的，真实 APK 上抓到过一例）。
+        if let Some(previous_end) = previous_end {
+            if previous_end != insn.addr {
+                leaders.insert(insn.addr);
+            }
+        }
+        previous_end = next;
         match mnemonic {
             "packed-switch" | "sparse-switch" => {
                 if let Some(target) = insn.target {

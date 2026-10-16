@@ -323,3 +323,95 @@ fn predecessors_mirror_the_edge_list() {
         );
     }
 }
+
+/// 跨表对账：块里的指令必须**恰好**等于指令列，顺序相同、不重不漏。
+///
+/// 这条是 CFG 唯一能跟"原始字节"间接挂钩的地方（指令列已被独立的布局检查对拍过），
+/// 所以它的"会响"必须被证明 —— 否则它只是一条恒真的绿灯。
+#[test]
+fn cross_check_catches_a_block_that_lost_an_instruction() {
+    let item = code(
+        vec![
+            instruction(0, Opcode::Const4, 1, Some(0), &[], 1, None),
+            return_void(1),
+            return_void(2),
+        ],
+        BTreeMap::new(),
+    );
+    let good = project_dex_code_item(&item).expect("project");
+    assert_eq!(good.cross_check_problems(), Vec::<String>::new());
+
+    // 把 0 号块的第二条指令地址改成下一条指令的地址：长度不变、也仍然不小于块起点，
+    // 所以单表对账看不出问题；只有跨表对账能发现 CFG 漏掉了真正的指令。
+    let mut broken = good;
+    assert_eq!(broken.cfg.block_instruction_addresses, [0, 1, 2]);
+    broken.cfg.block_instruction_addresses[1] = 2;
+    assert!(
+        broken.consistency_problems().is_empty(),
+        "这个破坏方式刻意绕开了单表对账，用来证明跨表对账是必要的"
+    );
+    let problems = broken.cross_check_problems();
+    assert!(
+        problems.iter().any(|p| p.contains("指令列")),
+        "跨表对账没发现块里少了指令：{problems:?}"
+    );
+}
+
+/// 载荷夹在指令之间时，**载荷之后那一段也要有块覆盖**。
+///
+/// 这是真实 APK 上抓到的一个真 bug：`CodeItem.instructions` 里没有 payload 的条目，
+/// 所以指令列中间会出现断口；只按"分支目标 / 终结指令之后"取块首的话，断口之后
+/// 那一段没有任何块覆盖，会被整段静默丢掉。
+#[test]
+fn instructions_after_a_payload_gap_are_still_covered_by_a_block() {
+    let mut payloads = BTreeMap::new();
+    payloads.insert(
+        3,
+        PayloadData::FillArrayData {
+            element_width: 1,
+            data: vec![1, 2, 3, 4],
+        },
+    );
+    let item = code(
+        vec![
+            // 31t：占 0..3，指向地址 3 的 payload。
+            instruction(0, Opcode::FillArrayData, 3, None, &[0], 0, Some(3)),
+            // payload 之后的指令：地址 9 与上一条的结束地址 3 之间有断口。
+            instruction(9, Opcode::ReturnVoid, 1, None, &[], 0, None),
+        ],
+        payloads,
+    );
+    let view = project_dex_code_item(&item).expect("project");
+
+    assert_eq!(
+        view.cfg.block_instruction_addresses,
+        [0, 9],
+        "断口之后的指令必须被某个块覆盖"
+    );
+    assert_eq!(view.cfg.block_starts, [0, 9]);
+    assert_eq!(view.cross_check_problems(), Vec::<String>::new());
+    assert_eq!(view.consistency_problems(), Vec::<String>::new());
+}
+
+/// 跨表对账也要能发现"块内地址不连续"。
+#[test]
+fn cross_check_catches_a_non_contiguous_block() {
+    let item = code(
+        vec![
+            instruction(0, Opcode::Const4, 1, Some(0), &[], 1, None),
+            return_void(1),
+        ],
+        BTreeMap::new(),
+    );
+    let mut view = project_dex_code_item(&item).expect("project");
+    assert_eq!(view.cross_check_problems(), Vec::<String>::new());
+    // 把块里的第二个地址推远一格：宽度 1 的指令之后应当是地址 1。
+    if let Some(address) = view.cfg.block_instruction_addresses.get_mut(1) {
+        *address = 5;
+    }
+    let problems = view.cross_check_problems();
+    assert!(
+        problems.iter().any(|p| p.contains("不连续")),
+        "跨表对账没发现块内地址不连续：{problems:?}"
+    );
+}

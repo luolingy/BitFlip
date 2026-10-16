@@ -726,6 +726,16 @@ fn every_real_methods_code_units_are_exactly_tiled_by_instructions_and_payloads(
                 method.code_off,
                 view_problems.iter().take(5).collect::<Vec<_>>()
             );
+            let cross_problems = view.cross_check_problems();
+            assert!(
+                cross_problems.is_empty(),
+                "{}: class_idx={} method_idx={} code_off={:#x} 指令列与 CFG 不互相印证（最多列 5 条）：{:?}",
+                member.name,
+                method.class_index,
+                method.method_idx,
+                method.code_off,
+                cross_problems.iter().take(5).collect::<Vec<_>>()
+            );
             checked_methods += 1;
             checked_payloads += check.payloads;
             if !check.is_exact() {
