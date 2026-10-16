@@ -415,3 +415,132 @@ fn cross_check_catches_a_non_contiguous_block() {
         "跨表对账没发现块内地址不连续：{problems:?}"
     );
 }
+
+// ── 畸形输入：不 panic、不编造、把异常如实报出来（CLAUDE.md §7）──────────────
+
+/// `try_item.handler_idx` 越界：报错，而不是少一列或补 0。
+#[test]
+fn a_try_item_with_a_dangling_handler_index_is_an_error_not_a_silent_drop() {
+    let mut item = code(
+        vec![
+            instruction(0, Opcode::Const4, 1, Some(0), &[], 1, None),
+            return_void(1),
+        ],
+        BTreeMap::new(),
+    );
+    item.tries.push(TryItem {
+        start_addr: 0,
+        insn_count: 1,
+        handler_idx: 3,
+    });
+    // 没有任何 catch_handler，却指到第 3 个。
+    let error = project_dex_code_item(&item).expect_err("越界 handler_idx 必须报错");
+    let message = error.to_string();
+    assert!(message.contains('3'), "报错里要写清越界的下标：{message}");
+}
+
+/// 稀疏 switch 的 keys 比 targets 少：列对账要说话，且不能 panic。
+#[test]
+fn a_sparse_switch_with_missing_keys_is_reported() {
+    let mut payloads = BTreeMap::new();
+    payloads.insert(
+        6,
+        PayloadData::SparseSwitch {
+            keys: vec![1],
+            targets: vec![3, 4],
+        },
+    );
+    let item = code(
+        vec![
+            instruction(0, Opcode::SparseSwitch, 3, None, &[0], 0, Some(6)),
+            return_void(3),
+            return_void(4),
+            return_void(6),
+        ],
+        payloads,
+    );
+    let view = project_dex_code_item(&item).expect("project");
+    let problems = view.payloads.consistency_problems();
+    assert!(
+        problems.iter().any(|p| p.contains("key")),
+        "keys 与 targets 数量不符必须被报出来：{problems:?}"
+    );
+}
+
+/// switch 指向的不是匹配的 payload：只保留默认落空，不编造 case 边。
+#[test]
+fn a_switch_pointing_at_the_wrong_payload_kind_gets_no_case_edges() {
+    let mut payloads = BTreeMap::new();
+    payloads.insert(
+        6,
+        PayloadData::FillArrayData {
+            element_width: 1,
+            data: vec![7, 7, 7, 7],
+        },
+    );
+    let item = code(
+        vec![
+            instruction(0, Opcode::SparseSwitch, 3, None, &[0], 0, Some(6)),
+            return_void(3),
+        ],
+        payloads,
+    );
+    let view = project_dex_code_item(&item).expect("project");
+    assert_eq!(
+        view.cfg.edge_kinds,
+        [DexEdgeKind::SwitchDefault],
+        "payload 类型对不上时只有默认落空"
+    );
+    assert!(view.cfg.unresolved_edge_targets.is_empty());
+}
+
+/// 分支目标越出方法末尾：记账，不连边，不 panic。
+#[test]
+fn a_branch_past_the_end_of_the_method_is_recorded() {
+    let item = code(
+        vec![
+            instruction(0, Opcode::Goto, 1, None, &[], 0, Some(999)),
+            return_void(1),
+        ],
+        BTreeMap::new(),
+    );
+    let view = project_dex_code_item(&item).expect("project");
+    assert_eq!(view.cfg.unresolved_edge_targets.len(), 1);
+    assert_eq!(view.cfg.unresolved_edge_targets[0].target, 999);
+    assert!(view.cfg.edge_kinds.is_empty());
+    assert!(view.consistency_problems().is_empty());
+}
+
+/// 自环：`goto` 跳到自己，前驱列里应当有自己，且不 panic。
+#[test]
+fn a_self_loop_is_reachable_from_itself() {
+    let item = code(
+        vec![instruction(0, Opcode::Goto, 1, None, &[], 0, Some(0))],
+        BTreeMap::new(),
+    );
+    let view = project_dex_code_item(&item).expect("project");
+    assert_eq!(view.cfg.edge_targets, [0]);
+    assert_eq!(view.cfg.predecessors, [0], "自环的前驱是自己");
+    assert!(view.cfg.consistency_problems().is_empty());
+    assert!(view.cross_check_problems().is_empty());
+}
+
+/// 宽度让地址回绕：不 panic（`checked_add` 为 `None` 时就此收块）。
+#[test]
+fn an_address_overflowing_u32_does_not_panic() {
+    let item = code(
+        vec![instruction(
+            u32::MAX,
+            Opcode::ReturnVoid,
+            1,
+            None,
+            &[],
+            0,
+            None,
+        )],
+        BTreeMap::new(),
+    );
+    let view = project_dex_code_item(&item).expect("project");
+    assert_eq!(view.cfg.block_starts, [u32::MAX]);
+    assert!(view.cfg.edge_kinds.is_empty());
+}
