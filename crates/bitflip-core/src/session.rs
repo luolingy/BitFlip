@@ -1278,10 +1278,12 @@ impl Session {
     /// # Errors
     ///
     /// 目标不是归档、成员名找不到或不唯一、成员数据越界、成员解析失败。
-    pub fn member_session(
-        &self,
-        name: &str,
-    ) -> Result<(Self, bitflip_loader::ArchiveMember), BitflipError> {
+    /// 共同的成员定位：容器检查 + 唯一性检查 + 取成员记录。
+    ///
+    /// 抽出来是为了让 [`Self::member_session`]（要**可分析对象**）与
+    /// [`Self::member_bytes`]（要**原始字节**）在"找的是哪个成员"上逐字一致 ——
+    /// 两份拷贝迟早会在某次改动里分叉，而分叉的表现是"同一个名字两条路给出不同成员"。
+    fn locate_member(&self, name: &str) -> Result<bitflip_loader::ArchiveMember, BitflipError> {
         if !self.info.is_archive() {
             // 保留"归档"这个词（测试按它断言），同时把可用的容器列全 ——
             // 只提 .a / .lib 会让 APK 用户以为这条路走不通。
@@ -1304,11 +1306,18 @@ impl Session {
             )));
         }
 
-        let member = self
-            .find_member(name)
-            .ok_or_else(|| BitflipError::not_found(format!("归档成员 {name:?}")))?
-            .clone();
+        self.find_member(name)
+            .ok_or_else(|| BitflipError::not_found(format!("归档成员 {name:?}")))
+            .cloned()
+    }
 
+    /// 取出成员内容，`MemberStorage` 决定走哪条路。
+    ///
+    /// 这一层**不做**成员格式识别 —— 那边的结论属于各自的解析器。
+    fn member_content(
+        &self,
+        member: &bitflip_loader::ArchiveMember,
+    ) -> Result<Arc<[u8]>, BitflipError> {
         // ── 取得成员内容 ────────────────────────────────────────────────
         //
         // 两条路，由 `MemberStorage` 决定（见 `bitflip_loader::MemberStorage`）：
@@ -1318,7 +1327,7 @@ impl Session {
         // 早先这里只有切片一条路，于是 APK 的成员会被当成"裸字节"去解析
         // —— 拿到的其实是 deflate 流，嗅探只会说"未识别"。
         // 那正是设计文档里 M0 要避免的失败模式：**看起来跑通了，其实什么都没识别**。
-        let content: Arc<[u8]> = match member.storage {
+        match member.storage {
             MemberStorage::Inline => {
                 // 内联成员**必须**有偏移：`None` 会让切片无从下手。
                 // 走到这里说明容器解析自相矛盾，如实报出来，不要静默取 0。
@@ -1331,15 +1340,16 @@ impl Session {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX);
                 let len = usize::try_from(member.size).unwrap_or(usize::MAX);
                 let end = start.checked_add(len).ok_or_else(|| {
-                    BitflipError::InvalidInput(format!("成员 {name:?} 的偏移+长度溢出"))
+                    BitflipError::InvalidInput(format!("成员 {:?} 的偏移+长度溢出", member.name))
                 })?;
                 let slice = self.bytes.get(start..end).ok_or_else(|| {
                     BitflipError::InvalidInput(format!(
-                        "成员 {name:?} 的数据区间 {start:#x}..{end:#x} 超出文件（{} 字节）",
+                        "成员 {:?} 的数据区间 {start:#x}..{end:#x} 超出文件（{} 字节）",
+                        member.name,
                         self.bytes.len()
                     ))
                 })?;
-                Arc::from(slice)
+                Ok(Arc::from(slice))
             }
             MemberStorage::Container { .. } => {
                 // 判据用**容器类别**而不是压缩方法号：能不能向容器要内容，
@@ -1365,9 +1375,39 @@ impl Session {
                         ))
                     },
                 )?;
-                Arc::from(data)
+                Ok(Arc::from(data))
             }
-        };
+        }
+    }
+
+    /// 取出归档成员的**原始字节**，不要求它是可分析对象（M2b）。
+    ///
+    /// 与 [`Self::member_session`] 的唯一区别是那道"可分析对象"的门槛：那条路要求
+    /// 成员能被 `parse_object` 解析，因此必然拒绝 DEX（`ObjectKind::Dex` 没有解析器，
+    /// ADR-0020）。DEX 视图要的恰好是"原始字节 + 我们自己的 DEX 解析器"，所以这里
+    /// 单独开一条出口 —— 而**不是**为了 DEX 放宽 `parse_object` 的门槛：那等于把 DEX
+    /// 混进对象模型，正是 ADR-0020 拒绝的事。
+    ///
+    /// 返回成员内容与成员记录（调用方要成员名/大小/截断标记，不必再查一次）。
+    ///
+    /// # Errors
+    ///
+    /// 目标不是归档、成员名找不到或不唯一、成员数据越界或取出失败。
+    pub fn member_bytes(
+        &self,
+        name: &str,
+    ) -> Result<(Arc<[u8]>, bitflip_loader::ArchiveMember), BitflipError> {
+        let member = self.locate_member(name)?;
+        let content = self.member_content(&member)?;
+        Ok((content, member))
+    }
+
+    pub fn member_session(
+        &self,
+        name: &str,
+    ) -> Result<(Self, bitflip_loader::ArchiveMember), BitflipError> {
+        let member = self.locate_member(name)?;
+        let content = self.member_content(&member)?;
         let slice: &[u8] = &content;
 
         // 成员自身的格式：归档里可能混有非对象成员（GNU 的长名表 `/`、

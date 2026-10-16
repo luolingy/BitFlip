@@ -31,7 +31,9 @@ use crate::cli::{FunctionsArgs, MembersArgs, SymbolArgs};
 /// `Other` 也返回空串：绝大多数成员（图片、字体、配置）都落到 `Other`，
 /// 给它们逐行标一个"其他"只是噪声。**注意这意味着"没有标注" ≠ "不重要"**，
 /// 表头的角色列只标出 APK 的那几个固定位置。
-fn apk_role_hint(is_zip: bool, name: &str) -> String {
+///
+/// `dex` 子命令也用它标出"这是第几个 dex"（那边同样是 ZIP 容器里的成员）。
+pub(crate) fn apk_role_hint(is_zip: bool, name: &str) -> String {
     if !is_zip {
         return String::new();
     }

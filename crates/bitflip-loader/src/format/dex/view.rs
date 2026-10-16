@@ -419,6 +419,119 @@ pub fn project_code_item(code: &CodeItem) -> Result<DexMethodView, DexViewError>
     })
 }
 
+/// 取出 CFG 并列数组里第 `index` 段的范围。
+///
+/// 注意这三列（块内指令、出边、前驱）存的是**累计结束位置**：`offsets[i]` 是第 `i` 段
+/// 的**末尾**，第 0 段从 0 开始。这与 [`DexInstructions::source_offsets`] 那种
+/// "开头先压一个 0"的写法**不同**，混用会整体错位一格。
+fn column_range(offsets: &[usize], index: usize, total: usize) -> Option<std::ops::Range<usize>> {
+    let end = *offsets.get(index)?;
+    let start = if index == 0 {
+        0
+    } else {
+        *offsets.get(index - 1)?
+    };
+    (start <= end && end <= total).then_some(start..end)
+}
+
+/// 边类别 → 给人看的标签。
+fn edge_label(kind: DexEdgeKind, switch_key: Option<i32>, exception_type: Option<u32>) -> String {
+    match kind {
+        DexEdgeKind::FallThrough => "落空".to_owned(),
+        DexEdgeKind::Branch => "分支".to_owned(),
+        DexEdgeKind::SwitchCase => match switch_key {
+            Some(key) => format!("switch 分支（键={key}）"),
+            // 不是占位符：这是在说"这一列本应有值却没有"，而不是替一个未知值编一个。
+            None => "switch 分支（键缺失）".to_owned(),
+        },
+        DexEdgeKind::SwitchDefault => "switch 默认".to_owned(),
+        DexEdgeKind::ExceptionHandler => match exception_type {
+            Some(index) => format!("异常处理（类型池下标={index}）"),
+            None => "异常处理（类型池下标缺失）".to_owned(),
+        },
+        DexEdgeKind::ExceptionCatchAll => "异常 catch-all".to_owned(),
+    }
+}
+
+/// 把 CFG 渲染成文本：块（起址、指令数、前驱）、出边、以及**没连上的目标**。
+///
+/// 文本而不是图 —— M2b 第一版先把事实摆出来（用户 2026-10-16 的决定）。
+/// 目标地址不是指令起点的边不连边，但一定会出现在末尾那段"未连上的目标"里，
+/// 并且开头的汇总行也会把它计数出来（含 0）—— 降级必须看得见（CLAUDE.md §7）。
+pub fn render_cfg_text(view: &DexMethodView, output: &mut String) {
+    let cfg = &view.cfg;
+    let blocks = cfg.block_ids.len();
+    let edges = cfg.edge_kinds.len();
+    let unresolved = cfg.unresolved_edge_targets.len();
+    let entry = cfg
+        .entry_block
+        .map_or_else(|| "无".to_owned(), |block| block.to_string());
+    let _ = writeln!(
+        output,
+        "CFG：{blocks} 个块、{edges} 条边、{unresolved} 个未连上的目标（入口块 {entry}）"
+    );
+
+    for index in 0..blocks {
+        let id = cfg.block_ids.get(index).copied().unwrap_or(u32::MAX);
+        let start = cfg.block_starts.get(index).copied().unwrap_or(0);
+        let instruction_count = column_range(
+            &cfg.block_instruction_offsets,
+            index,
+            cfg.block_instruction_addresses.len(),
+        )
+        .map_or(0, |range| range.len());
+        let predecessors = column_range(&cfg.predecessor_offsets, index, cfg.predecessors.len())
+            .map(|range| {
+                cfg.predecessors[range]
+                    .iter()
+                    .map(|block| format!("块{block}"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let predecessors = if predecessors.is_empty() {
+            "无".to_owned()
+        } else {
+            predecessors.join("、")
+        };
+        let _ = writeln!(
+            output,
+            "块 {id} @{start:04x}（{instruction_count} 条指令）  前驱：{predecessors}"
+        );
+
+        let Some(range) = column_range(&cfg.edge_offsets, index, cfg.edge_kinds.len()) else {
+            continue;
+        };
+        if range.is_empty() {
+            let _ = writeln!(output, "    没有出边");
+            continue;
+        }
+        for edge in range {
+            let label = edge_label(
+                cfg.edge_kinds
+                    .get(edge)
+                    .copied()
+                    .unwrap_or(DexEdgeKind::FallThrough),
+                cfg.edge_switch_keys.get(edge).copied().flatten(),
+                cfg.edge_exception_type_indices.get(edge).copied().flatten(),
+            );
+            let target = cfg.edge_targets.get(edge).copied().unwrap_or(u32::MAX);
+            let _ = writeln!(output, "    → 块{target} {label}");
+        }
+    }
+
+    if unresolved > 0 {
+        let _ = writeln!(output, "未连上的目标（{unresolved} 个，都没有连边）：");
+        for entry in &cfg.unresolved_edge_targets {
+            let label = edge_label(entry.kind, None, None);
+            let _ = writeln!(
+                output,
+                "    块{} → {:#06x}（{label}；目标不是任何指令的起点）",
+                entry.from_block, entry.target
+            );
+        }
+    }
+}
+
 /// Render all instruction rows into a reusable output buffer.
 pub fn render_instructions(
     instructions: &DexInstructions,

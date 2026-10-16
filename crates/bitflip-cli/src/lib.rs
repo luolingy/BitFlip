@@ -2,6 +2,7 @@
 
 mod browser;
 mod cli;
+mod dex;
 mod diff;
 mod export;
 mod info;
@@ -15,10 +16,11 @@ use std::process::ExitCode;
 use clap::Parser;
 
 pub use cli::{
-    Cli, Command, DiffArgs, ExportArgs, FunctionsArgs, InfoArgs, MembersArgs, OpenCli,
+    Cli, Command, DexArgs, DiffArgs, ExportArgs, FunctionsArgs, InfoArgs, MembersArgs, OpenCli,
     RawOverrideArgs, ServeArgs, SignatureArgs, SignatureBuildArgs, SignatureCommand,
     SignatureInfoArgs, SymbolArgs,
 };
+pub use dex::{build_json as build_dex_json, build_text as build_dex_text, run_dex};
 pub use diff::run_diff;
 pub use export::run_export;
 pub use info::run_info;
@@ -55,6 +57,7 @@ pub fn cli_main() -> ExitCode {
     match Cli::parse().command {
         Command::Info(args) => report(run_info(&args.target, args.json, args.verbose, &args.raw)),
         Command::Members(args) => report(run_members(&args)),
+        Command::Dex(args) => report(run_dex(&args)),
         Command::Functions(args) => report(run_functions(&args)),
         Command::Symbol(args) => report(run_symbol(&args)),
         Command::Signature(args) => report(run_signature(&args)),

@@ -61,7 +61,7 @@ pub use format::dex::layout::{
 };
 pub use format::dex::view::{
     project_code_item as project_dex_code_item, project_method as project_dex_method,
-    render_instructions as render_dex_instructions,
+    render_cfg_text as render_dex_cfg_text, render_instructions as render_dex_instructions,
     render_instructions_with_symbols as render_dex_instructions_with_symbols, DexCfgView,
     DexEdgeKind, DexExceptionRegion, DexHandlerEntry, DexInstructions, DexMethodView, DexPayloads,
     DexPoolKind, DexRenderReport, DexSymbolOutcome, DexSymbolResolver, DexSymbols, DexViewError,

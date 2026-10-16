@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use bitflip_loader::{project_dex_code_item, DexEdgeKind};
+use bitflip_loader::{project_dex_code_item, render_dex_cfg_text, DexEdgeKind};
 use droidsaw_dex::decode::{
     CatchHandler, CodeItem, Instruction, PayloadData, RegList, TryItem, TypedCatch,
 };
@@ -414,6 +414,82 @@ fn cross_check_catches_a_non_contiguous_block() {
         problems.iter().any(|p| p.contains("不连续")),
         "跨表对账没发现块内地址不连续：{problems:?}"
     );
+}
+
+// ── CFG 文本（M2b 第一版：先出文本，不做图）────────────────────────────────
+
+/// 逐字钉住 CFG 文本：块号、起址、指令数、前驱集合、出边标签。
+#[test]
+fn cfg_text_lists_blocks_edges_and_predecessors() {
+    let mut payloads = BTreeMap::new();
+    payloads.insert(
+        6,
+        PayloadData::PackedSwitch {
+            first_key: 5,
+            targets: vec![4],
+        },
+    );
+    let item = code(
+        vec![
+            // switch 之后的那条（地址 3）必须是新块的起点：控制转移落下来就到它。
+            instruction(0, Opcode::PackedSwitch, 3, None, &[0], 0, Some(6)),
+            instruction(3, Opcode::Const4, 1, Some(0), &[], 1, None),
+            return_void(4),
+        ],
+        payloads,
+    );
+    let view = project_dex_code_item(&item).expect("project");
+    let mut text = String::new();
+    render_dex_cfg_text(&view, &mut text);
+
+    // payload 地址 6 不是指令起点，所以它既不进块表也不进"未连上"账本。
+    assert_eq!(
+        text,
+        "CFG：3 个块、3 条边、0 个未连上的目标（入口块 0）\n\
+         块 0 @0000（1 条指令）  前驱：无\n\
+         \x20   → 块1 switch 默认\n\
+         \x20   → 块2 switch 分支（键=5）\n\
+         块 1 @0003（1 条指令）  前驱：块0\n\
+         \x20   → 块2 落空\n\
+         块 2 @0004（1 条指令）  前驱：块0、块1\n\
+         \x20   没有出边\n"
+    );
+}
+
+/// 连不上的目标必须在文本里单独列出来 —— 这行是 §7 里"降级要写在界面上"的落点。
+#[test]
+fn cfg_text_prints_unresolved_targets_instead_of_hiding_them() {
+    let item = code(
+        vec![
+            instruction(0, Opcode::Goto, 1, None, &[], 0, Some(9)),
+            return_void(1),
+        ],
+        BTreeMap::new(),
+    );
+    let view = project_dex_code_item(&item).expect("project");
+    let mut text = String::new();
+    render_dex_cfg_text(&view, &mut text);
+
+    assert_eq!(
+        text,
+        "CFG：2 个块、0 条边、1 个未连上的目标（入口块 0）\n\
+         块 0 @0000（1 条指令）  前驱：无\n\
+         \x20   没有出边\n\
+         块 1 @0001（1 条指令）  前驱：无\n\
+         \x20   没有出边\n\
+         未连上的目标（1 个，都没有连边）：\n\
+         \x20   块0 → 0x0009（分支；目标不是任何指令的起点）\n"
+    );
+}
+
+/// 空方法也要有汇总行 —— "0 个块"和"没打印"是两件事。
+#[test]
+fn cfg_text_for_an_empty_method_still_reports_zero() {
+    let item = code(Vec::new(), BTreeMap::new());
+    let view = project_dex_code_item(&item).expect("project");
+    let mut text = String::new();
+    render_dex_cfg_text(&view, &mut text);
+    assert_eq!(text, "CFG：0 个块、0 条边、0 个未连上的目标（入口块 无）\n");
 }
 
 // ── 畸形输入：不 panic、不编造、把异常如实报出来（CLAUDE.md §7）──────────────

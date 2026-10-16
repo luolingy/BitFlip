@@ -717,6 +717,51 @@ impl DexStructure {
             .unwrap_or_default()
     }
 
+    /// 把一个方法渲染成 smali 风格标识：`Lcom/foo/Bar;->baz(I)V`。
+    ///
+    /// 参数表或返回类型取不到时返回 `None`，**不给半截标识**：半截标识会让
+    /// "按标识查找"变成一次假成功（§7：拿不到就说拿不到）。
+    /// `parameters_off == 0` 是规范里的"无参数"，不是"读不到"，所以它正常出 `()`。
+    #[must_use]
+    pub fn method_signature(&self, method: usize) -> Option<String> {
+        let m = self.methods.get(method)?;
+        let class = self.class_descriptor(m.class_index as usize)?;
+        let name = self.method_name(method)?;
+        let id = self.file.methods.get(m.method_idx.0 as usize)?;
+        let proto = self.file.protos.get(id.proto_idx.0 as usize)?;
+
+        let mut out = String::with_capacity(class.len() + name.len() + 8);
+        out.push_str(class);
+        out.push_str("->");
+        out.push_str(name);
+        out.push('(');
+        if proto.parameters_off != 0 {
+            let parameters = self.file.type_lists.get(&proto.parameters_off)?;
+            for parameter in parameters {
+                out.push_str(self.file.get_type_descriptor(*parameter).ok()?);
+            }
+        }
+        out.push(')');
+        out.push_str(self.file.get_type_descriptor(proto.return_type_idx).ok()?);
+        Some(out)
+    }
+
+    /// 按 smali 风格标识找方法，返回它在 [`Self::methods`] 里的下标。
+    ///
+    /// **只做精确匹配**，理由与 [`Self::find_class_by_descriptor`] 一样：
+    /// 短名 / 子串 / 通配混在一起返回，"找到的到底是哪一个"就说不清了。
+    /// 一个类里重名方法靠原型区分，所以比较的是完整标识。
+    #[must_use]
+    pub fn find_method_by_signature(&self, signature: &str) -> Option<usize> {
+        // 先用 `->` 左边筛类，再只比较那个类自己的方法：全表十几万条逐个拼
+        // 字符串太浪费，而且这里的类内比较本来就已经足够精确。
+        let (class_descriptor, _) = signature.split_once("->")?;
+        let class = self.find_class_by_descriptor(class_descriptor)?;
+        self.class_methods(class)
+            .into_iter()
+            .find(|index| self.method_signature(*index).as_deref() == Some(signature))
+    }
+
     /// 方法总数（含抽象/native）。
     #[must_use]
     pub fn method_count(&self) -> usize {

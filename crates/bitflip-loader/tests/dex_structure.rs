@@ -426,6 +426,38 @@ fn a_minimal_but_conformant_dex_projects_classes_fields_and_methods() {
     assert_eq!(dex.find_class_by_descriptor("Foo"), None, "不做模糊匹配");
     assert_eq!(dex.find_class_by_descriptor("Ljava/lang/Object;"), None);
 
+    // ── smali 风格标识：`类->方法(参数)返回`
+    assert_eq!(
+        dex.method_signature(0).as_deref(),
+        Some("Lcom/example/Foo;-><init>()V"),
+        "无参方法（parameters_off == 0）出空括号"
+    );
+    assert_eq!(
+        dex.method_signature(1).as_deref(),
+        Some("Lcom/example/Foo;->bar(I)V")
+    );
+    assert_eq!(dex.method_signature(2), None, "下标越界给 None，不给空串");
+
+    // 按标识反查（精确匹配，重名方法靠原型区分）
+    assert_eq!(
+        dex.find_method_by_signature("Lcom/example/Foo;->bar(I)V"),
+        Some(1)
+    );
+    assert_eq!(
+        dex.find_method_by_signature("Lcom/example/Foo;-><init>()V"),
+        Some(0)
+    );
+    assert_eq!(
+        dex.find_method_by_signature("Lcom/example/Foo;->bar()V"),
+        None,
+        "原型不同就是不同方法，不许模糊命中"
+    );
+    assert_eq!(dex.find_method_by_signature("Lcom/example/Foo;->bar"), None);
+    assert_eq!(
+        dex.find_method_by_signature("Lcom/other/Bar;->bar(I)V"),
+        None
+    );
+
     // ── 完全合规的文件不该有任何降级说明
     assert!(
         dex.notes.is_empty(),

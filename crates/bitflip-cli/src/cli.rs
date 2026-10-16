@@ -76,6 +76,8 @@ pub enum Command {
     Info(InfoArgs),
     /// 列出归档成员（静态库 / ar 归档）
     Members(MembersArgs),
+    /// 查看 DEX（APK 或 .dex）：列类、看方法指令与文本 CFG
+    Dex(DexArgs),
     /// 列出识别出的函数
     Functions(FunctionsArgs),
     /// 在目标里定位一个符号（函数名或地址）
@@ -217,6 +219,43 @@ pub struct MembersArgs {
     /// 目标文件（归档 / 静态库）
     #[arg(value_name = "TARGET")]
     pub target: PathBuf,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+    /// 打开调试日志
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+/// `dex` 参数（M2b：DEX 视图的独立入口）。
+///
+/// 刻意**不**做成 `functions --member classes.dex`：那条路要过
+/// `Session::member_session`，它要求成员能被 `parse_object` 解析成对象，
+/// 而 DEX 没有对象解析器（ADR-0020），必然被拒。DEX 需要自己的入口，
+/// 也需要自己的输出形状（没有架构、没有线性地址、指令是寄存器机码元序列）。
+#[derive(Debug, Args)]
+pub struct DexArgs {
+    /// 目标文件（APK，或单个 .dex 文件）
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 只看这个 DEX 成员（APK 里有多个 DEX 时用；名字见不带选项时的列表）
+    #[arg(long, value_name = "NAME")]
+    pub member: Option<String>,
+    /// 列出这个类的方法（smali 描述符，如 `Lcom/Foo;`）
+    #[arg(long, value_name = "DESC")]
+    pub class: Option<String>,
+    /// 打印这个方法的指令与 CFG（smali 标识，如 `Lcom/Foo;->bar(I)V`）
+    #[arg(long, value_name = "SIG")]
+    pub method: Option<String>,
+    /// 不解析符号：池索引按原始形式输出（默认是解析成符号文本）
+    #[arg(long)]
+    pub no_symbols: bool,
+    /// 不打印 CFG
+    #[arg(long)]
+    pub no_cfg: bool,
+    /// 列表最多输出多少条（0 = 不限制）
+    #[arg(long, default_value_t = 200, value_name = "N")]
+    pub limit: usize,
     /// 输出 JSON（稳定的 wire 契约）
     #[arg(long)]
     pub json: bool,
