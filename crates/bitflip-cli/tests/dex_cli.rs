@@ -27,6 +27,8 @@ fn args(target: &Path) -> DexArgs {
         member: None,
         class: None,
         method: None,
+        list_classes: false,
+        search: None,
         no_symbols: false,
         no_cfg: false,
         limit: 200,
@@ -273,6 +275,136 @@ fn class_json_lists_every_occurrence() {
     assert_eq!(methods[1]["has_code"], true);
 }
 
+/// `--list-classes`：把所有类列出来，并交代"扫了多少、匹配多少、列出多少"。
+///
+/// 为什么要有这条路：`--class` 是精确匹配，而混淆过的 APK 里类名是
+/// `L_COROUTINE/ArtificialStackFrames;` 这种东西 —— 没有列表，命令行用户
+/// 实际上找不到类，只能先用别的工具查出全名。
+#[test]
+fn listing_classes_reports_totals_and_method_counts() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let target = write_minimal_dex(&dir);
+
+    let mut list = args(&target);
+    list.list_classes = true;
+    let text = build_dex_text(&list).expect("列类");
+
+    assert!(
+        text.contains("类列表（全部；精确匹配用 `--class`）"),
+        "要说清这里是列表、不是精确匹配：{text}"
+    );
+    assert!(
+        text.contains("minimal.dex：扫描 1 个类，匹配 1 个"),
+        "要给出每个文件的扫描与匹配数：{text}"
+    );
+    assert!(
+        text.contains("Lcom/example/Foo;  方法 2 个（2 有字节码 / 0 无）"),
+        "每个类要带方法数与有没有字节码：{text}"
+    );
+    assert!(
+        text.contains("合计：扫描 1 个类，匹配 1 个，列出 1 个。"),
+        "合计行是「这个列表可不可信」的唯一依据：{text}"
+    );
+    assert!(
+        !text.contains("未列出"),
+        "只有一个类且没截断时不该出现截断说明：{text}"
+    );
+}
+
+/// `--search`：**子串**、大小写不敏感；搜不到是合法答案，但必须说清扫了多少个。
+#[test]
+fn search_matches_a_case_insensitive_substring() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let target = write_minimal_dex(&dir);
+
+    // `--search` 隐含列表模式（用户不必再敲一遍 `--list-classes`）。
+    let mut hit = args(&target);
+    hit.search = Some("foo".to_owned());
+    let text = build_dex_text(&hit).expect("搜索");
+    assert!(
+        text.contains("描述符里含「foo」的类"),
+        "要说明匹配口径与关键词：{text}"
+    );
+    assert!(text.contains("匹配 1 个"), "小写子串要命中 Foo：{text}");
+    assert!(
+        !text.contains("没有类匹配"),
+        "命中时不该出现「没找到」的说明：{text}"
+    );
+
+    // 搜不到：退出码 0（合法答案），但要说清扫了多少、匹配多少，并给下一步提示。
+    let mut miss = args(&target);
+    miss.search = Some("Activity".to_owned());
+    let text = build_dex_text(&miss).expect("搜不到不是错误");
+    assert!(text.contains("扫描 1 个类，匹配 0 个"), "{text}");
+    assert!(
+        text.contains("合计：扫描 1 个类，匹配 0 个，列出 0 个。"),
+        "{text}"
+    );
+    assert!(
+        text.contains("没有类匹配这个子串"),
+        "搜不到要给人下一步：{text}"
+    );
+}
+
+/// 选择器互斥：两条路（文本与 JSON）都必须报错，不能静默只看其中一个。
+///
+/// 这条测试盯的是一个真实存在过的缺陷：JSON 分支早先是 `if method … else if class …`，
+/// 同时给 `--class` 与 `--method` 时静默只输出方法 —— 命令行给了两个互斥选择器，
+/// 输出里一个字都不提。
+#[test]
+fn conflicting_selectors_are_rejected_on_both_paths() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let target = write_minimal_dex(&dir);
+
+    let mut both = args(&target);
+    both.class = Some("Lcom/example/Foo;".to_owned());
+    both.method = Some("Lcom/example/Foo;->bar(I)V".to_owned());
+    let error = build_dex_text(&both).expect_err("文本路径要拒绝");
+    assert!(format!("{error:#}").contains("只能给一个"), "{error:#}");
+
+    both.json = true;
+    let error = build_dex_json(&both).expect_err("JSON 路径也要拒绝");
+    assert!(format!("{error:#}").contains("只能给一个"), "{error:#}");
+
+    // 列表与精确选择器也不能同时给。
+    let mut mixed = args(&target);
+    mixed.search = Some("foo".to_owned());
+    mixed.class = Some("Lcom/example/Foo;".to_owned());
+    let error = build_dex_text(&mixed).expect_err("列表与 --class 要拒绝");
+    let message = format!("{error:#}");
+    assert!(message.contains("--search"), "{message}");
+    assert!(message.contains("不能同时给"), "{message}");
+}
+
+/// `--list-classes --json`：稳定的字段形状（`total` 说共几个，`listed` 说给了几个）。
+#[test]
+fn class_list_json_has_a_stable_shape() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let target = write_minimal_dex(&dir);
+
+    let mut search = args(&target);
+    search.search = Some("foo".to_owned());
+    search.json = true;
+    search.limit = 1;
+    let value: serde_json::Value =
+        serde_json::from_str(&build_dex_json(&search).expect("JSON")).expect("合法 JSON");
+
+    assert_eq!(value["format_version"], 1);
+    assert_eq!(value["class_list"]["search"], "foo");
+    assert_eq!(value["class_list"]["total"], 1);
+    assert_eq!(value["class_list"]["listed"], 1);
+    assert_eq!(value["class_list"]["limit"], 1);
+    assert_eq!(value["class_list"]["skipped_without_descriptor"], 0);
+    assert_eq!(
+        value["class_list"]["classes"][0]["descriptor"],
+        "Lcom/example/Foo;"
+    );
+    assert_eq!(value["class_list"]["classes"][0]["member"], "minimal.dex");
+    assert_eq!(value["class_list"]["classes"][0]["short_name"], "Foo");
+    assert_eq!(value["class_list"]["classes"][0]["method_count"], 2);
+    assert_eq!(value["class_list"]["classes"][0]["methods_with_code"], 2);
+}
+
 /// 真实 APK（M2b 的端到端验证）。
 ///
 /// 样本路径取 `BITFLIP_TEST_APK`，默认是开发机上的那份；**样本不在就直接失败**，
@@ -350,5 +482,91 @@ fn the_real_apk_renders_a_method_from_a_real_dex_member() {
         value["method"]["unsupported_operands"],
         value["method"]["unavailable_operands"],
         value["method"]["unresolved_edge_targets"],
+    );
+
+    // ── 列表 / 搜索：混淆过的 APK 里 `--class` 没法手打，这条路是找类的实际入口
+    let mut list_args = args(&apk);
+    list_args.list_classes = true;
+    list_args.limit = 3;
+    let listed = build_dex_text(&list_args).expect("列前几个类");
+    assert!(
+        listed.contains("合计：扫描 "),
+        "列表要交代扫了多少、匹配了多少：{listed}"
+    );
+    assert!(
+        listed.contains("有 ") && listed.contains("未列出（`--limit 0` 可全部列出）"),
+        "截断必须写在输出里：{listed}"
+    );
+    for line in listed.lines().take(10) {
+        println!("{line}");
+    }
+
+    // 拿一个真实的类描述符去搜它自己：至少命中 1 个，并且列出该描述符。
+    let descriptor = structure.class_descriptor(0).expect("第一个类应当有描述符");
+    let mut search_args = args(&apk);
+    search_args.member = Some("classes.dex".to_owned());
+    search_args.search = Some(descriptor.to_owned());
+    search_args.limit = 5;
+    let found = build_dex_text(&search_args).expect("按描述符搜索");
+    assert!(found.contains(descriptor), "搜它自己应当命中：{found}");
+
+    // 混乱的 APK 上搜一个真实存在的短子串（取描述符的最后一段类名）。
+    let short = descriptor
+        .trim_end_matches(';')
+        .rsplit('/')
+        .next()
+        .unwrap_or(descriptor)
+        .to_owned();
+    let mut fuzzy = args(&apk);
+    fuzzy.member = Some("classes.dex".to_owned());
+    fuzzy.search = Some(short.clone());
+    let hits = build_dex_text(&fuzzy).expect("按短子串搜索");
+    let total_line = hits
+        .lines()
+        .find(|line| line.starts_with("合计："))
+        .expect("合计行");
+    println!("---- 真实 APK：搜索子串「{short}」 -> {total_line} ----");
+    assert!(
+        !total_line.contains("匹配 0 个"),
+        "搜一个刚刚见过存在的子串，不该是 0 个匹配：{hits}"
+    );
+
+    // 搜一个绝不可能出现的子串：必须是合法答案（不报错），且说清扫了多少个类。
+    let mut miss = args(&apk);
+    miss.member = Some("classes.dex".to_owned());
+    miss.search = Some("zzz_no_such_class_zzz".to_owned());
+    let empty = build_dex_text(&miss).expect("搜不到不是错误");
+    assert!(empty.contains("匹配 0 个"), "搜不到要如实说 0 个：{empty}");
+    assert!(
+        empty.contains("扫描 "),
+        "搜不到时也要说扫了多少个类，否则分不清'没匹配'与'没扫'：{empty}"
+    );
+    println!(
+        "---- 真实 APK：搜不存在的子串 -> {} ----",
+        empty
+            .lines()
+            .find(|line| line.starts_with("合计："))
+            .unwrap_or("")
+    );
+
+    // 搜索走 JSON：`total`/`listed`/`limit` 三者要能对上。
+    let mut json_search = args(&apk);
+    json_search.member = Some("classes.dex".to_owned());
+    json_search.search = Some(short);
+    json_search.limit = 5;
+    json_search.json = true;
+    let value: serde_json::Value =
+        serde_json::from_str(&build_dex_json(&json_search).expect("JSON")).expect("合法 JSON");
+    let total = value["class_list"]["total"].as_u64().unwrap_or(0);
+    let listed = value["class_list"]["listed"].as_u64().unwrap_or(0);
+    assert!(total > 0, "JSON 也要有匹配：{value}");
+    assert_eq!(listed, total.min(5), "{value}");
+    assert_eq!(value["class_list"]["limit"], 5);
+    assert_eq!(value["class_list"]["classes"][0]["member"], "classes.dex");
+    assert!(
+        value["class_list"]["classes"][0]["descriptor"]
+            .as_str()
+            .is_some_and(|d| d.starts_with('L')),
+        "{value}"
     );
 }

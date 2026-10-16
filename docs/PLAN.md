@@ -1382,8 +1382,73 @@ MSVC 修饰名反修饰、静态库 PDB。
     rust-embed 把前端编进二进制，"源码里有"与"二进制会服务它"是两件事；
   * 真实 APK 的 `#[ignore]` 用例还覆盖了"没有字节码"这条分支
     （`Landroid/support/v4/app/INotificationSideChannel;->cancel(…)V`）。
-* **本轮仍未做**：CLI 侧的 `--list-classes` / `--search`（服务端有了，CLI 还没有）、
-  DEX 进 `export`、覆盖率引导模糊测试、长时间 soak。
+* **本轮仍未做**：DEX 进 `export`（形状见下一条）、覆盖率引导模糊测试、长时间 soak。
+
+**进展 · M2b CLI 列表 / 搜索 + 网页 URL 状态（2026-10-16，同日第三轮，据实记录）**：
+用户这一轮点名的五件事：CLI 补搜索、标签页与状态支持 URL、DEX 导出先定形状、
+`callgraph_scale` 先不管、顺手修掉已发现的问题。
+
+* **CLI `--list-classes` / `--search <TEXT>`**（`crates/bitflip-cli/src/dex.rs`）：
+  服务端第二轮就有了 `search`，CLI 没有 —— 而"混淆过的 APK 里类名是
+  `L_COROUTINE/ArtificialStackFrames;`"在命令行上更严重：没有列表就只能先用别的
+  工具查出全名。`--search` 是**子串**、大小写不敏感，且**隐含** `--list-classes`
+  （用户说"找 Activity"，不该再要求他敲一遍列表开关）；`--class` 仍然是**精确**匹配，
+  这个分工写进输出第一行。输出必须给"扫描 N 个类、匹配 M 个、列出 K 个"三个数：
+  搜不到是**合法答案**（退出码 0），但如果只说"没有"，就分不清"没匹配"与"我们没扫"
+  （§7）。`--list-classes`/`--search` 与 `--class`/`--method` **互斥**，文本与 JSON
+  两条路都报错 —— JSON 那条路早先是 `if method { … } else if class { … }`，同时给
+  两个互斥选择器时会**静默只取方法**（命令行给了两个，输出一个字都不提）。这条是
+  写互斥检查时才发现的既有缺陷，顺手一起修了。
+* **`DexStructure::class_method_counts`**（loader）：类的方法数与其中有字节码的个数
+  只在**一处**定义。CLI 的类列表与服务端的 `/api/dex/classes` 都要这两个数，
+  各算一遍就会慢慢分叉，而分叉的表现是"两个界面同一份文件给出不同的数"——
+  最难发现的一类错误。服务端的 `classes` 处理函数已换过去。实现上不建中间 `Vec`：
+  类列表会对每个类调用一次（真实样本 7000+ 次）。
+* **网页 URL 状态**（`web/src/dexUrl.ts` + `DexView.tsx`）：标签页、选中的类、
+  选中的方法、类列表搜索词写进 **hash**（`#dex=1&member=…&class=…&method=…&search=…`），
+  刷新不丢、链接可分享。为什么是 hash 不是 query：hash 不发给服务端，类描述符这类
+  "目标文件里的内容"因此不会进服务端访问日志；为什么是 `replaceState` 不是
+  `pushState`：点 20 个类就压 20 条历史、要按 20 次"返回"才退得出视图 ——
+  那是把历史记录当状态存储用（外部改 hash 仍由 `hashchange` 接住并应用）。
+  指令分页的页码**不进 URL**：那是"看到第几页"，不是"在看哪个方法"。
+  `resolveToken()` 相应改成**只清令牌、保留 hash 里的其他参数**（原来整条 URL
+  清成 pathname，那会把刚存下的状态一起清掉；查询串仍整条丢弃，令牌必须走干净）。
+  URL 里的 `member` 不属于本次目标时（链接来自另一份 APK）**明说再换**，
+  不静默切到另一个文件。
+* **`web/src/dexUrl.ts` 有真测试**：`scripts/check-dex-url.mjs` 用 Node 的类型剥离
+  （`--experimental-strip-types`）直接 import **打包进 SPA 的那份源码**，喂假的
+  `window`/`history` 跑 10 条断言（读到 / 写回 / 编码往返 / 保留 token / 清空删键 /
+  状态没变不碰 URL / 订阅与取消）。这不是"复制一份逻辑来测"，
+  也没有浏览器依赖；已接进 `scripts/preflight.ps1`（`DEX url state (web)`）。
+  之所以值得单独立一条：URL 状态是最容易"看起来对、其实没写进去"的功能，
+  `tsc` 一个错误都不会报。
+* **顺手修掉的两处既有缺陷**（都是"界面显示了不存在的事实"这一类）：
+  * `web/src/api.ts` 的 `MemberWire.offset` 写成了 `number`，而服务端在 ZIP
+    本地头对不上时会**刻意给 `null`**（用 `0` 冒充会给出一个合法偏移，
+    前端拿去对照十六进制会白找一场）。`MembersView.tsx` 里的
+    `member.offset.toString(16)` 遇到这种成员会直接抛异常。现在类型是
+    `number | null`，界面显示"未知"并给出原因；同一行的键也从 `name@offset`
+    换成带下标（同名成员 + 未知偏移会让键撞在一起）。
+  * `MemberWire` 缺 `uncompressed_size` 与 `storage` 两个字段。ZIP 成员的 `size`
+    是**压缩后**大小，只显示它会让用户拿着一个 195 KB 的数字去对一份几 MB 的
+    反汇编结果 —— 服务端 DTO 的注释里专门写了这条警告，前端却读不到那个字段。
+    现在两者不同时把"解压后"一起显示。
+* **DEX 进 `export`：本轮只定形状**（用户明确要求"先定形状"）。
+  形状写在 `docs/APK-DEX-DESIGN.md` §M2c（字段级：`dex-json` / `dex-smali` /
+  `dex-dot-cfg`、选项扩展、信封、四条硬要求、验收清单），决定记在 **ADR-0021**：
+  沿用同一个 `export` 入口与 `GET /api/export`、由 `format` 判别视图
+  （不新开端点，否则"字节预算 + 截断报告 + 部分保留"那套会被抄第二遍然后分叉）、
+  机器码格式名用于 DEX 要**报错**、`--function`/`--range` 对 DEX 无意义要报错而
+  **不是静默忽略**、`format_versions.dex` 非 DEX 时是 `null` 不是 `0`、
+  导出必须**确定性**（同类输入逐字节相同，CI 靠它做差分）。**实现未做。**
+* **验证（数据层）**：CLI 合成样本用例 8 → 12 条（列类 / 搜索命中 / 搜索落空 /
+  三条互斥错误路径 / `class_list` JSON 形状）；真实 APK 的 `#[ignore]` 用例扩到
+  77 秒，实测 `classes.dex` 扫描 7643 个类、`--search ArtificialStackFrames` 命中 1、
+  搜不存在的子串命中 0；`scripts/check-dex-url.mjs` 10 条断言全过；
+  `npm run typecheck` 过；fmt / clippy / 架构分层 / 许可闸门全过。
+* **仍未做**：DEX `export` 的实现（形状已定）、覆盖率引导模糊测试、长时间 soak。
+  已知问题（与本阶段无关，用户明确"先不管"）：
+  `bitflip-analyze/tests/callgraph_scale.rs` 的 10k 函数用例在慢机器上会超 3000 ms 门槛。
 
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 

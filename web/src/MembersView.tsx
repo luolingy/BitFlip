@@ -133,9 +133,11 @@ export function MembersView({
               </tr>
             </thead>
             <tbody>
-              {members.map((m) => (
+              {members.map((m, index) => (
                 <MemberRow
-                  key={`${m.name}@${m.offset}`}
+                  // `offset` 可能是 `null`（ZIP 本地头对不上），所以键里带上下标：
+                  // 同名成员 + 未知偏移会让键撞在一起。
+                  key={`${index}:${m.name}`}
                   member={m}
                   active={m.name === selected}
                   onSelect={setSelected}
@@ -190,8 +192,37 @@ function MemberRow({
       }
     >
       <td className="mono">{member.name}</td>
-      <td className="mono">{`0x${member.offset.toString(16)}`}</td>
-      <td className="mono">{formatSize(member.size)}</td>
+      <td className="mono">
+        {member.offset === null ? (
+          // 拿不到就说拿不到：ZIP 成员的数据起点记在本地头里，本地头对不上
+          // 就算不出来。显示 `0x0` 会让用户以为内容真在文件开头（§7）。
+          <span
+            className="hint"
+            title="这个成员的数据起点记在 ZIP 本地头里，本地头对不上，算不出偏移"
+          >
+            未知
+          </span>
+        ) : (
+          `0x${member.offset.toString(16)}`
+        )}
+      </td>
+      <td className="mono">
+        {/*
+          ZIP 成员这里 `size` 是**压缩后**大小，`uncompressed_size` 才是解压后的。
+          只显示前者会让人拿着一个 195 KB 的数字去对一份几 MB 的反汇编结果，
+          所以两者不同时把两个都写出来。
+        */}
+        {formatSize(member.size)}
+        {member.uncompressed_size !== null &&
+          member.uncompressed_size !== member.size && (
+            <span
+              className="chip chip-small"
+              title="左边是压缩后大小（来自 ZIP 中央目录），这里是解压后的大小"
+            >
+              解压后 {formatSize(member.uncompressed_size)}
+            </span>
+          )}
+      </td>
       <td>
         {member.truncated && <span className="chip chip-small">已截断</span>}
         {!member.analyzable && <span className="chip chip-small">元数据</span>}

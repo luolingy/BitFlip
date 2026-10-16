@@ -364,22 +364,12 @@ pub(crate) async fn classes(
         .skip(offset)
         .take(limit)
         .map(|(class, descriptor)| {
-            let methods = entry.structure.class_methods(*class);
-            let with_code = methods
-                .iter()
-                .filter(|index| {
-                    entry
-                        .structure
-                        .methods
-                        .get(**index)
-                        .is_some_and(|method| method.has_code())
-                })
-                .count();
+            let (method_count, methods_with_code) = entry.structure.class_method_counts(*class);
             ClassRefWire {
                 descriptor: descriptor.clone(),
                 short_name: entry.structure.class_short_name(*class).map(str::to_string),
-                method_count: methods.len(),
-                methods_with_code: with_code,
+                method_count,
+                methods_with_code,
             }
         })
         .collect();

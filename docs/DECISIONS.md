@@ -297,6 +297,42 @@ M2（Dalvik 解码器 + CFG）→ M3（AXML + arsc）**。
 
 **参考**：`docs/APK-DEX-DESIGN.md` §M2、ADR-0019。
 
+### ADR-0021 · DEX 进 `export`：同一个入口，格式名做判别；选项与视图不匹配就报错
+
+**状态**：已决（**形状已定、实现未做**，2026-10-16）
+
+**背景**：ADR-0020 的"本 ADR 不定的事"里，第二件是 DEX 视图**怎么导出**；
+M9 已有 `export` 子命令与 `GET /api/export`（7 种格式、字节预算、截断报告、
+部分保留），M2b 已把 DEX 的读写路径做完（CLI + 服务端 + 网页）。
+
+**决策**
+
+1. **不新开入口**：沿用 `export` 子命令与 `GET /api/export`，格式新增
+   `dex-json` / `dex-smali` / `dex-dot-cfg`，**由 `format` 判别视图**。
+   第二个端点或第二个子命令必然把"截断报告 + 字节预算 + 部分保留"那套抄一遍，
+   然后在某次改动里分叉成两套说法。
+2. **机器码的格式名不许用于 DEX**：`asm-intel` / `asm-att` / `pseudo-c` +
+   `--member classes.dex` **报错**，不产出空的反汇编。
+3. **选项与视图不匹配就报错**：`--function` / `--range` 对 DEX 无意义
+   （没有线性地址空间、没有函数入口），给了就 `ExportError` 并说明该用
+   `--class` / `--method`。**不静默忽略**：忽略一个用户明确给出的选择器，
+   等于把"我按你说的做了"变成假话（§7）。
+4. **信封沿用 M9**：`ExportMeta` / `Truncation` / `notes` 不动，
+   `format_versions` 增一列 `dex: Option<u32>`，非 DEX 导出时为 `null`（**不是 0**）。
+5. **导出的必须是同一份事实**：`dex-json` 的字段名与 `/api/dex/*` 的 DTO 一致，
+   `class_count` 必须与 `/api/dex/inputs` 相等（两条独立路径给同一个数，
+   差一个就说明其中一条在编）。
+
+**理由**：导出文件是**给别人解析**的，占位符与默认值进去以后再也分不出真假 ——
+`droidsaw` 的 smali 渲染器写 `"?"` / `"<invalid>"` 正是被拒绝的那个做法
+（ADR-0020 的 2026-10-15 更正）。同理，导出必须**确定性**（同类输入逐字节相同），
+否则 CI 差分把"顺序变了"报成"内容变了"。
+
+**代价**：`ExportFormat` 变成"两种视图共用一枚枚举"，`export()` 内部要按格式分派。
+这是认下来的 —— 与 ADR-0020 的结论一致：认两种视图是对的，但不必认两个来源。
+
+**参考**：`docs/APK-DEX-DESIGN.md` §M2c（字段级形状）、ADR-0020、`crates/bitflip-core/src/export.rs`。
+
 ### ADR-0004 · 构建工具：npm（不用 pnpm）；构建目录固定在 F:
 
 **状态**：已决

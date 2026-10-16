@@ -19,6 +19,7 @@ import { DisassemblyView } from "./DisassemblyView";
 import { FunctionsView, HexView, StringsView, XrefsView } from "./AnalysisViews";
 import { MembersView } from "./MembersView";
 import { DexView } from "./DexView";
+import { readDexUrl } from "./dexUrl";
 import { ScriptConsole } from "./ScriptConsole";
 import {
   ArgScanView,
@@ -130,7 +131,10 @@ const VIEW_TITLES: Record<ViewId, string> = {
 export function App() {
   const token = useMemo(resolveToken, []);
   const [state, setState] = useState<LoadState>({ kind: "loading" });
-  const [view, setView] = useState<ViewId>("structure");
+  // 起始视图：hash 里带着 DEX 状态（`#dex=1…`）就直接落在 DEX 视图上 ——
+  // 分享出去的链接要能打开那个视图，而不是"打开了应用还要自己点一下"。
+  // 读的是已被 `resolveToken` **只清掉令牌**的 hash（见 `api.ts` 里那处改动）。
+  const [view, setView] = useState<ViewId>(() => (readDexUrl().active ? "dex" : "structure"));
   /**
    * 当前聚焦的地址。
    *

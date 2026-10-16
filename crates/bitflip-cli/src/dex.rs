@@ -64,10 +64,15 @@ pub fn run_dex(args: &DexArgs) -> anyhow::Result<()> {
 
 /// 组装文本报告（纯函数：`run_dex` 只负责打印，测试直接断言这里）。
 pub fn build_text(args: &DexArgs) -> anyhow::Result<String> {
+    check_selectors(args)?;
     let parsed = load_all(args)?;
 
     let mut out = String::new();
     let _ = writeln!(out, "目标：{}", args.target.display());
+    if listing(args) {
+        report_class_list(&mut out, &parsed, args);
+        return Ok(out);
+    }
     match (args.class.as_deref(), args.method.as_deref()) {
         (Some(class), Some(method)) => {
             bail!("`--class {class}` 与 `--method {method}` 只能给一个：前者列一个类的方法，后者看一个方法的指令")
@@ -79,8 +84,39 @@ pub fn build_text(args: &DexArgs) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// 是否走"列类 / 找类"模式。
+///
+/// `--search` 隐含 `--list-classes`：用户只说了"找 Activity"，再要求他也敲一遍
+/// `--list-classes` 是把实现细节推给他。
+fn listing(args: &DexArgs) -> bool {
+    args.list_classes || args.search.is_some()
+}
+
+/// 选择器之间的互斥检查（文本与 JSON 两条路共用）。
+///
+/// 两条路都必须查：JSON 那条路早先是 `if method { … } else if class { … }`，
+/// 同时给 `--class` 与 `--method` 时会**静默只取方法** —— 命令行明明给了两个互斥的
+/// 选择器，输出里却一个字都不提，用户会以为类列表也打印过了。
+fn check_selectors(args: &DexArgs) -> anyhow::Result<()> {
+    if listing(args) && (args.class.is_some() || args.method.is_some()) {
+        let which = if args.search.is_some() {
+            "--search"
+        } else {
+            "--list-classes"
+        };
+        bail!(
+            "{which} 与 `--class` / `--method` 不能同时给：前者按子串**列类**，后者**精确**看一个类或一个方法"
+        );
+    }
+    if let (Some(class), Some(method)) = (args.class.as_deref(), args.method.as_deref()) {
+        bail!("`--class {class}` 与 `--method {method}` 只能给一个：前者列一个类的方法，后者看一个方法的指令");
+    }
+    Ok(())
+}
+
 /// 组装 JSON 报告（稳定的 wire 契约；每份都带 `format_version`）。
 pub fn build_json(args: &DexArgs) -> anyhow::Result<String> {
+    check_selectors(args)?;
     let parsed = load_all(args)?;
     let inputs: Vec<_> = parsed
         .iter()
@@ -106,7 +142,9 @@ pub fn build_json(args: &DexArgs) -> anyhow::Result<String> {
         "dex_inputs": inputs,
     });
 
-    if let Some(signature) = args.method.as_deref() {
+    if listing(args) {
+        payload["class_list"] = class_list_json(&parsed, args);
+    } else if let Some(signature) = args.method.as_deref() {
         payload["method"] = method_json(&parsed, signature, args)?;
     } else if let Some(descriptor) = args.class.as_deref() {
         payload["class"] = class_json(&parsed, descriptor, args)?;
@@ -276,6 +314,176 @@ fn report_summary(out: &mut String, parsed: &[(DexInput, DexStructure)], args: &
         out,
         "说明：用 `--class Lcom/Foo;` 列类的方法；用 `--method 'Lcom/Foo;->bar(I)V'` 看指令与文本 CFG。"
     );
+}
+
+/// 列出类 / 找类（`--list-classes` / `--search`）。
+///
+/// # 为什么要有这条路
+///
+/// `--class` 是**精确**匹配，而混淆过的 APK 里类名是 `L_COROUTINE/ArtificialStackFrames;`
+/// 这种东西 —— 没有列表和子串搜索，命令行用户实际上找不到类，只能用别的工具先查出
+/// 全名。所以本条与 `--class` 的分工要写在输出里：这里是**子串**匹配（大小写不敏感），
+/// 那里是精确匹配。
+///
+/// # 空结果不是错误
+///
+/// 搜不到是**合法答案**，退出码 0；但必须说清"扫了多少个类、匹配了多少个"，
+/// 否则"没输出"分不清是没匹配还是我们没扫（CLAUDE.md §7）。
+fn report_class_list(out: &mut String, parsed: &[(DexInput, DexStructure)], args: &DexArgs) {
+    let needle = args.search.as_deref().map(str::to_lowercase);
+    let limit = if args.limit == 0 {
+        usize::MAX
+    } else {
+        args.limit
+    };
+
+    match args.search.as_deref() {
+        Some(text) => {
+            let _ = writeln!(
+                out,
+                "找类：描述符里含「{text}」的类（**子串**匹配，大小写不敏感；精确匹配用 `--class`）"
+            );
+        }
+        None => {
+            let _ = writeln!(out, "类列表（全部；精确匹配用 `--class`）");
+        }
+    }
+
+    let mut total_all = 0usize;
+    let mut listed_all = 0usize;
+    let mut scanned_all = 0usize;
+    let mut skipped_all = 0usize;
+    for (input, structure) in parsed {
+        let role = if input.role.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", input.role)
+        };
+
+        // 描述符取不到（类定义指向越界的 type_id）时如实跳过并计数，
+        // 不编一个名字出来充数。
+        let mut skipped = 0usize;
+        let mut matched: Vec<usize> = Vec::new();
+        for class in 0..structure.class_count() {
+            let Some(descriptor) = structure.class_descriptor(class) else {
+                skipped += 1;
+                continue;
+            };
+            if let Some(needle) = needle.as_deref() {
+                if !descriptor.to_lowercase().contains(needle) {
+                    continue;
+                }
+            }
+            matched.push(class);
+        }
+
+        scanned_all += structure.class_count();
+        skipped_all += skipped;
+        total_all += matched.len();
+
+        let remaining = limit.saturating_sub(listed_all);
+        let take = matched.len().min(remaining);
+        let _ = writeln!(
+            out,
+            "  {}{}：扫描 {} 个类，匹配 {} 个",
+            input.name,
+            role,
+            structure.class_count(),
+            matched.len()
+        );
+        for class in matched.iter().take(take) {
+            let descriptor = structure.class_descriptor(*class).unwrap_or_default();
+            let (method_count, with_code) = structure.class_method_counts(*class);
+            let _ = writeln!(
+                out,
+                "    {descriptor}  方法 {method_count} 个（{with_code} 有字节码 / {} 无）",
+                method_count - with_code
+            );
+        }
+        if take < matched.len() {
+            let _ = writeln!(out, "    …本文件还有 {} 个未列出", matched.len() - take);
+        }
+        if skipped > 0 {
+            let _ = writeln!(
+                out,
+                "    注意：有 {skipped} 个类的描述符取不到（类定义指向越界的 type_id），已如实跳过"
+            );
+        }
+        listed_all += take;
+    }
+
+    let _ = writeln!(
+        out,
+        "合计：扫描 {scanned_all} 个类，匹配 {total_all} 个，列出 {listed_all} 个。"
+    );
+    if skipped_all > 0 {
+        let _ = writeln!(out, "其中 {skipped_all} 个类的描述符取不到，已跳过。");
+    }
+    if listed_all < total_all {
+        let _ = writeln!(
+            out,
+            "有 {} 个未列出（`--limit 0` 可全部列出）。",
+            total_all - listed_all
+        );
+    }
+    if total_all == 0 && args.search.is_some() {
+        let _ = writeln!(
+            out,
+            "没有类匹配这个子串。换个短一点的子串试试 —— 混淆过的名字（如 `L_COROUTINE/…`）往往只在一小段前缀上交叠。"
+        );
+    }
+}
+
+/// `--list-classes` / `--search --json` 的那一段。
+fn class_list_json(parsed: &[(DexInput, DexStructure)], args: &DexArgs) -> serde_json::Value {
+    let needle = args.search.as_deref().map(str::to_lowercase);
+    let limit = if args.limit == 0 {
+        usize::MAX
+    } else {
+        args.limit
+    };
+
+    let mut total = 0usize;
+    let mut listed = 0usize;
+    let mut skipped = 0usize;
+    let mut classes = Vec::new();
+    for (input, structure) in parsed {
+        for class in 0..structure.class_count() {
+            let Some(descriptor) = structure.class_descriptor(class) else {
+                skipped += 1;
+                continue;
+            };
+            if let Some(needle) = needle.as_deref() {
+                if !descriptor.to_lowercase().contains(needle) {
+                    continue;
+                }
+            }
+            total += 1;
+            if listed >= limit {
+                continue;
+            }
+            listed += 1;
+            let (method_count, methods_with_code) = structure.class_method_counts(class);
+            classes.push(json!({
+                "member": input.name,
+                "descriptor": descriptor,
+                "short_name": structure.class_short_name(class),
+                "method_count": method_count,
+                "methods_with_code": methods_with_code,
+            }));
+        }
+    }
+
+    json!({
+        "search": args.search,
+        // 过滤后的匹配总数，与 `classes` 的长度可能不同（分页口径一致：
+        // `total` 说"共几个"，`listed` 说"这一页给了几个"）。
+        "total": total,
+        "listed": listed,
+        "limit": args.limit,
+        "skipped_without_descriptor": skipped,
+        "classes": classes,
+    })
 }
 
 /// 一个类的全部匹配（可能在多个 DEX 里都有）。

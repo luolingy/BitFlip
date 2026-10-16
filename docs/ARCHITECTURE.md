@@ -452,7 +452,15 @@ Wire 规则（借鉴 adi web 的正确部分并修正其问题）：
 - 交互：键盘优先；命令面板（`Ctrl+P`）统一入口；导航历史（`b`/前进）；地址跳转接受
   `0x401000` / `401000` / 符号名 / 函数名。
 - i18n：文案集中（`web/src/i18n/zh.ts` 为默认），禁止组件内硬编码中文。
-- 测试：`npm run typecheck` + 组件测试 + 端到端（Playwright）主链路。
+- **URL 状态放 hash**（约定写在 `web/src/dexUrl.ts`）：SPA 没有前端路由，hash 不会
+  发给服务端 —— 类描述符这类"目标文件里的内容"因此不进服务端访问日志。DEX 视图把
+  "看哪个 `classes*.dex` / 哪个类 / 哪个方法 / 搜索词"写进 hash（带 `dex=1` 标记，
+  分享的链接可直接落在该视图上），用 `replaceState` 而非 `pushState`（点一次类就压
+  一条历史等于把历史记录当状态存储用）。启动时 `resolveToken()` **只清令牌**、
+  保留 hash 里的其他参数；查询串只用来传令牌，仍整条丢弃。
+- 测试：`npm run typecheck` + `node --experimental-strip-types scripts/check-dex-url.mjs`
+  （直接 import 真实 `.ts` 源码跑 10 条断言，已接入 `preflight.ps1`）+ 组件测试 +
+  端到端（Playwright）主链路（**尚未落地**）。
 
 ## 10. 并发与资源模型
 

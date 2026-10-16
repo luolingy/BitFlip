@@ -268,6 +268,12 @@ try {
     Check 'the embedded bundle is served' (($bundle.Status -eq 200) -and ($bundle.Body.Length -gt 100000)) `
         "status=$($bundle.Status) bytes=$($bundle.Body.Length)"
     Check 'the embedded bundle contains the DEX view' ($bundle.Body -match '/api/dex/classes') 'looked for /api/dex/classes'
+    # The DEX view keeps its selection in the URL hash, so a link can be shared.
+    # 'hashchange' is the string that only the URL-state module introduces; if the
+    # built bundle stopped carrying it, the shipped UI would lose refresh/share
+    # and nothing else would notice (the source tree would still look right).
+    Check 'the embedded bundle carries the DEX url-state wiring' ($bundle.Body -match 'hashchange') 'looked for hashchange'
+    Check 'the embedded bundle carries the member size fields' ($bundle.Body -match 'uncompressed_size') 'looked for uncompressed_size'
     Check 'the embedded stylesheet has the CFG block' `
         ((Invoke-Api -Uri "http://127.0.0.1:$Port/assets/app.css" -Token '').Body -match 'dex-cfg') 'looked for .dex-cfg'
 }

@@ -247,6 +247,12 @@ pub struct DexArgs {
     /// 打印这个方法的指令与 CFG（smali 标识，如 `Lcom/Foo;->bar(I)V`）
     #[arg(long, value_name = "SIG")]
     pub method: Option<String>,
+    /// 列出类（每个类给方法数与 `code_off` 说不出的那些）；配合 `--search` 用
+    #[arg(long)]
+    pub list_classes: bool,
+    /// 在类描述符里按子串找（大小写不敏感）；给了它就等于 `--list-classes`
+    #[arg(long, value_name = "TEXT")]
+    pub search: Option<String>,
     /// 不解析符号：池索引按原始形式输出（默认是解析成符号文本）
     #[arg(long)]
     pub no_symbols: bool,
@@ -578,6 +584,29 @@ mod tests {
                 );
                 assert!(!args.no_cfg, "CFG 默认打印成文本");
                 assert_eq!(args.limit, 200);
+                assert!(!args.list_classes, "列表模式要显式打开");
+                assert_eq!(args.search, None);
+            }
+            other => panic!("期望 dex，得到 {other:?}"),
+        }
+
+        // 列表 / 搜索：`--search` 与 `--list-classes` 是两个独立开关，
+        // 两者的关系（`--search` 隐含列表）由命令层决定并写进说明。
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "dex",
+            "app.apk",
+            "--list-classes",
+            "--search",
+            "Activity",
+        ])
+        .expect("解析");
+        match cli.command {
+            Command::Dex(args) => {
+                assert!(args.list_classes);
+                assert_eq!(args.search.as_deref(), Some("Activity"));
+                assert_eq!(args.class, None);
+                assert_eq!(args.method, None);
             }
             other => panic!("期望 dex，得到 {other:?}"),
         }

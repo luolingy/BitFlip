@@ -240,7 +240,18 @@ export function resolveToken(): string | null {
     } catch {
       // 隐私模式下 sessionStorage 可能不可用：令牌只存在于内存里的返回值中。
     }
-    window.history.replaceState(null, "", window.location.pathname);
+    // **只清令牌，保留 hash 里的其他参数。** 原来是整条 URL 清成 pathname，
+    // 而 DEX 视图把"看哪个 DEX / 哪个类 / 哪个方法"放在 hash 里（可刷新、可分享），
+    // 一起清掉就等于每次刷新都回到"什么也没选"。查询串仍然整条丢弃：
+    // 它只可能来自 `?token=`，没有别的用途，而令牌必须走干净。
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+    params.delete("token");
+    const rest = params.toString();
+    window.history.replaceState(
+      null,
+      "",
+      window.location.pathname + (rest ? `#${rest}` : ""),
+    );
     return token;
   }
   try {
@@ -431,10 +442,32 @@ export interface FunctionAliasWire {
 export interface MemberWire {
   /** 成员名（已尽量解析长名表）。 */
   name: string;
-  /** 成员数据在容器里的文件偏移。 */
-  offset: number;
-  /** 成员数据长度。 */
+  /**
+   * 成员数据在容器里的文件偏移；**未知时为 `null`**。
+   *
+   * ZIP 成员的数据起点记在**本地头**里（中央目录只记本地头的位置），本地头
+   * 对不上时这个值算不出来。后端刻意给 `null` 而不是 `0`：用 `0` 冒充会给出一个
+   * **合法**偏移，前端拿去对照十六进制会白找一场。所以这里必须按可空处理，
+   * 不能写 `number` 然后直接 `toString(16)`。
+   */
+  offset: number | null;
+  /**
+   * 成员数据长度。
+   *
+   * 注意：ZIP 成员这里是**压缩后**大小（来自中央目录）；解压后的大小在
+   * `uncompressed_size`。两者不同时必须都显示，否则会看着一个 195 KB 的
+   * `.so` 报出与实际反汇编对不上的数字。
+   */
   size: number;
+  /**
+   * 成员**解压后**的长度；内联成员（ar / MSVC `.lib`）为 `null`（没有这一层）。
+   *
+   * 可能为 `0` 且不代表"空文件"：写了 data descriptor 的 ZIP 条目其长度在
+   * 本地头里是空的。不要把 `0` 当成确定的长度。
+   */
+  uncompressed_size: number | null;
+  /** 成员内容怎么取：`"inline"`（文件里就是裸字节）或 `"container"`（要经容器取出，可能压缩）。 */
+  storage: string;
   /** 成员数据是否超出嗅探窗口。 */
   truncated: boolean;
   /**

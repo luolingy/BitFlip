@@ -18,6 +18,9 @@
  *   没有指令，而不是显示一张空表。
  * - **解析不出来要说出来**：符号解析的已知缺口与异常、CFG 里连不上的边
  *   都要显示出来，`unresolved_edge_targets > 0` 时高亮。
+ * - **状态在 URL 里**（用户 2026-10-16 的决定）：标签页、选中的类与方法、搜索词
+ *   写进 hash，所以刷新不丢、链接可分享（`web/src/dexUrl.ts`）。
+ *   指令分页的页码**不**进 URL —— 那是"看到第几页"，不是"在看哪个方法"。
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -34,6 +37,7 @@ import {
   type DexInputsResponse,
   type DexMethodResponse,
 } from "./api";
+import { readDexUrl, subscribeDexHash, writeDexUrl } from "./dexUrl";
 
 /** 类列表每页条数（后端上限 1000）。 */
 const CLASS_PAGE = 200;
@@ -55,8 +59,16 @@ function messageOf(error: unknown): string {
 /** DEX 视图：标签页 + 类浏览器。 */
 export function DexView({ token }: { token: string | null }) {
   const [state, setState] = useState<Loaded<DexInputsResponse>>({ kind: "loading" });
+  // 这三个（加 `member`）是**唯一**进 URL 的选中状态，所以放在这里由本组件拥有：
+  // 分散在子组件里就没法写到 URL 上，也没法从 URL 里恢复。
+  const initial = readDexUrl();
   /** 当前选中的 DEX（用**成员名**：它是稳定的，下标不是）。 */
-  const [member, setMember] = useState<string | null>(null);
+  const [member, setMember] = useState<string | null>(initial.member);
+  /** 选中的类与方法（smali 描述符 / smali 标识）。 */
+  const [descriptor, setDescriptor] = useState<string | null>(initial.descriptor);
+  const [method, setMethod] = useState<string | null>(initial.method);
+  /** 类列表的过滤词（已提交的那个，不是输入框里的草稿）。 */
+  const [search, setSearch] = useState<string>(initial.search ?? "");
 
   useEffect(() => {
     let cancelled = false;
@@ -81,6 +93,34 @@ export function DexView({ token }: { token: string | null }) {
     };
   }, [token]);
 
+  // 外部改动 hash（粘贴一条链接）时应用它。`replaceState` 不触发 `hashchange`，
+  // 所以与下面那个写入 effect 不会互相触发。
+  useEffect(
+    () =>
+      subscribeDexHash(() => {
+        const url = readDexUrl();
+        setMember(url.member);
+        setDescriptor(url.descriptor);
+        setMethod(url.method);
+        setSearch(url.search ?? "");
+      }),
+    [],
+  );
+
+  // URL 同步必须在**所有** return 之前调用（hooks 的规则），所以这里先按
+  // "输入还没加载完"的情况推导出要写进 URL 的 member，再在下面就绪时用同一个值。
+  const currentName =
+    state.kind === "ready"
+      ? (state.data.inputs.find((input) => input.name === member) ??
+          state.data.inputs[0])?.name ?? null
+      : member;
+  useDexUrlSync({
+    member: currentName,
+    descriptor,
+    method,
+    search: search === "" ? null : search,
+  });
+
   if (state.kind === "loading") {
     return <div className="banner">正在读取 DEX 输入…</div>;
   }
@@ -101,9 +141,25 @@ export function DexView({ token }: { token: string | null }) {
 
   const { inputs } = state.data;
   const current = inputs.find((input) => input.name === member) ?? inputs[0] ?? null;
+  // URL 里的 member 不在本次目标里（例如链接来自另一份 APK）：**明说**再换，
+  // 不然用户会以为"链接里的那个 dex 就是这样"，而我们其实给的是另一个文件。
+  const missingMember =
+    member !== null && inputs.length > 0 && !inputs.some((input) => input.name === member)
+      ? member
+      : null;
 
   return (
     <div className="analysis-view">
+      {missingMember !== null && current && (
+        <ul className="notes notes-inline">
+          <li>
+            链接里的 <span className="mono">member={missingMember}</span>{" "}
+            不在本次目标里，已切到{" "}
+            <span className="mono">{current.name}</span>。
+          </li>
+        </ul>
+      )}
+
       {inputs.length > 1 ? (
         <div className="tabs dex-tabs">
           {inputs.map((input) => (
@@ -111,7 +167,13 @@ export function DexView({ token }: { token: string | null }) {
               key={input.name}
               type="button"
               className={`tab${input.name === current?.name ? " tab-active" : ""}`}
-              onClick={() => setMember(input.name)}
+              onClick={() => {
+                setMember(input.name);
+                // 换 DEX 之后原来的类/方法多半不在这个文件里：一起清掉，
+                // 免得留下一个"看着还在选中、其实属于另一个文件"的状态。
+                setDescriptor(null);
+                setMethod(null);
+              }}
               title={`${input.name}：${input.class_count} 类 / ${input.method_count} 方法`}
             >
               {input.name}
@@ -128,9 +190,41 @@ export function DexView({ token }: { token: string | null }) {
       )}
 
       {current && <DexFacts input={current} multiple={inputs.length > 1} />}
-      {current && <ClassBrowser key={current.name} token={token} member={current.name} />}
+      {current && (
+        <ClassBrowser
+          key={current.name}
+          token={token}
+          member={current.name}
+          search={search}
+          onSearch={(next) => {
+            setSearch(next);
+            setDescriptor(null);
+            setMethod(null);
+          }}
+          selected={descriptor}
+          onSelect={(next) => {
+            setDescriptor(next);
+            setMethod(null);
+          }}
+          method={method}
+          onSelectMethod={setMethod}
+        />
+      )}
     </div>
   );
+}
+
+/** 把 URL 状态同步到 hash（在状态变化后跑）。 */
+function useDexUrlSync(state: {
+  member: string | null;
+  descriptor: string | null;
+  method: string | null;
+  search: string | null;
+}): void {
+  const { member, descriptor, method, search } = state;
+  useEffect(() => {
+    writeDexUrl({ member, descriptor, method, search });
+  }, [member, descriptor, method, search]);
 }
 
 /** 当前 DEX 的计数与**它自己的**容错记录。 */
@@ -166,24 +260,51 @@ function DexFacts({ input, multiple }: { input: DexInputWire; multiple: boolean 
 }
 
 /** 类列表：搜索 + 分页，选中后加载类详情。 */
-function ClassBrowser({ token, member }: { token: string | null; member: string }) {
-  const [search, setSearch] = useState("");
-  const [applied, setApplied] = useState("");
+function ClassBrowser({
+  token,
+  member,
+  search,
+  onSearch,
+  selected,
+  onSelect,
+  method,
+  onSelectMethod,
+}: {
+  token: string | null;
+  member: string;
+  /** 已提交的过滤词（属于 URL 状态，所以由父组件拥有）。 */
+  search: string;
+  onSearch: (next: string) => void;
+  selected: string | null;
+  onSelect: (next: string) => void;
+  method: string | null;
+  onSelectMethod: (next: string | null) => void;
+}) {
+  /** 输入框里的草稿：没提交之前不影响请求，也不进 URL。 */
+  const [draft, setDraft] = useState(search);
   const [offset, setOffset] = useState(0);
   const [state, setState] = useState<Loaded<DexClassesResponse>>({ kind: "loading" });
-  const [selected, setSelected] = useState<string | null>(null);
+
+  // 过滤词或 DEX 变了就回到第一页（否则会停在一个"上一页已经不属于这个过滤词"的位置）；
+  // 输入框也要跟着外部状态走，否则粘贴一条带 search 的链接时框里是空的。
+  useEffect(() => {
+    setOffset(0);
+  }, [search, member]);
+  useEffect(() => {
+    setDraft(search);
+  }, [search]);
 
   const load = useCallback(() => {
     setState({ kind: "loading" });
     void fetchDexClasses(token, member, {
       offset,
       limit: CLASS_PAGE,
-      search: applied,
+      search,
     }).then(
       (data) => setState({ kind: "ready", data }),
       (error: unknown) => setState({ kind: "error", message: messageOf(error) }),
     );
-  }, [token, member, offset, applied]);
+  }, [token, member, offset, search]);
 
   useEffect(load, [load]);
 
@@ -193,9 +314,7 @@ function ClassBrowser({ token, member }: { token: string | null; member: string 
         className="view-toolbar dex-search"
         onSubmit={(event) => {
           event.preventDefault();
-          setOffset(0);
-          setApplied(search);
-          setSelected(null);
+          onSearch(draft);
         }}
       >
         <label className="compact-label" htmlFor="dex-class-search">
@@ -205,22 +324,20 @@ function ClassBrowser({ token, member }: { token: string | null; member: string 
           id="dex-class-search"
           type="text"
           className="input mono"
-          value={search}
+          value={draft}
           placeholder="例如 Activity / Lcom/example/"
-          onChange={(event) => setSearch(event.target.value)}
+          onChange={(event) => setDraft(event.target.value)}
         />
         <button type="submit" className="tab">
           搜索
         </button>
-        {applied !== "" && (
+        {search !== "" && (
           <button
             type="button"
             className="tab"
             onClick={() => {
-              setSearch("");
-              setApplied("");
-              setOffset(0);
-              setSelected(null);
+              setDraft("");
+              onSearch("");
             }}
           >
             清除
@@ -235,13 +352,13 @@ function ClassBrowser({ token, member }: { token: string | null; member: string 
       {state.kind === "ready" && (
         <>
           <p className="hint">
-            {applied === "" ? (
+            {search === "" ? (
               <>
                 共 <strong>{state.data.total}</strong> 个类
               </>
             ) : (
               <>
-                「<span className="mono">{applied}</span>」匹配{" "}
+                「<span className="mono">{search}</span>」匹配{" "}
                 <strong>{state.data.total}</strong> 个类
               </>
             )}
@@ -279,7 +396,7 @@ function ClassBrowser({ token, member }: { token: string | null; member: string 
                       className={
                         item.descriptor === selected ? "row-clickable member-active" : "row-clickable"
                       }
-                      onClick={() => setSelected(item.descriptor)}
+                      onClick={() => onSelect(item.descriptor)}
                       title={`查看 ${item.descriptor} 的字段与方法`}
                     >
                       <td className="mono">{item.descriptor}</td>
@@ -326,6 +443,8 @@ function ClassBrowser({ token, member }: { token: string | null; member: string 
           token={token}
           member={member}
           descriptor={selected}
+          method={method}
+          onSelectMethod={onSelectMethod}
         />
       )}
     </div>
@@ -337,18 +456,21 @@ function ClassDetail({
   token,
   member,
   descriptor,
+  method,
+  onSelectMethod,
 }: {
   token: string | null;
   member: string;
   descriptor: string;
+  /** 选中的方法（属于 URL 状态，所以由 `DexView` 拥有）。 */
+  method: string | null;
+  onSelectMethod: (next: string | null) => void;
 }) {
   const [state, setState] = useState<Loaded<DexClassResponse>>({ kind: "loading" });
-  const [method, setMethod] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setState({ kind: "loading" });
-    setMethod(null);
     void fetchDexClass(token, member, descriptor).then(
       (data) => {
         if (!cancelled) {
@@ -454,7 +576,7 @@ function ClassDetail({
                         : "row-clickable"
                       : ""
                   }
-                  onClick={item.has_code ? () => setMethod(item.signature) : undefined}
+                  onClick={item.has_code ? () => onSelectMethod(item.signature) : undefined}
                   title={
                     item.has_code
                       ? `查看 ${item.signature} 的指令与 CFG`

@@ -315,8 +315,142 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 >     实测：3 个 DEX（7643 / 8833 / 6462 类），类列表 `total=7643`、
 >     `search=Activity` 命中 160；`L_COROUTINE/ArtificialStackFrames;-><init>()V`
 >     2 条指令 / 1 块 / 0 边，`unsupported=0 unavailable=0`。
->   * **本轮仍未做**：CLI 侧的 `--list-classes` / `--search`（服务端已有，
->     CLI 还没有）、DEX 进 `export`、覆盖率引导模糊测试、长时间 soak。
+>   * **本轮仍未做**：DEX 进 `export`（形状见下面 M2c）、覆盖率引导模糊测试、
+>     长时间 soak。
+>   * **M2b CLI 列表 / 搜索（已完成 2026-10-16，同日第三轮）**：服务端先有了
+>     `search`，CLI 还没有，而"混淆过的 APK 里类名是
+>     `L_COROUTINE/ArtificialStackFrames;`"这件事在命令行上更严重 —— 没有列表
+>     就只能先用别的工具查出全名。补上 `--list-classes` 与 `--search <TEXT>`
+>     （**子串**、大小写不敏感），`--search` 隐含 `--list-classes`（用户说
+>     "找 Activity"，不该再要求他敲一遍列表开关）。分工写进输出：这里是子串匹配，
+>     `--class` 是**精确**匹配。空结果是合法答案（退出码 0），但必须说清
+>     "扫描 N 个类、匹配 M 个、列出 K 个" —— 否则"没输出"分不清"没匹配"与
+>     "我们没扫"（§7）。`--list-classes`/`--search` 与 `--class`/`--method`
+>     互斥，**文本与 JSON 两条路都报错**：JSON 那条路早先是
+>     `if method … else if class …`，同时给两个互斥选择器时会静默只看方法。
+>     类的方法数 / 有字节码数改由 loader 的 `DexStructure::class_method_counts`
+>     一处给出（服务端也换过去）—— 同一个数字在两个界面各算一遍就会慢慢分叉。
+>     实测（真实 APK，3 个 DEX）：`classes.dex` 扫描 7643 个类、
+>     `--search ArtificialStackFrames` 命中 1、搜不存在的子串命中 0。
+
+### M2c — DEX 进 `export`（**形状已定，未实现**，2026-10-16）
+
+> 用户 2026-10-16 的决定：**先定形状**（"dex导出先定形状"）。本节就是那份形状，
+> 只写契约，不写实现；实现时照这里写，要改先改这里。
+
+**放在哪个入口**：**沿用现有的 `export` 子命令与 `GET /api/export`**，不新开
+`dex export` / `/api/dex/export`。理由是 M9 那套"字节预算 + 截断报告 + 部分保留"
+的机器只该有一份：第二个入口会把它抄一遍，然后在某次改动里开始分叉（一个说
+"已截断"、另一个不说）。**视图由 `format` 判别**，不由端点判别：
+
+| 新格式名 | 内容 | `is_text` |
+| --- | --- | --- |
+| `dex-json` | 一个 DEX 的结构快照（类 / 字段 / 方法 / 指令 / CFG 计数） | 否 |
+| `dex-smali` | 类的方法用**我们自己的**渲染路径拼出的 smali 文本 | 是 |
+| `dex-dot-cfg` | 一个方法的 CFG（Graphviz DOT），与 `dot-cfg` 同形 | 是 |
+
+**不许**用 `asm-intel` / `asm-att` / `pseudo-c` 导出 DEX（ADR-0020 的第一条：
+DEX 没有线性地址空间、没有"函数入口"，套上去只会产出"看着像反汇编"的东西）。
+
+**选项扩展**（`ExportOptions` 与 CLI / HTTP 参数同步）：
+
+| 选项 | 类型 | 语义 | 不给时 |
+| --- | --- | --- | --- |
+| `member` | `Option<String>` | 导出哪个 `classes*.dex`（**成员名**，与网页 tab 同一身份） | 容器里只有 1 个 DEX 就用它；**多于 1 个则报错并列出可选名字**（不猜"通常大家都导出 classes.dex"） |
+| `class` | `Option<String>` | 只导出这个类（smali 描述符，**精确**匹配） | 导出全部类 |
+| `search` | `Option<String>` | 只导出描述符含该子串（大小写不敏感）的类 | 不过滤 |
+| `method` | `Option<String>` | 只导出这个方法（smali 标识，精确） | 导出该类全部方法 |
+| `include_instructions` | `bool`，默认 `true` | `dex-json` 里是否带指令数组 | —— |
+| `include_cfg` | `bool`，默认 `true` | 是否带 CFG（`dex-json` 里是块 / 边计数，`dex-dot-cfg` 里是图） | —— |
+
+**沿用**：`byte_limit` / `keep_partial` 照旧生效（对 DEX 按**已写出的字节**计数）；
+`max_functions` 对 DEX 是"最多导出多少个**方法**"的口径（**不新增 `max_methods`**，
+两个名字说的是同一件事）；`range`、`function` 对 DEX **不适用**；
+`include_bytes` 只在 `dex-smali` 下表示"每条指令附原始码元"。
+
+**选项与视图不匹配时报错，不忽略**：`--format dex-json --function 0x401000` 要
+`ExportError`，说清"DEX 没有地址空间，请用 `--class` / `--method`"。CLAUDE.md §7：
+静默忽略一个用户明确给出的选择器，等于把"我按你说的做了"变成假话。
+
+**信封**（`ExportMeta`）：
+
+* `format` = `dex-json` / `dex-smali` / `dex-dot-cfg`；
+* `format_versions` 增一列 `dex: Option<u32>` = `Some(DEX_FORMAT_VERSION)`（当前 1）。
+  非 DEX 导出时**必须是 `null`，不是 0** —— `0` 会被读成"这个文件是 DEX 版本 0"；
+* `target` = 目标路径、`file_size`、`generated_at` 照旧；
+* `arch` = `null`（DEX 没有架构，与 `ObjectKind::Dex` 的 `arch` 恒为 `None` 一致）；
+* `member`（新增，`Option<String>`）= 实际导出的 DEX 成员名；
+* `range_from` / `range_to` / `function` = `null`。
+
+**`dex-json` 的数据形状**（字段名 snake_case，与 `/api/dex/*` 的 DTO 保持一致，
+不复用机器码那套 `functions` / `xrefs` 名字）：
+
+```json
+{
+  "format_version": 1,
+  "member": "classes.dex",
+  "role": "主 dex",
+  "size": 8834567,
+  "header": { "class_count": 7643, "method_count": 53906 },
+  "notes": ["…"],
+  "classes": [
+    {
+      "descriptor": "Lcom/Foo;",
+      "short_name": "Foo",
+      "superclass": "Ljava/lang/Object;",
+      "source_file": "Foo.java",
+      "access_flags": 1,
+      "fields": [{ "name": "x", "type": "I", "access_flags": 8, "is_static": true }],
+      "methods": [
+        {
+          "signature": "Lcom/Foo;->bar(I)V",
+          "access_flags": 1,
+          "code_off": "00000000001894e0",
+          "has_code": true,
+          "registers_size": 2,
+          "ins_size": 2,
+          "outs_size": 1,
+          "instructions": [
+            { "code_unit": "0000000000000000", "text": "invoke-direct {v0}, …" }
+          ],
+          "cfg": { "blocks": 3, "edges": 4, "unresolved_edge_targets": 0 }
+        }
+      ]
+    }
+  ],
+  "skipped": { "classes_without_descriptor": 0, "methods_without_code": 1204 },
+  "symbols": { "enabled": true, "unsupported_operands": 17, "unavailable_operands": 0 },
+  "truncated": { "what": "instructions", "written": 1200000, "dropped": 43120, "hint": "…" }
+}
+```
+
+**这份形状的四条硬要求**：
+
+1. **拿不到符号就出池索引，不出占位符。** `--no-symbols`（`symbols.enabled=false`）
+   时指令文本形如 `string@12`；解析失败时保留可数的池索引，并把
+   `unsupported_operands` / `unavailable_operands` 两个计数放进 `symbols`。
+   ADR-0020 的更正（`droidsaw` 写 `"?"` / `"<invalid>"`）在这里同样成立：
+   导出文件是给别人解析的，占位符进去就再也分不出真假。
+2. **降级进文件。** 解析期 `notes`、`skipped`、`symbols`、`truncated` 四样都在
+   JSON 顶层；截断复用 M9 的 `Truncation`（`what`/`written`/`dropped`/`hint`），
+   不做第二套说法。
+3. **确定性。** 同一个输入导出两次必须逐字节相同：成员按容器顺序、类按
+   `class_defs` 顺序、方法按 `method_idx` 顺序、字段按声明顺序 —— 不许出现
+   `HashMap` 迭代顺序。CI 靠这条做差分，顺序不定就等于没法比对。
+4. **`code_off` 用定长 16 位小写十六进制**（与项目里所有 wire 地址一致，
+   虽然它是**码元偏移**不是地址，见 §6）。`code_off == 0` 的方法是合法结论
+   （抽象 / native），导出 `has_code: false` 并计入
+   `skipped.methods_without_code`，不是错误、也不是空数组。
+
+**验收（实现时按这几条写测试，现在只登记）**：
+
+* 合成样本：`dex-json` 的每个字段逐个断言（含 `format_versions.dex == 1`、
+  非 DEX 导出时它是 `null`）；
+* `--format asm-intel --member classes.dex`、`--format dex-json --function 0x401000`
+  两条**必须报错**，且错误信息里给出可用选项；
+* 确定性：同一输入连导两次，字节相同；
+* 真实 APK：3 个 DEX 时不给 `member` **报错**并列出名字；给了之后
+  `class_count` 与 `/api/dex/inputs` 对得上（两条独立路径必须给出同一个数）。
 
 用 `droidsaw-dex` 的 `decode`，**要写的是适配层**：
 

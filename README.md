@@ -18,12 +18,17 @@ UI 走 Web 是为了跨平台，不需要为每个平台维护原生 GUI 外壳�
 - 解析失败**不会**让目标打不开：识别结论照常显示，失败原因写在说明里；
 - **DEX 视图（CLI `bitflip-cli dex <APK|.dex>`、网页 `DEX` 视图；APK/DEX 里程碑的 M2b）**：
   按 smali 标识列类的方法（`--class 'Lcom/example/Foo;'`）、打印一个方法的指令与文本 CFG
-  （`--method 'Lcom/example/Foo;->bar(I)V'`）。符号解析默认开启；`--no-symbols` 输出原始池
-  下标并把"已关闭"写进报告；`--json` 给带版本号的稳定契约。APK 里有多个 DEX 时按成员名
-  区分（`classes.dex` / `classes2.dex` …）。**网页端同能力**：左侧导航的 `DEX` 视图对
-  每个 `classes*.dex` 开一个标签页（按文件名），类列表可搜索分页，钻到类详情（字段 /
-  方法）与方法详情（指令表 + 整个方法的文本 CFG）；每个标签页下只挂它自己的解析说明
-  （降级跟着来源走），"没有字节码"（抽象 / `native` 方法）会写清是合法结论。
+  （`--method 'Lcom/example/Foo;->bar(I)V'`）；`--list-classes` / `--search <子串>`
+  列出并**子串**查找类（大小写不敏感，`--search` 隐含列表 —— 混淆过的
+  `L_COROUTINE/…;` 没法手打），输出给出"扫描 / 匹配 / 列出"三个数，搜不到是合法答案。
+  符号解析默认开启；`--no-symbols` 输出原始池下标并把"已关闭"写进报告；`--json` 给带
+  版本号的稳定契约。APK 里有多个 DEX 时按成员名区分（`classes.dex` / `classes2.dex` …）。
+  **网页端同能力**：左侧导航的 `DEX` 视图对每个 `classes*.dex` 开一个标签页（按文件名），
+  类列表可搜索分页，钻到类详情（字段 / 方法）与方法详情（指令表 + 整个方法的文本 CFG）；
+  每个标签页下只挂它自己的解析说明（降级跟着来源走），"没有字节码"（抽象 / `native`
+  方法）会写清是合法结论。**选中的标签页 / 类 / 方法 / 搜索词保存在 URL 的 hash 里**，
+  刷新不丢、链接可分享（`#dex=1&member=classes.dex&class=…&method=…`）。
+  DEX 进 `export` 的**形状已定、实现未做**（`docs/APK-DEX-DESIGN.md` §M2c、ADR-0021）。
   其余能力（解码、函数识别、交叉引用、注释持久化……）按里程碑推进，
   **界面上未实现的入口一律置灰并标注里程碑**。
 
@@ -63,6 +68,10 @@ cargo build --release -p bitflip-app
 ./target/release/bitflip-cli dex path/to/app.apk
 ./target/release/bitflip-cli dex path/to/app.apk --class 'Lcom/example/Foo;'
 ./target/release/bitflip-cli dex path/to/app.apk --member classes2.dex --method 'Lcom/example/Foo;->bar(I)V'
+
+# 混淆过的 APK：先列类、再按子串找（--search 隐含 --list-classes）
+./target/release/bitflip-cli dex path/to/app.apk --member classes.dex --list-classes --limit 20
+./target/release/bitflip-cli dex path/to/app.apk --search Activity
 ```
 
 `--arch` / `--mode` / `--endian` / `--base` 是**公共覆盖参数**，`info`、`functions`、

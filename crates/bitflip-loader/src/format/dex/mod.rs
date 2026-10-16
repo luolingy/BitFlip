@@ -720,6 +720,27 @@ impl DexStructure {
             .unwrap_or_default()
     }
 
+    /// 类的方法数与其中有字节码的个数：`(方法数, 有字节码的方法数)`。
+    ///
+    /// 放在结构层而不是各调用点各算一遍：`has_code` 的判据（`code_off != 0`）
+    /// 只应该有一处定义 —— CLI 的类列表与服务端的 `/api/dex/classes` 都要显示
+    /// 这两个数，两处各写一遍就会慢慢分叉（而分叉的表现是"两个界面同一份文件
+    /// 给出不同的数"，那是最难发现的一类错误）。
+    ///
+    /// 不建中间 `Vec`：这个方法会在类列表里对每个类调用一次（真实样本 7000+ 次）。
+    #[must_use]
+    pub fn class_method_counts(&self, class: usize) -> (usize, usize) {
+        let Some(class) = self.classes.get(class) else {
+            return (0, 0);
+        };
+        let range = class.method_range();
+        let total = range.len();
+        let with_code = range
+            .filter(|index| self.methods.get(*index).is_some_and(DexMethod::has_code))
+            .count();
+        (total, with_code)
+    }
+
     /// 把一个方法渲染成 smali 风格标识：`Lcom/foo/Bar;->baz(I)V`。
     ///
     /// 参数表或返回类型取不到时返回 `None`，**不给半截标识**：半截标识会让

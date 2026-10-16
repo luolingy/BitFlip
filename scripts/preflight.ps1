@@ -1,8 +1,8 @@
 # BitFlip preflight: one-shot version of the CLAUDE.md section 5 checklist.
 #
 # Runs: staged temp/ guard, cargo fmt --check, clippy -D warnings, tests,
-# (when web/node_modules exists) the SPA typecheck, and (when a built binary
-# exists) the bind-address smoke test.
+# (when web/node_modules exists) the SPA typecheck, the DEX url-state check,
+# and (when a built binary exists) the bind-address smoke test.
 #
 # Exits non-zero if any step fails, so it can be used by hand or in a hook.
 #
@@ -146,6 +146,19 @@ try {
             Write-Host ""
             Write-Host "=== npm run typecheck"
             Write-Host "--- SKIP (web/node_modules missing; run: npm install --cache .npm-cache)"
+        }
+
+        # The DEX view keeps its selection in the URL hash so a link can be shared
+        # and a refresh lands back on the same class/method. tsc cannot see whether
+        # that round-trip actually works, and a broken one fails silently (the page
+        # just opens on nothing). The check imports the real .ts module under
+        # Node's type stripping and drives a fake window/history. No deps, no
+        # samples, so it always runs.
+        $dexUrlCheck = Join-Path $PSScriptRoot 'check-dex-url.mjs'
+        if (Test-Path -LiteralPath $dexUrlCheck) {
+            Invoke-Step -Name 'DEX url state (web)' -Action {
+                node --experimental-strip-types $dexUrlCheck
+            } | Out-Null
         }
     }
 

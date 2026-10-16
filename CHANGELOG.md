@@ -11,6 +11,44 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — `dex` 子命令的类列表与搜索；DEX 视图状态进 URL；DEX 导出形状定案
+
+M2b 的第三轮（用户 2026-10-16 点名的五件事）：CLI 补搜索、网页标签页与状态支持 URL、
+DEX 导出先定形状、`callgraph_scale` 先不管、顺手修掉两处既有缺陷。
+
+- **CLI `--list-classes` / `--search <TEXT>`**（`crates/bitflip-cli/src/dex.rs`）：
+  `--search` 是**子串**、大小写不敏感，并**隐含** `--list-classes`（用户说"找 Activity"，
+  不该再要求他敲一遍列表开关）；`--class` 仍是**精确**匹配，两边的分工写在输出第一行。
+  输出给出"扫描 N 个类、匹配 M 个、列出 K 个"三个数：搜不到是**合法答案**（退出码 0），
+  但只说"没有"就分不清"没匹配"与"我们没扫"。`--list-classes`/`--search` 与
+  `--class`/`--method` **互斥**，文本与 JSON 两条路都报错 —— JSON 那条路早先是
+  `if method { … } else if class { … }`，同时给两个互斥选择器时会**静默只取方法**。
+- **`DexStructure::class_method_counts`**（loader）：类的"方法数 / 有字节码数"只在一处
+  定义（CLI 类列表与服务端 `classes` 共用），不建中间 `Vec` —— 逐类调用 7000+ 次。
+- **网页 DEX 视图的状态进 URL**（`web/src/dexUrl.ts`）：标签页、选中的类、选中的方法、
+  搜索词写进 hash（`#dex=1&member=…&class=…&method=…&search=…`），刷新不丢、链接可分享，
+  带 `dex=1` 的链接直接落在 DEX 视图上。用 `replaceState` 而非 `pushState`（点 20 个类
+  不该要按 20 次"返回"）；指令分页页码不进 URL（那是"看到第几页"，不是"在看哪个方法"）；
+  URL 里的 `member` 不属于本次目标时**明说再换**。`resolveToken()` 相应改为
+  **只清令牌、保留 hash 里的其他参数**（原来整条 URL 清成 pathname，会把状态一起清掉；
+  查询串仍整条丢弃）。
+- **`web/src/api.ts` 的 `MemberWire` 修正**：`offset` 改为 `number | null`（服务端在 ZIP
+  本地头对不上时**刻意给 `null`**，而 `MembersView.tsx` 里的 `offset.toString(16)`
+  遇到这种成员会抛异常），并补上缺失的 `uncompressed_size` 与 `storage` ——
+  ZIP 成员的 `size` 是压缩后大小，只显示它会让用户拿着一个 195 KB 的数字去对一份
+  几 MB 的反汇编结果。
+- **DEX 进 `export`：形状已定，实现未做**（用户要求"先定形状"）。字段级形状写在
+  `docs/APK-DEX-DESIGN.md` §M2c（`dex-json` / `dex-smali` / `dex-dot-cfg`、选项扩展、
+  信封、四条硬要求、验收清单），决定记入 **ADR-0021**：沿用同一个 `export` 入口与
+  `GET /api/export`、由 `format` 判别视图；机器码格式名用于 DEX 要报错；
+  `--function`/`--range` 对 DEX 要报错而**不是静默忽略**；`format_versions.dex`
+  非 DEX 时是 `null` 不是 `0`；导出必须**确定性**（同类输入逐字节相同）。
+- **验证**：`crates/bitflip-cli/tests/dex_cli.rs` 8 → 12 条（列类 / 搜索命中 / 搜索落空 /
+  三条互斥错误路径 / `class_list` JSON 形状）；真实 APK 的 `#[ignore]` 用例实测
+  `classes.dex` 扫描 7643 个类、`--search ArtificialStackFrames` 命中 1、
+  搜不存在的子串命中 0；新增 `scripts/check-dex-url.mjs`（Node 类型剥离直接 import
+  真实源码，10 条断言）并接入 `scripts/preflight.ps1`。
+
 ### 新增 — DEX 服务端端点 `/api/dex/*` 与网页 DEX 视图（M2b 完成）
 
 M2b 的"界面"部分落地：CLI 之后，服务端与网页都能看 DEX 了。
