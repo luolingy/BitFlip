@@ -41,6 +41,9 @@
 /// 长度一律按规范从原始字节重算）。
 pub mod layout;
 
+/// DEX-specific SoA instructions, text rendering and CFG view (ADR-0020).
+pub mod view;
+
 use thiserror::Error;
 
 use droidsaw_dex::decode::parse_class_data;

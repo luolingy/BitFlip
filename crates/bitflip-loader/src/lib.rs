@@ -59,6 +59,12 @@ pub use format::dex::layout::{
     check_code_item_layout, payload_width_units, CodeHeaderFacts, LayoutCheck, LayoutProblem,
     LayoutProblemKind,
 };
+pub use format::dex::view::{
+    project_code_item as project_dex_code_item, project_method as project_dex_method,
+    render_instructions as render_dex_instructions, DexCfgView, DexEdgeKind, DexExceptionRegion,
+    DexHandlerEntry, DexInstructions, DexMethodView, DexPayloads, DexPoolKind, DexViewError,
+    UnresolvedEdgeTarget,
+};
 pub use format::dex::{
     parse as parse_dex_structure, DexClass, DexCountMismatches, DexCounts, DexDeclaredSizes,
     DexField, DexHeaderFacts, DexMethod, DexParseError, DexStructure,

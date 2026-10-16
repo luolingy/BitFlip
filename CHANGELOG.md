@@ -11,6 +11,22 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — DEX 专属方法指令视图与自建 CFG（M2a 初版）
+
+新增 `project_dex_method` / `project_dex_code_item`，在 DEX 专属路径将指令投影为 SoA
+列：码元地址、opcode/宽度、寄存器 CSR、literal、分支目标与池索引；payload 和
+异常处理器分别留在表中。`render_dex_instructions` 可写入复用缓冲区，输出 Dalvik
+mnemonic 和稳定数值操作数。
+
+CFG **由我们自己从解码事实构建**（库的控制流模块被 `tests/dex_library_boundary.rs`
+禁用）：块首、切块、分支/落空/switch/异常边、前驱与异常区间全部自算，目标不是指令
+起点的边不连边但记入 `unresolved_edge_targets`，不静默丢弃。规则由
+`tests/dex_cfg.rs` 逐条钉住。视图另有 `consistency_problems()` 对账各列长度与 CSR
+边界，防止漏 push 造成的静默错位。不复用原生机器码 `Disasm`，符合 ADR-0020。
+
+真实 APK 3 个 DEX 的 143486 个带代码方法全部投影并通过列对账。pool 目前显示数值
+索引，尚未解析成名字；CLI/UI/导出接线仍属 M2b。
+
 ### 新增 — DEX 31t 分支目标与 payload 交叉校验（M2a）
 
 布局校验现还会从原始字节读取 `fill-array-data` / `packed-switch` /

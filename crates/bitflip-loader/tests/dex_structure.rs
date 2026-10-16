@@ -10,7 +10,7 @@
 //!
 //! 合成样本证明"我们按规范读"，真实样本证明"规范之外还有现实"——两者缺一不可。
 
-use bitflip_loader::{DexStructure, ObjectKind};
+use bitflip_loader::{project_dex_method, DexStructure, ObjectKind};
 
 // ── 合成样本 ────────────────────────────────────────────────────────────────
 
@@ -708,6 +708,24 @@ fn every_real_methods_code_units_are_exactly_tiled_by_instructions_and_payloads(
                         member.name, method.class_index, method.method_idx, method.code_off
                     )
                 });
+            let view = project_dex_method(&raw, method.code_off).unwrap_or_else(|e| {
+                panic!(
+                    "{}: class_idx={} method_idx={} code_off={:#x} DEX view projection failed: {e}",
+                    member.name, method.class_index, method.method_idx, method.code_off
+                )
+            });
+            assert_eq!(view.instructions.len(), check.instructions);
+            assert_eq!(view.payloads.addresses.len(), check.payloads);
+            let view_problems = view.consistency_problems();
+            assert!(
+                view_problems.is_empty(),
+                "{}: class_idx={} method_idx={} code_off={:#x} 视图列不对齐（最多列 5 条）：{:?}",
+                member.name,
+                method.class_index,
+                method.method_idx,
+                method.code_off,
+                view_problems.iter().take(5).collect::<Vec<_>>()
+            );
             checked_methods += 1;
             checked_payloads += check.payloads;
             if !check.is_exact() {

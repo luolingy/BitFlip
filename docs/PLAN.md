@@ -1250,7 +1250,17 @@ MSVC 修饰名反修饰、静态库 PDB。
   `encoded_catch_handler_list`，收集每个 handler 的真实起点。每个磁盘
   `handler_off` 必须命中起点，并与库提供的 handler index 一一对拍。真实 APK
   全部通过；合成单测覆盖多个 handler、list 相对偏移及截断输入。
-* **仍未做**：Dalvik 解码投影（列式指令表）与指令文本渲染函数。
+* **M2a 指令视图初版已落地**（`crates/bitflip-loader/src/format/dex/view.rs`）：
+  指令 SoA 列（方法内码元地址、opcode、宽度、目的寄存器、CSR 源寄存器、literal、
+  target、池索引）、独立可复用 buffer 的文本渲染，以及分开的 payload / handler 列。
+  **CFG 由我们自己从解码事实构建**（`dex_library_boundary` 守卫禁用库的控制流模块）：
+  块首、切块、分支/落空/switch/异常边、前驱、异常区间全部自算，目标不是指令起点的
+  边不连边但记入 `unresolved_edge_targets`。规则由 `tests/dex_cfg.rs` 逐条钉住，
+  列长度与 CSR 边界由 `consistency_problems()` 对账。这不是 `Disasm`，不依赖
+  `bitflip-core`（ADR-0020）。合成测试覆盖指令渲染、分支、packed-switch、fill-array、
+  typed/catch-all handler 与异常区间；同一真实 APK 的 143486 个方法全部投影成功并通过
+  列对账。当前渲染用稳定 pool index，尚未解析成 DEX 符号文本。
+  此初版尚未经过完整异常输入审计，需在后续 M2a 工作继续完善。
 
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 

@@ -28,7 +28,9 @@
 **必须划清的一条线**：`droidsaw-dex` 的**反编译层不接入**。
 它的 `emit`/`emit_dex`/`sugar`/`r8_inversion` 做类型推断与 Java 源码生成，
 ADR-0018 已判定这类输出按定义就是推断，展示即违反 §7。
-好在这些是并列的公开模块，**只用 `parser`/`decode`/`cfg`/`xrefs`/`mutf8`/`opcodes`**。
+好在这些是并列的公开模块，**只用 `parser`/`decode`/`mutf8`/`opcodes`**；
+推断类模块（控制流、交叉引用、类型推断…）由我们自己实现，见
+`tests/dex_library_boundary.rs` 的禁用清单。
 
 **引用现成库的条件**（都来自实测，不是形式条款）：
 
@@ -262,28 +264,31 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 >
 > **拆成两段推进（据实记录，免得"看起来完成了"）**：
 >
-> * **M2a（事实层，先做）**：解码投影 + CFG 投影 + 渲染函数 + 黄金测试，
->   全部落在 DEX 侧，**不碰 `bitflip-core`**。并补齐 M1 推迟的三条验收
->   （"指令 ∪ 载荷恰好铺满 `[0, insns_size)`"、"`31t` 目标落在 payload 起始"、
->   "`try_item` 的 `handler_off` 落在 `encoded_catch_handler` 起点"）——
->   它们本来就要解码宽度，属于这一段。
+> * **M2a（事实层，进行中）**：解码投影 + CFG 投影 + 渲染函数 + 黄金测试，
+>   全部落在 DEX 侧，**不碰 `bitflip-core`**。M1 推迟的三条布局验收均已补齐。
+>   2026-10-15 的 `bitflip-loader::format::dex::view` 初版提供指令 SoA、payload 与
+>   handler 列、**自建 CFG**（不用库的控制流模块）与独立文本输出；合成测试通过，
+>   真实 APK 143486 个带代码方法投影通过。符号解析、输出/调用集成与完整审计尚未完成。
 > * **M2b（接产品，后做）**：CLI/导出怎么呈现 DEX 视图（新子命令，还是
 >   `--member classes.dex` 自动切视图）。ADR-0020 明确把这一条留到 M2a 之后，
 >   依据是"用户在命令行上想表达什么"。
 
-用 `droidsaw-dex` 的 `decode` + `cfg`，**要写的是适配层**：
+用 `droidsaw-dex` 的 `decode`，**要写的是适配层**：
 
 - 把 `decode::parse_code_item` 的 `Instruction`
   （`addr`/`Opcode`/`size`/`dst`/`src`/`literal`/`target`/`pool_idx`）
   投影成项目的列式指令表示；
-- 把 `cfg::Cfg`（`EdgeKind` 已是 `FallThrough | Branch | SwitchCase(i32) |
-  SwitchDefault | ExceptionHandler(TypeIdx) | ExceptionCatchAll`，外加
-  `ExceptionRegion { start_addr, end_addr, handler_blocks }`）
-  投影成项目的 CFG 表示；
-- **指令文本渲染要单独解决**：`droidsaw-dex` 有 `Opcode::mnemonic()`，
-  但项目的 `Disasm.renderer` 类型是 `Option<Arc<CapstoneDecoder>>`，
-  DEX 走不进去。**这一点要在动手前定**（新增 DEX 渲染路径，或把 renderer
-  抽象成 trait）。这是本方案里唯一一处"现成库帮不上"的**结构**问题。
+- **CFG 由我们自己构建。** `crates/bitflip-loader/tests/dex_library_boundary.rs`
+  把库的控制流模块列为禁用：控制流是二级结论（"这段代码会跳到哪"是我们推出来的），
+  CLAUDE.md §7 要求它由我们自己构建、每条依据都说得清。所以只用库的**事实** ——
+  指令的 `addr`/`size`/`op`/`target` 与 `tries`/`catch_handlers`/`payloads` ——
+  自己算块首、切块、连边；目标不是指令起点的边**不连边但逐条记账**
+  （`DexCfgView::unresolved_edge_targets`），不静默丢。
+  规则与用例见 `crates/bitflip-loader/tests/dex_cfg.rs`。
+- **指令文本渲染走 DEX 独立路径**：`view::render_instructions` 使用
+  `Opcode::mnemonic()` 并写入调用者复用的 buffer；寄存器、分支与 pool 引用以
+  稳定数值显示。此处不解析符号名，避免把视图渲染与库私有池生命周期耦合；
+  该选择落实 ADR-0020，不修改 `Disasm` 或 `bitflip-core`。
 
 ### M3 — AXML + resources.arsc
 
