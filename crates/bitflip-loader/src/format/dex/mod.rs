@@ -579,6 +579,15 @@ const fn mismatch(declared: u32, actual: u32) -> Option<(u32, u32)> {
 }
 
 impl DexStructure {
+    /// 这个 DEX 的符号解析器：把池索引写成字符串/类型/字段/方法文本。
+    ///
+    /// 返回我们自己的类型（库的 `DexFile` 不出现在公开签名里），于是换库的改动面
+    /// 仍然局限在适配层 —— 见 `tests/dex_library_boundary.rs` 的第一条守卫。
+    #[must_use]
+    pub fn symbols(&self) -> view::DexSymbols<'_> {
+        view::DexSymbols::new(&self.file)
+    }
+
     /// 类的类型描述符（`Lcom/foo/Bar;`）。
     ///
     /// 取不到时返回 `None`（而不是 `"?"` 或空串）—— 拿不到就说拿不到。

@@ -44,6 +44,56 @@ pub enum DexPoolKind {
     CallSite = 5,
 }
 
+/// 一次符号解析的结果。**没有"写了个占位符"这一档**。
+///
+/// 这里刻意不给 `bool`：`false` 会把"这一类引用我们还没做"和"索引越界/库解析失败"
+/// 混成同一件事，而调用方需要区别对待 —— 前者是已知缺口，后者是异常，必须被计数
+/// 并报出来。库自己的 smali 渲染器正是在这里写 `?` / `<invalid>`，CLAUDE.md §7 禁止。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DexSymbolOutcome {
+    /// 真实符号文本已写入。
+    Written,
+    /// 这一类引用我们**还没实现**（当前的 call-site）：已知缺口，不算异常。
+    NotSupported,
+    /// 索引越界或库拒绝解析：**异常**，调用方应当计数并报出来。
+    Unavailable,
+}
+
+/// 池索引 → 符号文本。视图自身不带字符串（CLAUDE.md §4），所以解析器由调用方传入。
+pub trait DexSymbolResolver {
+    /// 写入字符串字面量（含引号与转义）。
+    fn write_string(&self, index: u32, output: &mut String) -> DexSymbolOutcome;
+    /// 写入类型描述符（`I` / `Ljava/lang/String;`）。
+    fn write_type(&self, index: u32, output: &mut String) -> DexSymbolOutcome;
+    /// 写入字段引用（`Lcom/Foo;->bar:I`）。
+    fn write_field(&self, index: u32, output: &mut String) -> DexSymbolOutcome;
+    /// 写入方法引用（`Lcom/Foo;->bar(I)V`）；`proto` 只在库里另给了原型索引时存在。
+    fn write_method(&self, index: u32, proto: Option<u32>, output: &mut String)
+        -> DexSymbolOutcome;
+}
+
+/// 渲染一次之后的账：**写了几条、有几处是已知缺口、有几处是异常**。
+///
+/// 返回它而不是 `()`，是因为"没解析出来"必须能被看见（CLAUDE.md §7）：
+/// 只返回成功/失败的话，调用方可以轻易把一次大面积失败当成"没什么可显示的"。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DexRenderReport {
+    /// 渲染出的指令条数。
+    pub instructions: usize,
+    /// 已知未实现的操作数处数（例如 call-site）。
+    pub unsupported_operands: usize,
+    /// 异常：索引越界或库拒绝解析的操作数处数。
+    pub unavailable_operands: usize,
+}
+
+impl DexRenderReport {
+    /// 是否每一处操作数都写成了真实符号文本。
+    #[must_use]
+    pub const fn is_fully_resolved(&self) -> bool {
+        self.unsupported_operands == 0 && self.unavailable_operands == 0
+    }
+}
+
 impl DexInstructions {
     /// Number of decoded instructions.
     #[must_use]
@@ -66,6 +116,20 @@ impl DexInstructions {
         index: usize,
         output: &mut String,
     ) -> Result<(), DexViewError> {
+        self.render_instruction_with_symbols(index, None, output)
+            .map(|_| ())
+    }
+
+    /// 渲染一条指令，可选地把池索引解析成符号文本。
+    ///
+    /// 返回这条指令里**没写成符号**的操作数结果（`None` = 本来就没有池引用）。
+    /// 解析失败时**不写占位符**：保留可数的 `kind@index` 形式，把失败如实交回调用方。
+    pub fn render_instruction_with_symbols(
+        &self,
+        index: usize,
+        symbols: Option<&dyn DexSymbolResolver>,
+        output: &mut String,
+    ) -> Result<Option<DexSymbolOutcome>, DexViewError> {
         let opcode = *self
             .opcodes
             .get(index)
@@ -100,6 +164,7 @@ impl DexInstructions {
             write_operand_separator(output, &mut has_operand);
             write!(output, ":{target:04x}").map_err(|_| DexViewError::Formatting)?;
         }
+        let mut symbol_outcome = None;
         if let Some(Some(kind)) = self.pool_kinds.get(index) {
             let pool_idx = self
                 .pool_indices
@@ -107,12 +172,33 @@ impl DexInstructions {
                 .copied()
                 .flatten()
                 .ok_or(DexViewError::InvalidColumns)?;
+            let proto = self.pool_proto_indices.get(index).copied().flatten();
             write_operand_separator(output, &mut has_operand);
-            write!(output, "{}@{pool_idx}", pool_kind_name(*kind))
-                .map_err(|_| DexViewError::Formatting)?;
-            if let Some(Some(proto)) = self.pool_proto_indices.get(index) {
-                write!(output, "/proto@{proto}").map_err(|_| DexViewError::Formatting)?;
+            // 先按符号解析；`Written` 就不要再写数值形式了 —— 两种形式并列会让人
+            // 以为有两个操作数。
+            let outcome = match (symbols, kind) {
+                (Some(resolver), DexPoolKind::String) => resolver.write_string(pool_idx, output),
+                (Some(resolver), DexPoolKind::Type) => resolver.write_type(pool_idx, output),
+                (Some(resolver), DexPoolKind::Field) => resolver.write_field(pool_idx, output),
+                (Some(resolver), DexPoolKind::Method) => {
+                    resolver.write_method(pool_idx, proto, output)
+                }
+                (Some(_), DexPoolKind::CallSite) => DexSymbolOutcome::NotSupported,
+                (None, _) => DexSymbolOutcome::NotSupported,
+            };
+            if outcome != DexSymbolOutcome::Written {
+                // 没解析出来：保留可数的数值形式（这是事实，不是占位符）。
+                write!(output, "{}@{pool_idx}", pool_kind_name(*kind))
+                    .map_err(|_| DexViewError::Formatting)?;
+                if let Some(proto) = proto {
+                    write!(output, "/proto@{proto}").map_err(|_| DexViewError::Formatting)?;
+                }
             }
+            symbol_outcome = Some(match (outcome, symbols.is_some()) {
+                // 没有解析器时"数值形式"就是预期行为，不是缺口。
+                (_, false) => DexSymbolOutcome::Written,
+                (outcome, true) => outcome,
+            });
         }
         if let Some(&literal) = self.literals.get(index) {
             if has_literal_operand(mnemonic) {
@@ -120,7 +206,7 @@ impl DexInstructions {
                 write!(output, "#{literal}").map_err(|_| DexViewError::Formatting)?;
             }
         }
-        Ok(())
+        Ok(symbol_outcome)
     }
 }
 
@@ -331,6 +417,179 @@ pub fn render_instructions(
         output.push('\n');
     }
     Ok(())
+}
+
+/// 渲染全部指令，并把池索引解析成符号文本；返回一份"账"。
+///
+/// 解析不出来的操作数**不会**变成占位符：它保留可数的 `kind@index` 形式，
+/// 同时被计入 [`DexRenderReport`]，由调用方决定怎么呈现（§7：降级要写在界面上）。
+pub fn render_instructions_with_symbols(
+    instructions: &DexInstructions,
+    symbols: &dyn DexSymbolResolver,
+    output: &mut String,
+) -> Result<DexRenderReport, DexViewError> {
+    let mut report = DexRenderReport::default();
+    for index in 0..instructions.len() {
+        report.instructions += 1;
+        match instructions.render_instruction_with_symbols(index, Some(symbols), output)? {
+            Some(DexSymbolOutcome::NotSupported) => report.unsupported_operands += 1,
+            Some(DexSymbolOutcome::Unavailable) => report.unavailable_operands += 1,
+            Some(DexSymbolOutcome::Written) | None => {}
+        }
+        output.push('\n');
+    }
+    Ok(report)
+}
+
+/// 基于已解析 `droidsaw-dex` 池的符号解析器。
+///
+/// 字段是库类型但**不出现**在任何公开签名里：调用方通过
+/// `DexStructure::symbols()` 拿到它，于是换库时改动面仍在适配层内
+/// （`tests/dex_library_boundary.rs` 那条"库只许被适配层引用"的守卫）。
+pub struct DexSymbols<'a> {
+    file: &'a droidsaw_dex::DexFile,
+}
+
+impl<'a> DexSymbols<'a> {
+    pub(crate) const fn new(file: &'a droidsaw_dex::DexFile) -> Self {
+        Self { file }
+    }
+
+    fn type_descriptor(&self, index: u32) -> Option<&str> {
+        self.file
+            .get_type_descriptor(droidsaw_dex::ids::TypeIdx(index))
+            .ok()
+    }
+
+    /// 取原型的方法参数与返回值，用来拼 `(Args)Ret`。
+    ///
+    /// `parameters_off == 0` 是规范里的"无参数"（`type_lists` 里没有这一项），
+    /// 不是"取不到" —— 两者必须分开，否则无参方法会被当成解析失败。
+    fn write_proto(&self, proto_index: u32, output: &mut String) -> bool {
+        let Ok(proto_index) = usize::try_from(proto_index) else {
+            return false;
+        };
+        let Some(proto) = self.file.protos.get(proto_index) else {
+            return false;
+        };
+        output.push('(');
+        if proto.parameters_off != 0 {
+            let Some(parameters) = self.file.type_lists.get(&proto.parameters_off) else {
+                return false;
+            };
+            for parameter in parameters {
+                match self.type_descriptor(parameter.0) {
+                    Some(descriptor) => output.push_str(descriptor),
+                    None => return false,
+                }
+            }
+        }
+        output.push(')');
+        match self.type_descriptor(proto.return_type_idx.0) {
+            Some(descriptor) => {
+                output.push_str(descriptor);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl DexSymbolResolver for DexSymbols<'_> {
+    fn write_string(&self, index: u32, output: &mut String) -> DexSymbolOutcome {
+        match self.file.get_string(droidsaw_dex::ids::StringIdx(index)) {
+            Ok(text) => {
+                write_str_operand(output, text);
+                DexSymbolOutcome::Written
+            }
+            Err(_) => DexSymbolOutcome::Unavailable,
+        }
+    }
+
+    fn write_type(&self, index: u32, output: &mut String) -> DexSymbolOutcome {
+        match self.type_descriptor(index) {
+            Some(descriptor) => {
+                output.push_str(descriptor);
+                DexSymbolOutcome::Written
+            }
+            None => DexSymbolOutcome::Unavailable,
+        }
+    }
+
+    fn write_field(&self, index: u32, output: &mut String) -> DexSymbolOutcome {
+        let Some(field) = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.file.fields.get(index))
+        else {
+            return DexSymbolOutcome::Unavailable;
+        };
+        let Ok(name) = self.file.get_string(field.name_idx) else {
+            return DexSymbolOutcome::Unavailable;
+        };
+        let (Some(class), Some(kind)) = (
+            self.type_descriptor(field.class_idx.0),
+            self.type_descriptor(field.type_idx.0),
+        ) else {
+            return DexSymbolOutcome::Unavailable;
+        };
+        if write!(output, "{class}->{name}:{kind}").is_err() {
+            return DexSymbolOutcome::Unavailable;
+        }
+        DexSymbolOutcome::Written
+    }
+
+    fn write_method(
+        &self,
+        index: u32,
+        proto: Option<u32>,
+        output: &mut String,
+    ) -> DexSymbolOutcome {
+        let Some(method) = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.file.methods.get(index))
+        else {
+            return DexSymbolOutcome::Unavailable;
+        };
+        let Ok(name) = self.file.get_string(method.name_idx) else {
+            return DexSymbolOutcome::Unavailable;
+        };
+        let Some(class) = self.type_descriptor(method.class_idx.0) else {
+            return DexSymbolOutcome::Unavailable;
+        };
+        // 指令自带的原型索引优先；否则用 method_id 自己的 proto_idx（事实，不是猜的）。
+        let proto_index: u32 = match proto {
+            Some(proto) => proto,
+            None => method.proto_idx.0,
+        };
+        let mut prototype = String::new();
+        if !self.write_proto(proto_index, &mut prototype) {
+            return DexSymbolOutcome::Unavailable;
+        }
+        if write!(output, "{class}->{name}{prototype}").is_err() {
+            return DexSymbolOutcome::Unavailable;
+        }
+        DexSymbolOutcome::Written
+    }
+}
+
+/// 写字符串字面量。转义按 smali/Dalvik 的常见写法，但不借用库的渲染器
+/// （见 ADR-0020 的 2026-10-15 更正）。
+fn write_str_operand(output: &mut String, text: &str) {
+    output.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            control if control.is_control() => {
+                let _ = write!(output, "\\u{:04x}", control as u32);
+            }
+            other => output.push(other),
+        }
+    }
+    output.push('"');
 }
 
 impl DexInstructions {

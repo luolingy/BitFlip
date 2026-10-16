@@ -1269,6 +1269,14 @@ MSVC 修饰名反修饰、静态库 PDB。
   `DexMethodView::cross_check_problems()` 跨表对账（块内指令恰好等于指令列、块内地址
   连续、块首与边/前驱/handler 块号合法）。`dex_cfg.rs` 同时钉住了这条规则本身与
   "跨表对账确实会响"，避免它退化成恒真绿灯。修复后 143486 个真实方法全部通过。
+* **DEX 符号解析已落地**：`DexSymbolResolver` + `DexSymbols`（由
+  `DexStructure::symbols()` 取得），`render_dex_instructions_with_symbols` 把
+  `string@3` / `method@6` 渲染成真实文本。解析失败**不写占位符**：保留可数的池索引，
+  并把 `unsupported_operands`（已知缺口，如 call-site）与 `unavailable_operands`
+  （索引越界或库拒绝解析，属异常）分开计数 —— 库的 smali 渲染器在这里写 `?` /
+  `<invalid>`，我们不用它（理由见 ADR-0020 的 2026-10-15 更正）。公开签名里不出现
+  库的池类型，换库的改动面仍在适配层内。真实 APK 实测：2043423 条指令全部带符号
+  渲染成功，已知缺口 0、异常 0。
 
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 

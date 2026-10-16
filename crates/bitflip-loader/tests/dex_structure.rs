@@ -10,7 +10,9 @@
 //!
 //! 合成样本证明"我们按规范读"，真实样本证明"规范之外还有现实"——两者缺一不可。
 
-use bitflip_loader::{project_dex_method, DexStructure, ObjectKind};
+use bitflip_loader::{
+    project_dex_method, render_dex_instructions_with_symbols, DexStructure, ObjectKind,
+};
 
 // ── 合成样本 ────────────────────────────────────────────────────────────────
 
@@ -688,6 +690,10 @@ fn every_real_methods_code_units_are_exactly_tiled_by_instructions_and_payloads(
     let mut checked_payloads = 0usize;
     let mut without_code = 0usize;
     let mut problems: Vec<String> = Vec::new();
+    let mut rendered_instructions = 0usize;
+    let mut unsupported_operands = 0usize;
+    let mut unavailable_operands = 0usize;
+    let mut sample_text: Option<String> = None;
 
     for member in &dex_members {
         let raw = bitflip_loader::read_zip_member(&bytes, member.index)
@@ -738,6 +744,37 @@ fn every_real_methods_code_units_are_exactly_tiled_by_instructions_and_payloads(
             );
             checked_methods += 1;
             checked_payloads += check.payloads;
+
+            // 符号解析：真实池上跑一遍渲染，异常（索引越界/库拒绝解析）必须是 0。
+            // call-site 等已知缺口如实计数，不当成失败 —— 但也绝不静默。
+            let mut text = String::new();
+            let report =
+                render_dex_instructions_with_symbols(&view.instructions, &dex.symbols(), &mut text)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{}: class_idx={} method_idx={} code_off={:#x} 符号渲染失败: {e}",
+                            member.name, method.class_index, method.method_idx, method.code_off
+                        )
+                    });
+            rendered_instructions += report.instructions;
+            unsupported_operands += report.unsupported_operands;
+            unavailable_operands += report.unavailable_operands;
+            assert_eq!(
+                report.unavailable_operands,
+                0,
+                "{}: class_idx={} method_idx={} code_off={:#x} 有 {} 处符号解析异常；\
+                 输出片段（最多 200 字符）：{}",
+                member.name,
+                method.class_index,
+                method.method_idx,
+                method.code_off,
+                report.unavailable_operands,
+                text.chars().take(200).collect::<String>()
+            );
+            if sample_text.is_none() && text.contains("->") {
+                sample_text = Some(text.clone());
+            }
+
             if !check.is_exact() {
                 for p in &check.problems {
                     problems.push(format!(
@@ -759,6 +796,14 @@ fn every_real_methods_code_units_are_exactly_tiled_by_instructions_and_payloads(
         "  检查了 {checked_methods} 个方法的码元布局（含 {checked_payloads} 个载荷）；\
          {without_code} 个方法没有字节码（抽象/native，如实计数不计入检查）"
     );
+    println!(
+        "  符号渲染：{rendered_instructions} 条指令；已知缺口（如 call-site）\
+         {unsupported_operands} 处；解析异常 {unavailable_operands} 处"
+    );
+    if let Some(text) = &sample_text {
+        let sample: String = text.lines().take(8).collect::<Vec<_>>().join("\n    ");
+        println!("  首个含符号引用的方法（前 8 行）：\n    {sample}");
+    }
 
     // 设计文档写的验收门槛是"在 3000 个真实方法上 0 不吻合"。真实样本上我们
     // 检查的是全部带字节码的方法（远多于 3000），所以先钉住"确实检查到了量"。

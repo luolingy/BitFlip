@@ -11,6 +11,23 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — DEX 符号解析：池索引渲染成字符串/类型/字段/方法文本
+
+新增 `DexSymbolResolver` trait 与基于已解析池的实现 `DexSymbols`（经
+`DexStructure::symbols()` 取得）。`render_dex_instructions_with_symbols` 把
+`string@3` / `method@6` 这类数值操作数渲染成 `"..."` / `Lcom/Foo;->bar(I)V`。
+
+**解析不出来时不写占位符**：保留可数的 `kind@index`，并把结果记进
+`DexRenderReport` —— `unsupported_operands`（已知未实现，如 call-site）与
+`unavailable_operands`（索引越界或库拒绝解析，属异常）分开计数。这样"没解析出来"
+是看得见的（CLAUDE.md §7），而不是像库的 smali 渲染器那样静默写 `?` / `<invalid>`。
+公开签名里不出现库的池类型（`DexFile` 只做私有字段），换库的改动面仍在适配层内。
+
+真实 APK 实测：3 个 DEX、143486 个方法、**2043423 条指令全部渲染成功**，
+已知缺口 0 处、解析异常 0 处；样例输出
+`invoke-direct v0, Ljava/lang/Object;-><init>()V`。合成用例覆盖字符串/类型/字段/
+方法/多态调用、异常索引与 call-site 已知缺口（后者断言输出里不出现 `?`）。
+
 ### 更正 — 库其实有 smali 渲染器；我们不用它的理由要换
 
 `docs/DECISIONS.md` 的 ADR-0020 **背景**照抄了设计文档当时的说法：DEX 指令文本渲染是
