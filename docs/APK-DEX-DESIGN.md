@@ -88,6 +88,10 @@ ObjectKind::Elf           ← 已有，APK 里的 .so 直接命中
 APK 的成员是**有名字、格式各异**的，与 `Ar` 同构（只是成员格式不单一），
 所以复用 `members` + `member_kind` 那套即可，只是 `member_kind` 变成"逐个成员判"。
 
+DEX 视图给产品用时，出口在 `bitflip_core::dex`（M2b）——那条路**只借用分层，不扩模型**：
+core 已经因为同样的理由重新导出 `ApkRole` / `ArchiveMember` / `MemberStorage`
+（"不给嵌入方一个被迫依赖 `bitflip-loader` 的理由"）。
+
 ### 4.2 需要新增的概念
 
 1. **`Arch::Dalvik`**。`Arch` 现在 9 个变体，都是原生 ISA。Dalvik 是寄存器机，
@@ -264,16 +268,28 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 >
 > **拆成两段推进（据实记录，免得"看起来完成了"）**：
 >
-> * **M2a（事实层，进行中）**：解码投影 + CFG 投影 + 渲染函数 + 黄金测试，
+> * **M2a（事实层，已完成 2026-10-15）**：解码投影 + CFG 投影 + 渲染函数 + 黄金测试，
 >   全部落在 DEX 侧，**不碰 `bitflip-core`**。M1 推迟的三条布局验收均已补齐。
 >   2026-10-15 的 `bitflip-loader::format::dex::view` 初版提供指令 SoA、payload 与
 >   handler 列、**自建 CFG**（不用库的控制流模块）与独立文本输出；合成测试通过，
 >   真实 APK 143486 个带代码方法投影通过，2043423 条指令带符号渲染 0 异常。
->   CLI/导出接线（M2b）尚未完成；异常输入有 6 条定点用例 + 一套确定性模糊测试
->   （`tests/dex_fuzz.rs`），但没有覆盖率引导，也没有长时间 soak。
-> * **M2b（接产品，后做）**：CLI/导出怎么呈现 DEX 视图（新子命令，还是
->   `--member classes.dex` 自动切视图）。ADR-0020 明确把这一条留到 M2a 之后，
->   依据是"用户在命令行上想表达什么"。
+>   异常输入有 6 条定点用例 + 一套确定性模糊测试（`tests/dex_fuzz.rs`），
+>   但没有覆盖率引导，也没有长时间 soak。
+> * **M2b（接产品，进行中 2026-10-16）**：ADR-0020 把"CLI/导出怎么呈现 DEX 视图"
+>   留到 M2a 之后，2026-10-16 定案为**独立子命令** `bitflip-cli dex <APK|.dex>`
+>   ——不是 `functions --member classes.dex` 自动切视图，因为那条路要过
+>   `member_session`，而它要求成员是"可分析对象"，DEX 没有对象解析器（ADR-0020），
+>   必然被拒；DEX 的输出形状也自成一类（没有架构、没有线性地址）。
+>   **本轮已完成 CLI 侧**：`--class 'Lcom/Foo;'` 列类的方法、`--method
+>   'Lcom/Foo;->bar(I)V'`（smali 风格标识，精确匹配）打印指令与**文本 CFG**、
+>   `--no-symbols` 出原始池下标并把"已关闭"写进报告、`--json` 给出带
+>   `format_version` 的稳定契约；APK 里有多个 DEX 时按**成员名**区分（`classes.dex` /
+>   `classes2.dex` …，这正是 §4.2 第 5 条要解的"多 dex 身份"——按**成员名**判定，
+>   不引第二套索引）。出口经 `bitflip_core::dex`：分层约定是
+>   `cli/app → server → core → {loader, …}`，cli/server 不直接依赖 loader；
+>   但 DEX **不进对象模型** —— `ObjectKind::Dex` 仍然没有解析器、
+>   `parse_object` 仍然拒绝 DEX、`Disasm` 一行未改。
+>   **仍未做**：服务端 `/api/dex*` 与网页端"按 DEX 文件名分 tab"的界面。
 
 用 `droidsaw-dex` 的 `decode`，**要写的是适配层**：
 

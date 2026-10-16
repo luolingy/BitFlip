@@ -33,20 +33,21 @@ use crate::{BitflipError, Session};
 /// 不必因为一个字段就宣称核心 API 破坏性变更（`docs/ARCHITECTURE.md` 的版本策略）。
 pub const DEX_FORMAT_VERSION: u32 = 1;
 
+/// `code_item` 的结构自检（不投影，只查布局）。
+pub use bitflip_loader::check_code_item_layout;
 /// DEX 结构解析（[`bitflip_loader::parse_dex_structure`] 的出口）。
 pub use bitflip_loader::parse_dex_structure as parse;
 /// 整条指令列的投影。
 pub use bitflip_loader::project_dex_code_item as project_code_item;
 /// 单个 `code_item` 的投影（方法视图 + CFG）。
 pub use bitflip_loader::project_dex_method as project_method;
+/// CFG 的文本渲染。
+pub use bitflip_loader::render_dex_cfg_text as render_cfg_text;
 /// 指令列的数值形式渲染。
 pub use bitflip_loader::render_dex_instructions as render_instructions;
 /// 指令列的符号形式渲染（返回解析结果的分类计数）。
 pub use bitflip_loader::render_dex_instructions_with_symbols as render_instructions_with_symbols;
-/// CFG 的文本渲染。
-pub use bitflip_loader::render_dex_cfg_text as render_cfg_text;
-/// `code_item` 的结构自检（不投影，只查布局）。
-pub use bitflip_loader::check_code_item_layout;
+use bitflip_loader::ObjectKind;
 pub use bitflip_loader::{
     payload_width_units, CodeHeaderFacts, DexCfgView, DexClass, DexCountMismatches, DexCounts,
     DexDeclaredSizes, DexEdgeKind, DexExceptionRegion, DexField, DexHandlerEntry, DexHeaderFacts,
@@ -54,7 +55,6 @@ pub use bitflip_loader::{
     DexRenderReport, DexStructure, DexSymbolOutcome, DexSymbolResolver, DexSymbols, DexViewError,
     LayoutCheck, LayoutProblem, LayoutProblemKind, UnresolvedEdgeTarget,
 };
-use bitflip_loader::ObjectKind;
 
 /// 成员名是不是"看起来是 DEX"（大小写不敏感的 `.dex` 后缀）。
 ///

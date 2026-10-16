@@ -272,6 +272,24 @@ M2（Dalvik 解码器 + CFG）→ M3（AXML + arsc）**。
 - ADR 的**决定**（DEX 视图自成一类、不泛化 `Disasm`）依据的是 `Disasm` 前四格对 DEX
   不成立，与本条更正无关，故不变。
 
+**补记（2026-10-16，M2b 实施期间）**：上面"本 ADR 不定的事"（DEX 视图在 CLI/导出里
+**怎么呈现**）现在定了 —— 依据"用户在命令行上想表达什么"终于有了答案：
+
+- **独立子命令** `bitflip-cli dex <APK|.dex>`，**不是** `functions --member classes.dex`
+  自动切视图。后者要过 `Session::member_session`，它要求成员能被 `parse_object`
+  解析成对象，而 DEX 没有对象解析器（本 ADR 的第一条），必然被拒；而"看这个 APK 里的
+  DEX"与"反汇编一个 `.so`"确实是两件事（见上面的代价对比），分成两个入口不是新增复杂度。
+- 方法身份用 smali 风格标识 `Lcom/Foo;->bar(I)V`（**只做精确匹配**，与
+  `find_class_by_descriptor` 同一立场）。用户在 2026-10-16 同时定了其余三件：
+  APK 里有多个 DEX 时在**网页端按文件名分 tab**（CLI 侧按成员名区分）、符号解析默认开启
+  且降级必须出现在输出里、CFG 第一版只出文本。
+- **出口在 `bitflip_core::dex`，但对象模型一行未改**：CLI 与 server 只依赖 core，
+  DEX 能力因此必须从 core 出口（`ApkRole` / `ArchiveMember` / `MemberStorage` 早就是
+  同一做法）。core 侧只有三样东西：原样重导出 loader 的 DEX 入口、`Session::member_bytes`
+  （按成员名取**原始字节**）、一个名字判据。`ObjectKind::Dex` 仍然没有解析器、
+  `parse_object` 仍然拒绝 DEX、`Disasm` 不变 —— **借分层不等于扩模型**。
+  这也回答了上面"CLI/导出要认两种视图"的代价：认两种视图是对的，但不必认两个来源。
+
 已加守卫：`tests/dex_library_boundary.rs` 用**另一条独立的清单与另一套措辞**拒绝
 `droidsaw_dex::smali`（理由是"静默占位符"，不是"推断"），避免以后有人顺手接进来把
 `?` 漏进用户输出。教训与 §6.11 同形：**先核实"库做不到"，再据此写理由** ——

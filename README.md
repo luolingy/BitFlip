@@ -16,7 +16,12 @@ UI 走 Web 是为了跨平台，不需要为每个平台维护原生 GUI 外壳�
 - **浏览器里的段/节结构视图**：段（内存视角）与节（文件视角）分页签，含虚拟地址、文件偏移、
   权限、内容类别、是否映射，并高亮入口点所在的节；
 - 解析失败**不会**让目标打不开：识别结论照常显示，失败原因写在说明里；
-- 其余能力（解码、函数识别、交叉引用、注释持久化……）按里程碑推进，
+- **DEX 视图（`bitflip-cli dex <APK|.dex>`，APK/DEX 里程碑的 M2b 第一步）**：按 smali 标识
+  列类的方法（`--class 'Lcom/example/Foo;'`）、打印一个方法的指令与文本 CFG
+  （`--method 'Lcom/example/Foo;->bar(I)V'`）。符号解析默认开启；`--no-symbols` 输出原始池
+  下标并把"已关闭"写进报告；`--json` 给带版本号的稳定契约。APK 里有多个 DEX 时按成员名
+  区分（`classes.dex` / `classes2.dex` …）。**本阶段只有命令行**，网页端尚未接 DEX；
+  其余能力（解码、函数识别、交叉引用、注释持久化……）按里程碑推进，
   **界面上未实现的入口一律置灰并标注里程碑**。
 
 - **反汇编视图**：x86 / x86-64 / AArch64 / ARM / RISC-V / MIPS 的真实解码，
@@ -50,6 +55,11 @@ cargo build --release -p bitflip-app
 # 原始二进制（固件/裸镜像）：没有头可读，架构必须手工指定
 ./target/release/bitflip-cli info firmware.bin --arch arm --mode thumb --base 0x08000000
 ./target/release/bitflip    firmware.bin --arch arm --base 0x08000000
+
+# APK 里的 DEX：列类的方法、看方法的指令与文本 CFG（多个 DEX 按成员名区分）
+./target/release/bitflip-cli dex path/to/app.apk
+./target/release/bitflip-cli dex path/to/app.apk --class 'Lcom/example/Foo;'
+./target/release/bitflip-cli dex path/to/app.apk --member classes2.dex --method 'Lcom/example/Foo;->bar(I)V'
 ```
 
 `--arch` / `--mode` / `--endian` / `--base` 是**公共覆盖参数**，`info`、`functions`、

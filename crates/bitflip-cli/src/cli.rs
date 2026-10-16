@@ -537,6 +537,53 @@ mod tests {
     }
 
     #[test]
+    fn the_dex_subcommand_parses_its_selectors() {
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "dex",
+            "app.apk",
+            "--member",
+            "classes2.dex",
+            "--method",
+            "Lcom/Foo;->bar(I)V",
+            "--no-symbols",
+            "--no-cfg",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .expect("解析");
+        match cli.command {
+            Command::Dex(args) => {
+                assert_eq!(args.target.to_string_lossy(), "app.apk");
+                assert_eq!(args.member.as_deref(), Some("classes2.dex"));
+                assert_eq!(args.method.as_deref(), Some("Lcom/Foo;->bar(I)V"));
+                assert_eq!(args.class, None);
+                assert!(args.no_symbols);
+                assert!(args.no_cfg);
+                assert_eq!(args.limit, 5);
+                assert!(args.json);
+            }
+            other => panic!("期望 dex，得到 {other:?}"),
+        }
+
+        // 只给目标：即"概览"模式；默认值是符号解析开、CFG 开。
+        let cli = Cli::try_parse_from(["bitflip-cli", "dex", "app.apk"]).expect("解析");
+        match cli.command {
+            Command::Dex(args) => {
+                assert_eq!(args.class, None);
+                assert!(
+                    !args.no_symbols,
+                    "符号解析默认开启（用户 2026-10-16 的决定）"
+                );
+                assert!(!args.no_cfg, "CFG 默认打印成文本");
+                assert_eq!(args.limit, 200);
+            }
+            other => panic!("期望 dex，得到 {other:?}"),
+        }
+    }
+
+    #[test]
     fn subcommands_parse() {
         let cli = Cli::try_parse_from(["bitflip-cli", "info", "a.dll", "--json"]).expect("解析");
         match cli.command {

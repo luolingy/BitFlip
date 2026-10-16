@@ -111,7 +111,7 @@ pub fn build_json(args: &DexArgs) -> anyhow::Result<String> {
     } else if let Some(descriptor) = args.class.as_deref() {
         payload["class"] = class_json(&parsed, descriptor, args)?;
     }
-    Ok(serde_json::to_string_pretty(&payload).context("序列化 DEX 报告失败")?)
+    serde_json::to_string_pretty(&payload).context("序列化 DEX 报告失败")
 }
 
 /// 打开目标，整理出所有 DEX 输入并逐个解析。
@@ -138,10 +138,13 @@ fn collect_inputs(target: &Path, only: Option<&str>) -> anyhow::Result<Vec<DexIn
     }
 
     if let Some(name) = only {
-        bail!("{name:?}：目标 {} 不是归档，没有成员可选（--member 只对 APK/ZIP 有意义）", target.display());
+        bail!(
+            "{name:?}：目标 {} 不是归档，没有成员可选（--member 只对 APK/ZIP 有意义）",
+            target.display()
+        );
     }
-    let bytes = std::fs::read(target)
-        .with_context(|| format!("读取目标 {} 失败", target.display()))?;
+    let bytes =
+        std::fs::read(target).with_context(|| format!("读取目标 {} 失败", target.display()))?;
     Ok(vec![DexInput {
         name: file_name(target),
         role: String::new(),
@@ -196,9 +199,10 @@ fn role_label(name: &str) -> String {
 
 /// 单文件目标的显示名（拿不到就退回整个路径，不编名字）。
 fn file_name(target: &Path) -> String {
-    target
-        .file_name()
-        .map_or_else(|| target.display().to_string(), |name| name.to_string_lossy().into_owned())
+    target.file_name().map_or_else(
+        || target.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// 渲染整条指令列：数值形式（`symbols` 为 `None`）或符号形式。
@@ -218,7 +222,11 @@ fn instruction_rows(
             Some(dex::DexSymbolOutcome::Written) | None => {}
         }
         rows.push(InstructionRow {
-            address: instructions.addresses.get(index).copied().unwrap_or_default(),
+            address: instructions
+                .addresses
+                .get(index)
+                .copied()
+                .unwrap_or_default(),
             text,
         });
     }
@@ -227,13 +235,11 @@ fn instruction_rows(
 
 /// 不给选择时的概览：有哪几个 DEX、各有多少类与方法，以及怎么用。
 fn report_summary(out: &mut String, parsed: &[(DexInput, DexStructure)], args: &DexArgs) {
-    let names: Vec<&str> = parsed.iter().map(|(input, _)| input.name.as_str()).collect();
-    let _ = writeln!(
-        out,
-        "DEX 输入：{} 个（{}）",
-        parsed.len(),
-        names.join("、")
-    );
+    let names: Vec<&str> = parsed
+        .iter()
+        .map(|(input, _)| input.name.as_str())
+        .collect();
+    let _ = writeln!(out, "DEX 输入：{} 个（{}）", parsed.len(), names.join("、"));
 
     let limit = if args.limit == 0 {
         usize::MAX
@@ -314,10 +320,7 @@ fn report_class(
         } else {
             "（本命令只做精确匹配：类要写成 smali 描述符，如 `Lcom/Foo;`）"
         };
-        bail!(
-            "在 {} 个 DEX 里都找不到类 {descriptor}{hint}",
-            parsed.len()
-        );
+        bail!("在 {} 个 DEX 里都找不到类 {descriptor}{hint}", parsed.len());
     }
 
     let limit = if args.limit == 0 {
@@ -386,7 +389,10 @@ fn report_method(
         );
     }
     if matches.len() > 1 {
-        let names: Vec<&str> = matches.iter().map(|(input, _, _)| input.name.as_str()).collect();
+        let names: Vec<&str> = matches
+            .iter()
+            .map(|(input, _, _)| input.name.as_str())
+            .collect();
         bail!(
             "方法 {signature} 在多个 DEX 里都有（{}）：用 `--member <名字>` 指定一个",
             names.join("、")
@@ -404,11 +410,7 @@ fn report_method(
     } else {
         format!(" {}", input.role)
     };
-    let _ = writeln!(
-        out,
-        "来源：{}{}  code_off={code_off:#x}",
-        input.name, role
-    );
+    let _ = writeln!(out, "来源：{}{}  code_off={code_off:#x}", input.name, role);
 
     if code_off == 0 {
         // 合法结论，不是错误：抽象/native 方法本来就没有 code_item。
@@ -461,7 +463,10 @@ fn report_method(
 /// 符号解析的"账"：把缺口与异常都写出来。
 fn symbol_line(report: &DexRenderReport) -> String {
     if report.unsupported_operands == 0 && report.unavailable_operands == 0 {
-        return format!("符号解析：开启（{} 条指令的操作数都解析成了符号文本）", report.instructions);
+        return format!(
+            "符号解析：开启（{} 条指令的操作数都解析成了符号文本）",
+            report.instructions
+        );
     }
     format!(
         "符号解析：开启（已知缺口 {} 处（call-site 等尚未支持）；解析异常 {} 处（本该解析出来却没有））",
@@ -480,7 +485,10 @@ fn method_json(
         bail!("在 {} 个 DEX 里都找不到方法 {signature}", parsed.len());
     }
     if matches.len() > 1 {
-        let names: Vec<&str> = matches.iter().map(|(input, _, _)| input.name.as_str()).collect();
+        let names: Vec<&str> = matches
+            .iter()
+            .map(|(input, _, _)| input.name.as_str())
+            .collect();
         bail!(
             "方法 {signature} 在多个 DEX 里都有（{}）：用 `--member <名字>` 指定一个",
             names.join("、")
@@ -488,7 +496,10 @@ fn method_json(
     }
 
     let (input, structure, index) = matches[0];
-    let code_off = structure.methods.get(index).map_or(0, |method| method.code_off);
+    let code_off = structure
+        .methods
+        .get(index)
+        .map_or(0, |method| method.code_off);
     if code_off == 0 {
         return Ok(json!({
             "signature": signature,

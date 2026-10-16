@@ -11,6 +11,53 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — `bitflip dex` 子命令：列 DEX 的类、看方法的指令与文本 CFG（M2b 第一步）
+
+CLI 新增 `bitflip-cli dex <APK|.dex>`。呈现方式由用户 2026-10-16 定案为**独立子命令**，
+不是 `functions --member classes.dex` 自动切视图 —— 后者要过 `member_session`，
+而它要求成员能被 `parse_object` 解析成对象，DEX 没有对象解析器，必然被拒
+（理由与取舍见 ADR-0020 的 2026-10-16 补记）。
+
+- **选择器**：`--class 'Lcom/Foo;'` 列该类的方法（每个方法给 smali 标识与 `code_off`）；
+  `--method 'Lcom/Foo;->bar(I)V'` 打印寄存器 / 入参 / 出参、指令与**文本 CFG**。
+  两者都**只做精确匹配**：写法不对时报错并提示 smali 写法，不猜、不做子串或通配匹配。
+- `--member <名字>` 指定 APK 里的某个 DEX；不给时逐个处理所有 `classes*.dex`，
+  **按成员名区分**（`classes.dex` / `classes2.dex` …），不引第二套索引。
+- **符号解析默认开启**（池索引渲染成真实文本）；`--no-symbols` 改成输出原始池下标，
+  且报告**明说**"已关闭"——不让人误以为解析过且成功。解析不出来时保留**可数的**池索引，
+  并区分 `unsupported_operands`（已知缺口，如 call-site）与 `unavailable_operands`
+  （索引越界等异常）。不写 `?` / `<invalid>` 占位符。
+- `--no-cfg` 去掉 CFG 段；`--json` 给稳定契约（`DEX_FORMAT_VERSION`、码元偏移按项目约定
+  写成定长小写 16 位十六进制、缺失值一律 `null`、降级写在 `notes` 里）。
+- 抽象 / `native` 方法（`code_off == 0`）是**合法结论**：写"没有字节码"并以 0 退出。
+- **CFG 文本渲染**（`render_dex_cfg_text`）：块（起址、指令数、前驱）、出边（落空 / 分支 /
+  switch 键 / switch 默认 / 异常处理 / catch-all）与**未连上的目标**逐条列出，汇总行把
+  三个计数（含 0）都印出来 —— 降级不会被藏在空段里。
+- **出口在 `bitflip_core::dex`**（分层约定：`cli/server` 只依赖 core）。core 只加了三样：
+  原样重导出 loader 的 DEX 入口、`Session::member_bytes`（按成员名取原始字节）、名字判据
+  `is_dex_member_name`。**`ObjectKind::Dex` 仍然没有解析器、`parse_object` 仍然拒绝 DEX、
+  `Disasm` 一行未改**（ADR-0020）。
+
+### 变更 — loader 的合成 DEX 样本提到 `tests/common/dex_fixture.rs`，CLI 测试复用同一份
+
+`crates/bitflip-loader/tests/common/dex_fixture.rs` 由 loader 的结构黄金测试与
+`crates/bitflip-cli/tests/dex_cli.rs`（`#[path]` 引入）**共用**：样本只有一份，就没有
+"两个 crate 各养一份、再慢慢分叉"的机会。CLI 侧新增 8 条默认用例（概览 / 列类 / 方法 /
+无符号 / 无 CFG / JSON / 名字写法错误 / 方法不存在），另有 1 条 `#[ignore]` 的真实 APK
+端到端用例（`BITFLIP_TEST_APK`，样本缺失即失败、不静默跳过；实测 25.6 秒）。
+
+真实 APK 上另用二进制复核了四件事：3 个 DEX 成员的类/方法计数、带符号解析的方法报告、
+`--no-symbols` 的降级说明、错误退出码 1。概览里**如实**打出 loader 的容错记录
+（`classes.dex` / `classes2.dex` 各一处 `OutOfOrder { pool: StringIds }`）。
+
+### 修复 — CFG 文本里的块内指令范围整体错一格
+
+CFG 的 `block_instruction_offsets` / `edge_offsets` / `predecessor_offsets` 与
+`source_offsets` 用**同一个**约定（开头先压一个 `0`，其后每个块压结束位置）；文本渲染
+最初按"累计结束位置"去读（`offsets[i-1]..offsets[i]`），于是块号与内容整体错一格
+（`块 0` 显示 0 条指令、边挂到下一个块）。`dex_cfg.rs` 的三条逐字黄金测试现在钉住
+块 / 边 / 前驱、未连上目标与空方法汇总行的文本。
+
 ### 新增 — DEX 视图/CFG 的系统化模糊测试（确定性、可复现、防空转）
 
 `tests/dex_fuzz.rs`：三条靶子 —— 结构化随机 `CodeItem`（4000 例）、合法 `code_item`

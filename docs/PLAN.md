@@ -1299,6 +1299,54 @@ MSVC 修饰名反修饰、静态库 PDB。
   库的池类型，换库的改动面仍在适配层内。真实 APK 实测：2043423 条指令全部带符号
   渲染成功，已知缺口 0、异常 0。
 
+**进展 · M2b（2026-10-16，据实记录）**：呈现方式定案并落地了 CLI 一侧。
+
+* **决定**（用户 2026-10-16 拍板）：**独立子命令** `bitflip-cli dex <APK|.dex>`，
+  而不是 `functions --member classes.dex` 自动切视图。理由不是口味：后者要过
+  `Session::member_session`，它要求成员能被 `parse_object` 解析成对象，而 DEX
+  没有对象解析器（ADR-0020），必然被拒；DEX 的输出形状也确实自成一类。
+  方法的身份用 **smali 风格标识**（`Lcom/Foo;->bar(I)V`），**只做精确匹配** ——
+  短名 / 子串 / 参数通配混在一个返回值里，"命中哪个"就说不清了（与
+  `find_class_by_descriptor` 同一立场）。选择器的查找**不建全局索引**：
+  先用 `->` 左边筛类，再只比较那个类自己的方法，避免为 15 万条方法各拼一次字符串。
+* **出口在 `bitflip_core::dex`，但不进对象模型**：分层约定是
+  `cli/app → server → core → {loader, …}`，CLI 与 server 只依赖 core，所以 DEX
+  能力必须从 core 出口（`ApkRole` / `ArchiveMember` / `MemberStorage` 早就是同一做法，
+  理由是"不给嵌入方一个被迫依赖 `bitflip-loader` 的理由"）。core 侧只有三样东西：
+  原样重导出 loader 的 DEX 入口、`Session::member_bytes`（按成员名取**原始字节**，
+  与 `member_session` 共用同一套成员定位与容器取出代码）、一个名字判据
+  `is_dex_member_name`。**`ObjectKind::Dex` 仍然没有解析器、`parse_object` 仍然拒绝
+  DEX、`Disasm` 一行未改** ——"借分层"不等于"扩模型"。
+* **CLI**：`--class` 列类的方法、`--method` 打印指令与**文本 CFG**（用户决定：
+  第一版先出文本）、`--no-symbols` 出原始池下标、`--no-cfg` 去掉 CFG 段、`--json`
+  给稳定的 wire 契约（带 `DEX_FORMAT_VERSION`，码元偏移按项目约定写成定长小写 16 位
+  十六进制）。符号解析**默认开启**，两类解析不出来都写在报告里：
+  `unsupported_operands`（已知缺口，如 call-site）与 `unavailable_operands`（异常）。
+  关掉符号解析时报告会**明说**"已关闭、下面是原始池下标"，不让人误以为解析过且成功。
+  抽象/native 方法（`code_off == 0`）是**合法结论**：明确写"没有字节码"，退出码 0。
+* **CFG 文本渲染**（`render_dex_cfg_text`）：块（块号、起址、指令数、前驱集合）、
+  出边（落空 / 分支 / switch 分支键 / switch 默认 / 异常处理类型池下标 / catch-all）
+  与**未连上的目标**逐条列出；汇总行把三个计数（含 0）都印出来，降级不会被藏在
+  空段里。写它时踩到一次列错位：CFG 的 `block_instruction_offsets` / `edge_offsets` /
+  `predecessor_offsets` 与 `source_offsets` 用**同一个**约定（开头压一个 0，其后每个块
+  压结束位置），按"累计结束位置"去读就会整体错一格 —— 现在由 `dex_cfg.rs` 的三条
+  逐字黄金测试钉住（块/边/前驱文本、未连上目标的文本、空方法的汇总行）。
+* **两个测试共用同一份合成样本**：loader 的结构黄金测试与 CLI 的 `dex` 测试都用
+  `crates/bitflip-loader/tests/common/dex_fixture.rs`（后者 `#[path]` 引入）。
+  样本照规范拼、出处逐项写在代码里；只留一份，就没有"两个 crate 各养一份再慢慢分叉"
+  的机会。这层复用正是抓到上面那条列错位的原因。
+* **验证**：合成样本上逐行钉住 CLI 报告（8 条用例，含概览/列类/方法/无符号/无 CFG/
+  JSON/错误路径）；真实 APK 上 `classes.dex` 的一个真实方法端到端跑通
+  （`#[ignore]` + `BITFLIP_TEST_APK`，25.6 秒），并直接跑二进制复核了四件事：
+  3 个 DEX 成员的计数、带符号解析的方法报告、`--no-symbols` 的降级说明、
+  错误退出码 1。概览里还**如实地**把 loader 的容错记录打了出来
+  （`classes.dex` / `classes2.dex` 各有一处 `OutOfOrder { pool: StringIds }`）——
+  降级写在输出里，不是只写在文档里。
+* **仍未做**：服务端 `/api/dex*` 与网页端"多个 DEX 用 tab 标签页按文件名区分"的
+  界面（用户 2026-10-16 的决定），以及 DEX 的导出（`export` 子命令）。
+  已知问题：`bitflip-analyze/tests/callgraph_scale.rs` 的 10k 函数用例在慢机器上
+  会超 3000 ms 门槛，与本阶段无关、尚未处理。
+
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 
 **为什么单列一个里程碑而不是塞进 M10**：它引入的是一整套**新的执行模型**，不是

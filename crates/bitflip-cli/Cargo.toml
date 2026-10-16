@@ -29,6 +29,10 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
+# DEX 合成样本要按规范自己算 `header.signature`（SHA-1）。用 `sha1` 而不是自己写一份：
+# `droidsaw-dex` 用的就是它，两个不同实现之间的差异会变成一条难查的假失败。
+# 它不是新依赖 —— 已经在传递依赖里，许可闸门早已覆盖。
+sha1 = { workspace = true }
 
 [lints]
 workspace = true

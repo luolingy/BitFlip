@@ -421,16 +421,12 @@ pub fn project_code_item(code: &CodeItem) -> Result<DexMethodView, DexViewError>
 
 /// 取出 CFG 并列数组里第 `index` 段的范围。
 ///
-/// 注意这三列（块内指令、出边、前驱）存的是**累计结束位置**：`offsets[i]` 是第 `i` 段
-/// 的**末尾**，第 0 段从 0 开始。这与 [`DexInstructions::source_offsets`] 那种
-/// "开头先压一个 0"的写法**不同**，混用会整体错位一格。
+/// 这三列（块内指令、出边、前驱）与 [`DexInstructions::source_offsets`] 用**同一个**
+/// 约定：开头先压一个 `0`，其后每个块压一个**结束位置** —— 所以第 `index` 段是
+/// `offsets[index]..offsets[index + 1]`，列长比块数多 1。
 fn column_range(offsets: &[usize], index: usize, total: usize) -> Option<std::ops::Range<usize>> {
-    let end = *offsets.get(index)?;
-    let start = if index == 0 {
-        0
-    } else {
-        *offsets.get(index - 1)?
-    };
+    let start = *offsets.get(index)?;
+    let end = *offsets.get(index + 1)?;
     (start <= end && end <= total).then_some(start..end)
 }
 
