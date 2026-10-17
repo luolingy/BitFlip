@@ -233,6 +233,11 @@ fn print_parsed(parsed: &ObjectInfo) {
     if !parsed.symbols.is_empty() {
         stats.push(format!("符号 {}", parsed.symbols.len()));
     }
+    // 函数起点只有 Mach-O 的 LC_FUNCTION_STARTS 会给。为空时**不打印** ——
+    // "函数起点 0"会让 PE/ELF 看起来缺了一块，而它们本来就没有这样一张表。
+    if !parsed.function_starts.is_empty() {
+        stats.push(format!("函数起点 {}", parsed.function_starts.len()));
+    }
     if !parsed.relocations.is_empty() {
         stats.push(format!("重定位 {}", parsed.relocations.len()));
     }

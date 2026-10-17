@@ -477,21 +477,214 @@ fn fat_input_is_refused_by_the_thin_parser() {
     }
 }
 
+// ── 符号表（LC_SYMTAB） ────────────────────────────────────────────────────
+
+/// 64 位样本的 `LC_SYMTAB`：3 条符号里 1 条是 stab，对象模型只收另外 2 条。
+///
+/// 名字断言盯着"前缀字节占掉偏移 0"这一点：字符串表是 `" " + "_main\0…"`，
+/// 所以按 `n_strx` 取到的名字是 `_main`；要是解析器按偏移 0 或按顺序取，
+/// 这里会变成 `" _main"` 或别的东西（CLAUDE.md §6.11：样本按规范拼，不按解析器拼）。
+#[test]
+fn symtab_symbols_carry_names_sections_and_externality() {
+    let bytes = fixture::demo_symbols64();
+    let file = read(&bytes).expect("带 LC_SYMTAB 的样本必须能解析");
+
+    assert!(file.has_symtab);
+    assert_eq!(file.symbols.len(), 3, "样本里有 3 条 nlist_64");
+    assert_eq!(file.stab_symbols, 1, "其中第 3 条是 N_FUN 调试 stab");
+    assert_eq!(
+        file.symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["_main", "_printf", "main.c"],
+        "名字必须按 n_strx 从字符串表里取（偏移 0 是前缀字节，不是名字）"
+    );
+
+    let main = &file.symbols[0];
+    assert_eq!(main.value, 0x1_0000_0F00);
+    assert_eq!(main.n_type, fixture::N_SECT | fixture::N_EXT);
+    assert_eq!(main.n_sect, 1, "n_sect 是 1 基的跨段节号");
+    assert_eq!(main.section.as_deref(), Some("__TEXT,__text"));
+    assert!(main.is_external() && !main.is_undefined() && !main.is_stab());
+    assert!(main.is_function, "__text 是代码节，符号落在这里才算函数");
+    assert!(!main.is_weak());
+
+    let printf = &file.symbols[1];
+    assert_eq!(printf.value, 0, "未定义符号的 n_value 是 0");
+    assert_eq!(printf.n_sect, 0, "NO_SECT");
+    assert_eq!(printf.section, None, "没有节号就没有节名（不猜）");
+    assert!(printf.is_undefined() && printf.is_external());
+    assert!(!printf.is_function);
+
+    let stab = &file.symbols[2];
+    assert_eq!(stab.n_type, fixture::N_FUN);
+    assert!(stab.is_stab(), "0x24 & N_STAB(0xe0) = 0x20 != 0");
+}
+
+#[test]
+fn the_object_model_drops_stabs_but_keeps_the_count_in_notes() {
+    let object = parse_bytes(&fixture::demo_symbols64()).expect("能解析");
+
+    assert_eq!(object.symbols.len(), 2, "stab 不是普通符号");
+    assert!(!object.format.is_stripped, "有普通符号就不是剥离过的");
+    let names: Vec<&str> = object
+        .symbols
+        .iter()
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["_main", "_printf"]);
+
+    let main = &object.symbols[0];
+    assert_eq!(main.value, 0x1_0000_0F00);
+    // `nlist` 没有大小字段：0 是"未知"，不是"零字节"。
+    assert_eq!(main.size, 0);
+    assert!(main.defined && main.is_function && !main.is_weak);
+    assert_eq!(main.section.as_deref(), Some("__TEXT,__text"));
+    // `bind` 沿用 PE/COFF 那条最小交集映射：N_EXT → 全局(1)。
+    assert_eq!(main.bind, 1);
+
+    let printf = &object.symbols[1];
+    assert!(!printf.defined, "N_UNDF 就是未定义");
+    assert_eq!(printf.bind, 1, "外部未定义符号仍然是外部符号");
+    assert_eq!(
+        printf.source.as_str(),
+        "symtab",
+        "来源记 Static，表示它来自完整符号表"
+    );
+
+    let joined = object.notes.join("\n");
+    assert!(
+        joined.contains("调试 stab") && joined.contains("1"),
+        "stab 被排除这件事必须写进 notes：{joined}"
+    );
+    assert!(
+        joined.contains("没有大小字段"),
+        "size = 0 是未知而不是零字节，这一点要说出来：{joined}"
+    );
+}
+
+/// 32 位样本用 12 字节的 `nlist`（不是 16 字节的 `nlist_64`）。
+#[test]
+fn a_32bit_symtab_uses_twelve_byte_entries() {
+    let bytes = fixture::demo_symbols32();
+    assert!(!read(&bytes).expect("能解析").is_64);
+    let file = read(&bytes).expect("能解析");
+
+    assert_eq!(file.symbols.len(), 2);
+    assert_eq!(file.symbols[0].name, "_start");
+    assert_eq!(file.symbols[0].value, 0x1800);
+    assert!(file.symbols[0].is_function);
+    // 第 2 条在第 1 条之后 12 字节处。若按 16 字节步进，这一条会读到
+    // 字符串表或表外，名字/值都不可能是这个。
+    assert_eq!(file.symbols[1].name, "_abort");
+    assert_eq!(file.symbols[1].value, 0);
+    assert!(file.symbols[1].is_undefined());
+
+    let object = parse_bytes(&bytes).expect("对象模型也要能建起来");
+    assert_eq!(
+        object
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["_start", "_abort"]
+    );
+}
+
+/// `n_strx` 指向字符串表之外 ⇒ 拒绝（不读表外字节，也不退回空名字）。
+#[test]
+fn a_name_offset_past_the_string_table_is_rejected() {
+    let bytes = fixture::malformed_symbol_name_past_strsize();
+    let error = read(&bytes).expect_err("n_strx 越界必须拒绝");
+    assert!(matches!(error, ParseError::Inconsistent(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("n_strx"), "{message}");
+    assert!(message.contains("字符串表"), "{message}");
+}
+
+/// `symoff` 指向文件之外 ⇒ 拒绝（整表范围先校验）。
+#[test]
+fn a_symbol_table_past_the_end_of_the_file_is_rejected() {
+    let bytes = fixture::malformed_symoff_past_eof();
+    let error = read(&bytes).expect_err("symoff 越界必须拒绝");
+    assert!(matches!(error, ParseError::Inconsistent(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("LC_SYMTAB"), "{message}");
+    assert!(message.contains("超出文件大小"), "{message}");
+}
+
+// ── 函数起点（LC_FUNCTION_STARTS） ─────────────────────────────────────────
+
+/// ULEB128 增量序列：第一个相对镜像基址，其后相对上一个起点。
+#[test]
+fn function_starts_are_decoded_from_uleb_deltas() {
+    let bytes = fixture::demo_function_starts64();
+    let file = read(&bytes).expect("带 LC_FUNCTION_STARTS 的样本必须能解析");
+
+    assert_eq!(
+        file.function_starts,
+        vec![0x1_0000_0120, 0x1_0000_024C, 0x1_0000_025C],
+        "0x120 是相对 __TEXT.vmaddr 的增量，300 是**两字节** ULEB128，0x10 是再下一个增量"
+    );
+    // 升序是契约的一部分：分析层拿它当函数边界，顺序错了边界就错。
+    assert!(file.function_starts.windows(2).all(|w| w[0] < w[1]));
+
+    let object = parse_bytes(&bytes).expect("对象模型也要能建起来");
+    assert_eq!(object.function_starts, file.function_starts);
+    let joined = object.notes.join("\n");
+    assert!(
+        joined.contains("LC_FUNCTION_STARTS") && joined.contains('3'),
+        "解出几个起点必须写进 notes：{joined}"
+    );
+}
+
+/// payload 在最后一个增量中间结束 ⇒ 解出能解的，并说明"可能被截断"。
+///
+/// 这条钉住的是 §7 里最容易犯错的那一类：**短表**看起来像"这个文件只有两个函数"，
+/// 所以必须有一条 notes 说明它是被截断的。
+#[test]
+fn a_truncated_function_starts_payload_is_reported_not_silently_short() {
+    let bytes = fixture::function_starts_without_terminator64();
+    let file = read(&bytes).expect("截断的 payload 不是解析错误");
+    assert_eq!(file.function_starts.len(), 2, "完整的那两个增量要解出来");
+    let joined = file.notes.join("\n");
+    assert!(joined.contains("截断"), "{joined}");
+    assert!(joined.contains("终止符"), "{joined}");
+}
+
+/// `dataoff` 越过 EOF ⇒ 拒绝（表外没有合法解释）。
+#[test]
+fn function_starts_past_the_end_of_the_file_are_rejected() {
+    let bytes = fixture::malformed_function_starts_past_eof();
+    let error = read(&bytes).expect_err("dataoff 越界必须拒绝");
+    assert!(matches!(error, ParseError::Inconsistent(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("LC_FUNCTION_STARTS"), "{message}");
+    assert!(message.contains("超出文件大小"), "{message}");
+}
+
 // ── 诚实性：没做的部分必须出现在 notes 里 ──────────────────────────────────
 
 #[test]
 fn unimplemented_capabilities_are_stated_in_notes() {
+    // `demo_thin64` 里那条 LC_SYMTAB 的 nsyms 是 0：这是"命令在、表是空的"，
+    // 必须与"没有这条命令"说得不一样（§7）。dyld 绑定仍然没解析。
     let object = parse_bytes(&fixture::demo_thin64()).expect("能解析");
-    assert!(object.symbols.is_empty(), "本片没有符号表");
+    assert!(
+        object.symbols.is_empty(),
+        "nsyms = 0 的符号表解不出符号，这是文件里的事实"
+    );
     assert!(object.imports.is_empty(), "本片没有 dyld 绑定信息");
+    assert!(object.function_starts.is_empty(), "样本里没有这条命令");
     let joined = object.notes.join("\n");
     assert!(
-        joined.contains("LC_SYMTAB"),
-        "符号表没解析这件事必须说出来：{joined}"
+        joined.contains("LC_SYMTAB") && joined.contains("nsyms = 0"),
+        "空符号表这件事必须说出来：{joined}"
     );
     assert!(
-        joined.contains("符号表**没有解析**"),
-        "要明确说没解析，而不是只说存在：{joined}"
+        joined.contains("没有 LC_FUNCTION_STARTS"),
+        "缺哪张表就说哪张表，而不是让空表冒充\"没有函数\"：{joined}"
     );
     // 样本里没有 LC_DYLD_INFO / LC_CODE_SIGNATURE，所以那两条不该出现。
     assert!(!joined.contains("LC_CODE_SIGNATURE"), "{joined}");
@@ -512,7 +705,7 @@ fn a_binary_without_symtab_says_it_is_stripped() {
     let object = parse_bytes(&bytes).expect("能解析");
     assert!(
         object.format.is_stripped,
-        "没有 LC_SYMTAB 时判据就是「剥离」，但它只代表这条命令缺失"
+        "没有 LC_SYMTAB 就没有可引用的符号，所以是「已剥离」"
     );
     let joined = object.notes.join("\n");
     assert!(joined.contains("没有 LC_SYMTAB"), "{joined}");

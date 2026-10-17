@@ -90,7 +90,13 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// 因此 `ObjectInfo` 也多了这两个字段。字段本身是**增量**的（旧字段一个没动），
 /// 但公开结构体的形状变了（字面量构造会编译失败），所以版本号 +1。
 /// `bitflip-server` 的 `SERVER_API_VERSION` 保持与之同步（它转发的就是这套类型）。
-pub const CORE_API_VERSION: u32 = 2;
+///
+/// v3（M12 第三片）：`Object` 新增 `function_starts: Vec<u64>`（Mach-O 的
+/// `LC_FUNCTION_STARTS`），`ObjectInfo` 同步多出这个字段；另外 Mach-O 解析器
+/// 开始**真的填** `symbols`（字段本身早就有，形状没变，但"空表"的含义变了：
+/// 以前恒为空是因为没解析，现在空是"文件里没有可引用的符号"）。
+/// 同样是增量字段，但形状变了 ⇒ 版本号 +1。
+pub const CORE_API_VERSION: u32 = 3;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

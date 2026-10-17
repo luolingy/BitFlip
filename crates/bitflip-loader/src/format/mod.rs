@@ -35,7 +35,7 @@
 //! | [`zip`] | ZIP 容器（APK / JAR / XAPK 外壳） | 单文件。**只做容器层**：成员枚举与按需取出 |
 //! | [`dex`] | DEX（Dalvik Executable） | 单文件。**只做结构模型**：类/字段/方法清单，不解码字节码、不建 CFG |
 //! | [`axml`] | AXML（Android 二进制 XML） | 单文件。**只解清单**：`AndroidManifest.xml` 的字段摘要；不读 `resources.arsc`，`@` 引用原样保留 |
-//! | [`macho`] | Mach-O（thin）+ fat 容器 | **M12 第一片**：头/段/节/入口/`LC_UUID`/dylib；符号表、dyld 绑定、objc/swift、代码签名**都没有**。fat 切片能枚举（[`macho::fat`]）但没接进会话 |
+//! | [`macho`] | Mach-O（thin）+ fat 容器 | M12 第一～三片：头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`/`LC_FUNCTION_STARTS`；dyld 绑定、objc/swift、代码签名校验**都没有**。fat 切片能枚举（[`macho::fat`]）且已接进会话 |
 //!
 //! ELF 的内部拆分**故意没和 PE 一起做**：PE 那一次是纯粹的搬移（逐字节校验过），
 //! 一次只搬一个文件，出问题时能立刻定位。ELF 的拆分是同一类工作，单独一轮做，

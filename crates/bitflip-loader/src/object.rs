@@ -686,6 +686,17 @@ pub struct Object {
     pub image_base: u64,
     /// 入口点；`None` 表示该对象没有入口（例如 `.o`）。
     pub entry: Option<u64>,
+    /// 函数起点（绝对虚拟地址，**升序**）。
+    ///
+    /// 来源是 Mach-O 的 `LC_FUNCTION_STARTS`（dyld 用它按需建立函数边界，表里
+    /// 存的是 ULEB128 增量，解析器已还原成地址）。**其他格式是空表** ——
+    /// 那同样是"这个格式里没有这样一张表"的如实未知，不是"这个文件没有函数"：
+    /// PE 的函数边界在 `.pdata`（见 [`Object::unwind`]），ELF 没有等价的表，
+    /// 只能靠符号表或反汇编识别。
+    ///
+    /// 空表 ≠ "没有函数"。想区分"表不存在"与"表是空的"，看 `notes`：
+    /// 解析器对这两种情形写的是**不同**的说明（CLAUDE.md §7）。
+    pub function_starts: Vec<u64>,
     /// `LC_UUID` 的 16 字节，小写十六进制（32 个字符）。
     ///
     /// 只有 Mach-O 有这个概念（dyld 用它标识镜像）。**其他格式是 `None`** ——
@@ -791,6 +802,7 @@ impl Object {
             format: FormatInfo::default(),
             image_base: 0,
             entry: None,
+            function_starts: Vec::new(),
             uuid: None,
             dylibs: Vec::new(),
             segments: Vec::new(),
@@ -961,6 +973,9 @@ mod tests {
         let obj = sample();
         assert_eq!(obj.uuid, None);
         assert!(obj.dylibs.is_empty());
+        // `function_starts` 同理：只有 Mach-O 的 `LC_FUNCTION_STARTS` 会填它，
+        // 其他格式留空表（"没有这样一张表"）。断言它不是"默认有一个假起点"。
+        assert!(obj.function_starts.is_empty());
     }
 
     #[test]

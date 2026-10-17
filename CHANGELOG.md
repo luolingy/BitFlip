@@ -11,6 +11,37 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — Mach-O 的符号表与函数起点（M12 第三片）
+
+`Object.symbols` 对 Mach-O 一直是空的，函数边界也只能靠反汇编猜。这一片把
+`LC_SYMTAB` 与 `LC_FUNCTION_STARTS` 真的解出来，并**先说清哪些还是未知**。
+
+- **`LC_SYMTAB`**：按文件的位宽选表项宽度（`nlist_64` 16 字节 / `nlist` 12 字节），
+  解析 `n_strx`（字符串表偏移）、`n_type`、`n_sect`（1 基节号）、`n_desc`、`n_value`。
+  结构与取值都先做范围校验：`symoff + nsyms × entsize ≤ 文件长度`、
+  `stroff + strsize ≤ 文件长度`、每条 `n_strx < strsize` 且名字在字符串表内
+  **有 NUL 终止符** —— 任何一条不成立都返回 `ParseError`，不读表外字节，
+  也不把坏偏移退回空名字（那会把"文件坏了"伪装成"无名符号"）。
+- **调试 stab**（`N_STAB != 0`）不进 `Object.symbols`（混进 `nm` 风格的输出会让
+  "符号数"失真），但也没有被丢掉：条数记进 `MachOFile::stab_symbols` 与 `notes`。
+- **符号的 `is_function` 是从所在节的指令标志推出来的**，不是 `nlist` 里的事实
+  —— `nlist` 根本没有类型字段能区分函数与数据；`size` 同理没有字段，一律 0（未知）。
+  这两点在模块文档与 `notes` 里都写明。
+- **`LC_FUNCTION_STARTS`**：ULEB128 增量序列，第一个值相对镜像基址
+  （`__TEXT.vmaddr`），其后相对上一个起点，`0` 字节终止。解出的
+  `Object.function_starts` 是**绝对虚拟地址、升序**；非 Mach-O 一律空表
+  （"这个格式里没有这样一张表"，不是"没有函数"）。没有 `__TEXT`、基址未知时留空并说明；
+  payload 在终止符之前结束（截断）时解出能解的，但**必须**在 `notes` 里说"可能被截断"，
+  不静默返回短表。
+- `bitflip_core::ObjectInfo` 同步多出 `function_starts`（定长小写 16 位十六进制地址）；
+  CLI `info` 的"表"那一行增加"函数起点 N"，符号数沿用原有的"符号 N"。两处都是
+  **增量输出**：为空时不打印，免得 PE/ELF 看起来像缺了一块。
+- `CORE_API_VERSION` 2 → 3，`bitflip-server` 的 `SERVER_API_VERSION` 同步 2 → 3。
+  `symbols` / `function_starts` 都是**增量**字段（旧字段的名字、类型、含义一个没动），
+  `INFO_FORMAT_VERSION` 因此不动；但 Mach-O 的 `symbols` 从"恒空（没解析）"变成
+  "空就是文件里没有可引用的符号"，这是数据变化而非契约变化，`notes` 里两种情形
+  给的是**不同**的句子。
+
 ### 新增 — `.app` 主二进制的依据要写在结论里（M12 第二片收尾）
 
 认主二进制的那段判断原先只活在测试里，产品代码与界面拿不到它；于是用户看到

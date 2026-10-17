@@ -29,6 +29,10 @@ fn hex16(value: u64) -> String {
 /// **M12 第二片没有递增**：`ObjectInfo` 新增了 `uuid` / `dylibs` 两个字段，
 /// 属**增量**变更（旧字段的名字、类型、含义一个都没动，旧消费方忽略新字段即可）。
 /// 递增会让所有按版本号判定的消费方以为"语义变了"，那比新增两个字段更误导。
+///
+/// **M12 第三片同样不递增**：`ObjectInfo` 又多了 `function_starts`（同样是增量）。
+/// 变化的是**数据**而不是契约：Mach-O 的 `symbols` 以前恒为空（没解析）、现在会
+/// 真的有内容 —— 那正是这个字段一直以来的定义，不是新语义。
 pub const INFO_FORMAT_VERSION: u32 = 1;
 
 /// 节的 wire 表示。
@@ -160,6 +164,12 @@ pub struct ObjectInfo {
     /// 依赖库名（Mach-O 的 `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB`，按加载命令顺序）；
     /// 非 Mach-O 是空数组。同样是增量字段。
     pub dylibs: Vec<String>,
+    /// 函数起点（绝对虚拟地址，定长 hex，**升序**）。
+    ///
+    /// 来源是 Mach-O 的 `LC_FUNCTION_STARTS`；非 Mach-O 是空数组 ——
+    /// "这个格式里没有这样一张表"，不是"没有函数"（§7）。空数组的原因在 `notes` 里。
+    /// 这是 M12 第三片新增的**增量**字段：旧消费方忽略它即可。
+    pub function_starts: Vec<String>,
     /// 段（内存视角）。
     pub segments: Vec<SegmentInfo>,
     /// 节（文件视角）。
@@ -191,6 +201,12 @@ impl ObjectInfo {
             is_stripped: object.format.is_stripped,
             uuid: object.uuid.clone(),
             dylibs: object.dylibs.clone(),
+            // 地址在 wire 上统一成定长小写 16 位十六进制（CLAUDE.md §4）。
+            function_starts: object
+                .function_starts
+                .iter()
+                .map(|address| hex16(*address))
+                .collect(),
             segments: object
                 .segments
                 .iter()

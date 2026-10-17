@@ -41,12 +41,39 @@ fn parse_object_dispatches_macho_to_the_structure_parser() {
         "节名用「段名,节名」——Mach-O 里节名只在段内唯一"
     );
 
-    // 没有符号表解析：这一点必须能从结果里看出来（§7）。
+    // 这份样本的 LC_SYMTAB 是 nsyms = 0（命令在、表是空的），所以 symbols 为空是
+    // **文件里的事实**；它与"没有这条命令"在 notes 里说得不一样（§7）。
     assert!(object.symbols.is_empty());
     assert!(object.imports.is_empty());
     let notes = object.notes.join("\n");
     assert!(notes.contains("符号表"), "{notes}");
     assert!(notes.contains("dyld"), "{notes}");
+}
+
+#[test]
+fn symbols_and_function_starts_reach_the_object_model() {
+    // M12 第三片：这两项此前一个恒空（符号表没解析）、一个根本不存在
+    // （函数边界只能靠反汇编）。这里从 crate 外面各验一遍。
+    let bytes = fixture::demo_symbols64();
+    let object = parse_object(ObjectKind::MachO, &bytes, 0, ObjectId::Plain).expect("能解析");
+    assert_eq!(
+        object
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["_main", "_printf"],
+        "调试 stab 不进 symbols"
+    );
+    assert!(!object.format.is_stripped);
+
+    let bytes = fixture::demo_function_starts64();
+    let object = parse_object(ObjectKind::MachO, &bytes, 0, ObjectId::Plain).expect("能解析");
+    assert_eq!(
+        object.function_starts,
+        vec![0x1_0000_0120, 0x1_0000_024C, 0x1_0000_025C],
+        "一个增量是 300（两字节 ULEB128），必须解对"
+    );
 }
 
 #[test]

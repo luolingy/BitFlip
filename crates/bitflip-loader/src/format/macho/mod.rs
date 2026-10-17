@@ -1,6 +1,6 @@
-//! Mach-O 结构层解析（`docs/PLAN.md` M12 **第一片**）。
+//! Mach-O 结构层解析（`docs/PLAN.md` M12）。
 //!
-//! # 这一片覆盖什么
+//! # 已经覆盖什么
 //!
 //! | 结构 | 规范出处 | 状态 |
 //! |------|---------|------|
@@ -10,20 +10,23 @@
 //! | `LC_UNIXTHREAD` | 同上 `thread_command`；寄存器布局见 `mach/i386/thread_status.h`、`mach/arm/thread_status.h` | 解出 PC（四种架构），其余只记录存在性 |
 //! | `LC_UUID` | 同上 `uuid_command` | 16 字节 → 小写十六进制 |
 //! | `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB` | 同上 `dylib_command` | 依赖库名 |
-//! | fat / universal | `mach-o/fat.h` | 见 [`fat`]：**容器层已实现**，但没接进会话（见下） |
+//! | `LC_SYMTAB` | 同上 `symtab_command` + `mach-o/nlist.h` 的 `nlist` / `nlist_64` | 符号名/地址/节/外部性；32 位与 64 位各自按表项宽度（12 / 16 字节）解 |
+//! | `LC_FUNCTION_STARTS` | 同上 `linkedit_data_command` + ULEB128 增量 | 函数起点（绝对虚拟地址，升序） |
+//! | fat / universal | `mach-o/fat.h` | 见 [`fat`]：切片枚举 + 选片 + `parse_slice`，已接进容器与会话 |
 //!
 //! # 明确没做的（不要以为有）
 //!
-//! - **符号表**（`LC_SYMTAB` / `LC_DYSYMTAB`）：只记录"存在"这一个事实，
-//!   [`Object::symbols`] 是**空**的，原因写在 `notes` 里。`LC_FUNCTION_STARTS`
-//!   也没做，所以函数边界只能靠反汇编识别，没有权威来源。
+//! - **`LC_DYSYMTAB`**：动态符号表/间接符号表没有解析。`LC_SYMTAB` 已经把
+//!   `undefined` 符号（`N_UNDF`）标成未定义，但"这条未定义符号最终绑定到哪个库的
+//!   哪个地址"是 dyld 的事，本模块不下结论。
 //! - **dyld 绑定信息**（`LC_DYLD_INFO*` / `LC_DYLD_CHAINED_FIXUPS`）：没有解析，
 //!   因此 [`Object::imports`] 是**空**的 —— 这是与 PE/ELF 的已知差距。
 //! - **objc / swift 元数据**（`__objc_classname`、`__swift5_*` 等）：按普通节列出，
 //!   不解析内容。
 //! - **代码签名**（`LC_CODE_SIGNATURE`）：只记录存在性，**不做校验**。
-//! - **`.app` bundle / IPA 容器语义**：`LoaderError::IsDirectory` 仍然是拒绝，
-//!   IPA 的第二层（`Payload/*.app/`）也没有接进会话。
+//! - **`.app` bundle / IPA 容器语义**：`LoaderError::IsDirectory` 仍然是拒绝。
+//!   （IPA 里的主二进制定位已由 [`crate::bundle::find_main_binary`] 覆盖，那是
+//!   打包约定层面的判断，不是 Mach-O 格式的一部分。）
 //!
 //! # 几处判断，写在这里免得被当成 bug
 //!
@@ -46,26 +49,38 @@
 //! 4. **arm64e** 的 `cputype` 与 arm64 相同（`0x0100_000c`），区别只在
 //!    `cpusubtype == 2`。架构按 AArch64 解码（指令层面这是对的），指针认证（PAC）
 //!    语义不还原 —— 记进 `notes`。
-//! 5. **`LC_UUID` / dylib 名在 [`Object`] 里。** `parse` 会把它们填进
-//!    [`Object::uuid`] / [`Object::dylibs`]（结构层的原始事实仍在 [`MachOFile`]
-//!    里，两者同源）。刻意**不**只写进 `notes`：那样程序化消费只能去解析字符串，
-//!    而字符串是给人看的降级说明，不是数据通道。
-//! 6. **fat 切片还没接进容器抽象。** [`fat::read`] 能枚举切片（有测试），但
-//!    `ContainerKind::Fat` 的成员化（把切片当成 `ArchiveMember` 走会话）是下一片。
-//!    因此现在打开一个 fat 文件仍会报错，**不要**以为 fat 已经能用。
+//! 5. **`LC_UUID` / dylib 名 / 符号 / 函数起点都在 [`Object`] 里。** `parse` 会把
+//!    它们填进 [`Object::uuid`] / [`Object::dylibs`] / [`Object::symbols`] /
+//!    [`Object::function_starts`]（结构层的原始事实仍在 [`MachOFile`] 里，两者同源）。
+//!    刻意**不**只写进 `notes`：那样程序化消费只能去解析字符串，而字符串是给人看的
+//!    降级说明，不是数据通道。
+//! 6. **符号表的两个"不是事实"的地方，对象模型里如实标注。** `nlist` 没有大小字段，
+//!    所以 `RawSymbol::size` 一律 0（未知）；`nlist` 也没有"这是函数"标志，所以
+//!    `RawSymbol::is_function` 是从**符号所在节的指令标志**推出来的（`MachOSymbol`
+//!    上写明了这一点）。`n_type & N_TYPE == N_SECT` 的取值是 0xe —— 它是类型字段里
+//!    的一个取值，不是单独的位，判"定义在节里"必须按掩码比较。
+//! 7. **调试 stab 不进 `Object.symbols`，但也不被悄悄丢掉。** `N_STAB != 0` 的条目
+//!    留在 [`MachOFile::symbols`] 里，条数记在 [`MachOFile::stab_symbols`]，并写进
+//!    `notes` —— 让 `nm` 风格的输出混进 `N_FUN` / `N_SO` 会让"符号数"这个数字失真。
+//! 8. **`LC_FUNCTION_STARTS` 的增量基准。** 第一个值是相对**镜像基址**
+//!    （`__TEXT.vmaddr`）的增量，其后每个值是相对**上一个函数起点**的增量，0 字节
+//!    终止。没有 `__TEXT` 段时基址未知，函数起点留空并在 `notes` 里说明 ——
+//!    delta 无从还原成地址，猜一个基址等于编造地址。payload 没遇到终止符时
+//!    记一条"可能被截断"，不静默返回短表。
 //!
 //! # 解析纪律（与 PE/ELF 一致）
 //!
 //! 一律经 [`Reader`] 读字节，越界返回 `ParseError`；表项数量来自不可信输入
-//! （`ncmds` / `sizeofcmds` / `nsects`），先整体校验范围再逐项解析，绝不先分配。
-//! 能确定的就解析，不能确定的写进 `notes` —— 不猜、不留空白解释。
+//! （`ncmds` / `sizeofcmds` / `nsects` / `nsyms`），先整体校验范围再逐项解析，
+//! 绝不先分配。能确定的就解析，不能确定的写进 `notes` —— 不猜、不留空白解释。
 
 use std::fmt::Write as _;
 
 use bitflip_arch::{Arch, ArchSpec, Endian};
 
 use crate::object::{
-    ContentKind, FileRange, FormatInfo, Object, ObjectId, Perms, Section, Segment,
+    ContentKind, FileRange, FormatInfo, Object, ObjectId, Perms, RawSymbol, Section, Segment,
+    SymbolTableSource,
 };
 use crate::reader::{Endianness, ParseError, Reader};
 use crate::ObjectKind;
@@ -101,7 +116,7 @@ pub const HEADER64_SIZE: u64 = 32;
 
 /// `LC_SEGMENT`：32 位段命令（`segment_command`）。
 pub const LC_SEGMENT: u32 = 0x1;
-/// `LC_SYMTAB`：符号表。本片只记录存在性。
+/// `LC_SYMTAB`：符号表（`symtab_command`）。
 pub const LC_SYMTAB: u32 = 0x2;
 /// `LC_UNIXTHREAD`：线程状态，老式可执行文件的入口点来源。
 pub const LC_UNIXTHREAD: u32 = 0x5;
@@ -123,6 +138,8 @@ pub const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
 pub const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
 /// `LC_MAIN`：主可执行文件的入口点（**文件偏移**）。
 pub const LC_MAIN: u32 = 0x8000_0028;
+/// `LC_FUNCTION_STARTS`：函数起点表（`linkedit_data_command`，ULEB128 增量）。
+pub const LC_FUNCTION_STARTS: u32 = 0x26;
 /// `LC_DYLD_CHAINED_FIXUPS`：新版 dyld 的链式绑定信息。
 pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
 
@@ -141,6 +158,60 @@ pub const ENTRY_POINT_COMMAND_SIZE: u64 = 24;
 pub const UUID_COMMAND_SIZE: u64 = 24;
 /// `sizeof(struct dylib_command)` 的固定部分（`struct dylib` 是 4 个 `uint32`）。
 pub const DYLIB_COMMAND_SIZE: u64 = 24;
+/// `sizeof(struct symtab_command)`：cmd + cmdsize + 4 个 `uint32`。
+pub const SYMTAB_COMMAND_SIZE: u64 = 24;
+/// `sizeof(struct nlist_64)`：`uint32 n_strx` + 4 个 1/2 字节字段 + `uint64 n_value`。
+pub const NLIST64_SIZE: u64 = 16;
+/// `sizeof(struct nlist)`（32 位）：`uint32 n_strx` + 4 个 1/2 字节字段 + `uint32 n_value`。
+pub const NLIST32_SIZE: u64 = 12;
+/// `sizeof(struct linkedit_data_command)`：cmd + cmdsize + dataoff + datasize。
+pub const LINKEDIT_DATA_COMMAND_SIZE: u64 = 16;
+
+// ── nlist 的 `n_type` / `n_desc` 位（`mach-o/nlist.h`） ─────────────────────
+//
+// 规范原文：
+//   #define N_STAB 0xe0  /* if any of these bits set, a symbolic debugging entry */
+//   #define N_PEXT 0x10  /* private external symbol bit */
+//   #define N_TYPE 0x0e  /* mask for the type bits */
+//   #define N_EXT  0x01  /* external symbol bit, set for external symbols */
+//   #define N_UNDF 0x0   /* undefined, n_sect == NO_SECT */
+//   #define N_ABS  0x2   /* absolute, n_sect == NO_SECT */
+//   #define N_SECT 0xe   /* defined in section number n_sect */
+//   #define N_PBUD 0xc   /* prebound undefined (defunct) */
+//   #define N_INDR 0xa   /* indirect */
+// 注意 `N_SECT` 的取值是 0xe，它是 `N_TYPE` 里的一个**取值**而不是单独的位 ——
+// 判断"定义在某个节里"必须写 `n_type & N_TYPE == N_SECT`。
+
+/// `N_STAB`：置位表示这是调试用的 stab，不是普通符号。
+pub const N_STAB: u8 = 0xe0;
+/// `N_PEXT`：私有外部符号。
+pub const N_PEXT: u8 = 0x10;
+/// `N_TYPE`：类型位掩码。
+pub const N_TYPE: u8 = 0x0e;
+/// `N_EXT`：外部符号位。
+pub const N_EXT: u8 = 0x01;
+/// `N_UNDF`：未定义（`n_sect == NO_SECT`）。
+pub const N_UNDF: u8 = 0x0;
+/// `N_ABS`：绝对符号（值是常量，不是地址）。
+pub const N_ABS: u8 = 0x2;
+/// `N_SECT`：定义在 `n_sect` 号节里。
+pub const N_SECT: u8 = 0xe;
+/// `N_PBUD`：prebound undefined（已废弃，含义同未定义）。
+pub const N_PBUD: u8 = 0xc;
+
+/// `N_WEAK_REF`（`n_desc`）：未定义引用的弱链接。
+pub const N_WEAK_REF: u16 = 0x0040;
+/// `N_WEAK_DEF`（`n_desc`）：弱定义。
+pub const N_WEAK_DEF: u16 = 0x0080;
+
+/// 符号表条目上限（与 ELF 的 `MAX_SYMBOLS` 同一量级）。
+///
+/// 范围校验已经保证 `nsyms × entsize` 落在文件内，所以这个上限挡的是
+/// "文件本身有几百 MB 且符号表填满"的放大输入 —— 一条表项要分配一个 `String`，
+/// 不设上限就是拿不可信输入换内存。
+const MAX_SYMBOLS: u64 = 4_000_000;
+/// `LC_FUNCTION_STARTS` 的条目上限（每项 8 字节内存，量级同 `MAX_SYMBOLS`）。
+const MAX_FUNCTION_STARTS: u64 = 4_000_000;
 
 /// 一条加载命令最短长度：`cmd` + `cmdsize`。
 pub const LOAD_COMMAND_MIN_SIZE: u64 = 8;
@@ -251,7 +322,21 @@ pub struct MachOFile {
     pub image_base: Option<u64>,
     /// 段及其节（按加载命令顺序）。
     pub segments: Vec<MachOSegment>,
-    /// 是否存在 `LC_SYMTAB`。**只代表命令存在**，不代表符号表被解析过。
+    /// 符号表条目（`LC_SYMTAB` 的 `nlist` / `nlist_64`，**按表里的顺序**）。
+    ///
+    /// **含调试 stab**（[`MachOSymbol::is_stab`]）：结构层不替调用方过滤，
+    /// 但对象模型只把非 stab 的那些放进 [`Object::symbols`] —— 让 `nm` 风格的
+    /// 输出里混进 `N_FUN` / `N_SO` 这类调试条目，会让"符号数"这个数字失真。
+    /// 没有 `LC_SYMTAB` 时是空表；有但 `nsyms = 0` 时也是空表（原因在 `notes` 里）。
+    pub symbols: Vec<MachOSymbol>,
+    /// `N_STAB != 0` 的条目数（它们不在 [`Object::symbols`] 里，但也没有被悄悄丢掉）。
+    pub stab_symbols: usize,
+    /// `LC_FUNCTION_STARTS` 解出的函数起点（**绝对虚拟地址，升序**）。
+    ///
+    /// 空表可能是"没有这条命令"，也可能是"表是空的"或"没有镜像基址、无从还原"
+    /// —— 三种情形的 `notes` 不同，别把它们读成同一件事。
+    pub function_starts: Vec<u64>,
+    /// 是否存在 `LC_SYMTAB`。**只代表命令存在**；符号是否解析出来看 [`Self::symbols`]。
     pub has_symtab: bool,
     /// 解析过程中的说明（降级、跳过、没做的部分）。
     pub notes: Vec<String>,
@@ -295,6 +380,73 @@ pub struct MachOSection {
     pub align: u32,
     /// `flags`（低 8 位是 section type，高位是 attributes）。
     pub flags: u32,
+}
+
+/// 一条符号表条目（`struct nlist_64` / `struct nlist`，见 `mach-o/nlist.h`）。
+///
+/// 字段全部是**原始值**：`n_type` / `n_sect` / `n_desc` 的位语义由下面的访问器
+/// 解释，不在这里归一化 —— 归一化会丢掉"这条符号到底是什么"的取证材料。
+///
+/// `nlist` 没有大小字段，也没有"这是函数"标志：所以对象模型里的
+/// [`crate::object::RawSymbol::size`] 一律是 0（未知），
+/// `is_function` 只能从"所在的节是不是代码节"推出来（见 [`Self::is_function`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachOSymbol {
+    /// 名字（来自字符串表；`n_strx == 0` 时是空串，规范里 0 表示"没有名字"）。
+    pub name: String,
+    /// `n_value`：已定义的符号是虚拟地址，未定义的是 0。
+    pub value: u64,
+    /// `n_type` 原始值。
+    pub n_type: u8,
+    /// `n_sect` 原始值（**1 基**，0 = `NO_SECT`）。
+    pub n_sect: u8,
+    /// `n_desc` 原始值（`N_WEAK_DEF` / `N_WEAK_REF` 等位）。
+    pub n_desc: u16,
+    /// 解析出来的所在节名（与 [`Object::sections`] 同一命名 `段名,节名`）。
+    ///
+    /// `None` = `n_sect == 0`（没有节）或 `n_sect` 超出节总数 —— 后者是文件自相
+    /// 矛盾，会连同错误一起在 `notes` 里说明；这里不编一个节名。
+    pub section: Option<String>,
+    /// 是否落在**代码节**里（`S_ATTR_PURE_INSTRUCTIONS` / `S_ATTR_SOME_INSTRUCTIONS`）。
+    ///
+    /// 这是从节的 `flags` 推出来的，**不是** `nlist` 里的事实（`nlist` 没有类型
+    /// 字段能区分函数与数据）。文档这样写，是为了让调用方知道这一位有多可信。
+    pub is_function: bool,
+}
+
+impl MachOSymbol {
+    /// 是调试 stab 吗（`N_STAB` 任一位置位）。
+    #[must_use]
+    pub const fn is_stab(&self) -> bool {
+        self.n_type & N_STAB != 0
+    }
+
+    /// 是外部符号吗（`N_EXT`）。
+    #[must_use]
+    pub const fn is_external(&self) -> bool {
+        self.n_type & N_EXT != 0
+    }
+
+    /// 是私有外部符号吗（`N_PEXT`）。
+    #[must_use]
+    pub const fn is_private_external(&self) -> bool {
+        self.n_type & N_PEXT != 0
+    }
+
+    /// 未定义吗（`N_UNDF` / `N_PBUD`）。
+    #[must_use]
+    pub const fn is_undefined(&self) -> bool {
+        matches!(self.n_type & N_TYPE, N_UNDF | N_PBUD)
+    }
+
+    /// 是弱符号吗。
+    ///
+    /// 弱定义看 `n_desc` 的 `N_WEAK_DEF`，未定义引用的弱链接看 `N_WEAK_REF` ——
+    /// 两个位在**不同**的 `n_type` 分支上有意义，所以这里按"是否已定义"分。
+    #[must_use]
+    pub const fn is_weak(&self) -> bool {
+        self.n_desc & N_WEAK_DEF != 0 || (self.is_undefined() && self.n_desc & N_WEAK_REF != 0)
+    }
 }
 
 /// 入口点，以及它是**从哪条命令**来的。
@@ -366,9 +518,9 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
         return Err(ParseError::NotSupported {
             what: "容器",
             detail: "这是 fat / universal Mach-O：一个文件里有多层架构切片，没有\"这个文件\"的\
-                     单一架构。切片枚举已经实现（`format::macho::fat::read`，有测试），\
-                     但把切片接进容器抽象与成员会话是 M12 的下一片 —— 现在请把需要的那一片\
-                     切出来（`fat::read` 给的 offset/size）再单独解析"
+                     单一架构。切片枚举与会话成员化都已经实现（`format::macho::fat::read` /\
+                     `fat::parse_slice`，会话层按 `fat::SELECTION_RULE_ZH` 选片），\
+                     所以请走那条路：`parse` 只接受**一层**薄 Mach-O"
                 .to_string(),
         });
     }
@@ -506,13 +658,38 @@ struct CommandFacts {
     dylibs: Vec<String>,
     entry_off: Option<u64>,
     unix_thread: Option<UnixThread>,
-    has_symtab: bool,
+    symtab: Option<SymtabCommand>,
+    function_starts: Option<LinkeditData>,
     has_dyld_info: bool,
     has_chained_fixups: bool,
     has_codesig: bool,
     unhandled: Vec<u32>,
+    /// 命令本身合法、但需要说明的事（重复命令等）。逐条走到 `notes` 里。
+    notes: Vec<String>,
     /// 走完 `ncmds` 条命令后，`sizeofcmds` 里还剩多少字节。
     trailing_bytes: u64,
+}
+
+/// `LC_SYMTAB` 的原始字段（`struct symtab_command`）。
+#[derive(Debug, Clone, Copy)]
+struct SymtabCommand {
+    /// 符号表在文件里的偏移。
+    symoff: u64,
+    /// 符号条目数。
+    nsyms: u64,
+    /// 字符串表在文件里的偏移。
+    stroff: u64,
+    /// 字符串表的字节数。
+    strsize: u64,
+}
+
+/// `linkedit_data_command` 的文件范围（`LC_FUNCTION_STARTS` / `LC_CODE_SIGNATURE` 共用）。
+#[derive(Debug, Clone, Copy)]
+struct LinkeditData {
+    /// 数据在文件里的偏移。
+    dataoff: u64,
+    /// 数据的字节数。
+    datasize: u64,
 }
 
 /// `LC_UNIXTHREAD` 的线程状态。
@@ -644,17 +821,66 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
         );
     }
 
+    // ── 符号表与函数起点 ────────────────────────────────────────────────
+    //
+    // 放在镜像基址之后：`LC_FUNCTION_STARTS` 的第一个增量是相对 `__TEXT.vmaddr`
+    // 的，没有基址就无从还原（那时留空并说明，不猜）。
+    let symbols = match facts.symtab {
+        Some(command) => parse_symbols(reader, command, &header, &facts.segments, &mut notes)?,
+        None => Vec::new(),
+    };
+    let stab_symbols = symbols.iter().filter(|symbol| symbol.is_stab()).count();
+    let ordinary_symbols = symbols.len() - stab_symbols;
+    let function_starts = match facts.function_starts {
+        Some(range) => decode_function_starts(reader, range, image_base, &mut notes)?,
+        None => {
+            notes.push(
+                "没有 LC_FUNCTION_STARTS：函数边界没有权威来源，只能靠符号表或反汇编识别\
+                 （Object.function_starts 因此是空表 —— 那是\"表不存在\"，不是\"没有函数\"）"
+                    .to_string(),
+            );
+            Vec::new()
+        }
+    };
+
     // ── 没做的部分：一律写进 notes，不让界面看起来"完整" ────────────────
-    notes.push(if facts.has_symtab {
-        "存在 LC_SYMTAB：符号表**没有解析**（M12 的下一片），所以 Object.symbols 是空的；\
-         format.is_stripped 也只按「这条命令在不在」判断，不代表读到了符号。\
-         也没有 LC_FUNCTION_STARTS，函数边界只能靠反汇编识别"
-            .to_string()
-    } else {
-        "没有 LC_SYMTAB（符号表已被剥离或本来就没有）：Object.symbols 是空的，\
-         也没有 LC_FUNCTION_STARTS，函数边界只能靠反汇编识别"
-            .to_string()
-    });
+    match facts.symtab {
+        None => notes.push(
+            "没有 LC_SYMTAB（符号表已被剥离或本来就没有）：Object.symbols 是空的，\
+             这是文件里写着的事实，不是没解析"
+                .to_string(),
+        ),
+        Some(_) if ordinary_symbols > 0 => {
+            notes.push(format!(
+                "已解析 LC_SYMTAB：{ordinary_symbols} 条普通符号{}",
+                if stab_symbols > 0 {
+                    format!("，另有 {stab_symbols} 条调试 stab 不计入 Object.symbols")
+                } else {
+                    String::new()
+                }
+            ));
+            notes.push(
+                "Mach-O 的 nlist **没有大小字段**：Object.symbols 的 size 一律为 0（未知）；\
+                 is_function 是从符号所在节的指令标志推出来的，不是 nlist 里的事实"
+                    .to_string(),
+            );
+        }
+        Some(_) => {}
+    }
+    if stab_symbols > 0 && ordinary_symbols == 0 {
+        notes.push(format!(
+            "LC_SYMTAB 里只有 {stab_symbols} 条调试 stab（N_STAB != 0）：它们不是普通符号，\
+             因此 Object.symbols 为空 —— 调试信息本身也没有解析"
+        ));
+    }
+    if !function_starts.is_empty() {
+        notes.push(format!(
+            "已解析 LC_FUNCTION_STARTS：{} 个函数起点（第一个增量相对镜像基址 \
+             {:#x}，其后都是相对上一个起点的增量，0 字节终止）",
+            function_starts.len(),
+            image_base.unwrap_or(0)
+        ));
+    }
     if facts.has_dyld_info || facts.has_chained_fixups {
         notes.push(
             "存在 dyld 绑定信息（LC_DYLD_INFO* / LC_DYLD_CHAINED_FIXUPS）：**没有解析**，\
@@ -694,6 +920,10 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
         ));
     }
 
+    // 命令层自己的说明（重复命令等）追加到同一条 `notes` 里：解析结果只有一个
+    // `notes`，分两个通道会让其中一条被界面漏掉。
+    notes.extend(facts.notes);
+
     Ok(MachOFile {
         is_64: header.is_64,
         endian: header.endian,
@@ -710,7 +940,10 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
         entry,
         image_base,
         segments: facts.segments,
-        has_symtab: facts.has_symtab,
+        symbols,
+        stab_symbols,
+        function_starts,
+        has_symtab: facts.symtab.is_some(),
         notes,
     })
 }
@@ -782,7 +1015,24 @@ fn read_commands(
                     facts.dylibs.push(name);
                 }
             }
-            LC_SYMTAB => facts.has_symtab = true,
+            LC_SYMTAB => {
+                if facts.symtab.is_some() {
+                    facts
+                        .notes
+                        .push("有多条 LC_SYMTAB：只用第一条，其余忽略".to_string());
+                } else {
+                    facts.symtab = Some(read_symtab(&view, endianness)?);
+                }
+            }
+            LC_FUNCTION_STARTS => {
+                if facts.function_starts.is_some() {
+                    facts
+                        .notes
+                        .push("有多条 LC_FUNCTION_STARTS：只用第一条，其余忽略".to_string());
+                } else {
+                    facts.function_starts = Some(read_linkedit_data(&view, endianness)?);
+                }
+            }
             LC_DYLD_INFO | LC_DYLD_INFO_ONLY => facts.has_dyld_info = true,
             LC_DYLD_CHAINED_FIXUPS => facts.has_chained_fixups = true,
             LC_CODE_SIGNATURE => facts.has_codesig = true,
@@ -972,6 +1222,45 @@ fn read_uuid(view: &Reader<'_>) -> Result<String, ParseError> {
     Ok(out)
 }
 
+/// 读 `LC_SYMTAB`（`struct symtab_command`）。
+///
+/// 字段偏移出自 `mach-o/loader.h`：`cmd +0` / `cmdsize +4` / `symoff +8` /
+/// `nsyms +0xC` / `stroff +0x10` / `strsize +0x14`，共 24 字节。
+/// 这里只读字段；范围校验与条目解析在 [`parse_symbols`]（那里才拿得到文件长度）。
+fn read_symtab(view: &Reader<'_>, endianness: Endianness) -> Result<SymtabCommand, ParseError> {
+    if view.len() < SYMTAB_COMMAND_SIZE {
+        return Err(ParseError::Truncated {
+            what: "LC_SYMTAB",
+            needed: SYMTAB_COMMAND_SIZE,
+            actual: view.len(),
+        });
+    }
+    Ok(SymtabCommand {
+        symoff: u64::from(view.u32(8, endianness, "LC_SYMTAB.symoff")?),
+        nsyms: u64::from(view.u32(12, endianness, "LC_SYMTAB.nsyms")?),
+        stroff: u64::from(view.u32(16, endianness, "LC_SYMTAB.stroff")?),
+        strsize: u64::from(view.u32(20, endianness, "LC_SYMTAB.strsize")?),
+    })
+}
+
+/// 读 `linkedit_data_command`（`LC_FUNCTION_STARTS`）：`dataoff +8` / `datasize +0xC`。
+fn read_linkedit_data(
+    view: &Reader<'_>,
+    endianness: Endianness,
+) -> Result<LinkeditData, ParseError> {
+    if view.len() < LINKEDIT_DATA_COMMAND_SIZE {
+        return Err(ParseError::Truncated {
+            what: "linkedit_data_command（LC_FUNCTION_STARTS）",
+            needed: LINKEDIT_DATA_COMMAND_SIZE,
+            actual: view.len(),
+        });
+    }
+    Ok(LinkeditData {
+        dataoff: u64::from(view.u32(8, endianness, "LC_FUNCTION_STARTS.dataoff")?),
+        datasize: u64::from(view.u32(12, endianness, "LC_FUNCTION_STARTS.datasize")?),
+    })
+}
+
 /// 读 `LC_UNIXTHREAD` 的线程状态，尽量解出 PC。
 ///
 /// 解不出来**不是错误**：这条命令在真实文件里主要是历史包袱，而猜错一个 PC
@@ -1128,6 +1417,354 @@ fn note_objc_and_swift(segments: &[MachOSegment], notes: &mut Vec<String>) {
              也没有做 name demangling"
         ));
     }
+}
+
+// ── 符号表（LC_SYMTAB）与函数起点（LC_FUNCTION_STARTS） ────────────────────
+
+/// 节的显示名（`段名,节名`）：节名只在段内唯一，所以身份是这一**对**。
+///
+/// 对象模型的 [`Object::sections`] 与符号的 `section` 都用它 —— 两处各拼一遍
+/// 迟早会分叉（一处 trim 了、一处没有），而分叉的后果是"符号指向一个不存在的节"。
+fn section_display_name(section: &MachOSection) -> String {
+    if section.segname.is_empty() {
+        section.sectname.clone()
+    } else {
+        format!("{},{}", section.segname, section.sectname)
+    }
+}
+
+/// 把 `n_sect` 映射到节（`nlist.h`：`n_sect` 是**跨所有段的 1 基**节号）。
+fn section_by_index(segments: &[MachOSegment], n_sect: u8) -> Option<&MachOSection> {
+    if n_sect == 0 {
+        // `NO_SECT`：未定义/绝对符号都是这个值，不是"第 0 节"。
+        return None;
+    }
+    segments
+        .iter()
+        .flat_map(|segment| segment.sections.iter())
+        .nth(usize::from(n_sect) - 1)
+}
+
+/// 解析 `LC_SYMTAB` 指向的符号表。
+///
+/// # 拒绝什么，说明什么
+///
+/// 三条范围必须同时成立，任何一条不成立都返回 `ParseError`（不"尽量读"）：
+///
+/// 1. `symoff + nsyms × entsize <= 文件长度`（条表不越过 EOF）；
+/// 2. `stroff + strsize <= 文件长度`（字符串表不越过 EOF）；
+/// 3. 每条的 `n_strx < strsize`，且该名字在字符串表内有 NUL 终止符。
+///
+/// 能继续、但会**少给数据**的情形（条目数超上限）写进 `notes` 并写明丢了多少条 ——
+/// 那正好是"截断说明 + 停止解析"里可以精确陈述的那一类。
+fn parse_symbols(
+    reader: &Reader<'_>,
+    command: SymtabCommand,
+    header: &MachHeader,
+    segments: &[MachOSegment],
+    notes: &mut Vec<String>,
+) -> Result<Vec<MachOSymbol>, ParseError> {
+    let is_64 = header.is_64;
+    let endianness = header.endianness;
+    let entry_size = if is_64 { NLIST64_SIZE } else { NLIST32_SIZE };
+
+    // `nsyms = 0` 是合法且常见的情形（`ld -S` 之后又加了别的链接edit 数据）。
+    // 这不是错误，但也**不是**"解析失败"：符号表里就是没有条目。
+    if command.nsyms == 0 {
+        notes.push(
+            "存在 LC_SYMTAB，但 nsyms = 0：符号表里没有条目（Object.symbols 为空是文件里\
+             写着的事实，不是没解析）"
+                .to_string(),
+        );
+        return Ok(Vec::new());
+    }
+
+    // ── 表格范围：先整体校验，再逐项读 ──────────────────────────────────
+    let table_size = command.nsyms.checked_mul(entry_size).ok_or_else(|| {
+        ParseError::Overflow(format!(
+            "LC_SYMTAB：nsyms({}) × 表项大小({entry_size})",
+            command.nsyms
+        ))
+    })?;
+    let table_end = command.symoff.checked_add(table_size).ok_or_else(|| {
+        ParseError::Overflow(format!("LC_SYMTAB：symoff({:#x}) + 表大小", command.symoff))
+    })?;
+    if table_end > reader.len() {
+        return Err(ParseError::Inconsistent(format!(
+            "LC_SYMTAB 的符号表范围 {:#x}..{table_end:#x}（symoff + {} 条 × {entry_size} 字节）\
+             超出文件大小 {:#x}：文件被裁剪或头字段被人为改过",
+            command.symoff,
+            command.nsyms,
+            reader.len()
+        )));
+    }
+    let str_end = command.stroff.checked_add(command.strsize).ok_or_else(|| {
+        ParseError::Overflow(format!(
+            "LC_SYMTAB：stroff({:#x}) + strsize({:#x})",
+            command.stroff, command.strsize
+        ))
+    })?;
+    if str_end > reader.len() {
+        return Err(ParseError::Inconsistent(format!(
+            "LC_SYMTAB 的字符串表范围 {:#x}..{str_end:#x}（stroff + strsize）超出文件大小 {:#x}",
+            command.stroff,
+            reader.len()
+        )));
+    }
+    let strtab = reader.slice(command.stroff, command.strsize, "符号名字符串表")?;
+
+    // ── 条目上限：挡住"文件很大且符号表填满"的放大输入 ─────────────────
+    let mut count = command.nsyms;
+    if count > MAX_SYMBOLS {
+        notes.push(format!(
+            "LC_SYMTAB 声称有 {count} 条符号，超过上限 {MAX_SYMBOLS}：只解析前 {MAX_SYMBOLS} 条，\
+             其余 {} 条已丢弃（文件可能被构造）",
+            count - MAX_SYMBOLS
+        ));
+        count = MAX_SYMBOLS;
+    }
+
+    let mut out = Vec::new();
+    out.try_reserve(count.min(65_536) as usize)
+        .map_err(|_| ParseError::Overflow(format!("无法为 {count} 条符号预留内存")))?;
+
+    let mut nameless = 0u64;
+    let mut bad_sect = 0u64;
+    let mut cursor = command.symoff;
+    for index in 0..count {
+        // 整表范围上面已经校验过，所以逐项读只用 `cursor + 字段偏移`。
+        // `nlist` 与 `nlist_64` 的字段偏移相同，只有 `n_value` 的宽度不同
+        // （`mach-o/nlist.h`）：n_strx +0、n_type +4、n_sect +5、n_desc +6、n_value +8。
+        let n_strx = u64::from(reader.u32(cursor, endianness, "n_strx")?);
+        let n_type = reader.u8(cursor + 4, "n_type")?;
+        let n_sect = reader.u8(cursor + 5, "n_sect")?;
+        let n_desc = reader.u16(cursor + 6, endianness, "n_desc")?;
+        let value = if is_64 {
+            reader.u64(cursor + 8, endianness, "n_value")?
+        } else {
+            u64::from(reader.u32(cursor + 8, endianness, "n_value")?)
+        };
+
+        if n_strx >= command.strsize {
+            // 名字偏移必须落在字符串表内 —— 越界就拒绝，不读表外的字节，
+            // 也不退回空名字（那会把"坏文件"伪装成"无名符号"）。
+            return Err(ParseError::Inconsistent(format!(
+                "第 {index} 条符号的 n_strx = {n_strx:#x} 超出字符串表大小 {:#x}",
+                command.strsize
+            )));
+        }
+        let name = if n_strx == 0 {
+            // 规范：`n_strx == 0` 表示**没有名字**（不是"名字在偏移 0"）。
+            nameless += 1;
+            String::new()
+        } else {
+            read_symbol_name(strtab, n_strx, index)?
+        };
+
+        let section = section_by_index(segments, n_sect);
+        let section_name = section.map(section_display_name);
+        if n_sect != 0 && section.is_none() {
+            bad_sect += 1;
+        }
+        let is_function = section.is_some_and(|section| is_executable_section(section.flags));
+
+        out.push(MachOSymbol {
+            name,
+            value,
+            n_type,
+            n_sect,
+            n_desc,
+            section: section_name,
+            is_function,
+        });
+
+        cursor = cursor
+            .checked_add(entry_size)
+            .ok_or_else(|| ParseError::Overflow("符号表项偏移".to_string()))?;
+    }
+
+    if nameless > 0 {
+        notes.push(format!(
+            "有 {nameless} 条符号的 n_strx = 0（规范里表示\"没有名字\"）：它们按无名字保留，\
+             没有编造名字"
+        ));
+    }
+    if bad_sect > 0 {
+        notes.push(format!(
+            "有 {bad_sect} 条符号的 n_sect 指向不存在的节：它们的 section 留空（不猜）"
+        ));
+    }
+    Ok(out)
+}
+
+/// 从字符串表读一个名字，要求它在表内有 NUL 终止符。
+///
+/// 不用 [`Reader::cstr`]：那个函数在找不到 NUL 时会**返回整段**（对 `segname`
+/// 这种定长字段是对的），而字符串表里没有 NUL 终止符意味着文件坏了 ——
+/// 静默接受会给出一个被截断的名字，比报错更误导。
+fn read_symbol_name(strtab: &[u8], n_strx: u64, index: u64) -> Result<String, ParseError> {
+    let start = usize::try_from(n_strx)
+        .map_err(|_| ParseError::Overflow(format!("第 {index} 条符号的 n_strx = {n_strx:#x}")))?;
+    let Some(tail) = strtab.get(start..) else {
+        return Err(ParseError::Inconsistent(format!(
+            "第 {index} 条符号的 n_strx = {n_strx:#x} 超出字符串表大小 {:#x}",
+            strtab.len()
+        )));
+    };
+    let Some(end) = tail.iter().position(|&byte| byte == 0) else {
+        return Err(ParseError::Inconsistent(format!(
+            "第 {index} 条符号的名字（n_strx = {n_strx:#x}）在字符串表末尾之前没有 NUL \
+             终止符：字符串表被裁剪或 n_strx 指向了表中间"
+        )));
+    };
+    Ok(String::from_utf8_lossy(&tail[..end]).into_owned())
+}
+
+/// ULEB128 解一个值的结局。
+enum Uleb {
+    /// 解出的值与占用的字节数。
+    Value(u64, usize),
+    /// 数据在这一个值的中间就结束了（payload 被裁剪）。
+    Truncated,
+    /// 编码超过 `u64` 能表示的范围（payload 被构造）。
+    Overflow,
+}
+
+/// 从 `bytes[start..]` 解一个 ULEB128。
+///
+/// 编码（`mach-o/loader.h` 对 `LC_FUNCTION_STARTS` 的说明 + `dyld` 的
+/// `uleb128` 编码约定）：每个字节低 7 位是有效位、最高位表示"还有下一个字节"，
+/// 字节按**小端**顺序排列。`u64` 最多占 10 字节。
+fn uleb128_at(bytes: &[u8], start: usize) -> Uleb {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    for (offset, &byte) in bytes[start..].iter().enumerate() {
+        let low = u64::from(byte & 0x7f);
+        let shifted = low << shift;
+        // 左移把有效位挤出去的检查：挤出去就不是一个合法的 u64 编码。
+        if shifted >> shift != low {
+            return Uleb::Overflow;
+        }
+        value |= shifted;
+        if byte & 0x80 == 0 {
+            return Uleb::Value(value, offset + 1);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Uleb::Overflow;
+        }
+    }
+    Uleb::Truncated
+}
+
+/// 解析 `LC_FUNCTION_STARTS`：ULEB128 增量序列 → 绝对虚拟地址（升序）。
+///
+/// 编码方式（`mach-o/loader.h` 里 `LC_FUNCTION_STARTS` 的说明，实现见 dyld）：
+/// **第一个值是相对镜像基址（`__TEXT.vmaddr`）的增量**，其后每个值是相对**上一个
+/// 函数起点**的增量，遇到 `0` 字节列表结束（补齐用的 0 也在这里被吃掉）。
+///
+/// 三件事按 §7 处理：
+///
+/// * 数据范围越过 EOF ⇒ `ParseError`（文件被裁剪，不能读表外字节）；
+/// * 没有镜像基址 ⇒ 空表 + 说明（delta 无从还原成地址，不猜）；
+/// * payload 没遇到终止符（或最后一个 ULEB128 被截断）⇒ 已解出多少就是多少，
+///   但**必须**在 `notes` 里说是被截断的，不许静默返回短表。
+fn decode_function_starts(
+    reader: &Reader<'_>,
+    range: LinkeditData,
+    image_base: Option<u64>,
+    notes: &mut Vec<String>,
+) -> Result<Vec<u64>, ParseError> {
+    let end = range.dataoff.checked_add(range.datasize).ok_or_else(|| {
+        ParseError::Overflow(format!(
+            "LC_FUNCTION_STARTS：dataoff({:#x}) + datasize({:#x})",
+            range.dataoff, range.datasize
+        ))
+    })?;
+    if end > reader.len() {
+        return Err(ParseError::Inconsistent(format!(
+            "LC_FUNCTION_STARTS 的数据范围 {:#x}..{end:#x} 超出文件大小 {:#x}：\
+             文件被裁剪或头字段被人为改过",
+            range.dataoff,
+            reader.len()
+        )));
+    }
+    if range.datasize == 0 {
+        notes.push(
+            "有 LC_FUNCTION_STARTS，但 datasize = 0：表是空的（函数边界没有权威来源）".to_string(),
+        );
+        return Ok(Vec::new());
+    }
+    let Some(base) = image_base else {
+        notes.push(
+            "有 LC_FUNCTION_STARTS，但没有 __TEXT 段、镜像基址未知：第一个增量相对基址，\
+             基址都没有就无从还原成地址 —— 函数起点留空（不猜）"
+                .to_string(),
+        );
+        return Ok(Vec::new());
+    };
+
+    let payload = reader.slice(range.dataoff, range.datasize, "LC_FUNCTION_STARTS 的数据")?;
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    let mut current = base;
+    let mut terminated = false;
+    let mut overflow = false;
+
+    while cursor < payload.len() {
+        match uleb128_at(payload, cursor) {
+            Uleb::Value(0, used) => {
+                cursor += used;
+                terminated = true;
+                break;
+            }
+            Uleb::Value(delta, used) => {
+                cursor += used;
+                current = current.checked_add(delta).ok_or_else(|| {
+                    ParseError::Overflow(format!(
+                        "LC_FUNCTION_STARTS：{current:#x} + 增量 {delta:#x}"
+                    ))
+                })?;
+                out.push(current);
+                if out.len() as u64 >= MAX_FUNCTION_STARTS {
+                    notes.push(format!(
+                        "LC_FUNCTION_STARTS 超过上限 {MAX_FUNCTION_STARTS} 条：只保留前 \
+                         {MAX_FUNCTION_STARTS} 条，payload 里还有 {} 字节未解",
+                        payload.len() - cursor
+                    ));
+                    return Ok(out);
+                }
+            }
+            Uleb::Truncated => break,
+            Uleb::Overflow => {
+                overflow = true;
+                break;
+            }
+        }
+    }
+
+    if overflow {
+        return Err(ParseError::Inconsistent(format!(
+            "LC_FUNCTION_STARTS 在 payload 偏移 +{cursor:#x} 处的 ULEB128 超出 64 位：\
+             payload 被人为构造过"
+        )));
+    }
+    if !terminated {
+        notes.push(format!(
+            "LC_FUNCTION_STARTS 的 payload（{} 字节）在结尾之前没有遇到 0 终止符：已解出 {} \
+             个函数起点，表**可能被截断**（文件被裁剪，或 dataoff/datasize 写错）",
+            payload.len(),
+            out.len()
+        ));
+    } else if payload[cursor..].iter().any(|&byte| byte != 0) {
+        // 真实文件里终止符之后是补齐到 4/8 字节的 0；出现非零字节说明这段数据里
+        // 还有别的东西（或者是别人改的），按规范在 0 处停止，但要说出来。
+        notes.push(format!(
+            "LC_FUNCTION_STARTS 的终止符之后还有 {} 字节非零数据：按规范在 0 处停止解析",
+            payload.len() - cursor
+        ));
+    }
+    Ok(out)
 }
 
 // ── 入口点与对象模型 ────────────────────────────────────────────────────────
@@ -1304,6 +1941,15 @@ fn section_kind(segment_name: &str, section: &MachOSection) -> ContentKind {
 fn build_object(file: &MachOFile, id: ObjectId) -> Object {
     let mut object = Object::new(id, ObjectKind::MachO, file.arch, file.endian);
 
+    // 普通符号（去掉 stab）：`is_stripped` 与 `Object.symbols` 用的是**同一个**
+    // 判据 —— 此前的 `!has_symtab` 会把"有 LC_SYMTAB 但 nsyms = 0"的文件说成
+    // "没有剥离"，而它一个可引用的符号都没有（CLAUDE.md §7）。
+    let ordinary: Vec<&MachOSymbol> = file
+        .symbols
+        .iter()
+        .filter(|symbol| !symbol.is_stab())
+        .collect();
+
     object.format = FormatInfo {
         type_name: Some(filetype_label(file.filetype)),
         // Mach-O 头里没有 OS/ABI 字段：平台信息在 `LC_BUILD_VERSION` /
@@ -1314,19 +1960,45 @@ fn build_object(file: &MachOFile, id: ObjectId) -> Object {
         is_dynamic_library: file.filetype == MH_DYLIB,
         is_executable: file.filetype == MH_EXECUTE,
         is_relocatable: file.filetype == MH_OBJECT,
-        // 判据是"有没有 LC_SYMTAB"，**不是**符号表被解析过。符号表本身没解析，
-        // 这一点在 notes 里另外说明。
-        is_stripped: !file.has_symtab,
+        is_stripped: ordinary.is_empty(),
         declared_size: None,
     };
     object.header_flags = Some(file.flags);
     object.image_base = file.image_base.unwrap_or(0);
     object.entry = file.entry.map(|entry| entry.vaddr);
+    // 函数起点是**分析层要的地址**（函数边界），不是给人看的字符串，因此直接
+    // 进对象模型。非 Mach-O 格式留空表（"没有这样一张表"）。
+    object.function_starts = file.function_starts.clone();
     // `LC_UUID` 与依赖库现在有结构化字段了（M12 第二片）。它们**不再**塞进
     // `notes` 让消费方去解析字符串：那是把结构丢给字符串，而 `notes` 是
     // 给人读的降级说明，不是数据通道。
     object.uuid = file.uuid.clone();
     object.dylibs = file.dylibs.clone();
+
+    for symbol in ordinary {
+        // `bind` 沿用 PE/COFF 那条先例（`format::pe::inspect`）：只映射
+        // "局部 / 全局 / 弱"这一层最小交集，不硬套 ELF 的编号语义。
+        // Mach-O 的"外部"位是 `n_type & N_EXT`，弱符号看 `n_desc`。
+        let bind: u8 = if symbol.is_weak() {
+            2 // STB_WEAK
+        } else if symbol.is_external() {
+            1 // STB_GLOBAL
+        } else {
+            0 // STB_LOCAL
+        };
+        object.symbols.push(RawSymbol {
+            name: symbol.name.clone(),
+            value: symbol.value,
+            // nlist 没有大小字段：0 = 未知（不是"零字节"）。
+            size: 0,
+            defined: !symbol.is_undefined(),
+            is_function: symbol.is_function,
+            is_weak: symbol.is_weak(),
+            bind,
+            section: symbol.section.clone(),
+            source: SymbolTableSource::Static,
+        });
+    }
 
     for state in &file.segments {
         let perms = segment_perms(state.initprot);
@@ -1356,13 +2028,9 @@ fn build_object(file: &MachOFile, id: ObjectId) -> Object {
 
         for section in &state.sections {
             // 节名的身份是 (segname, sectname) 这一**对** —— 不同段里可以有同名节
-            // （`__TEXT,__const` 与 `__DATA,__const` 都真实存在）。`segname,sectname`
-            // 的写法与 `otool -l` 的输出一致，不会把两个不同的节合并成一个名字。
-            let name = if section.segname.is_empty() {
-                section.sectname.clone()
-            } else {
-                format!("{},{}", section.segname, section.sectname)
-            };
+            // （`__TEXT,__const` 与 `__DATA,__const` 都真实存在）。命名与符号的
+            // `section` 共用 `section_display_name`，两处各拼一遍迟早分叉。
+            let name = section_display_name(section);
 
             // 零填充节在文件里**没有**字节：`file` 给 0 长度（而不是把 offset 当真）。
             let file_range = if is_zerofill_section(section.flags) {

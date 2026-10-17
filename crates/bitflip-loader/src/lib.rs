@@ -3,16 +3,17 @@
 //! 三层抽象（见 `docs/ARCHITECTURE.md` §3）：
 //!
 //! - **容器（[`ContainerKind`]）**：一个文件里可能装着多个对象 —— 归档（ar / MSVC `.lib`）、
-//!   fat/universal、ZIP。ar 与 `.lib` 从 M0 起可枚举；fat/universal 的**切片枚举**
-//!   在 M12 第一片落地（[`format::macho::fat`]），但把切片接进成员会话还没做；
+//!   fat/universal、ZIP。ar 与 `.lib` 从 M0 起可枚举；fat/universal 的切片枚举、
+//!   选片与成员化在 M12 落地（[`format::macho::fat`]）；
 //!   ZIP 只做容器层（[`list_zip_members`] / [`read_zip_member`]）。
 //! - **对象（[`ObjectKind`]）**：可分析的基本单位 —— PE、COFF、ELF、Mach-O、raw。
 //! - **架构（[`bitflip_arch::ArchSpec`]）**：由格式的 machine 字段映射得到。
 //!
 //! 各格式的覆盖程度**不一样**，且这种不一样必须能被用户看到：PE/ELF 有导入导出与
-//! 符号，Mach-O 在 M12 第一片只到"段/节/入口"（符号表、dyld 绑定、objc/swift、
-//! 代码签名都没做）。每一处缺失都要落在解析结果的 `notes` 里，见
-//! [`format::macho`] 的模块文档；不猜、不留空白解释。
+//! 符号，Mach-O 已经有段/节/入口/符号表（`LC_SYMTAB`）/函数起点
+//! （`LC_FUNCTION_STARTS`），但 dyld 绑定、objc/swift 元数据、代码签名校验都没做。
+//! 每一处缺失都要落在解析结果的 `notes` 里，见 [`format::macho`] 的模块文档；
+//! 不猜、不留空白解释。
 //!
 //! # 通用层与格式层的分界
 //!
@@ -132,10 +133,11 @@ pub enum ContainerKind {
     /// fat 与 ar 都是"一个文件多个对象"，但切片**没有名字**（只有架构），
     /// 混进 `Ar` 会让"按名字找成员"这条既有逻辑带上一个说不通的空名字。
     ///
-    /// **M12 第一片的状态**：切片枚举已经实现（[`format::macho::fat::read`]，
-    /// 有单测与集成测试），但"把切片当成成员让会话去分析"还没做 ——
-    /// 也就是说 `ContainerKind::Fat` **还没被任何调用方产出成员列表**。
-    /// 打开一个 fat 文件仍然会报错（明确报错，不是静默当成原始二进制）。
+    /// **M12 第三片的状态**：切片枚举（[`format::macho::fat::read`]）、默认选片
+    /// 规则（[`format::macho::fat::SELECTION_RULE_ZH`]）与会话成员化都做了 ——
+    /// `bitflip-core` 的成员会话把每个切片当成 `ArchiveMember` 列出来，
+    /// 也能按 `--arch` 挑一片（`format::macho::fat::parse_slice`）。
+    /// 但**整份** fat 文件本身仍然不是一个对象：直接 `parse` 它依旧明确报错。
     Fat,
 }
 
@@ -181,12 +183,13 @@ pub enum ObjectKind {
     /// 产出一堆"看起来正常、实际无意义"的结论。它的结构模型在
     /// [`crate::format::dex`]，入口是 [`crate::parse_dex_structure`]。
     Dex,
-    /// Mach-O（可执行 / `.dylib`；结构层解析见 [`format::macho`]，M12 第一片）。
+    /// Mach-O（可执行 / `.dylib`；结构层解析见 [`format::macho`]，M12 第一～三片）。
     ///
-    /// "有解析器"覆盖的范围要说清楚：**头/段/节/入口/`LC_UUID`/dylib 名**都在，
-    /// 而符号表、dyld 绑定信息、objc/swift 元数据、代码签名**都不在** ——
-    /// 所以 Mach-O 对象的 `symbols` / `imports` 一定是空的，原因写在
-    /// `notes` 里。别把"能打开"当成"能反汇编出符号"。
+    /// "有解析器"覆盖的范围要说清楚：**头/段/节/入口/`LC_UUID`/dylib 名/符号表/
+    /// 函数起点**都在，而 dyld 绑定信息、objc/swift 元数据、代码签名**都不在** ——
+    /// 所以 Mach-O 对象的 `imports` 一定是空的，原因写在 `notes` 里。
+    /// `symbols` / `function_starts` 为空**可能是**"文件里没有"，也可能是解析没做到，
+    /// 两种情形的 `notes` 不同：以那里的说明为准，不要用空表反推结论。
     MachO,
     /// 未识别：按原始二进制处理。
     Raw,

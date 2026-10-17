@@ -571,8 +571,8 @@ fn sniff_macho(bytes: &[u8], g: &mut Guess) {
         _ => "未知 filetype",
     };
     g.notes.push(format!(
-        "识别为 Mach-O {kind}；结构与段/节解析见 format::macho（符号表、dyld 绑定、\
-         objc/swift、代码签名不在第一片范围内）"
+        "识别为 Mach-O {kind}；结构与段/节/入口/符号表/函数起点的解析见 format::macho\
+         （dyld 绑定、objc/swift 元数据、代码签名校验仍未做）"
     ));
 }
 

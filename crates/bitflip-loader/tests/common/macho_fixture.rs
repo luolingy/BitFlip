@@ -99,6 +99,47 @@
 //!     uint32_t cmd; uint32_t cmdsize; uint32_t flavor; uint32_t count;
 //!     uint32_t state[count];              // count 以 32 位字为单位
 //!   };
+//!   struct symtab_command {               // LC_SYMTAB 0x2，24 字节
+//!     uint32_t cmd;          +0
+//!     uint32_t cmdsize;      +4
+//!     uint32_t symoff;       +8   符号表在文件里的偏移
+//!     uint32_t nsyms;        +12  符号条目数
+//!     uint32_t stroff;       +16  字符串表在文件里的偏移
+//!     uint32_t strsize;      +20  字符串表的字节数
+//!   };
+//!   struct nlist_64 {                     // 64 位，16 字节
+//!     uint32_t n_strx;       +0   名字在字符串表里的偏移（0 = 没有名字）
+//!     uint8_t  n_type;       +4
+//!     uint8_t  n_sect;       +5   1 基节号；0 = NO_SECT
+//!     uint16_t n_desc;       +6
+//!     uint64_t n_value;      +8
+//!   };
+//!   struct nlist {                        // 32 位，12 字节（只有 n_value 窄了）
+//!     uint32_t n_strx;       +0
+//!     uint8_t  n_type;       +4
+//!     uint8_t  n_sect;       +5
+//!     uint16_t n_desc;       +6
+//!     uint32_t n_value;      +8
+//!   };
+//!   struct linkedit_data_command {        // LC_FUNCTION_STARTS 0x26，16 字节
+//!     uint32_t cmd;          +0
+//!     uint32_t cmdsize;      +4
+//!     uint32_t dataoff;      +8
+//!     uint32_t datasize;     +12
+//!   };
+//!
+//! mach-o/nlist.h 的 `n_type` 位（注意 `N_SECT` 是 `N_TYPE` 里的**取值** 0xe，
+//! 不是单独的一位）：
+//!
+//! ```text
+//! N_STAB 0xe0   N_PEXT 0x10   N_TYPE 0x0e   N_EXT 0x01
+//! N_UNDF 0x0    N_ABS  0x2    N_SECT 0xe    N_PBUD 0xc
+//! N_WEAK_REF 0x0040 (n_desc)  N_WEAK_DEF 0x0080 (n_desc)
+//! ```
+//!
+//! `LC_FUNCTION_STARTS` 的 payload 是 ULEB128 增量序列：第一个值相对镜像基址
+//! （`__TEXT.vmaddr`），其后每个值相对上一个函数起点，0 字节终止。ULEB128 的
+//! 编码是"每字节低 7 位有效、最高位表示还有下一个字节"，字节顺序为小端序。
 //!
 //! mach-o/fat.h
 //!   struct fat_header {                   // 8 字节，**恒为大端**
@@ -165,8 +206,32 @@ pub const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
 pub const LC_UNIXTHREAD: u32 = 0x5;
 /// `LC_SYMTAB`。
 pub const LC_SYMTAB: u32 = 0x2;
+/// `LC_FUNCTION_STARTS`。
+pub const LC_FUNCTION_STARTS: u32 = 0x26;
 /// `LC_DYLD_INFO_ONLY`（带 `LC_REQ_DYLD` 位的 `LC_DYLD_INFO`）。
 pub const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
+
+/// `nlist.n_type` 的位（`mach-o/nlist.h`）。
+pub const N_STAB: u8 = 0xe0;
+/// `N_PEXT`。
+pub const N_PEXT: u8 = 0x10;
+/// `N_TYPE`（类型位掩码）。
+pub const N_TYPE: u8 = 0x0e;
+/// `N_EXT`（外部符号位）。
+pub const N_EXT: u8 = 0x01;
+/// `N_UNDF`（未定义；`n_sect == NO_SECT`）。
+pub const N_UNDF: u8 = 0x0;
+/// `N_SECT`（定义在 `n_sect` 号节里）。注意它是 `N_TYPE` 的取值 0xe。
+pub const N_SECT: u8 = 0xe;
+/// `N_FUN`（`N_STAB` 一族的函数调试条目）：`0x24 & N_STAB == 0x20`，所以它算 stab。
+pub const N_FUN: u8 = 0x24;
+/// `N_WEAK_DEF`（`n_desc`）：弱定义。
+pub const N_WEAK_DEF: u16 = 0x0080;
+
+/// `sizeof(struct nlist_64)`。
+pub const NLIST64_SIZE: usize = 16;
+/// `sizeof(struct nlist)`。
+pub const NLIST32_SIZE: usize = 12;
 
 /// `CPU_TYPE_X86`。
 pub const CPU_TYPE_X86: u32 = 7;
@@ -426,12 +491,29 @@ pub fn lc_unix_thread(flavor: u32, count: u32, state: &[u32], little: bool) -> R
     RawCommand { bytes }
 }
 
-/// `LC_SYMTAB`（只为了让"有符号表"这个分支可测；本片不解析符号表内容）。
+/// `LC_SYMTAB`（`struct symtab_command`，24 字节）。
+///
+/// 字段偏移见模块文档：`symoff +8`、`nsyms +0xC`、`stroff +0x10`、`strsize +0x14`。
 #[must_use]
-pub fn lc_symtab(little: bool) -> RawCommand {
+pub fn lc_symtab(symoff: u32, nsyms: u32, stroff: u32, strsize: u32, little: bool) -> RawCommand {
     let mut bytes = vec![0u8; 24];
     put_u32(&mut bytes, 0, LC_SYMTAB, little);
     put_u32(&mut bytes, 4, 24, little);
+    put_u32(&mut bytes, 8, symoff, little);
+    put_u32(&mut bytes, 12, nsyms, little);
+    put_u32(&mut bytes, 16, stroff, little);
+    put_u32(&mut bytes, 20, strsize, little);
+    RawCommand { bytes }
+}
+
+/// `LC_FUNCTION_STARTS`（`struct linkedit_data_command`，16 字节）。
+#[must_use]
+pub fn lc_function_starts(dataoff: u32, datasize: u32, little: bool) -> RawCommand {
+    let mut bytes = vec![0u8; 16];
+    put_u32(&mut bytes, 0, LC_FUNCTION_STARTS, little);
+    put_u32(&mut bytes, 4, 16, little);
+    put_u32(&mut bytes, 8, dataoff, little);
+    put_u32(&mut bytes, 12, datasize, little);
     RawCommand { bytes }
 }
 
@@ -757,9 +839,9 @@ pub fn demo_thin64() -> Vec<u8> {
             true,
         ))
         // 真实可执行文件几乎都有 LC_DYLD_INFO_ONLY 与 LC_SYMTAB。加进来是为了让
-        // "存在但**没有解析**"这两条 notes 各走一遍（本片不读它们的内容）。
+        // "有这条命令但表是空的（nsyms = 0）"与"dyld 绑定没有解析"各走一遍。
         .command(lc_dyld_info_only(true))
-        .command(lc_symtab(true))
+        .command(lc_symtab(0, 0, 0, 0, true))
         .min_file_size(0x4000);
     build(&spec)
 }
@@ -905,6 +987,322 @@ pub fn demo_fat64() -> Vec<u8> {
 
     out[offset as usize..offset as usize + slice.len()].copy_from_slice(&slice);
     out
+}
+
+// ── 符号表（LC_SYMTAB）与函数起点（LC_FUNCTION_STARTS） ────────────────────
+
+/// 一条 `nlist` / `nlist_64` 的规格（字段语义见 `mach-o/nlist.h`，偏移见模块文档）。
+#[derive(Debug, Clone, Copy)]
+pub struct NlistSpec {
+    /// `n_strx`：名字在字符串表里的偏移（0 = 没有名字）。
+    pub n_strx: u32,
+    /// `n_type`。
+    pub n_type: u8,
+    /// `n_sect`（1 基；0 = `NO_SECT`）。
+    pub n_sect: u8,
+    /// `n_desc`。
+    pub n_desc: u16,
+    /// `n_value`。
+    pub n_value: u64,
+}
+
+impl NlistSpec {
+    /// 一条 `n_desc = 0` 的符号。
+    #[must_use]
+    pub const fn new(n_strx: u32, n_type: u8, n_sect: u8, n_value: u64) -> Self {
+        Self {
+            n_strx,
+            n_type,
+            n_sect,
+            n_desc: 0,
+            n_value,
+        }
+    }
+}
+
+/// 按规范布局编码一条符号（`nlist_64` 16 字节 / `nlist` 12 字节）。
+fn encode_nlist(spec: &NlistSpec, is_64: bool, little: bool) -> Vec<u8> {
+    let mut out = vec![0u8; if is_64 { NLIST64_SIZE } else { NLIST32_SIZE }];
+    put_u32(&mut out, 0, spec.n_strx, little);
+    out[4] = spec.n_type;
+    out[5] = spec.n_sect;
+    // `n_desc` 在规范里是 `int16_t`：按位原样写（弱符号位在低位）。
+    let desc = if little {
+        spec.n_desc.to_le_bytes()
+    } else {
+        spec.n_desc.to_be_bytes()
+    };
+    out[6..8].copy_from_slice(&desc);
+    if is_64 {
+        put_u64(&mut out, 8, spec.n_value, little);
+    } else {
+        put_u32(&mut out, 8, spec.n_value as u32, little);
+    }
+    out
+}
+
+/// 字符串表（`LC_SYMTAB.strsize` 那段）：`n_strx` 是表内**字节偏移**。
+///
+/// 一开始就写一个前缀字节（空格 `0x20`），所以第一条放进来的名字偏移是 **1**
+/// 而不是 0 —— 这正是这份样本要钉住的东西：解析器必须按 `n_strx` 取名字，
+/// 而不是"按顺序取下一个"，也不是"假定偏移 0 就是第一个名字"。
+#[derive(Debug, Clone)]
+pub struct StringTable {
+    bytes: Vec<u8>,
+}
+
+impl StringTable {
+    /// 空表 + 一个前缀字节。
+    #[must_use]
+    pub fn new() -> Self {
+        Self { bytes: vec![b' '] }
+    }
+
+    /// 追加一个名字，返回它的 `n_strx`。
+    pub fn add(&mut self, name: &str) -> u32 {
+        let offset = self.bytes.len() as u32;
+        self.bytes.extend_from_slice(name.as_bytes());
+        self.bytes.push(0);
+        offset
+    }
+
+    /// 表里的字节。
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// 表的字节数（`LC_SYMTAB.strsize`）。
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+}
+
+impl Default for StringTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 把 `payload` 追加到镜像末尾（按 `align` 对齐、中间补 0），返回它的文件偏移。
+fn append_payload(out: &mut Vec<u8>, align: u64, payload: &[u8]) -> u64 {
+    let offset = align_up(out.len() as u64, align);
+    out.resize(offset as usize, 0);
+    out.extend_from_slice(payload);
+    offset
+}
+
+/// 符号表样本的 64 位骨架：`__PAGEZERO` + `__TEXT`（含 1 个 `__text` 节）。
+///
+/// 地址空间与 [`demo_thin64`] 同一形状（`__TEXT.vmaddr = 0x1_0000_0000`），
+/// 只是 `filesize` 小一些：符号表与字符串表放在文件**末尾**，而段不声明覆盖它们
+/// （真实文件里它们在 `__LINKEDIT`，这里不建那个段 —— `LC_SYMTAB` 的
+/// symoff/stroff 是**文件偏移**，规范并不要求有段覆盖它们）。
+fn symbols_base64() -> ThinSpec {
+    ThinSpec::new64(CPU_TYPE_X86_64, 3)
+        .segment(SegmentSpec::new("__PAGEZERO", 0, 0x1_0000_0000, 0, 0).perms(0, 0))
+        .segment(
+            SegmentSpec::new("__TEXT", 0x1_0000_0000, 0x1000, 0, 0x1000)
+                .perms(RX, RX)
+                .section(
+                    SectionSpec::new("__text", "__TEXT", 0x1_0000_0F00, 0x10)
+                        .align(4)
+                        .flags(CODE_FLAGS),
+                ),
+        )
+        .command(lc_main(0xF00, 0, true))
+}
+
+/// 符号表样本的 32 位骨架：`__TEXT` + 1 个 `__text` 节（`vmaddr = 0x1000`）。
+fn symbols_base32() -> ThinSpec {
+    ThinSpec::new32(CPU_TYPE_X86, 3)
+        .segment(
+            SegmentSpec::new("__TEXT", 0x1000, 0x1000, 0, 0x1000)
+                .perms(RX, RX)
+                .section(
+                    SectionSpec::new("__text", "__TEXT", 0x1800, 0x10)
+                        .align(4)
+                        .flags(CODE_FLAGS),
+                ),
+        )
+        .command(lc_main(0x800, 0, true))
+}
+
+/// 命令在命令区里的文件偏移（段命令在前，其余命令按给出的顺序）。
+fn last_command_offset(spec: &ThinSpec) -> usize {
+    let mut offset = spec.header_size();
+    for segment in &spec.segments {
+        offset += spec.segment_command_size(segment);
+    }
+    // 最后一条非段命令：前面的都要跨过去。
+    for command in spec
+        .commands
+        .iter()
+        .take(spec.commands.len().saturating_sub(1))
+    {
+        offset += command.bytes.len() as u64;
+    }
+    offset as usize
+}
+
+/// 拼一份带 `LC_SYMTAB` 的镜像，返回（字节、`LC_SYMTAB` 命令的文件偏移）。
+///
+/// **两遍构造**：先按占位字段（symoff/nsyms/stroff/strsize 全 0）拼一遍，拿到
+/// "命令区结束时文件多长"，由此算出 symoff/stroff，再填真值重拼一次。这样样本的
+/// 偏移是**布局算出来的**，不是写死的常数 —— 换段布局也不会让 fixture 悄悄指错位置。
+fn build_symtab_image(is_64: bool, entries: &[NlistSpec], strings: &[u8]) -> (Vec<u8>, usize) {
+    let entry_size = if is_64 { NLIST64_SIZE } else { NLIST32_SIZE };
+    let with_symtab = |symoff: u32, nsyms: u32, stroff: u32, strsize: u32| -> ThinSpec {
+        let base = if is_64 {
+            symbols_base64()
+        } else {
+            symbols_base32()
+        };
+        base.command(lc_symtab(symoff, nsyms, stroff, strsize, true))
+    };
+
+    let layout = build(&with_symtab(0, 0, 0, 0));
+    let symoff = align_up(layout.len() as u64, 8);
+    let stroff = symoff + entries.len() as u64 * entry_size as u64;
+
+    let spec = with_symtab(
+        symoff as u32,
+        entries.len() as u32,
+        stroff as u32,
+        strings.len() as u32,
+    );
+    let command_offset = last_command_offset(&spec);
+    let mut out = build(&spec);
+    out.resize(symoff as usize, 0);
+    for entry in entries {
+        out.extend_from_slice(&encode_nlist(entry, is_64, true));
+    }
+    out.extend_from_slice(strings);
+    (out, command_offset)
+}
+
+/// 64 位、带 `LC_SYMTAB` 的样本：**3 条符号**（2 条普通 + 1 条 stab）。
+///
+/// | # | 名字 | `n_type` | `n_sect` | 含义 |
+/// |---|------|----------|----------|------|
+/// | 0 | `_main` | `N_SECT \| N_EXT` = `0x0e \| 0x01` = `0x0f` | 1 | 定义在 `__TEXT,__text` 的外部符号 |
+/// | 1 | `_printf` | `N_UNDF \| N_EXT` = `0x00 \| 0x01` = `0x01` | 0 | 外部未定义（来自共享库的引用） |
+/// | 2 | `main.c` | `N_FUN` = `0x24` | 1 | 调试 stab（`0x24 & N_STAB(0xe0) = 0x20 != 0`） |
+///
+/// 对象模型的 [`Object::symbols`] 里应当只有前两条：stab 不是普通符号。
+#[must_use]
+pub fn demo_symbols64() -> Vec<u8> {
+    let mut strings = StringTable::new();
+    // 第一条名字的 n_strx 是 1（前缀字节占了偏移 0）—— 故意非平凡。
+    let main_strx = strings.add("_main");
+    let printf_strx = strings.add("_printf");
+    let file_strx = strings.add("main.c");
+    let entries = [
+        NlistSpec::new(main_strx, N_SECT | N_EXT, 1, 0x1_0000_0F00),
+        // `N_UNDF` 是 0，所以"未定义 + 外部"就是 `N_EXT` 这一位。
+        NlistSpec::new(printf_strx, N_EXT, 0, 0),
+        NlistSpec::new(file_strx, N_FUN, 1, 0x1_0000_0F00),
+    ];
+    let (bytes, _) = build_symtab_image(true, &entries, strings.bytes());
+    bytes
+}
+
+/// 32 位、带 `LC_SYMTAB` 的样本：`nlist` 是 **12 字节**（不是 16）。
+///
+/// 存在的意义就是钉住"按文件的位宽选表项宽度"：解析器若一律按 16 字节走，
+/// 第 2 条的字段会从错位置读出来（甚至整表越界），断言就会红。
+#[must_use]
+pub fn demo_symbols32() -> Vec<u8> {
+    let mut strings = StringTable::new();
+    let start_strx = strings.add("_start");
+    let abort_strx = strings.add("_abort");
+    let entries = [
+        NlistSpec::new(start_strx, N_SECT | N_EXT, 1, 0x1800),
+        NlistSpec::new(abort_strx, N_EXT, 0, 0),
+    ];
+    let (bytes, _) = build_symtab_image(false, &entries, strings.bytes());
+    bytes
+}
+
+/// 拼一份带 `LC_FUNCTION_STARTS` 的镜像（payload 追加到文件末尾）。
+fn build_function_starts_image(payload: &[u8]) -> Vec<u8> {
+    let placeholder = symbols_base64().command(lc_function_starts(0, 0, true));
+    let layout = build(&placeholder);
+    let dataoff = align_up(layout.len() as u64, 8);
+    let spec = symbols_base64().command(lc_function_starts(
+        dataoff as u32,
+        payload.len() as u32,
+        true,
+    ));
+    let mut out = build(&spec);
+    append_payload(&mut out, 8, payload);
+    out
+}
+
+/// 64 位、带 `LC_FUNCTION_STARTS` 的样本：3 个起点，其中**一个增量为 300**（多字节）。
+///
+/// payload = `A0 02 | AC 02 | 10 | 00`，按 ULEB128（低 7 位有效、最高位表示续）解：
+///
+/// * `A0 02`：`0x20 | 0x80` 与 `0x02` → 2×128 + 0x20 = **0x120**
+///   ⇒ 第一个起点 = `__TEXT.vmaddr`（`0x1_0000_0000`）+ 0x120 = `0x1_0000_0120`
+/// * `AC 02`：`0x2C | 0x80` 与 `0x02` → 2×128 + 44 = **300（两字节）**
+///   ⇒ `0x1_0000_0120` + 300 = `0x1_0000_024C`
+/// * `10`：16 ⇒ `0x1_0000_025C`
+/// * `00`：终止符
+#[must_use]
+pub fn demo_function_starts64() -> Vec<u8> {
+    build_function_starts_image(&[0xa0, 0x02, 0xac, 0x02, 0x10, 0x00])
+}
+
+/// 畸形样本：`LC_FUNCTION_STARTS` 的 payload 在最后一个增量中间就结束了。
+///
+/// `A0 02` 与 `AC 02` 是两个完整增量，最后的 `80` 是"还有下一字节"却再没有下一字节
+/// —— 期望行为是**解出前两个并说明表可能被截断**，而不是报错或静默返回。
+#[must_use]
+pub fn function_starts_without_terminator64() -> Vec<u8> {
+    build_function_starts_image(&[0xa0, 0x02, 0xac, 0x02, 0x80])
+}
+
+/// 畸形样本：`LC_FUNCTION_STARTS.dataoff` 指向文件末尾之外。
+///
+/// 文件正好 0x1000 字节（`__TEXT.filesize`），dataoff = 0x1000 + 0x40 字节必然越界。
+/// 期望**拒绝**：读表外字节没有合法解释。
+#[must_use]
+pub fn malformed_function_starts_past_eof() -> Vec<u8> {
+    build(&symbols_base64().command(lc_function_starts(0x1000, 0x40, true)))
+}
+
+/// 畸形样本：某条符号的 `n_strx` 指向字符串表**之外**（`strsize` 之后）。
+///
+/// 期望**拒绝**：读表外的字节没有合法解释，退回空名字则会把"坏文件"伪装成
+/// "无名符号"（CLAUDE.md §7）。
+#[must_use]
+pub fn malformed_symbol_name_past_strsize() -> Vec<u8> {
+    let mut strings = StringTable::new();
+    let main_strx = strings.add("_main");
+    let entries = [
+        NlistSpec::new(main_strx, N_SECT | N_EXT, 1, 0x1_0000_0F00),
+        // 字符串表只有十几个字节：这个偏移远远超出表尾。
+        NlistSpec::new(0x1_0000, N_EXT, 0, 0),
+    ];
+    let (bytes, _) = build_symtab_image(true, &entries, strings.bytes());
+    bytes
+}
+
+/// 畸形样本：`LC_SYMTAB.symoff` 指向文件末尾之外。
+///
+/// 期望**拒绝**：整表范围先校验，`symoff + nsyms × 16` 越界就不能"尽量读"。
+#[must_use]
+pub fn malformed_symoff_past_eof() -> Vec<u8> {
+    let mut strings = StringTable::new();
+    let main_strx = strings.add("_main");
+    let entries = [NlistSpec::new(main_strx, N_SECT | N_EXT, 1, 0x1_0000_0F00)];
+    let (mut bytes, command_offset) = build_symtab_image(true, &entries, strings.bytes());
+    // `symoff` 在命令的 +8（见模块文档）；改成"文件末尾再往后 0x100"。
+    let symoff_past_eof = (bytes.len() + 0x100) as u32;
+    patch_u32(&mut bytes, command_offset + 8, symoff_past_eof, true);
+    bytes
 }
 
 /// 畸形样本：`sizeofcmds` 声明得比文件还大。

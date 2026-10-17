@@ -327,17 +327,18 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
         text.vaddr,
         text.vaddr + text.vsize
     );
-    // 本片**没有**解析符号表与导入：这两处必须为空，且原因写在 notes 里。
-    assert!(object.symbols.is_empty(), "本片没有符号表解析");
-    assert!(object.imports.is_empty(), "本片没有 dyld 绑定解析");
-    assert!(
-        object
-            .notes
-            .iter()
-            .any(|note| note.contains("LC_SYMTAB") || note.contains("符号表")),
-        "必须说明符号表没有解析：{:?}",
-        object.notes
+    // 符号表从 M12 第三片起**真的会解析**：这里不再断言"一定为空"，而是断言
+    // "对象模型的符号 + 调试 stab = 符号表条目数"，空与不空各自有说法（§7）。
+    // 具体计数由 `real_binaries_report_symbols_and_function_starts` 打印并把关。
+    assert_eq!(
+        object.symbols.len() + facts.stab_symbols,
+        facts.symbols.len(),
+        "object.symbols({}) + stab({}) 应当等于符号表条目数({})",
+        object.symbols.len(),
+        facts.stab_symbols,
+        facts.symbols.len()
     );
+    assert!(object.imports.is_empty(), "本片没有 dyld 绑定解析");
 
     // LC_UUID：dyld 用它标识镜像，Xcode 产出的可执行文件一定有；这里顺带验证
     // "16 字节 → 32 个小写十六进制字符"的转换没把高位丢掉、没把大小写弄反。
@@ -357,4 +358,187 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
         facts.ncmds,
         facts.sizeofcmds
     );
+}
+
+/// `temp/` 里**所有**存在的样本（按大小从小到大）。
+///
+/// 与 [`sample_path`] 的区别只在用途：那份给"随便一份就能验证结构层"的测试，
+/// 这份给"每份都要报一个计数"的验证 —— 四份 IPApp 的命令组合不一样，
+/// 只看一份容易把"这份没有"当成"这个格式没有"。
+fn all_sample_paths() -> Vec<PathBuf> {
+    if let Ok(from_env) = std::env::var("BITFLIP_TEST_MACHO_IPA") {
+        let path = PathBuf::from(from_env);
+        assert!(
+            path.is_file(),
+            "BITFLIP_TEST_MACHO_IPA 指向的 {} 不是文件",
+            path.display()
+        );
+        return vec![path];
+    }
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../temp");
+    const NAMES: [&str; 4] = [
+        "LiveContainer.ipa",
+        "Stapxs.QQ.Lite-3.3.3.ipa",
+        "SideStore.ipa",
+        "net.kdt.pojavlauncher-2.2-ios.ipa",
+    ];
+    let found: Vec<PathBuf> = NAMES
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.is_file())
+        .collect();
+    assert!(
+        !found.is_empty(),
+        "找不到真实 Mach-O 样本：请把任意一个 `.ipa` 放进 {}，\
+         或设 `BITFLIP_TEST_MACHO_IPA=<某个 .ipa 的完整路径>`",
+        dir.display()
+    );
+    found
+}
+
+/// 一份真实样本的计数（打印与断言共用，免得"打印的值"与"断言的值"两处各算一遍）。
+#[derive(Debug)]
+struct SampleCounts {
+    /// 样本文件名。
+    name: String,
+    /// 主二进制解压后多少字节。
+    binary_bytes: usize,
+    /// 符号表条目数（含 stab）。
+    symtab_entries: usize,
+    /// 调试 stab 数。
+    stabs: usize,
+    /// 对象模型里的普通符号数。
+    symbols: usize,
+    /// 函数起点数。
+    function_starts: usize,
+    /// 第一条函数起点（地址最小）与最后一条。
+    first_start: Option<u64>,
+    last_start: Option<u64>,
+    /// 对象模型给的说明里提到符号表 / 函数起点了吗。
+    notes_mention_symtab: bool,
+    notes_mention_function_starts: bool,
+}
+
+fn measure(path: &std::path::Path) -> SampleCounts {
+    let ipa =
+        std::fs::read(path).unwrap_or_else(|error| panic!("读不到 {}：{error}", path.display()));
+    let listing = zip::list_members(&ipa)
+        .unwrap_or_else(|error| panic!("IPA 应当是能列成员的 ZIP：{}", error.summary_zh()));
+    let (_index, _name, binary) = pick_main_binary(&ipa, &listing);
+    let (_how, facts, object) = parse_one_image(&binary);
+    let notes = object.notes.join("\n");
+    SampleCounts {
+        name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        binary_bytes: binary.len(),
+        symtab_entries: facts.symbols.len(),
+        stabs: facts.stab_symbols,
+        symbols: object.symbols.len(),
+        function_starts: object.function_starts.len(),
+        first_start: object.function_starts.first().copied(),
+        last_start: object.function_starts.last().copied(),
+        notes_mention_symtab: notes.contains("LC_SYMTAB"),
+        notes_mention_function_starts: notes.contains("LC_FUNCTION_STARTS"),
+    }
+}
+
+/// 四份真实 IPA：符号表与函数起点的计数必须**非平凡**，且数值自洽。
+///
+/// 这条测试的存在意义是"合成样本证明按规范工作，真实二进制证明规范真的被这样用"。
+/// 它打印的表格就是交付报告里那组数字的来源 —— 数字是测出来的，不是估的。
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_binaries_report_symbols_and_function_starts() {
+    let paths = all_sample_paths();
+    let counts: Vec<SampleCounts> = paths.iter().map(|path| measure(path)).collect();
+
+    eprintln!(
+        "{:<44} {:>10} {:>8} {:>6} {:>8} {:>8} {:>18}",
+        "样本", "二进制字节", "符号表", "stab", "普通符号", "函数起点", "首/末起点"
+    );
+    for row in &counts {
+        eprintln!(
+            "{:<44} {:>10} {:>8} {:>6} {:>8} {:>8}   {:?}..{:?}",
+            row.name,
+            row.binary_bytes,
+            row.symtab_entries,
+            row.stabs,
+            row.symbols,
+            row.function_starts,
+            row.first_start.map(|address| format!("{address:#x}")),
+            row.last_start.map(|address| format!("{address:#x}"))
+        );
+    }
+
+    for row in &counts {
+        assert_eq!(
+            row.symbols + row.stabs,
+            row.symtab_entries,
+            "{}：对象模型符号({}) + stab({}) 应当等于符号表条目数({})",
+            row.name,
+            row.symbols,
+            row.stabs,
+            row.symtab_entries
+        );
+
+        // iOS 13 之后 App Store 的二进制都带 LC_FUNCTION_STARTS（dyld 靠它按需
+        // 建立函数边界）；四份样本都是 Xcode 打包的 IPA，表不该缺席。
+        assert!(
+            row.notes_mention_function_starts,
+            "{}：notes 里必须提到 LC_FUNCTION_STARTS（有就说解出几个，没有就说没有）",
+            row.name
+        );
+        // 下限按二进制规模给，而不是一个对各份样本都"看起来合适"的常数：
+        // 96 KB 的启动器壳子（Stapxs）本来就不会有几百个函数。实测四份样本是
+        // 59 / 96 KB、114 / 148 KB、59 487 / 19 MB、1 168 / 1.1 MB ——
+        // 最稀疏的一份也有「每 16 KB 5 个」，所以每 16 KB 至少 1 个、且不少于 16 个，
+        // 是任何真实可执行文件都远远超过的密度。
+        // 这不是把标准降到零：0 个或个位数仍然会红，而那正是"表没解出来"的样子。
+        let floor = (row.binary_bytes as u64 / 16_384).max(16);
+        assert!(
+            row.function_starts as u64 >= floor,
+            "{}：LC_FUNCTION_STARTS 解出 {} 个函数起点，低于这份二进制的下限 {floor} 个\
+             —— 要么表没解出来，要么这份二进制确实没有这张表（那种情况要在断言里写清为什么）",
+            row.name,
+            row.function_starts
+        );
+        let (Some(first), Some(last)) = (row.first_start, row.last_start) else {
+            panic!("{}：函数起点为空", row.name);
+        };
+        assert!(
+            first < last,
+            "{}：函数起点必须升序（{first:#x} 到 {last:#x}）",
+            row.name
+        );
+
+        // 符号：stripped 的二进制可以是 0，但那时 notes 必须说清"没有 LC_SYMTAB"
+        // 或"nsyms = 0"，不能只留一个空表让人以为"这个文件没有符号"。
+        if row.symbols == 0 {
+            eprintln!(
+                "{}：普通符号为 0 —— 该二进制要么被剥符号（notes: {}），\
+                 要么符号表本来就是空的；函数起点 {} 个仍然给出了函数边界",
+                row.name,
+                if row.notes_mention_symtab {
+                    "有 LC_SYMTAB 相关说明"
+                } else {
+                    "**没有** LC_SYMTAB 相关说明（这是缺陷）"
+                },
+                row.function_starts
+            );
+            assert!(
+                row.notes_mention_symtab,
+                "{}：符号为空时 notes 必须解释原因，否则读者会以为解析没跑",
+                row.name
+            );
+        } else {
+            assert!(
+                row.symbols >= 10,
+                "{}：能读出符号的二进制不该只有 {} 条（可能是符号名解析错了）",
+                row.name,
+                row.symbols
+            );
+        }
+    }
 }
