@@ -335,3 +335,27 @@ pub fn build_with_a_wrong_signature() -> Vec<u8> {
 pub fn hand_read_class_defs_size(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(bytes[0x60..0x64].try_into().expect("4 字节"))
 }
+
+/// 把某个 u32 字段改成指定值（偏移按规范 §3.1 的头布局写）。
+///
+/// 只是原地改字节 —— 改完必须调 [`resign`]，否则库会先报校验和对不上。
+///
+/// `allow(dead_code)`：只有"造畸形样本"的那几个测试目标用得到它，而这份 fixture
+/// 被多个测试用 `#[path]` 引入，用不到的目标不该因此报错。
+#[allow(dead_code)]
+pub fn patch_u32(bytes: &mut [u8], off: usize, value: u32) {
+    put_u32(bytes, off, value);
+}
+
+/// 改过字节之后**重新签名**（`SHA-1` + Adler-32，按规范 §3.1 的两个区间）。
+///
+/// 为什么必须有这一步：造"头里的计数被改坏了、其余一切合规"的样本时，若不重算
+/// 签名，解析器在读计数**之前**就因为 Adler-32 不对而拒绝 —— 那条测试看着是绿的
+/// （确实报错了），但验证的是校验和，不是放大攻击守卫。踩过这个坑。
+#[allow(dead_code)]
+pub fn resign(bytes: &mut [u8]) {
+    let signature = sha1(&bytes[32..]);
+    bytes[12..32].copy_from_slice(&signature);
+    let checksum = adler32(&bytes[12..]);
+    put_u32(bytes, 8, checksum);
+}

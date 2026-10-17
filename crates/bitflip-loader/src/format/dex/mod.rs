@@ -53,6 +53,19 @@ use droidsaw_dex::{DexError, DexFile};
 /// DEX 的魔数前缀（Dalvik 规范 §3.1：`dex\n` + 三位版本 + NUL）。
 const DEX_MAGIC: &[u8; 4] = b"dex\n";
 
+/// 单份 DEX 的**字节上限**：256 MiB。
+///
+/// 这个数字不是新拍的 —— ZIP 成员**解压后**的上限（`format/zip` 的
+/// `MAX_MEMBER_BYTES`）就是 256 MiB。同一份内容从 APK 里打开和存成单文件打开
+/// 不该有两种表现，否则"同一个 dex、两种容器、不同行为"就是新的坑。
+///
+/// 它挡的是"输入本身太大"，而不是"计数被改坏了"：库的
+/// `droidsaw_common::guard::bound_count` 保证每个计数在**分配之前**就与输入
+/// 字节数比对过（见 [`parse`] 的说明），但"装得下的合法计数上限"本身是按输入
+/// 字节数算出来的 —— 一份 3 GB 的输入，合法计数上限也是 GB 量级。所以超大输入
+/// 必须在**读之前**挡（`bitflip-core` 的读取端用同一个数），而不是解析时挡。
+pub const MAX_DEX_BYTES: usize = 256 * 1024 * 1024;
+
 /// 参数可忽略的 DEX 解析错误。
 ///
 /// 只有两类：库本身报的错，和逐类解析 `class_data` 时的错。**不吞任何一类** ——
@@ -111,6 +124,57 @@ pub enum DexParseError {
         #[source]
         source: DexError,
     },
+    /// 这份输入超过 [`MAX_DEX_BYTES`]，**一个字节都没读**。
+    ///
+    /// 与 [`Self::Dex`] 分开：那不是"文件坏了"，而是"我们不处理这么大的输入"，
+    /// 报错时要能让人一眼分出来 —— 前者该换文件，后者该换工具或先切开。
+    #[error(
+        "这份输入有 {size} 字节，超过单份 DEX 的上限 {limit} 字节：\
+         解析器不解这么大的输入（APK 成员与单文件目标用的是同一个上限）"
+    )]
+    TooLarge {
+        /// 实际字节数。
+        size: usize,
+        /// 上限（[`MAX_DEX_BYTES`]）。
+        limit: usize,
+    },
+    /// 头里声明的条目数**不可能装进这份输入**。
+    ///
+    /// 这是放大攻击守卫（库的 `bound_count`，先比对后分配）报出来的。
+    /// 与 [`Self::Dex`] 分开，是因为结论不同：计数是**编的**（或被截断的文件
+    /// 留下的残值），不是我们解析不动 —— 用户该怀疑这份文件的来源，
+    /// 而不是去查解析器。
+    #[error(
+        "头里 {item} 声明了 {got} 项，而这份输入按最小记录宽度最多只装得下 {max} 项：\
+         计数是编的（或文件被截断），不是我们数错了"
+    )]
+    CountExceeded {
+        /// 库给这一段起的名字（`string_ids` / `type_ids` / `tries` …）。
+        item: &'static str,
+        /// 头里声明的项数。
+        got: u64,
+        /// 这份输入物理上最多装得下的项数。
+        max: usize,
+    },
+}
+
+impl From<DexError> for DexParseError {
+    /// 库的错误按"结论"分拣，而不是一律塞进 [`DexParseError::Dex`]。
+    ///
+    /// 只分拣**结论不同**的两类：
+    ///
+    /// * `BoundCountExceeded` —— 计数是编的（放大攻击守卫，先比对后分配）；
+    /// * 其余（魔数/版本/校验和/截断/越界）—— 文件读不下去，原样带出库的说明。
+    fn from(source: DexError) -> Self {
+        if let DexError::BoundCountExceeded(over) = &source {
+            return Self::CountExceeded {
+                item: over.item,
+                got: over.got,
+                max: over.max,
+            };
+        }
+        Self::Dex { source }
+    }
 }
 
 /// 这个前缀看起来是 DEX 吗。
@@ -364,21 +428,51 @@ impl std::fmt::Debug for DexStructure {
     }
 }
 
+/// 输入字节上限的唯一判断点。
+///
+/// 单独成函数只为一件事：让"超限"这条能用**算术**测（`MAX_DEX_BYTES + 1`），
+/// 而不是在测试里真的造一块 256 MiB 的缓冲区去撞上限 —— 那种测试跑起来比它
+/// 验证的东西还贵，且一旦上限变大就会把 CI 的内存吃掉。
+fn check_input_size(size: usize) -> Result<(), DexParseError> {
+    if size > MAX_DEX_BYTES {
+        return Err(DexParseError::TooLarge {
+            size,
+            limit: MAX_DEX_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// 解析一份 DEX 的**结构**。
 ///
 /// # Errors
 ///
 /// 见 [`DexParseError`]。
 ///
-/// # 关于资源上限
+/// # 关于资源上限（2026-10-17 核实，据实记录）
 ///
-/// `droidsaw-dex` 的 `parse` 接受一个可选预算（`budget`），本模块**暂时传
-/// `None`**，也就是不做解析预算。这是个**已知缺口**，不是"已经处理好了"：
-/// 恶意构造的 DEX 可以靠超大计数把内存顶上去。M11 的风险清单里已经记了
-/// 这一条（APK/ZIP 那边同样），接入预算属于后续工作 —— 在此之前，
-/// 调用方只应把**已经有尺寸上限**的字节交给本函数。
+/// 这里原来写的是"解析预算没接，恶意构造的 DEX 可以靠超大计数把内存顶上去，
+/// 接入预算属于后续工作"。这句话**前半对、后半不对**，照实测改掉：
+///
+/// * **计数顶不动内存**：库在每个 `Vec::with_capacity` 之前都过一遍
+///   `droidsaw_common::guard::bound_count` —— 把"声明了多少项"和"这份输入按
+///   最小记录宽度最多装得下多少项"相除比对，超出就**先报错、再分配**。
+///   六个 id 区段、`tries`、`class_data` 的条目计数都在这条守卫下。
+///   `tests/dex_parse_amplification.rs` 把每个计数字段改成 `0xFFFF_FFFF`
+///   逐个钉住：库哪天把这条守卫去掉，测试会红，而不是等线上 OOM。
+///   指令解码同理：`insns_size` 编多大都不会先分配，解码是逐条读、越界即错。
+/// * **预算没接，而且接了也是摆设**：库的 `Budget` 在**结构解析**阶段只有一处
+///   记账（`dex-parse-input`，按输入字节数），之后的分配不走它。真正要挡的是
+///   "这份输入本身有多大"，那就该在入口挡 —— 所以这里改成 [`MAX_DEX_BYTES`]
+///   硬上限，超了直接报 [`DexParseError::TooLarge`]：字节已经在调用方手里，
+///   但解析器**一个字节都不碰**（真正"不读"的是 `bitflip-core` 的读取端）。
+///   给一个永远不会触发的预算装样子，只会让下一个人以为这里已经处理好了
+///   （CLAUDE.md §7）。
+/// * 读取端用**同一个数**：`bitflip-core` 的单文件路径按文件大小先判再读，
+///   归档成员那条路本来就有 256 MiB 的成员上限。三处同数，行为才一致。
 pub fn parse(bytes: &[u8]) -> Result<DexStructure, DexParseError> {
-    let file = DexFile::parse(bytes, None).map_err(|source| DexParseError::Dex { source })?;
+    check_input_size(bytes.len())?;
+    let file = DexFile::parse(bytes, None).map_err(DexParseError::from)?;
 
     // 头的字段在下面会被反复读，但**不在这里留一个长借用**：函数末尾要把
     // `file` 移进 `DexStructure`，一个活到那时的借用会让那一步编译不过。
@@ -881,5 +975,21 @@ mod tests {
     fn non_dex_input_is_an_error() {
         let err = parse(b"not a dex file at all");
         assert!(matches!(err, Err(DexParseError::Dex { .. })));
+    }
+
+    #[test]
+    fn the_size_ceiling_is_a_comparison_not_a_heuristic() {
+        // 恰好等于上限：放行（上限是闭区间，不然"刚好 256 MiB"的文件会被拒）。
+        assert!(check_input_size(MAX_DEX_BYTES).is_ok());
+        // 多一个字节就必须拒，并且**带出两个数** —— 只报"太大"没法让人判断
+        // 是自己文件太大还是上限太低。
+        match check_input_size(MAX_DEX_BYTES + 1) {
+            Err(DexParseError::TooLarge { size, limit }) => {
+                assert_eq!(size, MAX_DEX_BYTES + 1);
+                assert_eq!(limit, MAX_DEX_BYTES);
+            }
+            other => panic!("期望 TooLarge，得到 {other:?}"),
+        }
+        assert!(check_input_size(0).is_ok());
     }
 }

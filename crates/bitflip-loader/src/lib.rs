@@ -70,7 +70,7 @@ pub use format::dex::view::{
 };
 pub use format::dex::{
     parse as parse_dex_structure, DexClass, DexCountMismatches, DexCounts, DexDeclaredSizes,
-    DexField, DexHeaderFacts, DexMethod, DexParseError, DexStructure,
+    DexField, DexHeaderFacts, DexMethod, DexParseError, DexStructure, MAX_DEX_BYTES,
 };
 
 /// 解析层错误。

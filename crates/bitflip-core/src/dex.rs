@@ -55,6 +55,11 @@ pub use bitflip_loader::render_dex_instructions as render_instructions;
 /// 指令列的符号形式渲染（返回解析结果的分类计数）。
 pub use bitflip_loader::render_dex_instructions_with_symbols as render_instructions_with_symbols;
 use bitflip_loader::ObjectKind;
+/// 单份 DEX 的字节上限（256 MiB）。
+///
+/// 读取端（[`read_input`]）与解析端（[`parse`]）用的是**同一个数**，理由见
+/// loader 里那个常量的说明：同一份内容从 APK 里打开和存成单文件打开不该有两种表现。
+pub use bitflip_loader::MAX_DEX_BYTES;
 pub use bitflip_loader::{
     payload_width_units, CodeHeaderFacts, DexCfgView, DexClass, DexCountMismatches, DexCounts,
     DexDeclaredSizes, DexEdgeKind, DexExceptionRegion, DexField, DexHandlerEntry, DexHeaderFacts,
@@ -205,6 +210,9 @@ pub struct DexInput {
 ///
 /// 输入列表取不到、`name` 不存在、有多个 DEX 却没给 `name`、读取失败、
 /// 内容不是 DEX，或 DEX 解析失败。
+///
+/// 单文件目标超过 [`MAX_DEX_BYTES`] 时**不读**：先看文件大小再决定，见
+/// [`read_input_bytes`] 里的说明。
 pub fn read_input(session: &Session, name: Option<&str>) -> Result<DexInput, BitflipError> {
     let inputs = input_names(session)?;
     let available = || {
@@ -256,6 +264,20 @@ fn read_input_bytes(session: &Session, name: &str) -> Result<Arc<[u8]>, BitflipE
     }
 
     let path = session.info().path.clone();
+    // 上限在**读之前**判：读一份 3 GB 的 .dex 再报"太大"是没意义的 —— 内存那时
+    // 已经吃掉了。用文件大小（元数据）而不是读完的长度，与 ZIP 成员那条路
+    // （先看中央目录里声明的解压后大小）同一手法；上限也是同一个数
+    // （`MAX_DEX_BYTES`，见 `bitflip-loader` 里那个常量的说明）。
+    let declared = std::fs::metadata(&path)
+        .map_err(|error| BitflipError::InvalidInput(format!("读 {path} 的文件大小失败：{error}")))?
+        .len();
+    if declared > bitflip_loader::MAX_DEX_BYTES as u64 {
+        return Err(BitflipError::InvalidInput(format!(
+            "{path} 有 {declared} 字节，超过单份 DEX 的上限 {} 字节：没有读它\
+             （APK 成员与单文件目标用的是同一个上限）",
+            bitflip_loader::MAX_DEX_BYTES
+        )));
+    }
     let bytes: Arc<[u8]> = std::fs::read(&path)
         .map_err(|error| BitflipError::InvalidInput(format!("读 {path} 失败：{error}")))?
         .into();

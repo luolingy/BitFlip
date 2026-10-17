@@ -11,6 +11,34 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 加固 — DEX 的放大攻击面：计数守卫钉死 + 输入上限 256 MiB
+
+关闭 M1 推迟验收的第 3 条（"解析预算没接，恶意构造的 DEX 可以靠超大计数顶内存"）。
+**核实后结论与当初写的不一样**，据实记在这里：
+
+- **计数顶不动内存**：`droidsaw-dex` 在每个 `Vec::with_capacity` 之前都用
+  `droidsaw-common::guard::bound_count` 把"头里声明了多少项"与"这份输入按最小记录
+  宽度最多装得下多少项"相除比对，超出就**先报错再分配**；指令解码逐条读、越界即错，
+  `insns_size` 编多大都不会先分配。但这只是**库的行为**，所以新增
+  `crates/bitflip-loader/tests/dex_parse_amplification.rs`（4 条）把它钉成我们的契约：
+  六个 id 计数字段改成 `0xFFFF_FFFF` 必须在分配之前报错且快速返回、"计数罩住别的
+  区段"由重叠守卫拦下、一条边界值用例证明阈值是 `文件字节数 / 4`。
+- **真正缺的是输入上限**：新增 `bitflip_loader::MAX_DEX_BYTES`（256 MiB，与 APK 成员
+  解压后的上限同一个数）。`parse_dex_structure` 入口超限直接报
+  `DexParseError::TooLarge`、**一个字节都不解析**；`bitflip-core` 读单文件 `.dex` 时
+  按**文件大小**先判再读（此前这条路没有任何上限，读一个 3 GB 的 `.dex` 会先把内存
+  吃掉再报错）。
+- **`Budget` 刻意不接**：它在结构解析阶段只记一次输入字节数（`dex-parse-input`），
+  接了也不会触发 —— 装样子比没有更坏（CLAUDE.md §7）。理由写进了
+  `parse_dex_structure` 的文档。
+- **错误分类**：`DexParseError` 增 `TooLarge` 与 `CountExceeded`。后者与 `Dex` 分开，
+  因为结论不同：计数是编的（或被截断文件的残值），该怀疑文件来源而不是解析器。
+- **测试**：`crates/bitflip-core/tests/dex_input_limit.rs`（2 条）用**稀疏文件**造
+  256 MiB+1 的目标，断言"报错文案带出上限 + 耗时说明没有先读"，并反向对照上限以内的
+  正常文件照读。
+- **文档**：`docs/PLAN.md` 的 M1 推迟验收第 3 条标记关闭并新增"进展 · DEX 的放大
+  攻击面"；`docs/APK-DEX-DESIGN.md` 的 §M1 状态块同步改判。
+
 ### 新增 — DEX 进 `export`：`dex-json` / `dex-smali` / `dex-dot-cfg`（M2c 完成）
 
 按 `docs/APK-DEX-DESIGN.md` §M2c 与 ADR-0021 把上一轮定下的形状实现完：
