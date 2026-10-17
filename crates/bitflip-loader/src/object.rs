@@ -686,6 +686,20 @@ pub struct Object {
     pub image_base: u64,
     /// 入口点；`None` 表示该对象没有入口（例如 `.o`）。
     pub entry: Option<u64>,
+    /// `LC_UUID` 的 16 字节，小写十六进制（32 个字符）。
+    ///
+    /// 只有 Mach-O 有这个概念（dyld 用它标识镜像）。**其他格式是 `None`** ——
+    /// 那是"这个格式里没有这样一个字段"的如实未知，不是"读出来是空的"。
+    /// 所以不要拿 `None` 去推断"符号表里没有 UUID"，那是两件事。
+    pub uuid: Option<String>,
+    /// 依赖库名（Mach-O 的 `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB`，按命令顺序）。
+    ///
+    /// 只有 Mach-O 有：PE 的依赖在导入表里（见 [`Import::module`]）、
+    /// ELF 的依赖在 `.dynamic` 的 `DT_NEEDED` 里（本片也没有归一化到这一层）。
+    /// **其他格式是空表** —— 同样的如实未知，不是"没有依赖"。
+    ///
+    /// 顺序**保序**：加载命令的先后是文件里的事实，重排会丢掉信息。
+    pub dylibs: Vec<String>,
     /// 段（内存视角）。
     pub segments: Vec<Segment>,
     /// 节（文件视角）。
@@ -777,6 +791,8 @@ impl Object {
             format: FormatInfo::default(),
             image_base: 0,
             entry: None,
+            uuid: None,
+            dylibs: Vec::new(),
             segments: Vec::new(),
             sections: Vec::new(),
             imports: Vec::new(),
@@ -935,6 +951,16 @@ mod tests {
             align: 16,
         });
         obj
+    }
+
+    #[test]
+    fn a_fresh_object_reports_uuid_and_dylibs_as_unknown_not_empty() {
+        // 空骨架的含义是"还没有从文件里读到"，不是"文件里写的就是空的"。
+        // 这条钉住默认值：非 Mach-O 的解析器不填这两个字段，结论就该是
+        // `None` / 空表（CLAUDE.md §7：未知用 None，不用空串/0 冒充）。
+        let obj = sample();
+        assert_eq!(obj.uuid, None);
+        assert!(obj.dylibs.is_empty());
     }
 
     #[test]

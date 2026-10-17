@@ -40,7 +40,10 @@ pub const TOKEN_HEADER: &str = "x-bitflip-token";
 pub const TOKEN_QUERY: &str = "token";
 
 /// 服务层 API 版本（wire 契约）。
-pub const SERVER_API_VERSION: u32 = 1;
+///
+/// 与 `bitflip_core::CORE_API_VERSION` **同步**：服务转发的是 core 的类型，
+/// 两者形状一变就得一起变（`bitflip-cli` 的 `version` 测试钉住这条一致性）。
+pub const SERVER_API_VERSION: u32 = 2;
 
 /// 程序名。
 pub const APP_NAME: &str = "bitflip";

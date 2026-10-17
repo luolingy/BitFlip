@@ -85,7 +85,12 @@ pub use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
 pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 
 /// `bitflip-core` 公共 API 版本。
-pub const CORE_API_VERSION: u32 = 1;
+///
+/// v2（M12 第二片）：`bitflip_loader::Object` 新增 `uuid` / `dylibs`，
+/// 因此 `ObjectInfo` 也多了这两个字段。字段本身是**增量**的（旧字段一个没动），
+/// 但公开结构体的形状变了（字面量构造会编译失败），所以版本号 +1。
+/// `bitflip-server` 的 `SERVER_API_VERSION` 保持与之同步（它转发的就是这套类型）。
+pub const CORE_API_VERSION: u32 = 2;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

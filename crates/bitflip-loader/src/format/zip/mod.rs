@@ -590,6 +590,10 @@ fn to_member(bytes: &[u8], index: usize, entry: &zip::read::ZipFileEntry<'_>) ->
         // 目录条目不是可分析对象；其余成员先按"装载内容"记，
         // 真正的格式由上层拿内容去嗅探决定。
         payload: !is_dir,
+        // 中央目录里没有架构字段，而且 ZIP 成员的格式本来就各不相同
+        // （APK 里同时有 dex / `.so` / 清单 / 资源）。要知道架构得先解析成员内容，
+        // 所以这里如实给 `None`。
+        arch: None,
     }
 }
 

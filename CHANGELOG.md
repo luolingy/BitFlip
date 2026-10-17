@@ -11,6 +11,28 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — `Object` 带 `uuid` 与依赖库（M12 第二片）
+
+`LC_UUID` 与 `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB` 的名分从"只在 `MachOFile` 里"
+变成了**对象模型的一等字段**：
+
+- `bitflip_loader::Object` 新增 `uuid: Option<String>`（32 个小写十六进制字符）与
+  `dylibs: Vec<String>`（按加载命令顺序，**保序**）。Mach-O 的 `parse` / `to_object`
+  路径填它们；PE / ELF / COFF / DEX / raw 一律留 `None` / 空表 —— 那是"这个格式里
+  没有这样一个字段"的**如实未知**，不是"读出来是空的"。刻意不写进 `notes`：
+  字符串是给人读的降级说明，不是数据通道。
+- `bitflip_core::ObjectInfo` 同步多出 `uuid` / `dylibs`（`info --json`、HTTP
+  `/api/sections` 都会带上）。这是**增量**字段：既有字段的名字、类型、含义一个没变，
+  `INFO_FORMAT_VERSION` 因此**不动**（递增会让按版本号判定的消费方以为语义变了）。
+- `CORE_API_VERSION` 1 → 2，`bitflip-server` 的 `SERVER_API_VERSION` 同步 1 → 2
+  （服务转发的就是这套类型；`bitflip-cli version` 的测试断言两者相等）。
+- CLI `info` 增加 `LC_UUID` 与"依赖库 N 个"两行，并在表区列出库名（最多 20 个，
+  其余显示剩余数目）；非 Mach-O 目标**不打印这两行**，免得看起来像缺了一块。
+
+**真实样本复核**（`temp/` 下四份 IPA，逐份用 `LC_UUID` / dylib 计数核对）：
+LiveContainer 5 个依赖库（uuid `08f27f31f1873803b735324ee22d6805`）、SideStore 79 个、
+Stapxs.QQ.Lite 29 个、pojavlauncher 20 个 —— 与上一片记录的数字一致。
+
 ### 新增 — PowerPC 架构支持（M12 第二片）
 
 `bitflip_arch::Arch` 增加了 `PowerPc`（`"ppc"`，32 位）与 `PowerPc64`（`"ppc64"`）两个变体，

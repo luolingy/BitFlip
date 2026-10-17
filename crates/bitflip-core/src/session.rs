@@ -25,6 +25,10 @@ fn hex16(value: u64) -> String {
 ///
 /// 消费者（脚本、UI）靠它判断字段含义是否变化。任何破坏性字段调整都必须递增，
 /// 并在此处说明变更 —— 这是 M1 验收标准 2 要求的"稳定 schema"。
+///
+/// **M12 第二片没有递增**：`ObjectInfo` 新增了 `uuid` / `dylibs` 两个字段，
+/// 属**增量**变更（旧字段的名字、类型、含义一个都没动，旧消费方忽略新字段即可）。
+/// 递增会让所有按版本号判定的消费方以为"语义变了"，那比新增两个字段更误导。
 pub const INFO_FORMAT_VERSION: u32 = 1;
 
 /// 节的 wire 表示。
@@ -148,6 +152,14 @@ pub struct ObjectInfo {
     pub is_relocatable: bool,
     /// 是否已剥离符号。
     pub is_stripped: bool,
+    /// `LC_UUID`（32 个小写十六进制字符）；非 Mach-O 是 `null`。
+    ///
+    /// 这是 M12 第二片新增的**增量**字段：旧消费方忽略它即可，既有字段的
+    /// 含义一个都没变（`INFO_FORMAT_VERSION` 因此不动）。
+    pub uuid: Option<String>,
+    /// 依赖库名（Mach-O 的 `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB`，按加载命令顺序）；
+    /// 非 Mach-O 是空数组。同样是增量字段。
+    pub dylibs: Vec<String>,
     /// 段（内存视角）。
     pub segments: Vec<SegmentInfo>,
     /// 节（文件视角）。
@@ -177,6 +189,8 @@ impl ObjectInfo {
             is_executable: object.format.is_executable,
             is_relocatable: object.format.is_relocatable,
             is_stripped: object.format.is_stripped,
+            uuid: object.uuid.clone(),
+            dylibs: object.dylibs.clone(),
             segments: object
                 .segments
                 .iter()
@@ -496,6 +510,17 @@ impl TargetInfo {
     pub fn object_identified(&self) -> bool {
         self.object != ObjectKind::Raw.as_str()
     }
+
+    /// 能不能用 `--member <名字>` 选一个成员来单独分析。
+    ///
+    /// 与 [`Self::is_archive`] **刻意分开**：fat / universal 不是"归档"（它的整份
+    /// 文件确实能打开 —— 会话按写明的规则挑一片），但它的切片仍然是可单独选的
+    /// 成员。把两者合成一个判断会让 `info` 要么说"这是归档"（错），
+    /// 要么让 `--member` 用不了（也错）。
+    #[must_use]
+    pub fn has_selectable_members(&self) -> bool {
+        self.is_archive() || self.container == ContainerKind::Fat.as_str()
+    }
 }
 
 /// 分析结果摘要（M0 占位；M2 起填入真实计数）。
@@ -675,9 +700,75 @@ fn fill_zip_members(guess: &mut Guess, bytes: Option<&[u8]>, file_size: u64) {
     }
 }
 
+/// 把 fat / universal 的切片填进 `guess`（M12 第三片）。
+///
+/// # 为什么在**完整字节**到手之后
+///
+/// fat 的架构表在文件开头（嗅探窗口足够），所以 `sniff` 已经能报"这是 fat 容器、
+/// 有 N 个切片"。但把每个切片变成 [`bitflip_loader::ArchiveMember`] 要对整个
+/// 文件校验切片范围（`format::macho::fat::read`）—— 那需要完整字节。
+///
+/// 与 [`fill_zip_members`] 同理，必须在 `TargetInfo::from_guess` **之前**调用：
+/// 成员数与摘要是在那里一次性定稿的。
+///
+/// # 选片失败不是打开失败
+///
+/// 用户指定的架构不在这份文件里时，容器**仍然是 fat**，切片也仍然列得出来 ——
+/// 那本身是有价值的结论。所以这里把原因记进 `notes`（并列出实际有哪些切片），
+/// 让 `members` 还能用；真正"没有可分析的这一片"由 `parse_target` 明确报出。
+fn fill_fat_members(guess: &mut Guess, bytes: Option<&[u8]>, file_size: u64) {
+    let Some(bytes) = bytes else {
+        guess.notes.push(if file_size > MAX_FULL_PARSE_BYTES {
+            format!(
+                "文件 {file_size} 字节超过完整解析上限 {MAX_FULL_PARSE_BYTES} 字节：\
+                 未读取完整字节，**fat 切片清单未枚举**（切片数未知）"
+            )
+        } else {
+            "未取得完整字节，**fat 切片清单未枚举**（切片数未知）".to_string()
+        });
+        return;
+    };
+
+    let container = match bitflip_loader::format::macho::fat::read(bytes) {
+        Ok(container) => container,
+        Err(error) => {
+            guess.notes.push(format!(
+                "fat 切片枚举失败：{} —— 容器已识别为 fat，但切片未列出",
+                error.summary_zh()
+            ));
+            return;
+        }
+    };
+
+    guess.members = container.members();
+    guess.members_truncated = false;
+    guess.notes.extend(container.notes.iter().cloned());
+
+    // 选中的架构要**同步到 guess**：`TargetInfo` 的 arch / bits / endian 与
+    // 摘要都读这里，而真正被解析的是同一片。不同步就会出现"界面说架构未识别、
+    // 结构里却有 aarch64 段表"这种自相矛盾（§7）。
+    //
+    // 用户显式给的架构（`--arch`）在 `open` 里已经写进 `guess.arch`，所以这里
+    // 把它当作"请求"传给 `select`：`--arch` 在 fat 上的含义就是"挑这一片"。
+    let requested = guess.arch.map(|spec| spec.arch);
+    match container.select(requested) {
+        Ok(selection) => {
+            if let Some(slice) = container.slices.get(selection.index) {
+                if let Some(spec) = slice.arch {
+                    guess.arch = Some(spec);
+                }
+            }
+        }
+        Err(error) => {
+            guess
+                .notes
+                .push(format!("fat 切片选择失败：{error} —— 切片本身仍然可用 `members` 查看"));
+        }
+    }
+}
+
 impl Session {
     /// 打开目标：检查路径、嗅探格式，并做一次完整解析。
-    ///
     /// 解析失败**不是**打开失败：嗅探结论仍然可用，此时 `parsed()` 返回 `None`
     /// 且原因记录在 `info().notes` 里。这样畸形文件也能被打开并查看"哪里坏了"，
     /// 而不是整个工具被一个坏节挡住（M1 要求"只返回错误，不 panic"）。
@@ -834,6 +925,10 @@ impl Session {
         // ZIP/APK：现在才够条件枚举成员（中央目录在文件末尾）。
         if guess.container == ContainerKind::Zip {
             fill_zip_members(&mut guess, full_bytes.as_deref(), file_size);
+        }
+        // fat / universal：同理，切片范围要对整个文件校验。
+        if guess.container == ContainerKind::Fat {
+            fill_fat_members(&mut guess, full_bytes.as_deref(), file_size);
         }
 
         let mut info = TargetInfo::from_guess(&path, file_size, &guess);
@@ -1090,16 +1185,33 @@ impl Session {
         }
 
         if guess.container == ContainerKind::Fat {
-            // fat/universal 容器里没有"这个文件"的单一架构：同一个文件装着
-            // x86_64 与 arm64 两套代码。切片枚举已经实现（`format::macho::fat`），
-            // 但**选哪一片**是个需要用户决定的事（可能要按设备或按目标架构选），
-            // 所以这里明确拒绝并说清下一步，而不是悄悄挑第 0 片。
-            return Err(
-                "这是 fat/universal Mach-O 容器：文件里有多套架构的切片，没有单一的 \
-                 image_base 与入口点。请先按架构选定要分析的那一片（切片枚举已实现，\
-                 接进会话是后续里程碑）"
-                    .to_string(),
-            );
+            // fat/universal 容器里没有"这个文件"的单一架构，但**有**一个写明的
+            // 选择规则（`fat::SELECTION_RULE_ZH`）：不指定架构时按规则挑一片，
+            // 指定了就按架构挑。两种情形都把"挑的是哪片、凭什么"写进
+            // `notes` —— 默认挑一片是**猜测**，猜测必须自报家门（§7）。
+            //
+            // 注意这里绝不"找不到就退回默认那片"：用户说要 arm64 而文件里没有
+            // arm64 时，报错要列出实际有哪些切片（`fat::FatError::ArchAbsent`）。
+            let container = bitflip_loader::format::macho::fat::read(bytes)
+                .map_err(|error| format!("fat 容器解析失败：{}", error.summary_zh()))?;
+            let requested = guess.arch.map(|spec| spec.arch);
+            let selection = container
+                .select(requested)
+                .map_err(|error| format!("fat 选片失败：{error}"))?;
+            let mut object =
+                bitflip_loader::format::macho::fat::parse_slice(bytes, selection.index, ObjectId::Plain)
+                    .map_err(|error| {
+                        format!(
+                            "fat 第 {} 片解析失败：{}",
+                            selection.index,
+                            error.summary_zh()
+                        )
+                    })?;
+            // 这条 note 落在**对象自己**的 notes 里：`info` 把它印在"结构说明"下，
+            // 与段/节并列。只放在目标级说明里的话，`--member` 选出来的切片
+            // 就不知道自己是第几片了。
+            object.note(container.selection_note(selection));
+            return Ok(object);
         }
 
         // 派发走 `bitflip_loader::parse_object` 这一个入口：新增格式时这里**不必改**
@@ -1293,11 +1405,12 @@ impl Session {
     /// [`Self::member_bytes`]（要**原始字节**）在"找的是哪个成员"上逐字一致 ——
     /// 两份拷贝迟早会在某次改动里分叉，而分叉的表现是"同一个名字两条路给出不同成员"。
     fn locate_member(&self, name: &str) -> Result<bitflip_loader::ArchiveMember, BitflipError> {
-        if !self.info.is_archive() {
+        if !self.info.has_selectable_members() {
             // 保留"归档"这个词（测试按它断言），同时把可用的容器列全 ——
             // 只提 .a / .lib 会让 APK 用户以为这条路走不通。
             return Err(BitflipError::InvalidInput(format!(
-                "目标不是归档（{}），无法按成员分析：--member 只对 .a / .lib / .apk 有意义",
+                "目标不是归档（{}），无法按成员分析：--member 只对 .a / .lib / .apk / \
+                 fat 切片有意义",
                 self.guess.container.label_zh()
             )));
         }
@@ -1764,9 +1877,17 @@ mod tests {
 
         // wire 契约：地址必须是定长 16 位
         assert_eq!(info.entry.as_ref().map(String::len), Some(16));
+        // `uuid` / `dylibs` 是 Mach-O 独有的概念：ELF 上必须是"如实未知"
+        // （`null` + 空数组），而不是空串或猜测值（CLAUDE.md §7）。
+        let parsed = session.parsed().expect("ELF 头能解析");
+        assert_eq!(parsed.uuid, None);
+        assert!(parsed.dylibs.is_empty());
         let json = serde_json::to_value(info).expect("序列化");
         assert_eq!(json["object"], "elf");
         assert!(json["image_base"].is_null());
+        let parsed_json = serde_json::to_value(parsed).expect("序列化");
+        assert!(parsed_json["uuid"].is_null());
+        assert_eq!(parsed_json["dylibs"].as_array().map(Vec::len), Some(0));
     }
 
     #[test]

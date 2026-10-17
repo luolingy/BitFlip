@@ -50,6 +50,39 @@ fn parse_object_dispatches_macho_to_the_structure_parser() {
 }
 
 #[test]
+fn lc_uuid_and_dylibs_reach_the_object_model() {
+    // M12 第二片：这两项此前只存在于 `MachOFile`，对象模型里没有位置 ——
+    // 于是 CLI / UI 拿不到、程序化消费只能去解析 notes 里的字符串。
+    let bytes = fixture::demo_thin64();
+    let object = parse_object(ObjectKind::MachO, &bytes, 0, ObjectId::Plain).expect("能解析");
+
+    let uuid = object.uuid.as_deref().expect("样本里有 LC_UUID");
+    assert_eq!(uuid.len(), 32, "LC_UUID 是 16 字节 → 32 个字符");
+    assert_eq!(uuid, "0123456789abcdeffedcba9876543210");
+    assert!(
+        uuid.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "必须是小写十六进制：{uuid:?}"
+    );
+
+    // 顺序**就是**加载命令的顺序：`libSystem` 是强链接、`UIKit` 是弱链接，
+    // 两者都在样本里，且 UIKit 在后。重排会丢掉文件里的事实。
+    assert_eq!(
+        object.dylibs,
+        vec![
+            "/usr/lib/libSystem.B.dylib".to_string(),
+            "/System/Library/Frameworks/UIKit.framework/UIKit".to_string(),
+        ]
+    );
+
+    // 没有 dylib 的样本必须是**空表**，不是占位名。
+    let thin32 = fixture::demo_thin32();
+    let object = parse_object(ObjectKind::MachO, &thin32, 0, ObjectId::Plain).expect("能解析");
+    assert_eq!(object.uuid, None, "这份样本没有 LC_UUID");
+    assert!(object.dylibs.is_empty());
+}
+
+#[test]
 fn a_32bit_binary_yields_its_single_segment() {
     let bytes = fixture::demo_thin32();
     let object = parse_object(ObjectKind::MachO, &bytes, 0, ObjectId::Plain).expect("能解析");

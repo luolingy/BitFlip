@@ -46,10 +46,11 @@
 //! 4. **arm64e** 的 `cputype` 与 arm64 相同（`0x0100_000c`），区别只在
 //!    `cpusubtype == 2`。架构按 AArch64 解码（指令层面这是对的），指针认证（PAC）
 //!    语义不还原 —— 记进 `notes`。
-//! 5. **`LC_UUID` / dylib 名不在 [`Object`] 里。** 对象模型没有对应字段，而把它们
-//!    塞进 `notes` 会让程序化消费只能靠解析字符串。它们留在 [`MachOFile`] 里
-//!    （[`read`] 的返回值）；要让 CLI / UI 显示，下一步需要给 `Object` 加字段。
-//! 6. **fat 切片没接进容器抽象。** [`fat::read`] 能枚举切片（有测试），但
+//! 5. **`LC_UUID` / dylib 名在 [`Object`] 里。** `parse` 会把它们填进
+//!    [`Object::uuid`] / [`Object::dylibs`]（结构层的原始事实仍在 [`MachOFile`]
+//!    里，两者同源）。刻意**不**只写进 `notes`：那样程序化消费只能去解析字符串，
+//!    而字符串是给人看的降级说明，不是数据通道。
+//! 6. **fat 切片还没接进容器抽象。** [`fat::read`] 能枚举切片（有测试），但
 //!    `ContainerKind::Fat` 的成员化（把切片当成 `ArchiveMember` 走会话）是下一片。
 //!    因此现在打开一个 fat 文件仍会报错，**不要**以为 fat 已经能用。
 //!
@@ -209,15 +210,15 @@ const ARM_THREAD_STATE64: u32 = 6;
 
 /// 一层**薄** Mach-O（非 fat）的结构层解析结果。
 ///
-/// 为什么不直接给 [`Object`]：下面这几项在对象模型里没有位置，塞进 `notes`
-/// 又会让程序化消费只能靠解析字符串 ——
+/// 为什么不直接给 [`Object`]：下面这几项要么在对象模型里没有位置，要么
+/// 对象模型只留了归一化后的形状 ——
 ///
-/// * `uuid`（`LC_UUID`）与 `dylibs`（依赖库名）；
 /// * `cputype` / `cpusubtype` / `filetype` / `ncmds` / `sizeofcmds` / `reserved`
 ///   这些**原始**头字段（对象模型只归一化了一部分）；
 /// * 节的 `align` / `flags` / `offset`（[`crate::object::Section`] 会丢掉它们）。
 ///
-/// 两种入口分工：要对象模型走 [`parse`]，要这些事实走 [`read`]。
+/// `uuid` 与 `dylibs` **两边都有**（M12 第二片起 [`Object::uuid`] /
+/// [`Object::dylibs`] 也有了）：要对象模型走 [`parse`]，要全部原始事实走 [`read`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachOFile {
     /// 是 64 位 Mach-O（`mach_header_64`）吗。
@@ -1321,6 +1322,11 @@ fn build_object(file: &MachOFile, id: ObjectId) -> Object {
     object.header_flags = Some(file.flags);
     object.image_base = file.image_base.unwrap_or(0);
     object.entry = file.entry.map(|entry| entry.vaddr);
+    // `LC_UUID` 与依赖库现在有结构化字段了（M12 第二片）。它们**不再**塞进
+    // `notes` 让消费方去解析字符串：那是把结构丢给字符串，而 `notes` 是
+    // 给人读的降级说明，不是数据通道。
+    object.uuid = file.uuid.clone();
+    object.dylibs = file.dylibs.clone();
 
     for state in &file.segments {
         let perms = segment_perms(state.initprot);

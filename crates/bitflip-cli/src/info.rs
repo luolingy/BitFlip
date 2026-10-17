@@ -166,6 +166,14 @@ fn print_parsed(parsed: &ObjectInfo) {
     if let Some(subsystem) = &parsed.subsystem {
         println!("子系统    {subsystem}");
     }
+    // LC_UUID / 依赖库只有 Mach-O 有。非 Mach-O 在这里**什么都不打印** ——
+    // 打印"UUID 未识别"会让 PE/ELF 看起来缺了一块，而它们本来就没有这个字段。
+    if let Some(uuid) = &parsed.uuid {
+        println!("LC_UUID   {uuid}");
+    }
+    if !parsed.dylibs.is_empty() {
+        println!("依赖库    {} 个", parsed.dylibs.len());
+    }
 
     // 段（内存视角）—— 分析走地址空间，这是权威视图
     if !parsed.segments.is_empty() {
@@ -254,6 +262,21 @@ fn print_parsed(parsed: &ObjectInfo) {
         }
         if modules.len() > 30 {
             println!("  … 其余 {} 个未显示", modules.len() - 30);
+        }
+    }
+
+    // 依赖库（Mach-O 的 LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB）
+    if !parsed.dylibs.is_empty() {
+        println!();
+        println!(
+            "依赖库（按加载命令顺序，共 {} 个，最多显示 20 个）",
+            parsed.dylibs.len()
+        );
+        for name in parsed.dylibs.iter().take(20) {
+            println!("  {name}");
+        }
+        if parsed.dylibs.len() > 20 {
+            println!("  … 其余 {} 个未显示", parsed.dylibs.len() - 20);
         }
     }
 

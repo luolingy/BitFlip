@@ -595,13 +595,18 @@ fn sniff_fat(bytes: &[u8], g: &mut Guess) {
     }
 
     g.container = ContainerKind::Fat;
-    // 容器是 fat，但**这一层没有可分析的对象**：fat 里没有"这个文件"的单一架构。
-    // 切片枚举已经实现（format::macho::fat），把它接成成员会话还没做，
-    // 所以对象类别仍是 `Raw` —— 让上层明确报"需要先选切片"，而不是硬套一层。
-    g.object = ObjectKind::Raw;
+    // 对象格式：fat 里的每一片按定义都是薄 Mach-O（架构表指向的就是 Mach-O 映像，
+    // 否则这个文件是坏的 —— 那种切片会在 `fat::read` 里被点名，架构记成未知）。
+    // 以前这里是 `Raw`，因为"fat 打不开"，于是 `object_identified()` 会说
+    // "没认出对象格式"——那是在描述一个已经不成立的限制。
+    g.object = ObjectKind::MachO;
+    // 成员格式：切片的格式就是 Mach-O。报 `None` 会让摘要打印"成员格式未识别"，
+    // 而那不是"没认出来"，是"这事根本不该逐成员判定"（与 ZIP 的情形相反）。
+    g.member_kind = Some(ObjectKind::MachO);
     g.notes.push(format!(
-        "Mach-O universal (fat) 容器，{nfat} 个切片；切片枚举已实现（format::macho::fat），\
-         但切片还没接进成员会话：请先按架构选一片"
+        "Mach-O universal (fat) 容器，{nfat} 个切片；每个切片是一个容器成员（名字形如 \
+         `slice 0: <架构>`），默认按写明的规则挑一片打开 —— 打开后的说明里会写清挑的是\
+         哪片、凭什么"
     ));
 }
 
@@ -791,6 +796,9 @@ fn sniff_ar(bytes: &[u8], g: &mut Guess, depth: u8) {
             // ar 的成员就是裸字节：成员头里写着长度，数据紧随其后，
             // 没有压缩这一层，所以能直接按偏移切片。
             storage: MemberStorage::Inline,
+            // ar 成员头里没有架构字段：要知道成员是哪种架构，得先解析它。
+            // 拿"容器里第一个成员的架构"顶替其余成员会造出假结论（§7）。
+            arch: None,
             payload: is_payload_member,
         });
 
