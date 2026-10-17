@@ -931,6 +931,28 @@ impl Session {
             fill_fat_members(&mut guess, full_bytes.as_deref(), file_size);
         }
 
+        // IPA / `.app`：认出主二进制，并且**把依据一起说出来**。
+        //
+        // 这不是可选装饰：猜出来的答案如果长得跟事实一模一样，它就是错的答案（§7）。
+        // 所以"凭什么认出它"跟着结论一起进 notes，界面上就印在结构说明里。
+        if guess.container == ContainerKind::Zip {
+            if let Some(bytes) = full_bytes.as_deref() {
+                let names: Vec<&str> = guess.members.iter().map(|m| m.name.as_str()).collect();
+                if let Some(found) = bitflip_loader::bundle::find_main_binary(&names, |index| {
+                    bitflip_loader::format::zip::read_member(bytes, index).ok()
+                }) {
+                    guess.notes.push(found.note_zh());
+                } else if bitflip_loader::bundle::looks_like_app_bundle(&guess.members) {
+                    // 是 .app，但主二进制认不出来。要说清"认不出"，别让它看起来像"没有"。
+                    guess.notes.push(
+                        "这份 .app 里认不出主二进制：第一层没有与 `.app` 同名的文件，\
+                         也没有头 4 字节是 Mach-O 魔数的成员（可能被加固或重排过）"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         let mut info = TargetInfo::from_guess(&path, file_size, &guess);
         // 覆盖说明同时**并入 `guess.notes`**：后续 `parse_target` 与
         // 分析层看到的是 `guess`，它们也该知道这些结论是用户强制的。

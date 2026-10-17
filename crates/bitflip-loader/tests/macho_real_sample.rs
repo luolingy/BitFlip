@@ -191,6 +191,36 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
         "主二进制 = 成员 #{index} {name}（解压后 {} 字节）",
         binary.len()
     );
+
+    // 产品里那份实现（`bitflip_loader::bundle`）必须与这里的选法**一致**。
+    // 测试里这份是早先写的对照实现：两边一旦分叉，这条断言就红，而不是等界面上
+    // 出现一个测试根本没覆盖过的答案。这正是"同一段判断只该有一份"的可执行版本。
+    {
+        let names: Vec<&str> = listing.members.iter().map(|m| m.name.as_str()).collect();
+        let found =
+            bitflip_loader::bundle::find_main_binary(&names, |i| zip::read_member(&ipa, i).ok())
+                .expect("产品实现也应当认得出主二进制");
+        assert_eq!(
+            (found.index, found.name.as_str()),
+            (index, name.as_str()),
+            "测试里的选法与产品实现分叉了：{found:?}"
+        );
+        eprintln!("依据 = {}", found.source.label_zh());
+        if found.source.is_guess() {
+            // LiveContainer 的可执行名与 `.app` 不同名，走的必然是指望第二层。
+            eprintln!("注意：这是**推断**（同名匹配落空），界面必须标明");
+            if name.contains("LiveContainer") {
+                assert!(
+                    found.source.is_guess(),
+                    "LiveContainer 的可执行名与 .app 不同名，必须走推断那一层：{found:?}"
+                );
+            }
+        }
+        assert!(
+            !found.note_zh().is_empty(),
+            "认出来就必须给得出一句依据说明"
+        );
+    }
     assert!(
         !binary.is_empty(),
         "主二进制解压后是空的：ZIP 层或选成员出了问题"

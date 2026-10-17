@@ -27,6 +27,7 @@
 
 mod sniff;
 
+pub mod bundle;
 pub mod ehframe;
 pub mod format;
 pub mod object;
