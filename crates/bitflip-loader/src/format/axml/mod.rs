@@ -42,6 +42,13 @@ pub const AXML_MAGIC: u32 = 0x0008_0003;
 /// （见 `format::dex::MAX_DEX_BYTES` 的说明）。
 pub const MAX_AXML_BYTES: usize = 32 * 1024 * 1024;
 
+/// 单份 `resources.arsc` 的字节上限：256 MiB。
+///
+/// 资源表比清单大得多（真实上架 APK 里通常是几 MB，大型游戏能到几十 MB），但它是
+/// **表**不是**数据**：解析只需要把条目索引建起来。上限取 256 MiB 与 DEX / APK 成员
+/// 那条线同一个数（同一份内容从 APK 里打开和单独打开不该有两种表现）。
+pub const MAX_ARSC_BYTES: usize = 256 * 1024 * 1024;
+
 /// AXML 解析错误。
 #[derive(Debug, Error)]
 pub enum AxmlError {
@@ -63,6 +70,14 @@ pub enum AxmlError {
         #[source]
         source: apk_info_axml::errors::AXMLError,
     },
+    /// `resources.arsc` 超过 [`MAX_ARSC_BYTES`]。
+    #[error("这份 resources.arsc 有 {size} 字节，超过上限 {limit} 字节：没有解析它")]
+    ResourcesTooLarge {
+        /// 实际字节数。
+        size: usize,
+        /// 上限（[`MAX_ARSC_BYTES`]）。
+        limit: usize,
+    },
 }
 
 /// 这个前缀看起来是 AXML 吗。
@@ -81,6 +96,20 @@ pub fn looks_like_axml(bytes: &[u8]) -> bool {
 /// （CLAUDE.md §4 禁止把每一项物化成带 `String` 的对象）。
 pub struct AxmlDocument {
     axml: AXML,
+    /// 资源表这次是什么状态 —— 它决定 `notes` 里那句降级说明怎么说，**不能靠猜**。
+    resources: ResourcesState,
+}
+
+/// 这次解析资源表的状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResourcesState {
+    /// 目标里没有 `resources.arsc`（或调用方没给）—— 引用一律原样保留。
+    Absent,
+    /// 读了，引用按 id 解出来了。
+    Resolved,
+    /// 有，但解析失败。**失败原因要带出去**：资源表坏了和"没这张表"是两件事，
+    /// 前者说明这个 APK 可能被动过，用户该知道。
+    Failed(String),
 }
 
 impl std::fmt::Debug for AxmlDocument {
@@ -163,11 +192,27 @@ impl AxmlDocument {
             .extend(self.unresolved_references(root));
 
         // 降级说明：只在这份文件**真的**有解不出来的引用时才说，不预先喊一遍。
+        // 措辞取决于资源表的状态 —— "没这张表"与"表坏了"是两件事，混成一句会让
+        // 一个可能被改过的 APK 看起来只是"少了个可选文件"。
         if !facts.unresolved_references.is_empty() {
+            let count = facts.unresolved_references.len();
+            match &self.resources {
+                ResourcesState::Absent => facts.notes.push(format!(
+                    "有 {count} 处属性是资源引用（以 `@` 开头），本次**没有读 `resources.arsc`**：\
+                     值按原始引用保留，没有替换成资源里的文本"
+                )),
+                ResourcesState::Resolved => facts.notes.push(format!(
+                    "有 {count} 处属性是资源引用：读了 `resources.arsc`，引用被解析成**资源名**\
+                     （如 `@string/app_name`），但**没有**替换成资源里的实际文本 —— 换成本文是\
+                     资源视图的事，清单摘要不做这层推断"
+                )),
+                ResourcesState::Failed(reason) => facts.notes.push(format!(
+                    "`resources.arsc` 读不了（{reason}）：{count} 处资源引用按原始值保留"
+                )),
+            }
+        } else if let ResourcesState::Failed(reason) = &self.resources {
             facts.notes.push(format!(
-                "有 {} 处属性是资源引用（以 `@` 开头），本次**没有读 `resources.arsc`**：\
-                 值按原始引用保留，没有替换成资源里的文本",
-                facts.unresolved_references.len()
+                "`resources.arsc` 读不了（{reason}）：本次按无资源表处理"
             ));
         }
         facts
@@ -201,16 +246,65 @@ impl AxmlDocument {
 /// 输入超过 [`MAX_AXML_BYTES`]（[`AxmlError::TooLarge`]），或库拒绝这份文件
 /// （[`AxmlError::Parse`]，带出库的原始分类）。
 pub fn parse(bytes: &[u8]) -> Result<AxmlDocument, AxmlError> {
+    parse_with_resources(bytes, None)
+}
+
+/// 带资源表解析：`resources` 是 `resources.arsc` 的原始字节。
+///
+/// 有资源表时，引用类属性（`@7f0d0001`）会被**解成真实文本**（应用名、字符串资源…）；
+/// 没有时原样保留并在 `notes` 里说明（见 [`AxmlDocument::manifest`]）。
+///
+/// # 配置选择：默认配置优先，**不是**我们挑的
+///
+/// 同一个资源在多个配置（语言 / 密度 / 夜间模式）下有不同的值。这里的取值由
+/// `apk-info-axml` 的 `ARSC` 决定：它按资源 id 取**默认（未带配置限定符的那一档）**
+/// 条目，与 `aapt dump --values` 的默认行为一致。我们**没有**自己再挑一遍配置 ——
+/// 也就是说"zh-CN 优先"这类按语言挑的策略**还没做**，那是资源视图自己的事，
+/// 不该藏在清单摘要里假装已经做了。
+///
+/// # Errors
+///
+/// 清单超过 [`MAX_AXML_BYTES`]、资源表超过 [`MAX_ARSC_BYTES`]，或库拒绝这份清单。
+/// 资源表**解析失败不算错误**：引用退回原样保留，原因进 `notes`（一份坏掉的资源表
+/// 不该让整份清单看不了）。
+pub fn parse_with_resources(
+    bytes: &[u8],
+    resources: Option<&[u8]>,
+) -> Result<AxmlDocument, AxmlError> {
     if bytes.len() > MAX_AXML_BYTES {
         return Err(AxmlError::TooLarge {
             size: bytes.len(),
             limit: MAX_AXML_BYTES,
         });
     }
+
+    // 资源表先解析：失败要记下来而不是照常往下走 —— 否则引用看起来"没解出来"
+    // 却没人知道是表坏了。
+    let (arsc, state) = match resources {
+        None => (None, ResourcesState::Absent),
+        Some(resources) => {
+            if resources.len() > MAX_ARSC_BYTES {
+                return Err(AxmlError::ResourcesTooLarge {
+                    size: resources.len(),
+                    limit: MAX_ARSC_BYTES,
+                });
+            }
+            let mut cursor = resources;
+            match apk_info_axml::ARSC::new(&mut cursor) {
+                Ok(arsc) => (Some(arsc), ResourcesState::Resolved),
+                Err(error) => (None, ResourcesState::Failed(error.to_string())),
+            }
+        }
+    };
+
     // 库的签名要一个 `&mut &[u8]`（它会推进游标）；我们只关心结果，不关心推进到哪。
     let mut cursor = bytes;
-    let axml = AXML::new(&mut cursor, None).map_err(|source| AxmlError::Parse { source })?;
-    Ok(AxmlDocument { axml })
+    let axml =
+        AXML::new(&mut cursor, arsc.as_ref()).map_err(|source| AxmlError::Parse { source })?;
+    Ok(AxmlDocument {
+        axml,
+        resources: state,
+    })
 }
 
 /// 应用清单里我们**如实**能拿到的那些字段。

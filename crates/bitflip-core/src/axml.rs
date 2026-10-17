@@ -19,6 +19,9 @@ use crate::{BitflipError, Session};
 /// APK 里清单的固定成员名（`aapt2` 的产出约定）。
 pub const MANIFEST_MEMBER: &str = "AndroidManifest.xml";
 
+/// APK 里资源表的固定成员名。
+pub const RESOURCES_MEMBER: &str = "resources.arsc";
+
 pub use bitflip_loader::format::axml::{AxmlError, ManifestFacts, MAX_AXML_BYTES};
 
 /// 一次清单解析的结果。
@@ -83,16 +86,39 @@ pub fn read_manifest(
         )));
     }
 
-    let document = bitflip_loader::format::axml::parse(&bytes).map_err(|error| {
-        BitflipError::InvalidInput(format!(
-            "把 {member_name} 当 AXML 解析失败：{error}",
-            member_name = member_name
-                .clone()
-                .unwrap_or_else(|| session.info().path.clone())
-        ))
-    })?;
+    // 资源表：有就读，没有就按"无资源表"处理（引用原样保留）。表坏了也不让整份
+    // 清单看不了 —— 但原因要进 notes，别让"表坏了"看起来像"没这张表"。
+    let mut resources_note = None;
+    let resources = if session.info().is_archive() {
+        match session.member_bytes(RESOURCES_MEMBER) {
+            Ok((bytes, _)) => Some(bytes),
+            Err(error) => {
+                // 成员不存在是最常见的情况（未混淆/未资源化的 APK 也可能没有这张表），
+                // 所以这里只在**不是"找不到"**时记一条说明。
+                if !error.to_string().contains("找不到") {
+                    resources_note = Some(format!("取 resources.arsc 失败：{error}"));
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    let facts = document.manifest();
+    let document = bitflip_loader::format::axml::parse_with_resources(&bytes, resources.as_deref())
+        .map_err(|error| {
+            BitflipError::InvalidInput(format!(
+                "把 {member_name} 当 AXML 解析失败：{error}",
+                member_name = member_name
+                    .clone()
+                    .unwrap_or_else(|| session.info().path.clone())
+            ))
+        })?;
+
+    let mut facts = document.manifest();
+    if let Some(note) = resources_note {
+        facts.notes.push(note);
+    }
     let xml = document.xml();
     Ok(ManifestReport {
         member: member_name,
