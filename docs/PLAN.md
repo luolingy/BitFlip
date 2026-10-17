@@ -33,7 +33,7 @@
 | 归档 | ar 长名表 `//`、符号索引 `/` | M5 | 与 `.lib` 同一抽象 |
 | Raw / 固件 | 任意二进制 + 手工基址/段定义 | M2 | 等价 IDA 的 "Binary file" 加载，实用且便宜 |
 | .NET 程序集 | PE + CLI header | 仅识别（M3） | 识别并提示，不做 CIL 反编译 |
-| Mach-O / fat | 可执行 / `.dylib` | **M12**（第一片已落地） | 已做头/段/节/入口/`LC_UUID`/dylib；`LC_FUNCTION_STARTS`（函数边界的权威来源）与符号表在下一片 |
+| Mach-O / fat | 可执行 / `.dylib` | **M12**（结构层 + 符号表 + 函数起点已落地） | 已做头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`（含 32 位 12 字节表项）/`LC_FUNCTION_STARTS`（ULEB128 增量）；dyld 绑定、objc/swift、代码签名校验在下一片 |
 | `.app` bundle / `.ipa` | 目录容器 / ZIP 容器 | **M12**（依赖 Mach-O） | 本项目第一次把"目录"当成可打开的目标 |
 | APK / DEX | ZIP 容器 + Dalvik 字节码 | **M11** | 与 M12 无依赖关系，可并行 |
 | APK 内的 `lib/*.so` | 就是 ELF | **M11（复用既有路径）** | 几乎零成本，先做 |
@@ -1794,6 +1794,58 @@ IPA（ZIP 容器）  →  .app（目录容器）  →  Mach-O 可执行文件  �
   小端 ppc 头照读但在 `notes` 里说明反常。**删掉**了"ppc 点名拒绝"那条），
   集成 1 条（走 `parse_object`）；CLI 侧 1 条（`--arch` 短名表与 `Arch::as_str` 往返，
   顺带发现 `--arch ppc` 此前根本没接上）。
+
+**进展 · M12 · 第三片：符号表与函数起点（2026-10-17，据实记录）**：
+
+* **做了什么**：`LC_SYMTAB`（`symtab_command`）与 `LC_FUNCTION_STARTS`
+  （`linkedit_data_command`）真的解出来了。`Object.symbols` 对 Mach-O 不再是恒空；
+  函数边界有了文件里的权威来源（`Object.function_starts`），不再只能靠反汇编。
+  `CORE_API_VERSION` 2 → 3、`SERVER_API_VERSION` 同步；`symbols` / `function_starts`
+  都是**增量**字段，`INFO_FORMAT_VERSION` 不动。
+* **表项宽度按位宽分叉**：`nlist_64` 16 字节、32 位 `nlist` 12 字节。两者的**字段偏移
+  完全相同**（`n_strx` +0、`n_type` +4、`n_sect` +5、`n_desc` +6，`n_value` 在 8 或 +8 处
+  分别是 8 字节 / 4 字节）——"32 位表项字段位置不同"是常见误记，规范里不是这样，
+  按 16 字节步进解 32 位样本会让第二条符号直接落到字符串表里。
+* **范围校验是这一片的重点**：`symoff + nsyms × entsize ≤ 文件长度`、
+  `stroff + strsize ≤ 文件长度`、每条 `n_strx < strsize`、名字在字符串表内**有 NUL**。
+  前两条与 `n_strx` 越界返回 `ParseError::Inconsistent`（带十六进制范围）；
+  `reader.cstr` 本身不要求终止符（它返回"到表尾的整段"），所以 NUL 检查单独实现。
+  `nsyms = 0`（命令在、表是空的）与"没有这条命令"给的是**不同**的 notes。
+* **调试 stab 不进 `Object.symbols`**：`N_STAB != 0` 的条目留在结构层
+  （`MachOFile::symbols`）并单独计数（`stab_symbols`），notes 说明"另有 N 条调试 stab
+  不计入"。实测这不是小数目：LiveContainer 1016 条里 575 条是 stab，
+  PojavLauncher 9187 条里 5734 条是 stab —— 不区分会让"符号数"虚高一到四倍。
+* **两处刻意的"推出来的"**：`is_function` 来自符号所在节的指令标志
+  （`S_ATTR_PURE_INSTRUCTIONS` / `S_ATTR_SOME_INSTRUCTIONS`），`RawSymbol::size` 恒 0 ——
+  `nlist` 里**没有**这两个字段。模块文档与 notes 都写明，别把推断当文件事实。
+* **`LC_FUNCTION_STARTS` 的语义**：payload 是 ULEB128 增量序列，第一个相对镜像基址
+  （`__TEXT.vmaddr`），其后相对上一个起点，`0` 字节终止。解成绝对虚拟地址、升序。
+  没有 `__TEXT`（算不出基址）、`datasize = 0`、payload 在终止符之前结束（截断）三种情况
+  **分别**有说明；截断时解出能解的，但 notes 必须写"可能被截断"，不静默返回短表。
+  超过 `MAX_FUNCTION_STARTS` 的计数上限时记一条"还有 N 个没有解"。
+* **真实样本实测**（四份 IPA，`temp/` 永不入库）：
+  * `LiveContainer.ipa` → 151 648 字节主二进制：符号表 1 016 条（575 stab）→ 441 条普通
+    符号；函数起点 **114** 个（`0x100004000` … `0x10000b54c`）；
+  * `Stapxs.QQ.Lite-3.3.3.ipa` → 95 920 字节：131 条（1 stab）→ 130 条；起点 **59** 个；
+  * `SideStore.ipa` → 19 611 632 字节：3 412 条（1 stab）→ 3 411 条；起点 **59 487** 个
+    （`0x100008000` … `0x100c74868`）；
+  * `net.kdt.pojavlauncher-2.2-ios.ipa` → 1 176 816 字节：9 187 条（5 734 stab）→ 3 453 条；
+    起点 **1 168** 个（`0x100009be4` … `0x100079600`）。
+  四份都带 `LC_FUNCTION_STARTS`，`object.symbols + stab = 符号表条目数` 逐份成立
+  （断言钉住）。**"真实 iOS 二进制该有几百个函数起点"这个预期被实测修正了**：
+  96 KB 的 Stapxs 只有 59 个（它就是个几十 KB 的壳子），所以真实样本测试的下限按二进制
+  规模算（每 16 KB 至少 1 个、且不少于 16 个），0 个或个位数仍然会红。
+* **测试**：macho 单测 31 → 43 条（其中新增符号表 5 条、函数起点 4 条：64 位三条符号含
+  stab 排除、32 位 12 字节步进、`n_strx` 越界、`symoff` 越界、`dataoff` 越界、
+  多字节 ULEB128（增量 300）、截断 payload 的 notes）；集成 4 → 7 条（新增一条走
+  `parse_object` 公开入口）；真实样本 1 → 2 条（新增一条打印四份 IPA 的计数表格并把关）。
+  合成样本里字符串表**故意以空格字节开头**，所以第一条符号的 `n_strx = 1` 而不是 0 ——
+  这钉住"按 `n_strx` 取名字"，按顺序取会读到 `" _main"`。
+* **顺带修掉的过期文档**：macho 模块的"还没做"清单、`sniff`/`lib`/`format` 的覆盖说明、
+  `docs/FORMAT-COVERAGE-VS-IDA.md`、本文件的状态表 —— 它们此前还在说"符号表没解析"
+  与"fat 没接进会话"，后者在第二片（对象模型 + fat 成员化）之后就已经不成立了。
+* **没做的（仍然写进 notes）**：`LC_DYSYMTAB`、dyld 绑定（`Object.imports` 仍为空）、
+  objc/swift 元数据、代码签名校验（只记存在性）。下一片接 dyld 绑定，才有导入表。
 
 ---
 
