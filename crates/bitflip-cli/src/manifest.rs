@@ -1,19 +1,22 @@
-//! `bitflip-cli apk`：看 APK 清单（M11 · M3 的第一片）。
+//! `bitflip-cli manifest`：看 APK 清单（M11 · M3 的第一片）。
+//!
+//! 子命令按**主题**命名（清单），不按容器命名（`apk`）—— 同一个"清单"将来也会从
+//! 单个 AXML 文件、或从别的容器里打开；名字绑在容器上，将来就得再开一个。
 //!
 //! 三个出口共用**同一次解析**：摘要（默认）、还原出的 XML（`--xml`）、稳定的 wire
 //! JSON（`--json`）。这样"界面上看到的"和"脚本里拿到的"不会各算一遍而分叉。
 
 use anyhow::{bail, Result};
 
-use crate::cli::ApkArgs;
+use crate::cli::ManifestArgs;
 
-/// 跑 `apk` 子命令：解析一次，按开关打印摘要 / XML / JSON。
+/// 跑 `manifest` 子命令：解析一次，按开关打印摘要 / XML / JSON。
 ///
 /// # Errors
 ///
 /// 打开目标失败、目标里没有清单、或清单不是能解析的 AXML —— 都会带着**具体原因**
 /// 返回（清单视图的价值就在于原因，压成一句"解析失败"等于没有）。
-pub fn run_apk(args: &ApkArgs) -> Result<()> {
+pub fn run_manifest(args: &ManifestArgs) -> Result<()> {
     if args.xml && args.json {
         bail!("`--xml` 与 `--json` 只能给一个：前者要还原出的 XML 文本，后者要结构化的摘要");
     }

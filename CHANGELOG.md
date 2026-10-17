@@ -19,7 +19,9 @@
   `ManifestFacts`）。单份上限 `MAX_AXML_BYTES = 32 MiB`，**解析前**判。
 - `bitflip-core::axml::read_manifest`：归档走成员取出、单文件按**文件大小**先判上限；
   非 AXML 明确报错（纯文本 XML 解不了，这话要说出来）。
-- `bitflip-cli apk <TARGET> [--member NAME] [--xml] [--json]`：摘要 / 还原的 XML / 稳定 JSON。
+- `bitflip-cli manifest <TARGET> [--member NAME] [--xml] [--json]`：摘要 / 还原的 XML / 稳定 JSON。
+  子命令按**主题**命名（清单）而不是按容器（`apk`）：同一个清单将来也会从单个 AXML
+  文件或别的容器打开，名字绑在容器上以后就得再开一个。
 
 **如实记录的边界**：`resources.arsc` **没有读**。所以 `@7f0d0001` 这类引用类属性**原样保留**，
 并列进 `unresolved_references`、在 `notes` 里说明 —— 不是解析失败，也不是空值。HTTP

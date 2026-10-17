@@ -1528,7 +1528,8 @@ MSVC 修饰名反修饰、静态库 PDB。
 
 * **做了什么**：`bitflip-loader::format::axml`（AXML → 可读 XML + 字段摘要）、
   `bitflip-core::axml::read_manifest`（归档成员 / 单文件两条取字节的路，单文件按
-  **文件大小**先判 `MAX_AXML_BYTES = 32 MiB`）、`bitflip-cli apk`（摘要 / `--xml` / `--json`）。
+  **文件大小**先判 `MAX_AXML_BYTES = 32 MiB`）、`bitflip-cli manifest`（摘要 / `--xml` /
+  `--json`；子命令按**主题**命名，不按容器命名 —— 同一个清单将来也会从单个 AXML 打开）。
 * **依赖与地板**：新增 `apk-info-axml` 1.0.13 + `apk-info-xml` 1.0.13（都是 Apache-2.0，
   许可闸门覆盖）。它们声明 `rust-version = "1.93.0"`（edition 2024），
   `[workspace.package] rust-version` 因此 **1.87 → 1.93**。这是**用户可见**的改动：

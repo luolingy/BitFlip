@@ -1,12 +1,12 @@
 //! BitFlip 命令行实现（`bitflip` 与 `bitflip-cli` 共用）。
 
-mod apk;
 mod browser;
 mod cli;
 mod dex;
 mod diff;
 mod export;
 mod info;
+mod manifest;
 mod members;
 mod serve;
 mod signature;
@@ -16,7 +16,6 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-pub use apk::run_apk;
 pub use cli::{
     Cli, Command, DexArgs, DiffArgs, ExportArgs, FunctionsArgs, InfoArgs, MembersArgs, OpenCli,
     RawOverrideArgs, ServeArgs, SignatureArgs, SignatureBuildArgs, SignatureCommand,
@@ -26,6 +25,7 @@ pub use dex::{build_json as build_dex_json, build_text as build_dex_text, run_de
 pub use diff::run_diff;
 pub use export::run_export;
 pub use info::run_info;
+pub use manifest::run_manifest;
 pub use members::{run_functions, run_members, run_symbol};
 pub use serve::{serve_blocking, ServeRequest};
 pub use signature::run_signature;
@@ -60,7 +60,7 @@ pub fn cli_main() -> ExitCode {
         Command::Info(args) => report(run_info(&args.target, args.json, args.verbose, &args.raw)),
         Command::Members(args) => report(run_members(&args)),
         Command::Dex(args) => report(run_dex(&args)),
-        Command::Apk(args) => report(run_apk(&args)),
+        Command::Manifest(args) => report(run_manifest(&args)),
         Command::Functions(args) => report(run_functions(&args)),
         Command::Symbol(args) => report(run_symbol(&args)),
         Command::Signature(args) => report(run_signature(&args)),

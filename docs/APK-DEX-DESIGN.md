@@ -613,7 +613,8 @@ versionName / minSdk / targetSdk / permissions / activities / services /
 >   26 条权限、入口 `com.weavi.ahh.SplashActivity`、58 处解不出的资源引用。
 > * `resources.arsc` **还没读**。所以引用类属性（`@7f0d0001`）**原样保留**并列进
 >   `unresolved_references`，`notes` 里如实说明 —— 不是"解析失败"，也不是空值。
-> * 出口：`bitflip-cli apk <TARGET> [--member NAME] [--xml] [--json]`。
+> * 出口：`bitflip-cli manifest <TARGET> [--member NAME] [--xml] [--json]`（子命令按**主题**
+>   命名而不是按容器：同一个清单将来也会从单个 AXML 或别的容器打开）。
 >   HTTP（`GET /api/apk/manifest`）与网页视图**还没有**，是下一片。
 
 ### 暂不排期

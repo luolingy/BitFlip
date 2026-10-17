@@ -79,7 +79,7 @@ pub enum Command {
     /// 查看 DEX（APK 或 .dex）：列类、看方法指令与文本 CFG
     Dex(DexArgs),
     /// 查看 APK 清单（AXML）：包名、版本、组件、权限，或还原出的 XML
-    Apk(ApkArgs),
+    Manifest(ManifestArgs),
     /// 列出识别出的函数
     Functions(FunctionsArgs),
     /// 在目标里定位一个符号（函数名或地址）
@@ -96,9 +96,9 @@ pub enum Command {
     Version,
 }
 
-/// `apk` 参数（M11 · M3 的第一片：只看清单）。
+/// `manifest` 参数（M11 · M3 的第一片：只看清单）。
 #[derive(Debug, Args)]
-pub struct ApkArgs {
+pub struct ManifestArgs {
     /// 目标：APK，或一个独立的 AXML 文件（AndroidManifest.xml）
     #[arg(value_name = "TARGET")]
     pub target: PathBuf,
