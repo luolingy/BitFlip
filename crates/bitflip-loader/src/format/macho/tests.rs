@@ -373,25 +373,65 @@ fn a_section_outside_its_segment_is_rejected() {
     assert!(message.contains("不在所在段"), "{message}");
 }
 
+/// ppc 32 位：`cputype = 18` 现在**能解析**，架构是 `ppc/32/be`。
+///
+/// 这条测试曾经断言的是"点名拒绝"（`bitflip_arch` 没有 PowerPC 变体也没有
+/// 解码后端）。M12 第二片给 arch 层加了变体与 capstone 的 ppc 后端，所以
+/// 断言反过来：**能解析，且架构映射对**。ppc 的指令解码由
+/// `bitflip-arch` 的单测用真实编码的黄金值覆盖（这里不重复）。
 #[test]
-fn powerpc_is_recognised_then_rejected_by_name() {
+fn powerpc_binaries_now_parse_with_their_architecture() {
+    let bytes = fixture::demo_thin_ppc32();
+    let file = read(&bytes).expect("ppc 32 位样本必须能解析");
+    assert_eq!(file.cputype, fixture::CPU_TYPE_POWERPC);
+    assert_eq!(file.endian, Endian::Big, "Mach-O 的 ppc 是大端");
+    assert_eq!(file.arch.to_string(), "ppc/32/be");
+    assert_eq!(file.entry.map(|entry| entry.vaddr), Some(0x1400));
+    assert_eq!(file.segments.len(), 1);
+    assert!(
+        file.notes.iter().any(|note| note.contains("大端")),
+        "大端这件事要写在 notes 里：{:?}",
+        file.notes
+    );
+
+    let object = parse_bytes(&bytes).expect("对象模型也要能建起来");
+    assert_eq!(object.arch.to_string(), "ppc/32/be");
+    assert_eq!(object.entry, Some(0x1400));
+}
+
+/// ppc64：`cputype = 0x01000012` → `ppc64/64/be`。
+#[test]
+fn powerpc64_binaries_map_to_the_64bit_architecture() {
+    let bytes = fixture::demo_thin_ppc64();
+    let file = read(&bytes).expect("ppc64 样本必须能解析");
+    assert!(file.is_64);
+    assert_eq!(file.cputype, fixture::CPU_TYPE_POWERPC64);
+    assert_eq!(file.arch.to_string(), "ppc64/64/be");
+    assert_eq!(file.entry.map(|entry| entry.vaddr), Some(0x1_0000_0500));
+}
+
+/// 小端文件头配 ppc 的 `cputype`：照读，但要说出"这不是常规产物"。
+///
+/// 现实里 Mach-O 的 ppc 切片一律是大端。这条不是拒绝，而是"事实说明" ——
+/// 结构层按文件端序读，结论自洽；但用户看到一个 ppc 的 Mach-O 是小端时，
+/// 有权知道这不合常规（CLAUDE.md §7：降级/反常要写在结论里）。
+#[test]
+fn a_little_endian_ppc_header_is_parsed_but_flagged() {
     let spec = fixture::ThinSpec::new32(fixture::CPU_TYPE_POWERPC, 0).segment(
         fixture::SegmentSpec::new("__TEXT", 0x1000, 0x1000, 0, 0x1000)
             .perms(fixture::RX, fixture::RX),
     );
     let bytes = fixture::build(&spec);
-    match read(&bytes) {
-        Err(ParseError::Unsupported {
-            what,
-            value,
-            detail,
-        }) => {
-            assert_eq!(what, "cputype");
-            assert_eq!(value, 18);
-            assert!(detail.contains("PowerPC"), "{detail}");
-        }
-        other => panic!("期望 ppc 被点名为 Unsupported，实际是 {other:?}"),
-    }
+    let file = read(&bytes).expect("小端 ppc 头不是格式错误");
+    assert_eq!(file.endian, Endian::Little);
+    assert_eq!(file.arch.to_string(), "ppc/32/le");
+    assert!(
+        file.notes
+            .iter()
+            .any(|note| note.contains("不是 Apple 工具链的常规产物")),
+        "小端 ppc 这件反常必须写进 notes：{:?}",
+        file.notes
+    );
 }
 
 #[test]

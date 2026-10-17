@@ -24,6 +24,18 @@ pub enum Arch {
     Mips,
     /// MIPS64。
     Mips64,
+    /// PowerPC（32 位，classic G3/G4/G5 与 Darwin 上的 ppc）。
+    ///
+    /// 与 [`Self::PowerPc64`] 分成两个变体而不是"一个架构 + 模式"：本仓库
+    /// 既有的 32/64 成对架构（[`Self::X86`] / [`Self::X86_64`]、
+    /// [`Self::Mips`] / [`Self::Mips64`]、[`Self::Riscv32`] /
+    /// [`Self::Riscv64`]）都是这么分的，`ArchSpec` 的 `ptr_size` 与
+    /// `default_mode` 也按这套分法推导。混成一个变体就得让
+    /// `Arch::default_mode` 回答"这个架构默认几位"，而那是调用方已经
+    /// 说清楚的事。
+    PowerPc,
+    /// PowerPC64（64 位 ppc）。
+    PowerPc64,
     /// WebAssembly（M10 目标）。
     Wasm32,
 }
@@ -40,6 +52,8 @@ impl Arch {
             Self::Riscv64 => "riscv64",
             Self::Mips => "mips",
             Self::Mips64 => "mips64",
+            Self::PowerPc => "ppc",
+            Self::PowerPc64 => "ppc64",
             Self::Wasm32 => "wasm32",
         }
     }
@@ -56,15 +70,17 @@ impl Arch {
     pub const fn default_mode(self) -> Mode {
         match self {
             Self::X86 => Mode::M32,
-            Self::X86_64 | Self::Aarch64 | Self::Riscv64 | Self::Mips64 => Mode::M64,
-            Self::Arm | Self::Riscv32 | Self::Mips | Self::Wasm32 => Mode::M32,
+            Self::X86_64 | Self::Aarch64 | Self::Riscv64 | Self::Mips64 | Self::PowerPc64 => {
+                Mode::M64
+            }
+            Self::Arm | Self::Riscv32 | Self::Mips | Self::PowerPc | Self::Wasm32 => Mode::M32,
         }
     }
 
     /// 该架构**惯用**的字节序。
     ///
-    /// 只有同时支持两种端序的架构（MIPS、ARM、RISC-V）才有真正的选择余地；
-    /// 这里给的始终是**该架构最常见的那一种**，不是"唯一正确的"。
+    /// 只有同时支持两种端序的架构（MIPS、ARM、RISC-V、PowerPC）才有真正的
+    /// 选择余地；这里给的始终是**该架构最常见的那一种**，不是"唯一正确的"。
     /// 只在"用户手工指定了架构却没说端序"时用作兜底 ——
     /// 要按少见的那种解，必须由用户显式说 `--endian`。
     ///
@@ -73,12 +89,16 @@ impl Arch {
     /// 端序判断属于架构知识，`bitflip-core` 这类架构无关的代码不该自己写
     /// `Endian::Little` —— 否则"哪个架构是小端"这件事就散落到全仓库了。
     ///
-    /// 目前所有已支持架构的工具链默认都是小端，所以这里还没有分支；
-    /// 真要区分时（例如把 MIPS 大端固件作为一等场景），改的应该是**这一个**
-    /// 函数，而不是去调用方找散落的 `Endian::Little`。
+    /// 目前只有 PowerPC 是**大端惯用**：classic ppc（Darwin / OS X ppc、
+    /// 游戏机、大端 ppc Linux）都是大端，Mach-O 的 ppc 切片也一律是
+    /// `MH_CIGAM*`。小端 ppc（ppc64le）是后来才出现的分支，要它必须
+    /// 显式说端序。其余已支持架构的工具链默认都是小端。
     #[must_use]
     pub const fn preferred_endian(self) -> Endian {
-        Endian::Little
+        match self {
+            Self::PowerPc | Self::PowerPc64 => Endian::Big,
+            _ => Endian::Little,
+        }
     }
 
     /// 用户只给了架构、没给模式与端序时用的完整规格。
@@ -100,7 +120,12 @@ impl Arch {
                     4
                 }
             }
-            Self::X86_64 | Self::Aarch64 | Self::Riscv64 | Self::Mips64 | Self::Wasm32 => 8,
+            Self::X86_64
+            | Self::Aarch64
+            | Self::Riscv64
+            | Self::Mips64
+            | Self::PowerPc64
+            | Self::Wasm32 => 8,
             _ => 4,
         }
     }
@@ -116,9 +141,13 @@ impl Arch {
                     Self::Mips
                 }
             }
-            40 => Self::Arm,      // EM_ARM
-            62 => Self::X86_64,   // EM_X86_64
-            183 => Self::Aarch64, // EM_AARCH64
+            // EM_PPC(20) / EM_PPC64(21)。两者是**不同**的 e_machine，所以
+            // 这里不看 `is_64`（`is_64` 用于 MIPS/RISC-V 那种共用编号的架构）。
+            21 => Self::PowerPc64, // EM_PPC64
+            20 => Self::PowerPc,   // EM_PPC
+            40 => Self::Arm,       // EM_ARM
+            62 => Self::X86_64,    // EM_X86_64
+            183 => Self::Aarch64,  // EM_AARCH64
             243 => {
                 if is_64 {
                     Self::Riscv64
@@ -147,16 +176,25 @@ impl Arch {
 
     /// Mach-O `cputype` → 架构与模式。
     ///
-    /// 覆盖 x86(7) / x86_64(0x01000007) / arm(12) / arm64(0x0100000c)。
-    /// **没有 PowerPC**（`CPU_TYPE_POWERPC` 18 / 0x01000012）：本 crate 没有 ppc
-    /// 变体也没有 ppc 解码器，返回 `None` 让调用方明确报"这一层解析不了"，
-    /// 而不是塞进一个不存在的架构里。
+    /// 覆盖 x86(7) / x86_64(0x01000007) / arm(12) / arm64(0x0100000c) /
+    /// ppc(18) / ppc64(0x01000012)。
+    ///
+    /// PowerPC 从 M12 第二片起是**真支持**：`bitflip-arch` 有 `ppc` / `ppc64`
+    /// 变体，capstone 的 `arch_powerpc` 后端也已编进构建（见 `backend` 的
+    /// 单测）。此前这里对 ppc 返回 `None`，原因是"有架构没解码器会让分析层
+    /// 解出垃圾"（CLAUDE.md §7）—— 那个前提现在不成立了。
+    ///
+    /// 注意这里**不**决定端序：Mach-O 的端序由文件魔数（`MH_MAGIC` 还是
+    /// `MH_CIGAM`）决定，调用方传进来。ppc 的 Mach-O 事实上都是大端，
+    /// 而"ppc 惯用大端"这条知识在 [`Arch::preferred_endian`]。
     pub const fn from_macho_cputype(cputype: u32) -> Option<(Self, Mode)> {
         Some(match cputype {
-            7 => (Self::X86, Mode::M32),               // CPU_TYPE_X86
-            0x0100_0007 => (Self::X86_64, Mode::M64),  // CPU_TYPE_X86_64
-            12 => (Self::Arm, Mode::M32),              // CPU_TYPE_ARM
-            0x0100_000c => (Self::Aarch64, Mode::M64), // CPU_TYPE_ARM64
+            7 => (Self::X86, Mode::M32),                 // CPU_TYPE_X86
+            0x0100_0007 => (Self::X86_64, Mode::M64),    // CPU_TYPE_X86_64
+            12 => (Self::Arm, Mode::M32),                // CPU_TYPE_ARM
+            0x0100_000c => (Self::Aarch64, Mode::M64),   // CPU_TYPE_ARM64
+            18 => (Self::PowerPc, Mode::M32),            // CPU_TYPE_POWERPC
+            0x0100_0012 => (Self::PowerPc64, Mode::M64), // CPU_TYPE_POWERPC64
             _ => return None,
         })
     }
@@ -307,7 +345,39 @@ mod tests {
         assert_eq!(Arch::from_elf_machine(183, true), Some(Arch::Aarch64));
         assert_eq!(Arch::from_elf_machine(243, true), Some(Arch::Riscv64));
         assert_eq!(Arch::from_elf_machine(243, false), Some(Arch::Riscv32));
+        // EM_PPC / EM_PPC64 是两个不同的 e_machine，不看 is_64
+        assert_eq!(Arch::from_elf_machine(20, false), Some(Arch::PowerPc));
+        assert_eq!(Arch::from_elf_machine(21, true), Some(Arch::PowerPc64));
         assert_eq!(Arch::from_elf_machine(0xffff, true), None);
+    }
+
+    /// Mach-O 的 `cputype` 表：六种已知 CPU，含 **ppc / ppc64**。
+    ///
+    /// 这两条曾经是"识别但拒绝"（`bitflip-arch` 没有变体、也没有解码器）。
+    /// 现在表里有了，解析器就不该再拒绝它们 —— 这条测试钉住的是**表**，
+    /// 解码能力由 `backend::tests` 里的 ppc 用例钉住。
+    #[test]
+    fn macho_cputype_maps_to_arch_and_mode() {
+        assert_eq!(
+            Arch::from_macho_cputype(0x0100_0007),
+            Some((Arch::X86_64, Mode::M64))
+        );
+        assert_eq!(Arch::from_macho_cputype(7), Some((Arch::X86, Mode::M32)));
+        assert_eq!(
+            Arch::from_macho_cputype(0x0100_000c),
+            Some((Arch::Aarch64, Mode::M64))
+        );
+        assert_eq!(Arch::from_macho_cputype(12), Some((Arch::Arm, Mode::M32)));
+        // CPU_TYPE_POWERPC = 18 / CPU_TYPE_POWERPC64 = 0x01000012（mach/machine.h）
+        assert_eq!(
+            Arch::from_macho_cputype(18),
+            Some((Arch::PowerPc, Mode::M32))
+        );
+        assert_eq!(
+            Arch::from_macho_cputype(0x0100_0012),
+            Some((Arch::PowerPc64, Mode::M64))
+        );
+        assert_eq!(Arch::from_macho_cputype(0x1234), None);
     }
 
     #[test]
@@ -344,6 +414,10 @@ mod tests {
         assert_eq!(Arch::X86.default_spec().to_string(), "x86/32/le");
         assert_eq!(Arch::Riscv32.default_spec().to_string(), "riscv32/32/le");
         assert_eq!(Arch::Mips64.default_spec().to_string(), "mips64/64/le");
+        // ppc 是**唯一**大端惯用的架构：classic ppc 都是大端，
+        // 所以"只给架构"时的兜底端序必须是大端，否则解出来的是字节序反了的垃圾。
+        assert_eq!(Arch::PowerPc.default_spec().to_string(), "ppc/32/be");
+        assert_eq!(Arch::PowerPc64.default_spec().to_string(), "ppc64/64/be");
     }
 
     /// ARM 的默认模式必须是 **ARM 状态**而不是 Thumb。
@@ -360,12 +434,24 @@ mod tests {
     /// 指针宽度跟着模式走：同一个架构在不同模式下宽度不同。
     #[test]
     fn default_spec_ptr_size_is_consistent_with_mode() {
-        for arch in [Arch::X86_64, Arch::Aarch64, Arch::Riscv64, Arch::Mips64] {
+        for arch in [
+            Arch::X86_64,
+            Arch::Aarch64,
+            Arch::Riscv64,
+            Arch::Mips64,
+            Arch::PowerPc64,
+        ] {
             let spec = arch.default_spec();
             assert_eq!(spec.ptr_size, 8, "{arch} 应是 64 位");
             assert!(spec.is_64bit());
         }
-        for arch in [Arch::X86, Arch::Arm, Arch::Riscv32, Arch::Mips] {
+        for arch in [
+            Arch::X86,
+            Arch::Arm,
+            Arch::Riscv32,
+            Arch::Mips,
+            Arch::PowerPc,
+        ] {
             let spec = arch.default_spec();
             assert_eq!(spec.ptr_size, 4, "{arch} 应是 32 位");
             assert!(!spec.is_64bit());

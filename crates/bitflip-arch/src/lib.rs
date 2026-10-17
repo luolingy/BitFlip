@@ -36,4 +36,9 @@ pub use types::{Arch, ArchSpec, Endian, Mode};
 /// 2：`MemRef` 增加 `index_extend`（AArch64 索引扩展），
 ///    `Operand` 增加 AArch64 的系统寄存器/PState/屏障/预取/系统操作/
 ///    浮点立即数/SVCR/SME 索引，并修掉内存索引被整个丢掉的问题。
-pub const ARCH_API_VERSION: u32 = 2;
+/// 3：新增 `Arch::PowerPc` / `Arch::PowerPc64`（M12 第二片）。`Arch` 是
+///    `#[non_exhaustive]`，所以加变体本身不算破坏性变更；但**行为**变了三处，
+///    下游要能分辨是哪个版本给的结论：capstone 的 ppc 后端真实可用了、
+///    `preferred_endian` 第一次对某些架构返回 `Endian::Big`（此前恒为小端）、
+///    `abi_for_spec` 对 ppc 返回一套调用约定（此前是 `None`）。
+pub const ARCH_API_VERSION: u32 = 3;

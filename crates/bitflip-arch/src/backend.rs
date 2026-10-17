@@ -83,6 +83,7 @@ enum CsTarget {
     Arm(capstone::arch::arm::ArchMode),
     Riscv(capstone::arch::riscv::ArchMode),
     Mips(capstone::arch::mips::ArchMode),
+    Ppc(capstone::arch::ppc::ArchMode),
 }
 
 /// 把 [`ArchSpec`] 映射成 capstone 的架构/模式。
@@ -90,6 +91,11 @@ enum CsTarget {
 /// 返回 `None` 表示 capstone 没有对应后端 —— 调用方据此返回
 /// [`DecodeError::Unsupported`]，而不是猜一个近似架构去解码
 /// （用 x86 解码 ARM 字节会得到"看起来成功"的垃圾）。
+///
+/// ppc 的三种 capstone 模式是 `Mode32` / `Mode64` / `Qpx`（QPX 是 POWER
+/// 浮点扩展，不是位宽）。本仓库只按 32/64 位映射；QPX **不**自动开启：
+/// 它会把部分浮点指令解释成另一套语义，而对象头里没有任何字段说"这段代码
+/// 用 QPX"。要它应当是用户的显式选择，不是解析器的猜测。
 fn cs_target_for(spec: ArchSpec) -> Option<CsTarget> {
     Some(match (spec.arch, spec.mode) {
         (Arch::X86, Mode::M16) => CsTarget::X86(capstone::arch::x86::ArchMode::Mode16),
@@ -105,8 +111,46 @@ fn cs_target_for(spec: ArchSpec) -> Option<CsTarget> {
         (Arch::Riscv64, _) => CsTarget::Riscv(capstone::arch::riscv::ArchMode::RiscV64),
         (Arch::Mips, _) => CsTarget::Mips(capstone::arch::mips::ArchMode::Mips32),
         (Arch::Mips64, _) => CsTarget::Mips(capstone::arch::mips::ArchMode::Mips64),
+        // ppc 只有一种"32 位"和一种"64 位"模式；Thumb 这类跨架构模式对 ppc
+        // 没有意义，落下去就是"用错模式解"——所以不兜底，让它变成 Unsupported。
+        (Arch::PowerPc, Mode::M32) => CsTarget::Ppc(capstone::arch::ppc::ArchMode::Mode32),
+        (Arch::PowerPc64, Mode::M64) => CsTarget::Ppc(capstone::arch::ppc::ArchMode::Mode64),
         _ => return None,
     })
+}
+
+/// 本项目的端序 → capstone 的端序。
+///
+/// 这个转换必须存在，而不是在 `build_engine` 里两处各写一次 `match`：
+/// 后者正是"哪个架构要显式传端序"这件事散落的地方。端序知识属于 arch 层
+/// （见 `Arch::preferred_endian` 与 `scripts/check-arch-layering.ps1`）。
+const fn cs_endian(endian: crate::types::Endian) -> capstone::Endian {
+    match endian {
+        crate::types::Endian::Little => capstone::Endian::Little,
+        crate::types::Endian::Big => capstone::Endian::Big,
+    }
+}
+
+/// 该架构在 capstone 里的寄存器编号**上界（不含）**。
+///
+/// 数值来自 capstone 绑定的 `*_REG_ENDING` 哨兵常量（`capstone-sys` 的
+/// bindgen 输出，`pre_generated/capstone.rs`），不是本项目自己数出来的：
+/// 数少了会让后面的寄存器名静默解析失败，而那种失败**不报错**，
+/// 只表现为"参数推断没有结论"（ppc 上就踩过，见
+/// [`CapstoneDecoder::register_id`] 的说明）。
+///
+/// 未映射的架构返回 0 —— 扫描范围 `1..0` 是空区间，于是解析失败而不是猜。
+fn reg_id_limit(arch: Arch) -> u16 {
+    let limit: u32 = match arch {
+        Arch::X86 | Arch::X86_64 => capstone::arch::x86::X86Reg::X86_REG_ENDING,
+        Arch::Aarch64 => capstone::arch::arm64::Arm64Reg::ARM64_REG_ENDING,
+        Arch::Arm => capstone::arch::arm::ArmReg::ARM_REG_ENDING,
+        Arch::Riscv32 | Arch::Riscv64 => capstone::arch::riscv::RiscVReg::RISCV_REG_ENDING,
+        Arch::Mips | Arch::Mips64 => capstone::arch::mips::MipsReg::MIPS_REG_ENDING,
+        Arch::PowerPc | Arch::PowerPc64 => capstone::arch::ppc::PpcReg::PPC_REG_ENDING,
+        _ => 0,
+    };
+    u16::try_from(limit).unwrap_or(u16::MAX)
 }
 
 /// 构造一个 capstone 引擎。
@@ -114,13 +158,26 @@ fn cs_target_for(spec: ArchSpec) -> Option<CsTarget> {
 /// 每个架构走自己的 builder 链（capstone 的类型系统要求如此）。
 /// 共同点是都开 `detail(true)` —— 没有它就拿不到"读了哪些寄存器"
 /// "内存操作数是什么"，而这些正是结构化指令模型必须有的字段。
+///
+/// # 端序
+///
+/// capstone 的 builder 只给**同时支持两种端序**的架构提供 `.endian()` 方法
+/// （`third-party/capstone/src/arch/mod.rs` 的 `both_endian` 标志：arm /
+/// arm64 / mips / ppc / riscv 有，x86 没有 —— x86 的端序是固定的）。
+/// 所以这里**按架构把这个值传下去**，而不是永远吃 capstone 的默认小端。
+///
+/// 早先这里从不传端序：对小端架构没有区别，对 ppc 就是致命的 —— ppc 的
+/// 指令编码是大端，按小端解出来的不是"解不出来"，而是**另一条合法指令**，
+/// 属于最难发现的错误（输出看起来完全正常）。这也是 `Arch::preferred_endian`
+/// 对 ppc 返回大端的原因。
 fn build_engine(spec: ArchSpec) -> Result<Capstone, BackendError> {
-    use capstone::arch::{BuildsCapstone, BuildsCapstoneSyntax};
+    use capstone::arch::{BuildsCapstone, BuildsCapstoneEndian, BuildsCapstoneSyntax};
 
     let target = cs_target_for(spec).ok_or(BackendError::Unsupported {
         arch: spec.arch,
         mode: spec.mode,
     })?;
+    let endian = cs_endian(spec.endian);
 
     let result = match target {
         // x86 家族额外指定 Intel 语法：面向 Windows/x86 逆向的主流习惯，
@@ -137,11 +194,33 @@ fn build_engine(spec: ArchSpec) -> Result<Capstone, BackendError> {
         CsTarget::Arm64 => Capstone::new()
             .arm64()
             .mode(capstone::arch::arm64::ArchMode::Arm)
+            .endian(endian)
             .detail(true)
             .build(),
-        CsTarget::Arm(mode) => Capstone::new().arm().mode(mode).detail(true).build(),
-        CsTarget::Riscv(mode) => Capstone::new().riscv().mode(mode).detail(true).build(),
-        CsTarget::Mips(mode) => Capstone::new().mips().mode(mode).detail(true).build(),
+        CsTarget::Arm(mode) => Capstone::new()
+            .arm()
+            .mode(mode)
+            .endian(endian)
+            .detail(true)
+            .build(),
+        CsTarget::Riscv(mode) => Capstone::new()
+            .riscv()
+            .mode(mode)
+            .endian(endian)
+            .detail(true)
+            .build(),
+        CsTarget::Mips(mode) => Capstone::new()
+            .mips()
+            .mode(mode)
+            .endian(endian)
+            .detail(true)
+            .build(),
+        CsTarget::Ppc(mode) => Capstone::new()
+            .ppc()
+            .mode(mode)
+            .endian(endian)
+            .detail(true)
+            .build(),
     };
 
     result.map_err(|error| BackendError::Build {
@@ -197,11 +276,19 @@ engine_slot!(ENGINE_RISCV32);
 engine_slot!(ENGINE_RISCV64);
 engine_slot!(ENGINE_MIPS);
 engine_slot!(ENGINE_MIPS64);
+engine_slot!(ENGINE_PPC);
+engine_slot!(ENGINE_PPC64);
 
 /// 选定架构对应的线程局部槽位。
 ///
 /// 未知架构落到 x86_64 槽位只是为了避免 `Option`；真正的拒绝发生在
 /// [`build_engine`]，那里会返回 `Unsupported`。
+///
+/// 槽位按**架构**而不是按"架构 + 模式/端序"分：同一架构的不同模式共用
+/// 一个槽位，而槽位里缓存的是**第一次**构造的引擎（`ThreadEngines::with`
+/// 只在 `None` 时构造）。所以一个线程不可以交替用两个 spec 解码 ——
+/// 现状是安全的，因为 `CapstoneDecoder` 的 `spec` 在构造时就固定了，
+/// 而槽位只被该解码器按自己的 spec 填充。
 fn slot_for(arch: Arch) -> &'static std::thread::LocalKey<RefCell<Option<Capstone>>> {
     match arch {
         Arch::X86 => &ENGINE_X86,
@@ -211,6 +298,11 @@ fn slot_for(arch: Arch) -> &'static std::thread::LocalKey<RefCell<Option<Capston
         Arch::Riscv64 => &ENGINE_RISCV64,
         Arch::Mips => &ENGINE_MIPS,
         Arch::Mips64 => &ENGINE_MIPS64,
+        // ppc 与 ppc64 各占一个槽位：两者的 capstone 引擎是**不同的后台**
+        // （32/64 位寄存器与指令表），共用一个槽位会让先构造的那个把
+        // 另一个解错。
+        Arch::PowerPc => &ENGINE_PPC,
+        Arch::PowerPc64 => &ENGINE_PPC64,
         // X86_64 与未知架构共用槽位；未知架构会在构建时被拒绝
         _ => &ENGINE_X86_64,
     }
@@ -272,27 +364,28 @@ impl CapstoneDecoder {
     ///
     /// 一次调用是 O(寄存器数)；参数推断按函数做，但每个架构的 ABI 表
     /// 很小（几个到十几个名字），且调用方会在分析开始时解析一次。
+    ///
+    /// # 编号是**稀疏**的（ppc 上踩到）
+    ///
+    /// 早先这里的循环把"第一个查不到名字的编号"当成表尾直接返回 `None`。
+    /// 这对 x86/arm/arm64/mips/riscv 是成立的（它们的编号确实从 1 连续），
+    /// 但 capstone 的 ppc 寄存器表有**空洞**：编号 1、4、7、11、53、119
+    /// 是空的（实测，见 `ppc_register_ids_are_sparse`）。于是 ppc 上
+    /// 第 1 个编号就返回 `None`，**所有** ppc 寄存器名都解析不出来 ——
+    /// 后果是 ppc 的参数标注静默失效（ABI 表在、名字查不到 → 空结论）。
+    ///
+    /// 现在改成扫到该架构的**真实上界**（capstone 绑定的 `*_REG_ENDING`）
+    /// 而不是撞到第一个空洞就收工：上界是精确值，不是猜的魔法数字。
     #[must_use]
     pub fn register_id(spec: ArchSpec, name: &str) -> Option<RegId> {
         let decoder = CapstoneDecoder::new(spec).ok()?;
+        let limit = reg_id_limit(spec.arch);
         decoder.with_engine(|cs| {
-            // capstone 的寄存器编号不保证连续，按下标逐个问名字，
-            // 直到越界返回 None。
-            let mut index = 1u16;
-            loop {
-                let reg = capstone::RegId(index);
-                match cs.reg_name(reg) {
-                    Some(found) => {
-                        if found.eq_ignore_ascii_case(name) {
-                            return Some(RegId(index));
-                        }
-                        index = index.saturating_add(1);
-                    }
-                    // 编号超出该架构的寄存器表：到头了。
-                    // 这里**不是**"出错"，只是枚举结束。
-                    None => return None,
-                }
-            }
+            // 扫到上界为止，**不**在第一个空洞处收工（见上面的说明）。
+            (1..limit).find_map(|index| {
+                let found = cs.reg_name(capstone::RegId(index))?;
+                found.eq_ignore_ascii_case(name).then_some(RegId(index))
+            })
         })
     }
 
@@ -440,6 +533,29 @@ fn convert(
     // 只取一次，避免两处各判一遍不一致。
     let mnemonic_str = insn.mnemonic().unwrap_or("");
 
+    // ppc 的**返回/间接调用**只能靠助记符补：capstone 的 ppc 后端不产出
+    // `CS_GRP_RET`（`grep -r CS_GRP_RET arch/PowerPC/` 在 capstone 的 C 源码里
+    // 是空的），`blr` / `bctrl` / `bctr` 一律只带 `CS_GRP_JUMP`。照组的结论：
+    // `blr`（返回）会被当成"条件分支"多出一个顺序后继，`bctrl`（间接调用）
+    // 会被当成跳转而丢掉调用关系 —— ppc 的 CFG 与调用图会整体错。
+    //
+    // 这是本文件里**唯一**按助记符改流程的地方，理由是后端缺组信息（有
+    // 上面那条 grep 证据），而不是"懒得查组"。其余架构仍然只认组。
+    if matches!(arch, Arch::PowerPc | Arch::PowerPc64) {
+        match mnemonic_str {
+            "blr" => {
+                is_ret = true;
+                is_jump = false;
+            }
+            // `bctrl` = 经 CTR 的调用（`bctrl` 会写 LR），所以是 Call 而不是 Jump。
+            "bctrl" => {
+                is_call = true;
+                is_jump = false;
+            }
+            _ => {}
+        }
+    }
+
     // MRS/MSR 的**系统寄存器编码**与 IC/DC/AT/TLBI 的**子操作**共用 capstone
     // 的 `ARM64_OP_SYS` 一个字段（C 端一物两用：`printMRSSystemRegister` 与
     // `printMSRSystemRegister` 都往上写原始编码，见 third-party/capstone/PATCH.md）。
@@ -468,6 +584,9 @@ fn convert(
             }
             ArchOperand::ArmOperand(op) => {
                 convert_arm_operand(&op, is_jump || is_call, &mut operands, &mut target);
+            }
+            ArchOperand::PpcOperand(op) => {
+                convert_ppc_operand(&op, is_jump || is_call, &mut operands, &mut target);
             }
             // 其余架构（RISC-V / MIPS）在 M2 先不提取操作数细节：
             // 宁可少给字段，也不要给错的字段。流程语义仍然是对的。
@@ -590,6 +709,74 @@ fn opt_reg(reg: capstone::RegId) -> Option<RegId> {
 /// 单独起个名字是为了让引用点能说清"这个 41 是什么"，否则读代码的人
 /// 只会看到一个魔法数字。
 const RIP_REG_ID: u16 = 41;
+
+/// ppc 操作数。
+///
+/// # 这个 `match` 是**穷尽**的（没有 `_` 兜底）
+///
+/// 与 arm64 的理由相同：`_ => {}` 会让"capstone 新增了操作数类型"变成
+/// 静默丢字段，而丢字段的反汇编**看起来是一条完整的指令**（CLAUDE.md §7）。
+///
+/// # ppc 的 detail 只给三种类型
+///
+/// `third-party/capstone` 的 C 端（`capstone/arch/PowerPC/PPCInstPrinter.c`）
+/// 只写 `PPC_OP_REG` / `PPC_OP_IMM` / `PPC_OP_MEM`，`PPC_OP_CRX` 一次都没有
+/// （`PPC_OP_CRX` 只出现在 `ppc.h` 的枚举与 `cstool` 里）。所以 `Crx`
+/// 这条分支现实中走不到 —— 但它仍然显式写出来而不是靠 `_` 兜住，理由见上。
+///
+/// # 为什么 `MemRef::size` 恒为 0
+///
+/// capstone 的 ppc 内存操作数（`ppc_op_mem`）只有 `base` 与 `disp` 两个字段，
+/// **没有**宽度信息（x86 的 `X86Operand` 有 `size`）。宽度要靠助记符
+/// （`lwz` = 4 字节、`ld` = 8 字节）推断，而"按助记符前缀猜宽度"是那种
+/// 猜错了也不报错的推断。所以这里如实给 0（未知），由渲染层与消费方
+/// 自己判断要不要用它。
+fn convert_ppc_operand(
+    op: &capstone::arch::ppc::PpcOperand,
+    is_control_flow: bool,
+    operands: &mut Vec<crate::insn::Operand>,
+    target: &mut Option<u64>,
+) {
+    use capstone::arch::ppc::PpcOperand;
+
+    match op {
+        PpcOperand::Reg(reg) => {
+            if let Some(reg) = opt_reg(*reg) {
+                operands.push(crate::insn::Operand::Reg(reg));
+            }
+        }
+        PpcOperand::Imm(value) => {
+            operands.push(crate::insn::Operand::Imm(*value));
+            // 直接分支/调用的目标就在立即数里（capstone 已经算成**绝对地址**，
+            // 与 arm64 的 `bl #0x…` 一致；不是相对位移，所以不做换算）。
+            if is_control_flow {
+                *target = Some(*value as u64);
+            }
+        }
+        PpcOperand::Mem(mem) => {
+            // ppc 的内存操作数没有 index/scale（`lwzx r3, r4, r5` 的索引寄存器
+            // 是**独立的通用寄存器操作数**，不是一个带 scale 的寻址模式），
+            // 所以这里给 `index: None` 是事实，不是漏了。
+            operands.push(crate::insn::Operand::Mem(crate::insn::MemRef {
+                base: opt_reg(mem.base()),
+                index: None,
+                scale: 0,
+                disp: i64::from(mem.disp()),
+                size: 0,
+                write: false,
+                index_extend: None,
+            }));
+        }
+        // 见函数文档：本版本 capstone 的 ppc 打印器从不产出 `CRX`。
+        // 真出现时**不猜**：`4*cr0+eq` 这种条件寄存器字段没有对应的
+        // `Operand` 变体，塞成寄存器会显示成 `bt cr0` —— 语法正确、语义
+        // 不同的另一种指令。留下一条告警让它可被发现，而不是静默丢。
+        PpcOperand::Crx(_) => {
+            tracing::warn!("capstone 产出了 PPC_OP_CRX 操作数，本版本没有建模，该操作数未显示");
+        }
+        PpcOperand::Invalid => {}
+    }
+}
 
 /// x86 操作数。
 fn convert_x86_operand(
@@ -995,8 +1182,15 @@ fn convert_arm_operand(
 /// 助记符前缀）替代。这里保守地倾向于"有条件"，因为**多给一个后继**比
 /// **漏掉一个后继**安全得多 —— 后者会让 CFG 丢块。
 fn is_conditional_jump(mnemonic: &str) -> bool {
-    // 无条件跳转的助记符（x86: jmp；ARM64: b；ARM: b）
-    !matches!(mnemonic, "jmp" | "b" | "b.w" | "j" | "br" | "bx")
+    // 无条件跳转的助记符（x86: jmp；ARM64: b；ARM: b；ppc: b / ba / bctr）
+    //
+    // ppc 的两条要单独列：`ba` 是"绝对地址的无条件分支"，`bctr` 是
+    // "跳到 CTR 里那个地址"，两者都**没有**顺序后继。漏掉它们会让 CFG 多出
+    // 一条不存在的边（`conditional: true` 的语义就是"有两个后继"）。
+    !matches!(
+        mnemonic,
+        "jmp" | "b" | "b.w" | "j" | "br" | "bx" | "ba" | "bctr"
+    )
 }
 
 #[cfg(test)]
@@ -1434,5 +1628,211 @@ mod tests {
         assert!(is_conditional_jump("je"));
         assert!(is_conditional_jump("jne"));
         assert!(is_conditional_jump("jl"));
+        // ppc 的无条件分支：`ba`（绝对地址）与 `bctr`（跳 CTR）都没有顺序后继
+        assert!(!is_conditional_jump("ba"));
+        assert!(!is_conditional_jump("bctr"));
+        assert!(is_conditional_jump("bne"));
+        assert!(is_conditional_jump("bdnz"));
+    }
+
+    // ── PowerPC（M12 第二片） ────────────────────────────────────────────
+
+    /// ppc 的**大端**解码：`addc r2, r3, r4`。
+    ///
+    /// # 这条黄金值是从编码推出来的，不是抄反汇编输出
+    ///
+    /// PowerPC 的整数指令都是 4 字节、**大端**存放。`addc` 在 PowerPC ISA
+    /// （Book I，"Integer Arithmetic Instructions"）里的编码是：
+    ///
+    /// ```text
+    /// 31 | rD | rA | rB | OE(1) | XO(9) | Rc(1)
+    ///  0..5  6..10 11..15 16..20  21  22..30  31
+    /// ```
+    /// 其中 `XO = 10`（`addc` 的扩展操作码）、`OE = 0`（不更新 OV）。
+    ///
+    /// 取 `rD = 2, rA = 3, rB = 4`：
+    ///
+    /// ```text
+    /// 011111 00010 00011 00100 0 000001010 0 = 0x7C432014
+    /// ```
+    ///
+    /// 所以文件里的字节是 `7C 43 20 14`。capstone 自己的 ppc 用例
+    /// （`third-party/capstone/src/test.rs::test_arch_ppc`）里也有一条
+    /// `("addc", b"\x7c\x43\x20\x14")` —— 助记符对得上，操作数是按上面的
+    /// 字段切分独立推出来的（两处一致才敢当黄金值）。
+    #[test]
+    fn ppc32_big_endian_addc_decodes_registers_and_operands() {
+        let spec = ArchSpec::from_arch(Arch::PowerPc, Mode::M32, Endian::Big);
+        let dec = CapstoneDecoder::new(spec).expect("ppc 解码器必须能构造");
+        let insn = dec
+            .decode_one(&[0x7c, 0x43, 0x20, 0x14], 0x1000)
+            .expect("addc 应当能解");
+
+        assert_eq!(insn.len, 4, "ppc 指令恒为 4 字节");
+        assert_eq!(dec.mnemonic_name(&insn).as_deref(), Some("addc"));
+        assert_eq!(insn.flow, Flow::Fallthrough);
+        assert_eq!(insn.operands.len(), 3, "rD / rA / rB 三个操作数");
+
+        let names: Vec<Option<String>> = insn
+            .operands
+            .iter()
+            .map(|op| match op {
+                Operand::Reg(reg) => dec.register_name(*reg),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("r2".to_string()),
+                Some("r3".to_string()),
+                Some("r4".to_string())
+            ],
+            "rD=2 / rA=3 / rB=4（编码里三段各 5 位）"
+        );
+    }
+
+    /// 端序**必须**传到 capstone：同样的字节按小端解，得到的是另一条指令。
+    ///
+    /// 这条是"为什么 `build_engine` 要显式传端序"的证据。不传端序时 capstone
+    /// 一律按小端解 ppc —— 而 ppc 的编码是大端，于是每条指令都解成**另一条
+    /// 合法指令**（或者干脆解不出来）：不报错、看起来正常，只是全错。
+    ///
+    /// # 为什么小端那一半必须换线程
+    ///
+    /// 解码器的 capstone 句柄是**线程局部**的，槽位按架构分（见 `slot_for`）。
+    /// 同一个线程里先后建两个 ppc 解码器（一个大端、一个小端），第二个会
+    /// 复用第一个构造的引擎 —— 于是这条测试会"证明"端序没传下去，其实是
+    /// 测法错了。换线程就让槽位是空的，按自己的 spec 真构造一次。
+    #[test]
+    fn ppc_decoding_depends_on_the_requested_endianness() {
+        let bytes = [0x7c, 0x43, 0x20, 0x14];
+        let big = CapstoneDecoder::new(ArchSpec::from_arch(Arch::PowerPc, Mode::M32, Endian::Big))
+            .expect("ppc 大端解码器");
+        let big_insn = big.decode_one(&bytes, 0).expect("大端解 addc");
+        assert_eq!(big.mnemonic_name(&big_insn).as_deref(), Some("addc"));
+
+        let wrong = std::thread::spawn(move || {
+            let little = CapstoneDecoder::new(ArchSpec::from_arch(
+                Arch::PowerPc,
+                Mode::M32,
+                Endian::Little,
+            ))
+            .expect("ppc 小端解码器");
+            let decoded = little.decode_one(&bytes, 0);
+            decoded
+                .as_ref()
+                .ok()
+                .and_then(|insn| little.mnemonic_name(insn))
+        })
+        .join()
+        .expect("线程应正常结束");
+
+        // 实测（本机 capstone 0.14 + arch_powerpc）：小端模式下这四个字节
+        // **一条指令都解不出来**（`decode_one` 报 Truncated），所以这里的
+        // 结果是 `None`。断言只要求"不是同一条指令" —— 将来 capstone 改了
+        // 小端的行为（解成另一条合法指令）时，这条测试仍然是对的。
+        assert_ne!(
+            wrong.as_deref(),
+            Some("addc"),
+            "小端下绝不该解出同一条指令 —— 解出了说明端序根本没传下去"
+        );
+    }
+
+    /// ppc64 的 `blr`（`0x4E800020`）：函数返回。
+    ///
+    /// `blr` = "branch to link register"。编码 `0x4E800020` 是 PowerPC 里
+    /// 最广为人知的常量之一（每个 ppc 函数都以它结尾），primary opcode 19
+    /// （XL 型）、`XO = 16`。
+    ///
+    /// # 这条流程不是从 capstone 的 group 来的
+    ///
+    /// capstone 的 ppc 后端**不产出 `CS_GRP_RET`**（`grep -r CS_GRP_RET`
+    /// 在 `arch/PowerPC/` 下为空），`blr` 只带 `CS_GRP_JUMP`。所以 `convert`
+    /// 里对 ppc 的 `blr` / `bctrl` 做了一次按助记符的修正（那里写了完整理由）。
+    /// 若哪天 capstone 补上组信息，这条仍然是 Return —— 结论不变。
+    #[test]
+    fn ppc64_big_endian_blr_is_a_return() {
+        let spec = ArchSpec::from_arch(Arch::PowerPc64, Mode::M64, Endian::Big);
+        let dec = CapstoneDecoder::new(spec).expect("ppc64 解码器必须能构造");
+        let insn = dec
+            .decode_one(&[0x4e, 0x80, 0x00, 0x20], 0x1000)
+            .expect("blr 应当能解");
+        assert_eq!(dec.mnemonic_name(&insn).as_deref(), Some("blr"));
+        assert_eq!(insn.flow, Flow::Return, "blr 是返回，不是普通分支");
+    }
+
+    /// ppc 的条件分支：目标地址从立即数来，且必须标成"有两个后继"。
+    ///
+    /// 字节 `40 82 00 14` 在 capstone 的 ppc 用例里是 `bne`；位移字段
+    /// `0x0014` 是 16 位有符号数，从地址 0 起算就是 `0x14`。
+    #[test]
+    fn ppc_conditional_branch_targets_an_absolute_address() {
+        let spec = ArchSpec::from_arch(Arch::PowerPc, Mode::M32, Endian::Big);
+        let dec = CapstoneDecoder::new(spec).expect("ppc 解码器");
+        let insn = dec
+            .decode_one(&[0x40, 0x82, 0x00, 0x14], 0)
+            .expect("bne 应当能解");
+        assert_eq!(dec.mnemonic_name(&insn).as_deref(), Some("bne"));
+        assert_eq!(
+            insn.flow,
+            Flow::Branch { conditional: true },
+            "bne 有顺序后继：{:?}",
+            insn.flow
+        );
+        assert_eq!(insn.target, Some(0x14), "分支目标应当已解析成绝对地址");
+    }
+
+    /// ppc 的寄存器编号是**稀疏**的：不能拿"第一个空洞"当表尾。
+    ///
+    /// 实测（本机 capstone 0.14 + `arch_powerpc`）：编号 1、4、7、11、53、119
+    /// 返回 `None`，而 `r3` 在 90、`r31` 在 118、`PPC_REG_ENDING = 344`。
+    /// 早先的 `register_id` 在第 1 个 `None` 处就放弃了，于是**所有** ppc
+    /// 寄存器名都解析不出来 —— 参数标注会静默变成空结论（不报错）。
+    #[test]
+    fn ppc_register_ids_are_sparse() {
+        let spec = ArchSpec::from_arch(Arch::PowerPc, Mode::M32, Endian::Big);
+        let dec = CapstoneDecoder::new(spec).expect("ppc 解码器");
+
+        // 编号 1 是空洞：这正是旧实现踩的那一处。
+        assert_eq!(dec.register_name(RegId(1)), None, "编号 1 是空洞");
+        assert_eq!(
+            dec.register_name(RegId(90)).as_deref(),
+            Some("r3"),
+            "r3 的编号是 90（实测）"
+        );
+        assert_eq!(
+            CapstoneDecoder::register_id(spec, "r3"),
+            Some(RegId(90)),
+            "名字解析不能因为第一个空洞就放弃"
+        );
+        assert_eq!(CapstoneDecoder::register_id(spec, "r31"), Some(RegId(118)));
+        // 上界来自 capstone 的 PPC_REG_ENDING，不是猜的
+        assert_eq!(reg_id_limit(Arch::PowerPc), 344);
+        assert_eq!(reg_id_limit(Arch::PowerPc64), 344);
+    }
+
+    /// ppc 的 `lwz`（内存操作数）：`lwz r1, 0(0)`。
+    ///
+    /// 编码 `0x80200000`：primary opcode 32（`lwz`）、`rD = 1`、`rA = 0`、
+    /// `d = 0`。`rA = 0` 在 ppc 里表示"基址寄存器是 0"，capstone 把它报成
+    /// 无效寄存器（编号 0），因此这里 `base` 必须是 `None` —— 不是"基址是 r0"。
+    ///
+    /// `size` 恒为 0：capstone 的 ppc 内存操作数不带宽度（见
+    /// `convert_ppc_operand` 的说明），所以这里断言的是"如实未知"。
+    #[test]
+    fn ppc_memory_operand_keeps_displacement_and_reports_unknown_width() {
+        let spec = ArchSpec::from_arch(Arch::PowerPc, Mode::M32, Endian::Big);
+        let dec = CapstoneDecoder::new(spec).expect("ppc 解码器");
+        let insn = dec
+            .decode_one(&[0x80, 0x20, 0x00, 0x00], 0)
+            .expect("lwz 应当能解");
+        assert_eq!(dec.mnemonic_name(&insn).as_deref(), Some("lwz"));
+        let Some(Operand::Mem(mem)) = insn.operands.last() else {
+            panic!("lwz 的第二个操作数应当是内存引用：{:?}", insn.operands);
+        };
+        assert_eq!(mem.disp, 0, "位移字段 d = 0");
+        assert_eq!(mem.base, None, "rA = 0 表示没有基址寄存器，不是 r0");
+        assert_eq!(mem.size, 0, "ppc detail 不给宽度：如实记 0（未知）");
     }
 }

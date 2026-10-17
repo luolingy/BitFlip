@@ -167,7 +167,7 @@ impl RawOverrideArgs {
             let arch = parse_arch(text).ok_or_else(|| {
                 anyhow::anyhow!(
                     "架构无法识别：{text:?}。可用值：x86、x86_64、aarch64、arm、riscv32、\
-                     riscv64、mips、mips64、wasm32"
+                     riscv64、mips、mips64、ppc、ppc64、wasm32"
                 )
             })?;
             opts.arch = Some(arch);
@@ -218,6 +218,8 @@ fn parse_arch(text: &str) -> Option<bitflip_core::Arch> {
         "riscv64" | "rv64" => Arch::Riscv64,
         "mips" | "mips32" => Arch::Mips,
         "mips64" => Arch::Mips64,
+        "ppc" | "ppc32" | "powerpc" => Arch::PowerPc,
+        "ppc64" | "powerpc64" => Arch::PowerPc64,
         "wasm32" | "wasm" => Arch::Wasm32,
         _ => return None,
     })
@@ -582,6 +584,37 @@ mod tests {
     fn cli_definitions_are_valid() {
         OpenCli::command().debug_assert();
         Cli::command().debug_assert();
+    }
+
+    /// `--arch` 的短名表必须与 `Arch::as_str` **一一对应**。
+    ///
+    /// 这条是回归测试：M12 第二片给 `Arch` 加了 `ppc` / `ppc64`，但
+    /// `parse_arch` 当时没跟上 —— 于是 `--arch ppc` 报"架构无法识别"，
+    /// 而文件里明明能解析出 ppc。两个表各写一份就会这样，所以让测试
+    /// 遍历**全部**架构变体逐个对一遍，新加变体时漏了就红。
+    #[test]
+    fn every_arch_name_parses_back_to_itself() {
+        use bitflip_core::Arch;
+        for arch in [
+            Arch::X86,
+            Arch::X86_64,
+            Arch::Aarch64,
+            Arch::Arm,
+            Arch::Riscv32,
+            Arch::Riscv64,
+            Arch::Mips,
+            Arch::Mips64,
+            Arch::PowerPc,
+            Arch::PowerPc64,
+            Arch::Wasm32,
+        ] {
+            let name = arch.as_str();
+            assert_eq!(
+                parse_arch(name),
+                Some(arch),
+                "`--arch {name}` 解析不回来 —— 短名表与 Arch::as_str 不同步"
+            );
+        }
     }
 
     #[test]

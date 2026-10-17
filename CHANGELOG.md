@@ -11,6 +11,46 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — PowerPC 架构支持（M12 第二片）
+
+`bitflip_arch::Arch` 增加了 `PowerPc`（`"ppc"`，32 位）与 `PowerPc64`（`"ppc64"`）两个变体，
+并且**真的有解码后端**，不是只有名字：
+
+- **解码**：走 capstone 的 `arch_powerpc`（`Capstone::new().ppc()`，`Mode32` / `Mode64`），
+  端序按 `ArchSpec.endian` 传给 capstone。`ARCH_API_VERSION` 2 → 3。
+- **映射**：Mach-O `CPU_TYPE_POWERPC = 18` → `ppc/32/be`、`CPU_TYPE_POWERPC64 = 0x01000012`
+  → `ppc64/64/be`（`preferred_endian` 对 ppc 返回**大端**，这是本项目第一次对某些架构
+  不返回小端）；ELF 顺带补了 `EM_PPC = 20` / `EM_PPC64 = 21`。
+- **调用约定**：`abi_for_spec` 对 ppc 返回 `r3`–`r10` 传参、`r3` 返回、`r1` 栈指针、
+  返回地址在 LR、栈 16 字节对齐。帧指针给 `None`（ppc 的公开 ABI 不规定它，`r31` 只是
+  Darwin 惯例 —— 不把惯例写成规定）。
+- Mach-O 解析器**不再拒绝** ppc：`cputype = 18 / 0x01000012` 正常解析出架构。
+
+**修掉两个"静默错"的既有缺陷**（都是加 ppc 时暴露的）：
+
+- `CapstoneDecoder::build_engine` 从不把端序传给 capstone，一律按小端构造。对全是小端的
+  既有架构没有可见影响，但 ppc 的编码是大端 —— 不传就会把每条指令解成**另一条合法指令**。
+  现在 arm / arm64 / mips / riscv / ppc 都显式 `.endian(spec.endian)`。
+- `CapstoneDecoder::register_id` 把"第一个查不到名字的寄存器编号"当成表尾，而 capstone 的
+  ppc 寄存器编号是**稀疏**的（1 / 4 / 7 / 11 / 53 / 119 是空洞，`r3` 在 90）。于是 ppc 上
+  **所有**寄存器名都解析失败 → 参数标注静默变成空结论。改成扫到 capstone 绑定的
+  `*_REG_ENDING` 上界（`PPC_REG_ENDING = 344`）。
+- CLI 的 `--arch` 短名表补上 `ppc` / `ppc64`：此前 `--arch ppc` 报"架构无法识别"，
+  尽管文件里已经能解析出 ppc。新增一条遍历全部 `Arch` 变体的往返测试盯住这张表。
+
+**如实记录的边界**：`LC_UNIXTHREAD` 的 ppc 线程状态**没有解**（`ppc_thread_state(_64)` 的
+字段表本机没有权威来源可对照），所以 ppc 可执行文件的入口点只有 `LC_MAIN` 一条路，
+走 `LC_UNIXTHREAD` 的文件入口点记成未知并在 `notes` 里说明。capstone 的 ppc 后端不产出
+`CS_GRP_RET`，`blr` / `bctrl` 的流程语义由 `convert` 里一处**按助记符**的修正补上
+（全仓库唯一一处，grep 证据写在注释里）。QPX 模式、Altivec/VSX 语义、ppc 跳转表识别都没做。
+
+**本机没有真实 ppc 样本**：`temp/` 下四份 IPA 全是薄 arm64，没有任何 ppc 切片。所以 ppc 的成绩
+由两类证据支撑 —— 结构层的合成样本（`tests/common/macho_fixture.rs` 的 `demo_thin_ppc32` /
+`demo_thin_ppc64`，字段偏移照 `mach-o/loader.h`）与解码层的**真实编码黄金值**
+（`addc r2,r3,r4` = `7C 43 20 14`、`blr` = `4E 80 00 20`、`bne` = `40 82 00 14`、
+`lwz` = `80 20 00 00`，每条都在测试的文档注释里写了编码推导）。**没有**用真实 ppc 文件验证过，
+这一点不能被读成"验证过"。
+
 ### 新增 — Mach-O 结构层：头 / 段 / 节 / 入口点（M12 第一片）
 
 能解析 Mach-O（可执行文件、`.dylib`、`.o` 同一个头，差别在 `filetype`），拿到段、节与入口点：
@@ -35,6 +75,8 @@
 `.app` 目录与 IPA 的第二层没接进会话、fat 切片还没成员化（所以 fat 文件**仍然打不开**）。
 **ppc 识别但拒绝**：`bitflip_arch` 没有 PowerPC 变体也没有 ppc 解码后端，`cputype = 18 /
 0x01000012` 返回 `Unsupported` 并点名原因 —— 加一个没有解码器的架构变体会让分析层解出垃圾（§7）。
+（**已被上面那条 ppc 条目取代**：现在 ppc / ppc64 能解析也能解码。这一行保留是因为它记录了
+第一片当时的真实状态。）
 
 真实样本（`temp/` 下**四份** IPA 全试了，均薄 arm64、`aarch64/64/le`、
 `image_base = 0x100000000`）：`LiveContainer.ipa` 主二进制 151 648 字节（5 段 / 26 节，

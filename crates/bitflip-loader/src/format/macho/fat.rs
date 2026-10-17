@@ -22,10 +22,7 @@
 
 use bitflip_arch::{Arch, ArchSpec, Endian};
 
-use super::{
-    looks_like_fat, CPU_TYPE_POWERPC, CPU_TYPE_POWERPC64, MH_CIGAM, MH_CIGAM_64, MH_MAGIC,
-    MH_MAGIC_64,
-};
+use super::{looks_like_fat, MH_CIGAM, MH_CIGAM_64, MH_MAGIC, MH_MAGIC_64};
 use crate::object::{Object, ObjectId};
 use crate::reader::{Endianness, ParseError, Reader};
 
@@ -78,7 +75,7 @@ pub struct FatSlice {
     pub reserved: Option<u32>,
     /// 切片的架构（读切片自己的魔数与 `cputype` 得到）。
     ///
-    /// `None` = 切片开头不是 Mach-O 魔数，或 `cputype` 未映射（ppc 也在这里）——
+    /// `None` = 切片开头不是 Mach-O 魔数，或 `cputype` 未映射 ——
     /// 两种情况都**不猜**，原因在 [`FatFile::notes`] 里。
     pub arch: Option<ArchSpec>,
 }
@@ -165,13 +162,6 @@ pub fn read(bytes: &[u8]) -> Result<FatFile, ParseError> {
             )));
         }
 
-        if cputype == CPU_TYPE_POWERPC || cputype == CPU_TYPE_POWERPC64 {
-            notes.push(format!(
-                "切片 #{index} 是 PowerPC（cputype = {cputype:#x}）：能识别，但 bitflip_arch \
-                 没有 PowerPC 变体，这一片解析会明确报错（见 format::macho 的模块文档）"
-            ));
-        }
-
         if size == 0 {
             return Err(ParseError::Inconsistent(format!(
                 "切片 #{index}（cputype = {cputype:#x}）的 size 为 0"
@@ -221,11 +211,13 @@ pub fn read(bytes: &[u8]) -> Result<FatFile, ParseError> {
     })
 }
 
-/// 这个 `cputype` 是已知的 Mach-O CPU 吗（含"能识别但不能解析"的 ppc）。
+/// 这个 `cputype` 是已知的 Mach-O CPU 吗。
+///
+/// 判据就是 `bitflip_arch` 的映射表 —— 不在这里再列一遍 CPU 编号：
+/// 那份表在 ppc 之前是"能识别但拒绝解析"的，两处各写一份的话，
+/// 加 ppc 时就只有一份会跟上（这正是把判据收敛到 arch 层的理由）。
 fn is_known_macho_cpu(cputype: u32) -> bool {
     Arch::from_macho_cputype(cputype).is_some()
-        || cputype == CPU_TYPE_POWERPC
-        || cputype == CPU_TYPE_POWERPC64
 }
 
 /// 读切片自己的 Mach-O 魔数，得出端序与位宽，再映射架构。

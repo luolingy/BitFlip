@@ -85,6 +85,24 @@ fn a_fat_container_is_enumerated_and_each_slice_parses() {
 }
 
 #[test]
+fn powerpc_binaries_parse_through_the_public_entry() {
+    // ppc 曾经是"识别但拒绝"（arch 层没有变体、也没有解码后端）。
+    // 现在两条路都得通：结构层给架构，解码器给指令。
+    let thin32 = fixture::demo_thin_ppc32();
+    let object = parse_object(ObjectKind::MachO, &thin32, 0, ObjectId::Plain).expect("ppc 能解析");
+    assert_eq!(object.arch.to_string(), "ppc/32/be");
+    assert_eq!(object.arch.ptr_size, 4);
+    assert_eq!(object.entry, Some(0x1400));
+
+    let thin64 = fixture::demo_thin_ppc64();
+    let object =
+        parse_object(ObjectKind::MachO, &thin64, 0, ObjectId::Plain).expect("ppc64 能解析");
+    assert_eq!(object.arch.to_string(), "ppc64/64/be");
+    assert_eq!(object.arch.ptr_size, 8);
+    assert_eq!(object.entry, Some(0x1_0000_0500));
+}
+
+#[test]
 fn a_malformed_sizeofcmds_is_rejected_not_guessed() {
     let bytes = fixture::malformed_sizeofcmds_too_big();
     let error =

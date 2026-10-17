@@ -226,6 +226,18 @@ const RISCV_CALLEE_SAVED: &[&str] = &[
 const MIPS_ARGS: &[&str] = &["a0", "a1", "a2", "a3"];
 const MIPS_CALLEE_SAVED: &[&str] = &["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "fp"];
 
+/// PowerPC 的整数参数寄存器（`r3`–`r10`，最多 8 个）。
+///
+/// 出处：PowerPC 的 32/64 位公开调用约定（Darwin / AiX / SysV 三家在这
+/// 一点上一致）：`r3`–`r10` 传整型/指针参数，`r3` 兼作返回值，`r11`/`r12`
+/// 是易失的暂存寄存器（不用于传参），`r1` 是栈指针，`r14`–`r31` 由被调用者
+/// 保存。返回地址在 LR（链接寄存器）里，与 ARM/MIPS/RISC-V 同类。
+const PPC_ARGS: &[&str] = &["r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"];
+const PPC_CALLEE_SAVED: &[&str] = &[
+    "r14", "r15", "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23", "r24", "r25", "r26",
+    "r27", "r28", "r29", "r30", "r31",
+];
+
 /// 取某个架构规格下的调用约定。
 ///
 /// `windows` 用于区分 x86_64 的两套约定 —— 它们的前四个参数寄存器
@@ -324,6 +336,23 @@ pub fn abi_for_spec(spec: ArchSpec, windows: bool) -> Option<AbiSpec> {
             return_address: ReturnAddress::LinkRegister("ra"),
             stack_align: 8,
             name_zh: "MIPS o32",
+        },
+        Arch::PowerPc | Arch::PowerPc64 => AbiSpec {
+            spec,
+            arg_reg_names: PPC_ARGS,
+            ret_reg_name: reg!("r3"),
+            // ppc 的公开 ABI **不要求**帧指针：Darwin 上惯用 r31，SysV 上
+            // 完全看编译器，`-fomit-frame-pointer` 是常态。给不出"这个 ABI
+            // 规定的帧指针"就不点名（`None` 的语义正是"该 ABI 允许省略"），
+            // 而不是把惯例写成规定。
+            frame_pointer_name: None,
+            stack_pointer_name: "r1",
+            callee_saved_names: PPC_CALLEE_SAVED,
+            // `bl` 把返回地址写进 LR，`blr` 从 LR 跳回。
+            return_address: ReturnAddress::LinkRegister("lr"),
+            // PowerPC 的 32/64 位公开调用约定都要求栈指针 16 字节对齐。
+            stack_align: 16,
+            name_zh: "PowerPC ABI（寄存器传参）",
         },
         // WebAssembly 是栈式虚拟机，没有寄存器调用约定。
         // 返回 None 而不是硬套一套寄存器名。
@@ -483,10 +512,16 @@ mod tests {
             Arch::Riscv32,
             Arch::Mips,
             Arch::Mips64,
+            Arch::PowerPc,
+            Arch::PowerPc64,
         ] {
             for windows in [false, true] {
                 let mode = match arch {
-                    Arch::X86_64 | Arch::Aarch64 | Arch::Riscv64 | Arch::Mips64 => Mode::M64,
+                    Arch::X86_64
+                    | Arch::Aarch64
+                    | Arch::Riscv64
+                    | Arch::Mips64
+                    | Arch::PowerPc64 => Mode::M64,
                     _ => Mode::M32,
                 };
                 let Some(abi) = abi_for_spec(spec(arch, mode), windows) else {
@@ -573,6 +608,32 @@ mod tests {
         );
     }
 
+    /// ppc：`r3`–`r10` 传参、`r3` 返回值、`r1` 栈指针、返回地址在 LR。
+    ///
+    /// 这些是 PowerPC 公开调用约定里**三家（Darwin / AIX / SysV）一致**的部分。
+    /// 刻意**不**断言帧指针是 `r31`：那是 Darwin 的惯例而不是 ABI 规定，
+    /// 所以表里给的是 `None`（"该 ABI 允许省略"）。
+    #[test]
+    fn powerpc_passes_arguments_in_r3_to_r10() {
+        let abi32 = abi_for_spec(spec(Arch::PowerPc, Mode::M32), false).expect("ppc");
+        let abi64 = abi_for_spec(spec(Arch::PowerPc64, Mode::M64), false).expect("ppc64");
+
+        for abi in [&abi32, &abi64] {
+            assert_eq!(abi.arg_reg_name(0), Some("r3"));
+            assert_eq!(abi.arg_reg_name(7), Some("r10"));
+            // 第 9 个参数（下标 8）走栈，不能编一个寄存器出来
+            assert_eq!(abi.arg_reg_name(8), None);
+            assert!(abi.arg_is_on_stack(8));
+            assert_eq!(abi.register_arg_count(), 8);
+            assert_eq!(abi.stack_pointer_name, "r1");
+            assert_eq!(abi.ret_reg_name, "r3");
+            assert_eq!(abi.return_address, ReturnAddress::LinkRegister("lr"));
+            assert_eq!(abi.frame_pointer_name, None, "ppc 的 ABI 不规定帧指针");
+        }
+        assert_eq!(abi32.spec.mode, Mode::M32);
+        assert_eq!(abi64.spec.mode, Mode::M64);
+    }
+
     #[test]
     fn every_abi_has_a_stack_pointer_and_a_return_path() {
         for arch in [
@@ -584,6 +645,8 @@ mod tests {
             Arch::Riscv64,
             Arch::Mips,
             Arch::Mips64,
+            Arch::PowerPc,
+            Arch::PowerPc64,
         ] {
             let s = spec(arch, arch.default_mode());
             let abi = abi_for_spec(s, false).unwrap_or_else(|| panic!("{arch:?} 应当有调用约定"));

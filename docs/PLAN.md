@@ -1655,6 +1655,9 @@ IPA（ZIP 容器）  →  .app（目录容器）  →  Mach-O 可执行文件  �
    这一层抽象（`ContainerKind::Fat`）在 M0 就预留了，现在填实。
 2. **架构**：x86_64 已有；**ARM64 已有**（M5 为 ELF AArch64 做的）。所以 Mach-O
    的架构支持实际上不需要新的解码后端，只需要正确的 ABI/调用约定映射。
+   （2026-10-17 更正：这句话对 x86 / x86_64 / arm / arm64 成立，但**对 ppc 不成立** ——
+   第一片能"识别但拒绝"ppc 就是因为没有 ppc 解码后端。第二片补上了 capstone 的
+   `arch_powerpc` 后端，详见下面"进展 · 第二片"。）
 3. **`.app` bundle**：目录作为容器。**这是本项目第一次把"目录"当成可打开的目标**
    —— `LoaderError::IsDirectory` 目前是一句"排期在 M10"的拒绝。要改成"进入目录、
    枚举 `Contents/`、把 `Contents/MacOS/<name>`、`Frameworks/*.dylib`、
@@ -1745,6 +1748,52 @@ IPA（ZIP 容器）  →  .app（目录容器）  →  Mach-O 可执行文件  �
   第 **32** 个字，不是第 16 个。第一版单测按 16 写，红了 —— 正好说明这条测试在真验。
 * **下一片**：fat 切片成员化（`ContainerKind::Fat` → `ArchiveMember`）+ `.app` 目录容器
   + IPA 递归；符号表与 `LC_FUNCTION_STARTS` 是"函数边界"的前提，应排在接反汇编之前。
+
+**进展 · M12 · 第二片：PowerPC（2026-10-17，据实记录）**：
+
+* **做了什么**：`bitflip_arch::Arch` 加了 `PowerPc`（32 位）与 `PowerPc64` 两个变体，
+  解码走 **capstone 的 `arch_powerpc` 后端**（`Capstone::new().ppc()`，`Mode32`/`Mode64`），
+  端序按文件给（ppc Mach-O 一律大端）。`Arch::from_macho_cputype` 把
+  `CPU_TYPE_POWERPC = 18` → `ppc/32/be`、`CPU_TYPE_POWERPC64 = 0x01000012` → `ppc64/64/be`；
+  `Arch::from_elf_machine` 顺带补了 `EM_PPC = 20` / `EM_PPC64 = 21`（ELF 侧同样是"表里有
+  就能解"，但 ELF 的 ppc 样本本机没有，只有映射单测）。`abi_for_spec` 给了 ppc 的调用约定
+  （`r3`–`r10` 传参、`r3` 返回、`r1` 栈指针、返回地址在 LR、栈 16 字节对齐）。
+  `ARCH_API_VERSION` 2 → 3。
+* **ppc 的"支持"到底有多少是真的**：能解析（结构层）、能**解码**（capstone 后端，
+  有真实编码的黄金值单测）、能标注调用约定。**没有做**：`LC_UNIXTHREAD` 的 ppc 线程状态
+  （`ppc_thread_state(_64)` 的 `srr0` 是 PC，但它的 `count` 与字段表本机没有权威来源可对照，
+  所以 ppc 的入口点只有 `LC_MAIN` 那一条路，走 `LC_UNIXTHREAD` 的 ppc 可执行文件入口点
+  记成未知并在 `notes` 里说明）；ppc 的 Altivec/VSX 寄存器语义、QPX 模式（capstone 支持，
+  但没有 QPX 样本，不开）；ppc 的跳转表识别（`jumptable::preferred_width` 走兜底 U32）。
+* **本机没有真实 ppc 样本** —— 这句话必须写在这里，否则"支持 ppc"会被读成"验证过真实文件"。
+  `temp/` 下四份 IPA 全是薄 arm64，没有一个 ppc 切片；本机也没有 ppc 的 ELF/vmlinux。
+  所以 ppc 路径的证据只有两类：结构层的**合成样本**（`tests/common/macho_fixture.rs` 的
+  `demo_thin_ppc32` / `demo_thin_ppc64`，字段偏移照 `mach-o/loader.h`）与解码层的
+  **真实编码黄金值**（`addc r2,r3,r4` = `7C 43 20 14`、`blr` = `4E 80 00 20`、
+  `bne` = `40 82 00 14`、`lwz` = `80 20 00 00`，编码出处写在测试的文档注释里）。
+  `tests/fixtures` 里生成 ppc 样本的命令（clang 交叉编译）也没写 —— 本机 clang 的 ppc
+  后端能出 object，但没有链接器能出 Mach-O 可执行文件，硬凑一个会变成"合成样本冒充真实样本"。
+* **踩到的两个坑（都是"静默错"）**：
+  1. `CapstoneDecoder::register_id` 的循环把"第一个查不到名字的编号"当成表尾，而 capstone
+     的 ppc 寄存器编号是**稀疏**的（1、4、7、11、53、119 是空洞，`r3` 在 90）。于是 ppc 上
+     **所有**寄存器名都解析失败 —— 参数标注会静默变成空结论。改成扫到 capstone 绑定的
+     `*_REG_ENDING`（`PPC_REG_ENDING = 344`）上界，并加了一条把这些空洞钉住的单测。
+  2. capstone 的 ppc 后端**不产出 `CS_GRP_RET`**（`grep -r CS_GRP_RET arch/PowerPC/` 为空），
+     `blr` 只带 `CS_GRP_JUMP` —— 照组的结论，每个 ppc 函数的返回都会被当成"条件分支"多出
+     一个顺序后继，`bctrl`（间接调用）会被当成跳转。`convert` 里对 ppc 的 `blr` / `bctrl`
+     做了一次按助记符的修正，理由与 grep 证据写在代码注释里（这是全仓库唯一按助记符改流程
+     的地方）。
+* **顺带修掉的端序 bug**：`build_engine` 此前从不把 `spec.endian` 传给 capstone，
+  一律按小端构造。对 x86/arm64/arm/mips/riscv（全是小端）没有可见影响，但 ppc 是大端 ——
+  不传就会把每条指令解成另一条**合法**指令。现在 arm/arm64/mips/riscv/ppc 都显式
+  `.endian(spec.endian)`。单测用"同四个字节按小端解不出 `addc`"钉住（实测：小端模式下
+  capstone 一条指令都解不出来，报 Truncated）。
+* **测试**：`bitflip-arch` 库单测 81 → 87 条（新增 7 条与 ppc 相关：`addc` 的操作数、
+  端序敏感性、`blr` 是返回、`bne` 的绝对目标、`lwz` 的 `base = None` 与宽度未知、
+  寄存器编号稀疏、ppc 调用约定）；loader 侧 3 条（ppc32/ppc64 解析与架构映射、
+  小端 ppc 头照读但在 `notes` 里说明反常。**删掉**了"ppc 点名拒绝"那条），
+  集成 1 条（走 `parse_object`）；CLI 侧 1 条（`--arch` 短名表与 `Arch::as_str` 往返，
+  顺带发现 `--arch ppc` 此前根本没接上）。
 
 ---
 

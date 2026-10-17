@@ -176,8 +176,10 @@ pub const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 pub const CPU_TYPE_ARM: u32 = 12;
 /// `CPU_TYPE_ARM64`。
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
-/// `CPU_TYPE_POWERPC`。
+/// `CPU_TYPE_POWERPC`（`mach/machine.h`：18）。
 pub const CPU_TYPE_POWERPC: u32 = 18;
+/// `CPU_TYPE_POWERPC64`（`CPU_TYPE_POWERPC | CPU_ARCH_ABI64` = `0x01000012`）。
+pub const CPU_TYPE_POWERPC64: u32 = 0x0100_0012;
 /// `CPU_SUBTYPE_ARM64E`（与 `CPU_TYPE_ARM64` 共用 cputype）。
 pub const CPU_SUBTYPE_ARM64E: u32 = 2;
 
@@ -780,6 +782,64 @@ pub fn demo_thin32() -> Vec<u8> {
         )
         .command(lc_main(0x800, 0, true))
         .min_file_size(0x2000);
+    build(&spec)
+}
+
+/// 一个 **32 位大端 PowerPC** 的样本：1 个段 / 1 个节、带 `LC_MAIN`。
+///
+/// 为什么单独有一个 ppc 样本，而不是复用 `demo_thin32`：
+///
+/// * Mach-O 的 ppc 是**大端**（`MH_CIGAM`，文件里魔数字节是 `FE ED FA CE`），
+///   与 x86/arm 的小端样本走的不是同一条读字段的路径；
+/// * `cputype = 18` 直到 M12 第二片才被映射成架构（此前是"识别但拒绝"），
+///   这一份就是那条路径的回归样本。
+///
+/// 布局照 `mach-o/loader.h` 与真实 ppc 可执行文件的习惯：`__TEXT` 从
+/// `vmaddr = 0x1000` 起、`fileoff = 0`，`LC_MAIN.entryoff = 0x400` 落在
+/// `__TEXT` 的文件范围内，换算后的虚拟地址应当是 `0x1400`。
+///
+/// 注意 `__text` 的字节是**零填充**的（构造器不写机器码）：这份样本证明的是
+/// "结构层与架构映射对"，ppc 的**指令解码**由 `bitflip-arch` 的单测用真实
+/// 编码的黄金值钉住（`backend::tests` 里的 `addc` / `blr` / `bne`）。
+#[must_use]
+pub fn demo_thin_ppc32() -> Vec<u8> {
+    let spec = ThinSpec::new32(CPU_TYPE_POWERPC, 0)
+        .big_endian()
+        .segment(
+            SegmentSpec::new("__TEXT", 0x1000, 0x1000, 0, 0x1000)
+                .perms(RX, RX)
+                .section(
+                    SectionSpec::new("__text", "__TEXT", 0x1400, 0x40)
+                        .align(4)
+                        .flags(CODE_FLAGS),
+                ),
+        )
+        .command(lc_main(0x400, 0, false))
+        .min_file_size(0x1000);
+    build(&spec)
+}
+
+/// 一个 **64 位大端 PowerPC** 的样本：1 个段 / 1 个节、带 `LC_MAIN`。
+///
+/// `cputype = CPU_TYPE_POWERPC64`（`0x01000012`）、`mach_header_64`（32 字节头）。
+/// ppc64 的 Mach-O 同样是大端。`__TEXT` 在 `vmaddr = 0x1_0000_0000`、
+/// `fileoff = 0`，`LC_MAIN.entryoff = 0x500` → 入口 `0x1_0000_0500`。
+#[must_use]
+pub fn demo_thin_ppc64() -> Vec<u8> {
+    const TEXT_VMADDR: u64 = 0x1_0000_0000;
+    let spec = ThinSpec::new64(CPU_TYPE_POWERPC64, 0)
+        .big_endian()
+        .segment(
+            SegmentSpec::new("__TEXT", TEXT_VMADDR, 0x1000, 0, 0x1000)
+                .perms(RX, RX)
+                .section(
+                    SectionSpec::new("__text", "__TEXT", TEXT_VMADDR + 0x500, 0x40)
+                        .align(4)
+                        .flags(CODE_FLAGS),
+                ),
+        )
+        .command(lc_main(0x500, 0, false))
+        .min_file_size(0x1000);
     build(&spec)
 }
 

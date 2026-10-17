@@ -32,12 +32,17 @@
 //!    覆盖它的段，用该段的 `(fileoff, vmaddr)` 做线性平移 —— 通常就是 `__TEXT`。
 //!    换算式写进 `notes`（用户能核对）。**找不到覆盖它的段时入口点留 `None`**，不猜。
 //! 2. **大端 Mach-O。** 结构层按文件端序读（[`Reader`] 两种端序都支持），所以
-//!    `MH_CIGAM` / `MH_CIGAM_64` 不会被误读。但现实中大端 Mach-O 基本只有
-//!    ppc/armeb，而 ppc 没有映射（见下），所以大端路径目前只在单测里走到。
-//! 3. **ppc 明确拒绝。** `CPU_TYPE_POWERPC`（18）/ `ppc64`（`0x0100_0012`）能**识别**，
-//!    但 `bitflip_arch::Arch` 没有 PowerPC 变体、也没有 ppc 解码后端。加一个
-//!    **没有解码器**的架构变体会让分析层解出垃圾（CLAUDE.md §7），所以这里返回
-//!    [`ParseError::Unsupported`] 并点名原因，而不是挑一个近似架构。
+//!    `MH_CIGAM` / `MH_CIGAM_64` 不会被误读。现实里大端 Mach-O 基本只有
+//!    ppc/armeb —— ppc 现在有解码后端了（见下），所以这条路径**不再只是**单测里
+//!    走到：一个 `cputype = 18` 且文件头是 `MH_CIGAM` 的样本会被解析成
+//!    `ppc/32/be` 并交给 capstone 的 ppc 后端（有单测；本机没有真实 ppc 样本）。
+//! 3. **ppc / ppc64 是真支持。** `CPU_TYPE_POWERPC`（18）/ `ppc64`（`0x0100_0012`）
+//!    映射到 `bitflip_arch::Arch::PowerPc` / `PowerPc64`，解码走 capstone 的
+//!    `arch_powerpc` 后端（`Capstone::new().ppc()`），端序按文件给（ppc Mach-O
+//!    都是大端）。**仍然没做的**：`LC_UNIXTHREAD` 的 ppc 线程状态没有解 ——
+//!    `ppc_thread_state(_64)` 的 `srr0` 是 PC，但它的 `count` 与字段表本机
+//!    没有权威来源可对照，所以 ppc 的入口点只有 `LC_MAIN` 那条路；
+//!    走 `LC_UNIXTHREAD` 的 ppc 可执行文件入口点会记成未知并在 `notes` 里说明。
 //! 4. **arm64e** 的 `cputype` 与 arm64 相同（`0x0100_000c`），区别只在
 //!    `cpusubtype == 2`。架构按 AArch64 解码（指令层面这是对的），指针认证（PAC）
 //!    语义不还原 —— 记进 `notes`。
@@ -149,7 +154,7 @@ pub const CPU_TYPE_X86_64: u32 = 0x0100_0007;
 pub const CPU_TYPE_ARM: u32 = 12;
 /// `CPU_TYPE_ARM64`。
 pub const CPU_TYPE_ARM64: u32 = 0x0100_000c;
-/// `CPU_TYPE_POWERPC`。**能识别但拒绝解析**（见模块文档第 3 条）。
+/// `CPU_TYPE_POWERPC`：ppc 32 位（Mach-O 的 ppc 一律大端）。
 pub const CPU_TYPE_POWERPC: u32 = 18;
 /// `CPU_TYPE_POWERPC64`。
 pub const CPU_TYPE_POWERPC64: u32 = 0x0100_0012;
@@ -336,7 +341,7 @@ pub fn looks_like_fat(bytes: &[u8]) -> bool {
 ///
 /// # Errors
 ///
-/// 魔数不是 Mach-O；`cputype` 未映射（含 ppc，见模块文档）；命令区越界或
+/// 魔数不是 Mach-O；`cputype` 未映射；命令区越界或
 /// 自相矛盾；段/节的文件范围越界。这些都是"拒绝而不是误读"。
 pub fn read(bytes: &[u8]) -> Result<MachOFile, ParseError> {
     read_with(&Reader::new(bytes))
@@ -447,7 +452,9 @@ impl MachHeader {
 
 /// `cputype`（+ `cpusubtype`）→ [`ArchSpec`]。
 ///
-/// ppc 单独点名拒绝，理由见模块文档第 3 条。
+/// 架构表在 `bitflip_arch`（`Arch::from_macho_cputype`）—— 解析器**不**自己
+/// 维护一份 CPU 编号表，否则"哪几个 CPU 能解"会在两处各说一次，迟早分叉。
+/// 这里只做 Mach-O 特有的事：把文件端序拼进去、给 arm64e 与 ppc 记说明。
 fn resolve_arch(
     cputype: u32,
     cpusubtype: u32,
@@ -465,22 +472,25 @@ fn resolve_arch(
                         .to_string(),
                 );
             }
+            // Mach-O 的 ppc 事实上都是大端（`MH_CIGAM`）。小端文件配 ppc 的
+            // `cputype` 虽然能解，但那不是 Apple 工具链的产物；这是**事实说明**
+            // 而不是拒绝 —— 结构层按文件端序读，结论仍然自洽。
+            if (cputype == CPU_TYPE_POWERPC || cputype == CPU_TYPE_POWERPC64)
+                && endian == Endian::Little
+            {
+                notes.push(
+                    "cputype 是 PowerPC，但文件头是 MH_MAGIC（小端）：现实里 Mach-O 的 \
+                     ppc 切片一律是大端，这份文件不是 Apple 工具链的常规产物"
+                        .to_string(),
+                );
+            }
             Ok(spec)
-        }
-        None if cputype == CPU_TYPE_POWERPC || cputype == CPU_TYPE_POWERPC64 => {
-            Err(ParseError::Unsupported {
-                what: "cputype",
-                value: u64::from(cputype),
-                detail: "识别为 Mach-O 的 PowerPC（ppc / ppc64），但 bitflip_arch::Arch \
-                         没有 PowerPC 变体、也没有 ppc 解码后端。加一个**没有解码器**的\
-                         架构变体会让分析层解出垃圾，所以这里明确拒绝而不是猜一个近似架构\
-                         （CLAUDE.md §7）。要真支持 ppc，得先给 bitflip-arch 加后端",
-            })
         }
         None => Err(ParseError::Unsupported {
             what: "cputype",
             value: u64::from(cputype),
-            detail: "未知或尚未映射的 Mach-O CPU 类型（已映射：x86 / x86_64 / arm / arm64）",
+            detail: "未知或尚未映射的 Mach-O CPU 类型（已映射：x86 / x86_64 / arm / \
+                     arm64 / ppc / ppc64）",
         }),
     }
 }
@@ -572,8 +582,8 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
     let mut notes = Vec::new();
     if header.endian == Endian::Big {
         notes.push(
-            "大端 Mach-O：所有字段按大端解析。现实中大端 Mach-O 基本只有 ppc/armeb，\
-             而 ppc 没有映射（见 cputype 的拒绝说明）"
+            "大端 Mach-O：所有字段按大端解析。现实里大端 Mach-O 基本只有 ppc/armeb，\
+             而 ppc 的指令解码走 capstone 的 ppc 后端（端序同样按文件给）"
                 .to_string(),
         );
     }
