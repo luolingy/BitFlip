@@ -115,8 +115,11 @@ fn looks_like_macho(bytes: &[u8]) -> bool {
         )
 }
 
-/// 从可能为 fat 的字节里挑一层薄 Mach-O，返回（描述、对象）。
-fn parse_one_image(bytes: &[u8]) -> (String, bitflip_loader::object::Object) {
+/// 从可能为 fat 的字节里挑一层薄 Mach-O，返回（描述、结构层事实、对象）。
+///
+/// 事实与对象一起返回，是因为 `LC_UUID` 与 dylib 名只存在于 [`macho::MachOFile`]
+/// （对象模型没有对应字段）—— 这条测试要把它们打出来给人核对。
+fn parse_one_image(bytes: &[u8]) -> (String, macho::MachOFile, bitflip_loader::object::Object) {
     if macho::looks_like_fat(bytes) {
         let container = macho::fat::read(bytes).expect("fat 容器的架构表必须能读");
         eprintln!(
@@ -148,11 +151,18 @@ fn parse_one_image(bytes: &[u8]) -> (String, bitflip_loader::object::Object) {
             .unwrap_or(0);
         let object = macho::fat::parse_slice(bytes, chosen, ObjectId::Plain)
             .unwrap_or_else(|error| panic!("第 {chosen} 片解析失败：{}", error.summary_zh()));
-        (format!("fat 第 {chosen} 片"), object)
+        let raw = macho::fat::slice_bytes(bytes, &container.slices[chosen])
+            .expect("切片的字节范围在读容器时已经校验过");
+        let facts = macho::read(raw).unwrap_or_else(|error| {
+            panic!("第 {chosen} 片的结构层事实读不出来：{}", error.summary_zh())
+        });
+        (format!("fat 第 {chosen} 片"), facts, object)
     } else {
+        let facts = macho::read(bytes)
+            .unwrap_or_else(|error| panic!("薄 Mach-O 结构层读取失败：{}", error.summary_zh()));
         let object = macho::parse(bytes, 0, ObjectId::Plain)
             .unwrap_or_else(|error| panic!("薄 Mach-O 解析失败：{}", error.summary_zh()));
-        ("薄 Mach-O".to_string(), object)
+        ("薄 Mach-O".to_string(), facts, object)
     }
 }
 
@@ -186,7 +196,7 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
         "主二进制解压后是空的：ZIP 层或选成员出了问题"
     );
 
-    let (how, object) = parse_one_image(&binary);
+    let (how, facts, object) = parse_one_image(&binary);
     eprintln!("解析路径：{how}");
 
     let text = object
@@ -197,6 +207,24 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
 
     eprintln!("对象：kind = {:?}", object.kind);
     eprintln!("架构 = {} / 端序 = {:?}", object.arch, object.endian);
+    eprintln!(
+        "头字段：cputype = {:#010x} / cpusubtype = {:#x} / filetype = {} / ncmds = {} / \
+         sizeofcmds = {} / flags = {:#010x}",
+        facts.cputype, facts.cpusubtype, facts.filetype, facts.ncmds, facts.sizeofcmds, facts.flags
+    );
+    eprintln!(
+        "LC_UUID = {:?} / 依赖库 {} 个{}",
+        facts.uuid,
+        facts.dylibs.len(),
+        if facts.dylibs.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "（前 3 个：{:?}）",
+                facts.dylibs.iter().take(3).collect::<Vec<_>>()
+            )
+        }
+    );
     eprintln!(
         "format.type_name = {:?} / is_executable = {} / is_stripped = {}",
         object.format.type_name, object.format.is_executable, object.format.is_stripped
@@ -279,5 +307,24 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
             .any(|note| note.contains("LC_SYMTAB") || note.contains("符号表")),
         "必须说明符号表没有解析：{:?}",
         object.notes
+    );
+
+    // LC_UUID：dyld 用它标识镜像，Xcode 产出的可执行文件一定有；这里顺带验证
+    // "16 字节 → 32 个小写十六进制字符"的转换没把高位丢掉、没把大小写弄反。
+    let uuid = facts
+        .uuid
+        .as_deref()
+        .expect("真实 iOS 可执行文件一定有 LC_UUID");
+    assert_eq!(uuid.len(), 32, "LC_UUID 应当是 32 个字符，实际 {uuid:?}");
+    assert!(
+        uuid.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "LC_UUID 应当是小写十六进制：{uuid:?}"
+    );
+    assert!(
+        facts.ncmds > 0 && facts.sizeofcmds > 0,
+        "真实二进制不可能一条加载命令都没有（ncmds = {} / sizeofcmds = {}）",
+        facts.ncmds,
+        facts.sizeofcmds
     );
 }
