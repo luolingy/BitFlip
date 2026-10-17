@@ -32,6 +32,11 @@ thiserror = { workspace = true }
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = { workspace = true }
+# DEX 合成样本（`tests/common/dex_fixture.rs`，与 CLI / server 共用同一份）
+# 要按规范算 `header.signature`（SHA-1）。用 `sha1` 而不是自己写一份：
+# 它已经在传递依赖里，许可闸门早已覆盖。CLI 与 server 的 dev-dependencies
+# 里是同一条注释、同一个理由 —— 三个 crate 引的是**同一份样本**。
+sha1 = { workspace = true }
 
 [lints]
 workspace = true

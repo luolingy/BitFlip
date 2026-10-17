@@ -69,6 +69,12 @@ pub enum ExportFormat {
     /// 见 `docs/DECOMPILER-SCOPE.md`：这不是反编译器，条件跳转以 `goto` 出现，
     /// 不还原 if/while/for，不做类型推断。用户必须知道这一点才能正确理解输出。
     PseudoC,
+    /// DEX 结构快照（JSON）。见 `docs/APK-DEX-DESIGN.md` §M2c 与 ADR-0021。
+    DexJson,
+    /// DEX 的 smali 风格文本（**我们自己的渲染路径**，不是可回汇编的源文件）。
+    DexSmali,
+    /// DEX 一个方法的 CFG（Graphviz DOT），与 [`Self::DotCfg`] 同形。
+    DexDotCfg,
 }
 
 impl ExportFormat {
@@ -83,6 +89,9 @@ impl ExportFormat {
             Self::JsonXrefs => "json-xrefs",
             Self::DotCfg => "dot-cfg",
             Self::PseudoC => "pseudo-c",
+            Self::DexJson => "dex-json",
+            Self::DexSmali => "dex-smali",
+            Self::DexDotCfg => "dex-dot-cfg",
         }
     }
 
@@ -97,6 +106,9 @@ impl ExportFormat {
             Self::JsonXrefs,
             Self::DotCfg,
             Self::PseudoC,
+            Self::DexJson,
+            Self::DexSmali,
+            Self::DexDotCfg,
         ]
     }
 
@@ -115,8 +127,19 @@ impl ExportFormat {
     pub const fn is_text(self) -> bool {
         matches!(
             self,
-            Self::AsmIntel | Self::AsmAtt | Self::DotCfg | Self::PseudoC
+            Self::AsmIntel
+                | Self::AsmAtt
+                | Self::DotCfg
+                | Self::PseudoC
+                | Self::DexSmali
+                | Self::DexDotCfg
         )
+    }
+
+    /// 是不是 DEX 视图的格式（决定入口走哪条路、哪些选项有意义）。
+    #[must_use]
+    pub const fn is_dex(self) -> bool {
+        matches!(self, Self::DexJson | Self::DexSmali | Self::DexDotCfg)
     }
 }
 
@@ -147,6 +170,28 @@ pub struct ExportOptions {
     /// 恒为 `true` —— 保留半份仍然有用的数据比丢掉整份好，前提是
     /// 报告里写清楚了。这个字段存在只是为了让上面的取舍显式可见。
     pub keep_partial: bool,
+
+    /// 导出哪个 DEX 输入（成员名，或单文件目标的文件名）。见 ADR-0021。
+    ///
+    /// `None` 的挑选规则由 [`crate::dex::read_input`] 定义：只有一个 DEX 就用它，
+    /// 多于一个则**报错**并列出可选名字。
+    pub member: Option<String>,
+    /// 只导出这个类（smali 描述符，**精确**匹配）。
+    pub class: Option<String>,
+    /// 只导出描述符含该子串（大小写不敏感）的类。
+    pub search: Option<String>,
+    /// 只导出这个方法（smali 标识，**精确**匹配）。
+    pub method: Option<String>,
+    /// `dex-json` 里是否带指令数组（默认带）。
+    pub include_instructions: bool,
+    /// 是否带 CFG（`dex-json` 里是块 / 边计数，`dex-dot-cfg` 里是图）。
+    pub include_cfg: bool,
+    /// 指令文本**不解析符号**，输出原始池索引（`string@12` 这类）。
+    ///
+    /// 与 CLI 的 `--no-symbols` 同义。关掉时不会产出 `unsupported_operands` /
+    /// `unavailable_operands` 两个计数 —— **那两个数在关闭时没有意义**，
+    /// 交回 0 会被读成"解析过、全都没问题"（§7）。
+    pub no_symbols: bool,
 }
 
 impl Default for ExportOptions {
@@ -159,6 +204,13 @@ impl Default for ExportOptions {
             max_functions: 512,
             byte_limit: Some(DEFAULT_EXPORT_BYTE_LIMIT),
             keep_partial: true,
+            member: None,
+            class: None,
+            search: None,
+            method: None,
+            include_instructions: true,
+            include_cfg: true,
+            no_symbols: false,
         }
     }
 }
@@ -200,12 +252,24 @@ pub enum ExportError {
         /// 附加说明（中文），必须能显示给用户。
         notes: Vec<String>,
     },
+    /// 选项与所选格式不是一回事（给 DEX 格式传地址段、给机器码格式传 DEX 选择器）。
+    ///
+    /// 单独一个变体而不是 `InvalidInput`：两件事对用户要做的事不一样 ——
+    /// "参数写错了"是改参数，"选错了视图"是换 `--format`（ADR-0021）。
+    /// **不静默忽略**：忽略一个明确给出的选择器，等于把"我按你说的做了"变成假话。
+    MismatchedOptions {
+        /// 主消息。
+        message: String,
+        /// 附加说明（中文），例如"可用值：…"。
+        notes: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for ExportError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OverBudget { message, notes, .. } => {
+            Self::OverBudget { message, notes, .. }
+            | Self::MismatchedOptions { message, notes } => {
                 write!(formatter, "{message}")?;
                 for note in notes {
                     write!(formatter, "\n  · {note}")?;
@@ -280,11 +344,16 @@ pub struct ExportMeta {
     pub range_to: Option<String>,
     /// 只导出单个函数时的入口地址；未指定为 `null`。
     pub function: Option<String>,
+    /// 实际导出的 DEX 成员名；非 DEX 导出为 `null`（**不写空串**）。
+    pub member: Option<String>,
     /// 导出发生的时间（RFC 3339，UTC）。
     pub generated_at: String,
 }
 
 /// 各层 wire 版本集合。
+///
+/// 每个**用到的**视图各占一列；**没用到的**是 `None` 而不是 `0` —— `0` 会被
+/// 读成"这个文件是版本 0 的那个视图"，而事实是我们根本没碰它（§7）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FormatVersions {
     /// 本模块的导出格式版本。
@@ -295,6 +364,8 @@ pub struct FormatVersions {
     pub disasm: u32,
     /// 分析结论版本。
     pub analysis: u32,
+    /// DEX 视图版本（[`crate::dex::DEX_FORMAT_VERSION`]）；非 DEX 导出为 `null`。
+    pub dex: Option<u32>,
 }
 
 /// 执行一次导出，返回文本。
@@ -313,6 +384,10 @@ pub fn export(
     format: ExportFormat,
     options: &ExportOptions,
 ) -> Result<(String, ExportReport), BitflipError> {
+    // **先**查选项与视图是否匹配，再建反汇编：反过来的话，给一个 DEX 目标传
+    // `--member` 会先撞上"这个目标不能反汇编"，把"选择器给错了"这条真正
+    // 有用的信息盖掉。`export_with_disasm_prebuilt` 里还会再查一次（纯函数，无害）。
+    check_options(format, options)?;
     match format {
         ExportFormat::AsmIntel | ExportFormat::AsmAtt => {
             let disasm = session.disassemble(crate::DisasmScanOptions::default())?;
@@ -347,18 +422,32 @@ fn export_with_disasm_prebuilt(
     format: ExportFormat,
     options: &ExportOptions,
 ) -> Result<(String, ExportReport), BitflipError> {
+    // 先查选项与视图是否匹配：不匹配时**一个字节都不该写出**（ADR-0021）。
+    // 放在最前面还有个实际好处：`--function` 打错时不必先跑一遍分析。
+    check_options(format, options)?;
+
     let job = session.detached_job();
-    let meta = build_meta(session, format, options);
+    let mut meta = build_meta(session, format, options);
 
     // 截断账目里"少的是什么"随格式而定：反汇编是"指令"，DOT 是"基本块"。
     let item_kind: &'static str = match format {
-        ExportFormat::DotCfg => "基本块",
+        ExportFormat::DotCfg | ExportFormat::DexDotCfg => "基本块",
         _ => "指令",
+    };
+    // 截断的"下一步怎么办"也必须随视图而定：给 DEX 的用户推荐 `--from/--to`
+    // 是在推荐一个我们自己会**报错**的选项（DEX 没有线性地址空间）。
+    let truncation_hint: &'static str = if format.is_dex() {
+        "用 --class / --search 缩小范围，或调大 --limit-bytes"
+    } else {
+        "用 --from/--to 按地址段分批导出，或调大 --limit-bytes"
     };
     let mut writer = ExportWriter::new(options.byte_limit, item_kind);
     let mut notes: Vec<String> = Vec::new();
 
     let items: u64 = match format {
+        ExportFormat::DexJson | ExportFormat::DexSmali | ExportFormat::DexDotCfg => {
+            write_dex(session, &mut writer, format, options, &mut meta, &mut notes)?
+        }
         ExportFormat::AsmIntel | ExportFormat::AsmAtt => {
             // 语法风格设在**反汇编视图**上，而不是在导出层另渲染一遍 ——
             // 只有一条渲染路径，导出的文本与界面走的是同一份代码。
@@ -406,10 +495,7 @@ fn export_with_disasm_prebuilt(
         }
     };
 
-    let truncated = truncation_of(
-        &writer,
-        "用 --from/--to 按地址段分批导出，或调大 --limit-bytes",
-    );
+    let truncated = truncation_of(&writer, truncation_hint);
     let text = writer.finish();
     let report = ExportReport {
         format,
@@ -423,6 +509,10 @@ fn export_with_disasm_prebuilt(
 }
 
 /// 组装来源信息。
+///
+/// `member` 由调用方在**真的挑定了**之后填进来（`write_dex` 会覆盖它）：
+/// 这里先给 `options.member`，导出的内容里则是实际读到的那个名字 ——
+/// 两者在"没给 member、目标只有一个 DEX"时必须一致，不一致就是我们在骗人。
 fn build_meta(session: &Session, format: ExportFormat, options: &ExportOptions) -> ExportMeta {
     let info = session.info();
     ExportMeta {
@@ -433,6 +523,8 @@ fn build_meta(session: &Session, format: ExportFormat, options: &ExportOptions) 
             info: INFO_FORMAT_VERSION,
             disasm: DISASM_FORMAT_VERSION,
             analysis: ANALYSIS_FORMAT_VERSION,
+            // 只有 DEX 视图的导出才带上这一列；别的格式给 `null` 而不是 0。
+            dex: format.is_dex().then_some(crate::dex::DEX_FORMAT_VERSION),
         },
         target: info.path.clone(),
         file_size: info.file_size,
@@ -440,8 +532,81 @@ fn build_meta(session: &Session, format: ExportFormat, options: &ExportOptions) 
         range_from: options.range.map(|(from, _)| hex16(from)),
         range_to: options.range.map(|(_, to)| hex16(to)),
         function: options.function.map(hex16),
+        member: options.member.clone(),
         generated_at: now_rfc3339(),
     }
+}
+
+/// 选项与所选视图是否匹配。**不匹配就报错**（ADR-0021）。
+///
+/// # 为什么不能"忽略用不上的选项"
+///
+/// 用户敲了 `--function 0x401000` 又选了 `dex-json`，只有三种做法：报错、
+/// 忽略、或者拿去当别的东西用。后两种都会让用户按自己的意图读一份**不是**
+/// 那个意图的输出。CLAUDE.md §7 的"拿不到就说拿不到"在这里的形态是
+/// "这个选项在这个视图上不成立，就说不成立"。
+///
+/// # 为什么是公开的
+///
+/// 导出路径自己会先调它一遍，但**调用方可能在这之前先做别的事**：服务端
+/// 为了复用缓存的反汇编，会在 `export_with_disasm` 之前先取一份 `Disasm`，
+/// 而归档目标上那一步会先失败（"成员清单在文件末尾"）——
+/// 于是"选择器给错了"这条真正有用的信息被盖掉，实测在真实 APK 上就是这样
+/// 漏出来的。所以这个检查必须能**在别的动作之前**单独调一次。
+pub fn check_options(format: ExportFormat, options: &ExportOptions) -> Result<(), BitflipError> {
+    let dex_selectors: Vec<&str> = [
+        options.member.is_some().then_some("member"),
+        options.class.is_some().then_some("class"),
+        options.search.is_some().then_some("search"),
+        options.method.is_some().then_some("method"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if format.is_dex() {
+        let wrong: Vec<&str> = [
+            options.range.is_some().then_some("--from/--to"),
+            options.function.is_some().then_some("--function"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !wrong.is_empty() {
+            return Err(ExportError::MismatchedOptions {
+                message: format!(
+                    "{} 对 DEX 视图没有意义（本次格式 {}）：DEX 没有线性地址空间，也没有函数入口",
+                    wrong.join(" / "),
+                    format.as_str()
+                ),
+                notes: vec![
+                    "DEX 里找代码用类与方法：--class 'Lcom/Foo;' / --search 子串 / --method 'Lcom/Foo;->bar(I)V'"
+                        .to_string(),
+                    "地址段与单个函数是机器码视图（PE / ELF / …）的概念，请改用 asm-intel / json-functions / dot-cfg"
+                        .to_string(),
+                ],
+            }
+            .into());
+        }
+        return Ok(());
+    }
+
+    if !dex_selectors.is_empty() {
+        return Err(ExportError::MismatchedOptions {
+            message: format!(
+                "{} 是 DEX 视图的选择器，但本次格式是 {}：一套选择器只对一个视图有意义",
+                dex_selectors.join(" / "),
+                format.as_str()
+            ),
+            notes: vec![
+                "要看 DEX 就用 --format dex-json / dex-smali / dex-dot-cfg（把 --member 指向 classes*.dex）"
+                    .to_string(),
+                "机器码目标按地址选：--from/--to / --function".to_string(),
+            ],
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// 当前时间（RFC 3339，UTC）。
@@ -865,6 +1030,728 @@ fn is_x86_family(arch: Option<&str>) -> bool {
         }
         None => false,
     }
+}
+
+/// DEX 视图的导出（`dex-json` / `dex-smali` / `dex-dot-cfg`）。见 `docs/APK-DEX-DESIGN.md` §M2c。
+///
+/// # 三条路共用什么
+///
+/// 1. **挑输入**：`crate::dex::read_input`（只有一个 DEX 就用它，多于一个必须指名）。
+/// 2. **挑类与方法**：一份逻辑、一个顺序（`class_defs` 顺序、类内 `method_idx` 顺序）。
+/// 3. **渲染指令**：`render_instruction_with_symbols` / `project_code_item` ——
+///    导出文件里的指令文本与界面上看到的是**同一份代码**产出的。在这里另写一个
+///    渲染器，就等于允许"导出文件与界面不一样"，而那种不一致没人会去比对。
+///
+/// # 确定性（§M2c 的第 3 条硬要求）
+///
+/// 全程按下标顺序遍历，不碰 `HashMap`：同一个输入连导两次必须逐字节相同，
+/// 否则 CI 的差分会把"顺序变了"报成"内容变了"。
+fn write_dex(
+    session: &Session,
+    writer: &mut ExportWriter,
+    format: ExportFormat,
+    options: &ExportOptions,
+    meta: &mut ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let input = crate::dex::read_input(session, options.member.as_deref())?;
+    // 信封里写**实际读到**的那个成员名：没给 `member` 时也不能留空 ——
+    // 读的人要靠它知道自己手里这份文件是哪个 dex。
+    meta.member = Some(input.name.clone());
+    notes.extend(input.structure.notes.iter().cloned());
+
+    let selected = select_dex_classes(&input.name, &input.structure, options, notes)?;
+    // M9 的这两个选项在 DEX 视图上没有对应物：DEX 的文本导出没有"字节"列
+    // （原始码元还没接到导出层），也没有源码行（debug_info 还没解析）。
+    // **关掉一个本来就没有的东西不会让输出少东西**，所以这不是"静默忽略选择器"；
+    // 但也不能让它看起来生效了 —— 写进说明，用户才知道这个开关没起作用。
+    if !options.include_bytes {
+        notes.push("--no-bytes 对 DEX 视图没有影响：文本导出里没有字节列".to_string());
+    }
+    if !options.include_source {
+        notes.push(
+            "--no-source 对 DEX 视图没有影响：DEX 视图还没有源码行（debug_info 未解析）"
+                .to_string(),
+        );
+    }
+    match format {
+        ExportFormat::DexJson => write_dex_json(&input, &selected, writer, options, meta, notes),
+        ExportFormat::DexSmali => write_dex_smali(&input, &selected, writer, options, meta, notes),
+        _ => write_dex_dot_cfg(&input, &selected, writer, options, meta, notes),
+    }
+}
+
+/// 选中的类（下标 + 描述符），顺序 = `class_defs` 顺序。
+///
+/// **筛空是错误，不是"导出了 0 个类"**：一份空文件与"筛错了 / 类写错了"在结果上
+/// 长得一模一样，而写文件这个动作会让人以为"就是这样"。CLI 的 `--search`（一条
+/// **列表**命令）搜不到是合法答案 —— 那里输出里写着"扫描 N 个、匹配 0 个"；
+/// 导出没有那行输出，所以只能报错。
+fn select_dex_classes(
+    member: &str,
+    structure: &crate::dex::DexStructure,
+    options: &ExportOptions,
+    notes: &mut Vec<String>,
+) -> Result<Vec<(usize, String)>, BitflipError> {
+    let needle = options
+        .search
+        .as_deref()
+        .map(str::to_lowercase)
+        .filter(|text| !text.is_empty());
+
+    let mut skipped = 0usize;
+    let mut selected: Vec<(usize, String)> = Vec::new();
+    for class in 0..structure.class_count() {
+        let Some(descriptor) = structure.class_descriptor(class) else {
+            skipped += 1;
+            continue;
+        };
+        if let Some(wanted) = options.class.as_deref() {
+            if descriptor != wanted {
+                continue;
+            }
+        }
+        if let Some(needle) = needle.as_deref() {
+            if !descriptor.to_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        // `--method` 也在这里筛类：不然只导一个方法时，输出里会带上**所有**
+        // 类的头部（实测一个真实 APK 上是 7643 个 `.class` 段落陪 1 个方法），
+        // 那份文件看起来像"整个 dex 的清单"，而用户只问了一个方法。
+        if let Some(wanted) = options.method.as_deref() {
+            if !structure
+                .class_methods(class)
+                .into_iter()
+                .any(|index| structure.method_signature(index).as_deref() == Some(wanted))
+            {
+                continue;
+            }
+        }
+        selected.push((class, descriptor.to_string()));
+    }
+
+    if selected.is_empty() {
+        if let Some(wanted) = options.class.as_deref() {
+            let hint = if wanted.starts_with('L') && wanted.ends_with(';') {
+                ""
+            } else {
+                "（本命令只做精确匹配：类要写成 smali 描述符，如 `Lcom/Foo;`）"
+            };
+            return Err(BitflipError::InvalidInput(format!(
+                "{member} 里没有类 {wanted}{hint}",
+            )));
+        }
+        if let Some(wanted) = options.method.as_deref() {
+            let hint = if wanted.contains("->") && wanted.contains('(') {
+                ""
+            } else {
+                "（方法要写成 smali 标识，如 `Lcom/Foo;->bar(I)V`）"
+            };
+            return Err(BitflipError::InvalidInput(format!(
+                "{member} 里找不到方法 {wanted}{hint}"
+            )));
+        }
+        let needle = needle.unwrap_or_default();
+        return Err(BitflipError::InvalidInput(format!(
+            "{member} 里没有描述符含「{needle}」的类（这个 DEX 有 {} 个类）：\
+             导出一个空文件与'筛错了'分辨不出来，所以这里报错",
+            structure.class_count()
+        )));
+    }
+
+    if skipped > 0 {
+        notes.push(format!(
+            "有 {skipped} 个类的描述符解析不出来（类定义指向越界的 type_id），已如实跳过"
+        ));
+    }
+    Ok(selected)
+}
+
+/// 一个类里要导出的方法下标（类内 `method_idx` 顺序）。
+///
+/// `options.method` 给了就只留标识完全相等的那个 —— 与 CLI / 服务端同一立场：
+/// 短名、子串、参数通配混在一个结果里，"命中哪个"就说不清了。
+fn selected_methods(
+    structure: &crate::dex::DexStructure,
+    class: usize,
+    options: &ExportOptions,
+) -> Vec<usize> {
+    let all = structure.class_methods(class);
+    match options.method.as_deref() {
+        None => all,
+        Some(wanted) => all
+            .into_iter()
+            .filter(|index| structure.method_signature(*index).as_deref() == Some(wanted))
+            .collect(),
+    }
+}
+
+/// 渲染一条 DEX 指令，并把"账"记进 `rendered`。返回渲染失败数。
+///
+/// `resolver` 为 `None` 时输出原始池索引（`--no-symbols`）：那时**不记账** ——
+/// 交回 0 会被读成"解析过、全都没问题"（§7）。关掉符号这件事由 `symbols.enabled`
+/// 与 note 说清楚。
+fn render_dex_instruction(
+    instructions: &crate::dex::DexInstructions,
+    index: usize,
+    resolver: Option<&dyn crate::dex::DexSymbolResolver>,
+    text: &mut String,
+    rendered: &mut crate::dex::DexRenderReport,
+) -> u64 {
+    match instructions.render_instruction_with_symbols(index, resolver, text) {
+        Ok(Some(crate::dex::DexSymbolOutcome::NotSupported)) => {
+            rendered.unsupported_operands += 1;
+            0
+        }
+        Ok(Some(crate::dex::DexSymbolOutcome::Unavailable)) => {
+            rendered.unavailable_operands += 1;
+            0
+        }
+        Ok(_) => {
+            rendered.instructions += 1;
+            0
+        }
+        Err(error) => {
+            text.clear();
+            text.push_str(&format!("<渲染失败：{error}>"));
+            1
+        }
+    }
+}
+
+/// DEX 结构快照（JSON）。
+///
+/// 一次成文（`write_document`）：JSON 是单个文档，截断它只会得到解析不了的半份，
+/// 所以超预算时**报错**并给出缩小范围的办法 —— 与 `json-functions` 同一条规矩。
+fn write_dex_json(
+    input: &crate::dex::DexInput,
+    selected: &[(usize, String)],
+    writer: &mut ExportWriter,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let structure = &input.structure;
+    let symbols = structure.symbols();
+    let resolver: Option<&dyn crate::dex::DexSymbolResolver> = if options.no_symbols {
+        None
+    } else {
+        Some(&symbols)
+    };
+
+    // `max_functions` 对 DEX 是"最多多少个**方法**"的口径（不新增 `max_methods`）。
+    let method_budget = options.max_functions;
+    let mut methods_written = 0usize;
+    let mut methods_over_limit = 0u64;
+    let mut methods_without_code = 0u64;
+    let mut methods_parse_failed = 0u64;
+    let mut instructions_rendered = 0u64;
+    let mut render_failures = 0u64;
+    let mut rendered = crate::dex::DexRenderReport::default();
+
+    let mut classes = Vec::with_capacity(selected.len());
+    for (class, descriptor) in selected {
+        let methods: Vec<serde_json::Value> = selected_methods(structure, *class, options)
+            .into_iter()
+            .filter_map(|method| {
+                let facts = structure.methods.get(method);
+                let code_off = facts.map_or(0, |f| f.code_off);
+                let base = json!({
+                    "index": method,
+                    "signature": structure.method_signature(method),
+                    "name": structure.method_name(method),
+                    "access_flags": facts.map_or(0, |f| f.access_flags),
+                    "is_direct": facts.is_some_and(|f| f.is_direct),
+                    "code_off": (code_off != 0).then(|| hex16(u64::from(code_off))),
+                    "has_code": code_off != 0,
+                });
+
+                if code_off == 0 {
+                    // 抽象 / native 方法是**合法结论**，不是错误，也不算"没导出来"。
+                    methods_without_code += 1;
+                    return Some(base);
+                }
+                if methods_written >= method_budget {
+                    methods_over_limit += 1;
+                    return None;
+                }
+                methods_written += 1;
+
+                let view = match crate::dex::project_method(&input.bytes, code_off) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        // 单个方法解析失败**不放弃整次导出**：这是"这一段拿不到"，
+                        // 报成整份失败会连带丢掉已经能读的几万个类。理由写进 note。
+                        methods_parse_failed += 1;
+                        return Some(json!({
+                            "index": method,
+                            "signature": structure.method_signature(method),
+                            "code_off": hex16(u64::from(code_off)),
+                            "has_code": true,
+                            "error": error.to_string(),
+                        }));
+                    }
+                };
+
+                let mut instructions = Vec::new();
+                if options.include_instructions {
+                    for index in 0..view.instructions.len() {
+                        let mut text = String::new();
+                        // 渲染不出来就**不留半行**：写下去会被当成"就是这样"。
+                        render_failures += render_dex_instruction(
+                            &view.instructions,
+                            index,
+                            resolver,
+                            &mut text,
+                            &mut rendered,
+                        );
+                        instructions_rendered += 1;
+                        instructions.push(json!({
+                            "code_unit": hex16(u64::from(view.instructions.addresses.get(index).copied().unwrap_or(0))),
+                            "text": text,
+                        }));
+                    }
+                }
+
+                let mut entry = base;
+                let object = entry.as_object_mut().expect("json! 产出的是对象");
+                object.insert("registers_size".to_string(), json!(view.registers_size));
+                object.insert("ins_size".to_string(), json!(view.ins_size));
+                object.insert("outs_size".to_string(), json!(view.outs_size));
+                if options.include_instructions {
+                    object.insert("instructions".to_string(), json!(instructions));
+                }
+                if options.include_cfg {
+                    object.insert(
+                        "cfg".to_string(),
+                        json!({
+                            "blocks": view.cfg.block_ids.len(),
+                            "edges": view.cfg.edge_kinds.len(),
+                            "unresolved_edge_targets": view.cfg.unresolved_edge_targets.len(),
+                        }),
+                    );
+                }
+                Some(entry)
+            })
+            .collect();
+
+        classes.push(json!({
+            "descriptor": descriptor,
+            "short_name": structure.class_short_name(*class),
+            "superclass": structure.superclass_descriptor(*class),
+            "source_file": structure.source_file(*class),
+            "access_flags": structure.classes.get(*class).map_or(0, |c| c.access_flags),
+            "fields": structure.class_fields(*class).into_iter().map(|field| {
+                let facts = structure.fields.get(field);
+                json!({
+                    "index": field,
+                    "name": structure.field_name(field),
+                    "type_descriptor": structure.field_type_descriptor(field),
+                    "access_flags": facts.map_or(0, |f| f.access_flags),
+                    "is_static": facts.is_some_and(|f| f.is_static),
+                })
+            }).collect::<Vec<_>>(),
+            "methods": methods,
+        }));
+    }
+
+    if methods_over_limit > 0 {
+        notes.push(format!(
+            "方法数上限为 {method_budget}（--max-functions），还有 {methods_over_limit} 个方法未导出"
+        ));
+    }
+    if methods_without_code > 0 {
+        notes.push(format!(
+            "有 {methods_without_code} 个方法没有字节码（抽象 / native）：它们仍在文件里，`has_code: false` —— 这是合法结论，不是解析失败"
+        ));
+    }
+    if methods_parse_failed > 0 {
+        notes.push(format!(
+            "有 {methods_parse_failed} 个方法的 code_item 解析失败：文件里给了 `error` 字段，没有假装它们没有字节码"
+        ));
+    }
+    if render_failures > 0 {
+        notes.push(format!(
+            "有 {render_failures} 条指令渲染失败：位置上写了 `<渲染失败：…>`，没有留半行冒充指令"
+        ));
+    }
+
+    let accounting = options.include_instructions && !options.no_symbols;
+    if options.no_symbols && options.include_instructions {
+        notes.push(
+            "`--no-symbols`：指令文本里的池引用是原始索引，`symbols.unsupported_operands` / \
+             `unavailable_operands` 为 null —— 那是'没解析'，不是'解析全通过'"
+                .to_string(),
+        );
+    }
+
+    let document = json!({
+        "format_version": crate::dex::DEX_FORMAT_VERSION,
+        "producer": meta.producer,
+        "meta": meta,
+        "member": input.name,
+        "role": input.role,
+        "size": input.bytes.len(),
+        "header": {
+            "class_count": structure.class_count(),
+            "method_count": structure.method_count(),
+            "method_count_with_code": structure.method_count_with_code(),
+        },
+        "totals": {
+            "classes_written": classes.len(),
+            "methods_written": methods_written,
+            "instructions_written": instructions_rendered,
+            "filtered_by_class": options.class.is_some(),
+            "filtered_by_search": options.search.is_some(),
+            "filtered_by_method": options.method.is_some(),
+        },
+        "classes": classes,
+        // 降级四样：解析期说明、跳过、符号账目、截断（本格式没有流式截断，见 note）。
+        "notes": notes,
+        "skipped": {
+            "methods_without_code": methods_without_code,
+            "methods_over_limit": methods_over_limit,
+            "methods_parse_failed": methods_parse_failed,
+        },
+        "symbols": {
+            "enabled": options.include_instructions.then_some(!options.no_symbols),
+            "instructions": options.include_instructions.then_some(rendered.instructions),
+            // 关掉符号解析时**这两个数是 null**：给 0 会被读成"解析过、全都没问题"。
+            "unsupported_operands": accounting.then_some(rendered.unsupported_operands),
+            "unavailable_operands": accounting.then_some(rendered.unavailable_operands),
+            "render_failures": options.include_instructions.then_some(render_failures),
+        },
+    });
+
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|error| BitflipError::Internal(format!("序列化 DEX 结构快照失败：{error}")))?;
+    write_document(writer, &text, options, "DEX 结构快照")?;
+
+    if render_failures > 0 {
+        notes.push("（渲染失败的条数见 `symbols.render_failures`）".to_string());
+    }
+    Ok(classes.len() as u64)
+}
+
+/// DEX 的 smali 风格文本。
+///
+/// **不是可回汇编的 smali 源文件**：注解、`.line`、调试信息、泛型签名等属性没有
+/// 保留，指令文本来自我们自己的渲染路径。头一行就把这件事写清楚 ——
+/// 让人以为拿到的文件能喂给 `smali` 重新打包，那是彻底误导。
+fn write_dex_smali(
+    input: &crate::dex::DexInput,
+    selected: &[(usize, String)],
+    writer: &mut ExportWriter,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let structure = &input.structure;
+    let symbols = structure.symbols();
+    let resolver: Option<&dyn crate::dex::DexSymbolResolver> = if options.no_symbols {
+        None
+    } else {
+        Some(&symbols)
+    };
+
+    writer.push_raw(&format!(
+        "# bitflip-export v{} format=dex-smali target={} member={} dex v{} generated_at={}\n",
+        EXPORT_FORMAT_VERSION,
+        meta.target,
+        input.name,
+        crate::dex::DEX_FORMAT_VERSION,
+        meta.generated_at
+    ));
+    writer.push_raw(
+        "# 这是 smali **风格**的清单，不是可回汇编的 smali 源文件：\n\
+         #   - 没有注解、`.line`、调试信息、泛型签名等属性；\n\
+         #   - 指令文本来自 BitFlip 自己的渲染路径，解析不出符号时保留可数的池索引\n\
+         #     （`string@12` 这类），不会写成 `?` / `<invalid>` 冒充结果。\n",
+    );
+
+    let method_budget = options.max_functions;
+    let mut methods_written = 0usize;
+    let mut methods_over_limit = 0u64;
+    let mut methods_without_code = 0u64;
+    let mut instructions: u64 = 0;
+    let mut render_failures = 0u64;
+    let mut rendered = crate::dex::DexRenderReport::default();
+
+    'classes: for (class, descriptor) in selected {
+        writer.push_line(&format!(
+            "\n.class {descriptor}   super={}   source_file={}\n",
+            structure.superclass_descriptor(*class).unwrap_or("（无）"),
+            structure.source_file(*class).unwrap_or("（无）")
+        ));
+        for field in structure.class_fields(*class) {
+            writer.push_line(&format!(
+                ".field {} {} {}   # access_flags={:#x}\n",
+                if structure.fields.get(field).is_some_and(|f| f.is_static) {
+                    "static"
+                } else {
+                    "instance"
+                },
+                structure.field_type_descriptor(field).unwrap_or("?"),
+                structure.field_name(field).unwrap_or("（无名）"),
+                structure.fields.get(field).map_or(0, |f| f.access_flags),
+            ));
+        }
+
+        for method in selected_methods(structure, *class, options) {
+            let facts = structure.methods.get(method);
+            let code_off = facts.map_or(0, |f| f.code_off);
+            let signature = structure
+                .method_signature(method)
+                .unwrap_or_else(|| format!("<方法 {method} 的标识取不到>"));
+            let mut header = format!(".method {signature}");
+            if code_off == 0 {
+                methods_without_code += 1;
+                header.push_str("   # 无字节码：抽象或 native 方法\n");
+                writer.push_line(&header);
+                writer.push_line(".end method\n");
+                continue;
+            }
+            if methods_written >= method_budget {
+                methods_over_limit += 1;
+                continue;
+            }
+            methods_written += 1;
+
+            let view = match crate::dex::project_method(&input.bytes, code_off) {
+                Ok(view) => view,
+                Err(error) => {
+                    // 解析不了就说解析不了，并把它计入截断账目 —— 不能安静跳过，
+                    // 否则读者会以为这个方法本来就没有指令。
+                    writer.push_line(&format!("{header}   # code_item 解析失败：{error}\n"));
+                    writer.push_line(".end method\n");
+                    continue;
+                }
+            };
+            header.push_str(&format!(
+                "   # code_off={} registers={} ins={} outs={}\n",
+                hex16(u64::from(code_off)),
+                view.registers_size,
+                view.ins_size,
+                view.outs_size
+            ));
+            if !writer.push_line(&header) {
+                // 预算耗尽：后面的都不再写了，账目由 `truncation_of` 给出。
+                break 'classes;
+            }
+
+            for index in 0..view.instructions.len() {
+                let mut text = String::new();
+                render_failures += render_dex_instruction(
+                    &view.instructions,
+                    index,
+                    resolver,
+                    &mut text,
+                    &mut rendered,
+                );
+                // 地址前缀**已经**在 `text` 里（`render_instruction*` 的约定，
+                // 与 CFG 文本一致），这里只加缩进 —— 再加一次会变成
+                // `0000: 0000: new-instance …`。
+                if !writer.push_line(&format!("    {text}\n")) {
+                    break 'classes;
+                }
+                instructions += 1;
+            }
+
+            if options.include_cfg {
+                let mut cfg = String::new();
+                crate::dex::render_cfg_text(&view, &mut cfg);
+                // CFG 文本**逐行加 `#`**：这段不是 smali 语法，标成注释一眼可见。
+                for line in cfg.lines() {
+                    if !writer.push_line(&format!("# {line}\n")) {
+                        break 'classes;
+                    }
+                }
+            }
+            if !writer.push_line(".end method\n") {
+                break 'classes;
+            }
+        }
+    }
+
+    notes.push(format!(
+        "smali 风格清单：写出 {methods_written} 个方法 / {instructions} 条指令；\
+         符号解析的账目是已知缺口 {} 处、解析异常 {} 处",
+        rendered.unsupported_operands, rendered.unavailable_operands
+    ));
+    if options.no_symbols {
+        notes.push(
+            "（`--no-symbols`：指令文本里的池引用保持原始索引，所以上面那两个计数是 0 —— \
+             这是'没解析'，不是'解析全通过'）"
+                .to_string(),
+        );
+    }
+    if render_failures > 0 {
+        notes.push(format!(
+            "有 {render_failures} 条指令渲染失败：位置上写了 `<渲染失败：…>`，没有留半行冒充指令"
+        ));
+    }
+    if methods_without_code > 0 {
+        notes.push(format!(
+            "有 {methods_without_code} 个方法没有字节码（抽象 / native）：清单里写明了原因，不是漏了"
+        ));
+    }
+    if methods_over_limit > 0 {
+        notes.push(format!(
+            "方法数上限为 {method_budget}（--max-functions），还有 {methods_over_limit} 个方法未导出"
+        ));
+    }
+    Ok(methods_written as u64)
+}
+
+/// DEX 的 CFG（Graphviz DOT）：一个方法一个 `subgraph`。
+fn write_dex_dot_cfg(
+    input: &crate::dex::DexInput,
+    selected: &[(usize, String)],
+    writer: &mut ExportWriter,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let structure = &input.structure;
+
+    writer.push_raw(&format!(
+        "// bitflip-export v{} format=dex-dot-cfg target={} member={} dex v{} generated_at={}\n\
+         // 每个 cluster 是一个方法，节点是基本块（标签是码元偏移，DEX 没有线性地址）。\n",
+        EXPORT_FORMAT_VERSION,
+        meta.target,
+        input.name,
+        crate::dex::DEX_FORMAT_VERSION,
+        meta.generated_at
+    ));
+    writer
+        .push_raw("digraph bitflip {\n  rankdir=TB;\n  node [shape=box, fontname=\"Consolas\"];\n");
+
+    let method_budget = options.max_functions;
+    let mut methods_written = 0usize;
+    let mut methods_over_limit = 0u64;
+    let mut blocks: u64 = 0;
+    let mut unresolved_total: u64 = 0;
+
+    for (class, _) in selected {
+        for method in selected_methods(structure, *class, options) {
+            let code_off = structure.methods.get(method).map_or(0, |f| f.code_off);
+            if code_off == 0 {
+                continue;
+            }
+            if methods_written >= method_budget {
+                methods_over_limit += 1;
+                continue;
+            }
+            let signature = structure
+                .method_signature(method)
+                .unwrap_or_else(|| format!("<方法 {method} 的标识取不到>"));
+            let view = match crate::dex::project_method(&input.bytes, code_off) {
+                Ok(view) => view,
+                Err(error) => {
+                    // 解析不了的方法在这里也**留一个节点**：不然读图的人会以为
+                    // 这个方法没有控制流，而我们其实只是没解析出来。
+                    writer.push_raw(&format!(
+                        "  // 方法 {signature}（code_off={:#x}）解析失败：{error}\n",
+                        code_off
+                    ));
+                    continue;
+                }
+            };
+            methods_written += 1;
+
+            let cfg = &view.cfg;
+            let cluster = format!("cluster_m{method}");
+            writer.push_raw(&format!(
+                "  subgraph {cluster} {{\n    label={};\n    style=solid;\n",
+                dot_quote(&format!("{signature} @{}", hex16(u64::from(code_off))))
+            ));
+            // 入口块用双线框：图里能一眼看出从哪进。
+            for index in 0..cfg.block_ids.len() {
+                let id = cfg.block_ids.get(index).copied().unwrap_or(u32::MAX);
+                let start = cfg.block_starts.get(index).copied().unwrap_or(0);
+                // 段长的约定与 CFG 文本共用一处定义（`dex_column_range`）。
+                let count = crate::dex::dex_column_range(
+                    &cfg.block_instruction_offsets,
+                    index,
+                    cfg.block_instruction_addresses.len(),
+                )
+                .map_or(0, |range| range.len());
+                // 入口块用双线框（`peripheries=2` 是**独立**属性，不能塞进
+                // `shape` 的值里 —— Graphviz 会把整串当成一个不认识的形状）。
+                let border = if Some(id) == cfg.entry_block {
+                    ", peripheries=2"
+                } else {
+                    ""
+                };
+                blocks += 1;
+                writer.push_raw(&format!(
+                    "    b{method}_{id} [label={}, shape=box{border}];\n",
+                    dot_quote(&format!("块{id} @{start:04x}（{count} 条）"))
+                ));
+            }
+            for index in 0..cfg.block_ids.len() {
+                let id = cfg.block_ids.get(index).copied().unwrap_or(u32::MAX);
+                let Some(range) =
+                    crate::dex::dex_column_range(&cfg.edge_offsets, index, cfg.edge_kinds.len())
+                else {
+                    continue;
+                };
+                for edge in range {
+                    let target = cfg.edge_targets.get(edge).copied().unwrap_or(u32::MAX);
+                    let label = crate::dex::dex_edge_label(
+                        cfg.edge_kinds
+                            .get(edge)
+                            .copied()
+                            .unwrap_or(crate::dex::DexEdgeKind::FallThrough),
+                        cfg.edge_switch_keys.get(edge).copied().flatten(),
+                        cfg.edge_exception_type_indices.get(edge).copied().flatten(),
+                    );
+                    // 异常边画虚线：它是"可能跳"，不是"一定跳"。
+                    let style = if matches!(
+                        cfg.edge_kinds.get(edge).copied(),
+                        Some(crate::dex::DexEdgeKind::ExceptionHandler)
+                            | Some(crate::dex::DexEdgeKind::ExceptionCatchAll)
+                    ) {
+                        "dashed"
+                    } else {
+                        "solid"
+                    };
+                    writer.push_raw(&format!(
+                        "    b{method}_{id} -> b{method}_{target} [label={}, style={style}];\n",
+                        dot_quote(&label)
+                    ));
+                }
+            }
+            // 没连上的目标画成**不可达的方框**：它们不是任何指令的起点，
+            // 所以不能放进块里，但也不能不画（§7：降级要看得见）。
+            for entry in &cfg.unresolved_edge_targets {
+                unresolved_total += 1;
+                let target = entry.target;
+                writer.push_raw(&format!(
+                    "    u{method}_{target:x} [label={}, shape=\"box\", style=\"dashed\", color=orange];\n",
+                    dot_quote(&format!("未连上的目标 {target:#06x}"))
+                ));
+                writer.push_raw(&format!(
+                    "    b{method}_{} -> u{method}_{target:x} [label={}, style=dashed, color=orange];\n",
+                    entry.from_block,
+                    dot_quote(&crate::dex::dex_edge_label(entry.kind, None, None))
+                ));
+            }
+            writer.push_raw("  }\n");
+        }
+    }
+    writer.push_raw("}\n");
+
+    notes.push(format!(
+        "画了 {methods_written} 个方法 / {blocks} 个基本块；未连上的目标 {unresolved_total} 个（画成橙色虚线框）"
+    ));
+    if methods_over_limit > 0 {
+        notes.push(format!(
+            "方法数上限为 {method_budget}（--max-functions），还有 {methods_over_limit} 个方法未画"
+        ));
+    }
+    Ok(blocks)
 }
 
 /// 函数清单（JSON）。

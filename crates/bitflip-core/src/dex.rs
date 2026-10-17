@@ -35,6 +35,13 @@ pub const DEX_FORMAT_VERSION: u32 = 1;
 
 /// `code_item` 的结构自检（不投影，只查布局）。
 pub use bitflip_loader::check_code_item_layout;
+/// 并列数组（块内指令 / 出边 / 前驱）的**分段约定**：`offsets[i]..offsets[i + 1]`。
+///
+/// 导出 DEX 的 DOT 时要用它：约定只该有一处定义 —— 抄一份到导出层，
+/// 下次库那边调整列宽时导出会静默错一格，而图看起来仍然"是个 CFG"。
+pub use bitflip_loader::dex_column_range;
+/// 边类别 → 中文标签（CFG 文本与 DOT 共用同一套措辞）。
+pub use bitflip_loader::dex_edge_label;
 /// DEX 结构解析（[`bitflip_loader::parse_dex_structure`] 的出口）。
 pub use bitflip_loader::parse_dex_structure as parse;
 /// 整条指令列的投影。
@@ -116,4 +123,149 @@ pub fn apk_role_label(name: &str) -> Option<String> {
         crate::ApkRole::Signature => Some("v1 签名文件".to_string()),
         crate::ApkRole::Other => None,
     }
+}
+
+/// 一个 DEX 输入的名字与角色标签。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DexInputName {
+    /// 归档成员名，或单文件目标的文件名。
+    pub name: String,
+    /// APK 命名约定下的中文角色标签；`None` = 不属于那几个固定位置。
+    pub role: Option<String>,
+}
+
+/// 本次目标里的 DEX 输入，**按容器顺序**。
+///
+/// 归档目标：成员名以 `.dex` 结尾（大小写不敏感）的那些，名字与顺序原样保留
+/// （`classes2.dex` 不重编成 `classes1.dex` —— 文件名里的号码是构建产物的一部分）。
+/// 单文件目标（`bitflip foo.dex`）：目标本身，名字取文件名。
+///
+/// 一个 DEX 都找不到时**报错**而不是返回空列表：空列表会让界面显示"这个目标里没有
+/// DEX"，而那与"我们没有做这一步"长得一模一样（CLAUDE.md §7）。
+///
+/// # Errors
+///
+/// 归档里没有 `.dex` 结尾的成员。
+pub fn input_names(session: &Session) -> Result<Vec<DexInputName>, BitflipError> {
+    if session.info().is_archive() {
+        let names: Vec<DexInputName> = session
+            .members()
+            .iter()
+            .filter(|member| is_dex_member_name(&member.name))
+            .map(|member| DexInputName {
+                name: member.name.clone(),
+                role: apk_role_label(&member.name),
+            })
+            .collect();
+        if names.is_empty() {
+            return Err(BitflipError::InvalidInput(format!(
+                "目标 {:?} 里没有以 .dex 结尾的成员（成员数 {}）：DEX 视图需要 APK 或 .dex 文件",
+                session.info().path,
+                session.members().len()
+            )));
+        }
+        return Ok(names);
+    }
+
+    Ok(vec![DexInputName {
+        name: target_file_name(session),
+        role: None,
+    }])
+}
+
+/// 单文件目标在界面上的名字（文件名；没有文件名就用整条路径）。
+#[must_use]
+pub fn target_file_name(session: &Session) -> String {
+    let info = session.info();
+    std::path::Path::new(&info.path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| info.path.clone())
+}
+
+/// 一个 DEX 输入的字节与解析结果。
+pub struct DexInput {
+    /// 成员名 / 文件名。
+    pub name: String,
+    /// APK 角色标签。
+    pub role: Option<String>,
+    /// 原始字节。
+    pub bytes: Arc<[u8]>,
+    /// 解析出来的结构。
+    pub structure: DexStructure,
+}
+
+/// 读出并解析一个 DEX 输入。
+///
+/// `name` 为 `None` 时的挑选规则**只有一条**：本次目标恰好只有一个 DEX 就用它，
+/// 多于一个则报错并把可选名字列出来。不猜"通常大家都看 classes.dex"——
+/// 猜错的表现是导出了一份**别的文件**的内容，而文件名还写着目标名。
+///
+/// # Errors
+///
+/// 输入列表取不到、`name` 不存在、有多个 DEX 却没给 `name`、读取失败、
+/// 内容不是 DEX，或 DEX 解析失败。
+pub fn read_input(session: &Session, name: Option<&str>) -> Result<DexInput, BitflipError> {
+    let inputs = input_names(session)?;
+    let available = || {
+        inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+
+    let picked = match name.filter(|wanted| !wanted.is_empty()) {
+        Some(wanted) => inputs
+            .iter()
+            .find(|input| input.name == wanted)
+            .ok_or_else(|| {
+                BitflipError::InvalidInput(format!(
+                    "没有名为 {wanted:?} 的 DEX 输入（可用：{}）",
+                    available()
+                ))
+            })?,
+        None if inputs.len() > 1 => {
+            return Err(BitflipError::InvalidInput(format!(
+                "缺少 member 参数：本次目标有 {} —— 请指定看哪一个",
+                available()
+            )));
+        }
+        None => inputs.first().ok_or_else(|| {
+            // `input_names` 已经保证非空，这里只是不留 `unwrap`。
+            BitflipError::InvalidInput("本次目标里没有 DEX 输入".to_string())
+        })?,
+    };
+
+    let bytes = read_input_bytes(session, &picked.name)?;
+    let structure = parse(&bytes).map_err(|error| {
+        BitflipError::InvalidInput(format!("把 {} 当 DEX 解析失败：{error}", picked.name))
+    })?;
+    Ok(DexInput {
+        name: picked.name.clone(),
+        role: picked.role.clone(),
+        bytes,
+        structure,
+    })
+}
+
+/// 取一个输入的原始字节（归档成员走 [`read_member`]；单文件从磁盘读）。
+fn read_input_bytes(session: &Session, name: &str) -> Result<Arc<[u8]>, BitflipError> {
+    if session.info().is_archive() {
+        return read_member(session, name);
+    }
+
+    let path = session.info().path.clone();
+    let bytes: Arc<[u8]> = std::fs::read(&path)
+        .map_err(|error| BitflipError::InvalidInput(format!("读 {path} 失败：{error}")))?
+        .into();
+    // 与 `read_member` 同一条内容判据：单文件目标也可能只是**名字**像 DEX。
+    let guess = bitflip_loader::sniff_bytes(&bytes);
+    if guess.object != ObjectKind::Dex {
+        return Err(BitflipError::InvalidInput(format!(
+            "{path} 不是 DEX（按内容识别为 {}）：DEX 视图需要 APK 或 .dex 文件",
+            guess.object.label_zh()
+        )));
+    }
+    Ok(bytes)
 }

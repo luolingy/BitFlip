@@ -263,7 +263,64 @@ try {
     $typo = Invoke-ApiJson -PathAndQuery '/api/dex/classes?member=classes.dex&limt=5' -Token $script:token
     Check 'a misspelled parameter is a 400, not silently ignored' ($typo.Status -eq 400) "status=$($typo.Status)"
 
-    # ---- 6. the served SPA really contains the DEX view
+    # ---- 6. GET /api/export with a DEX format (M2c / ADR-0021)
+    # One endpoint, two views, discriminated by `format`. What only a real
+    # process + real APK can show here: that an ARCHIVE target reaches the DEX
+    # exporter at all (the CLI bails on archives before this point) and that the
+    # two views' selectors are rejected rather than silently ignored.
+    $exportBase = "http://127.0.0.1:$Port/api/export"
+    $dexExport = Invoke-Api -Uri ("$exportBase" + "?format=dex-json&member=classes.dex&limit=2000000&class=" + (Get-Escaped $descriptor)) -Token $script:token
+    Check '/api/export?format=dex-json answers 200' ($dexExport.Status -eq 200) "status=$($dexExport.Status)"
+    $dexSnapshot = $null
+    try { $dexSnapshot = $dexExport.Body | ConvertFrom-Json } catch { $dexSnapshot = $null }
+    Check 'the DEX snapshot is valid JSON' ($null -ne $dexSnapshot) "bytes=$($dexExport.Body.Length)"
+    Check 'the snapshot names the member it came from' ([string]$dexSnapshot.member -eq 'classes.dex') "member=$($dexSnapshot.member)"
+    Check 'the snapshot carries the DEX view version' ($dexSnapshot.meta.format_versions.dex -eq 1) `
+        "dex=$($dexSnapshot.meta.format_versions.dex)"
+    Check 'the snapshot exports the requested class' ([string]$dexSnapshot.classes[0].descriptor -eq $descriptor) `
+        "descriptor=$($dexSnapshot.classes[0].descriptor)"
+    Check 'the header counts every class of the member' ([int]$dexSnapshot.header.class_count -gt 1000) `
+        "classes=$($dexSnapshot.header.class_count)"
+    Check 'skipped methods are accounted for, not dropped' ($null -ne $dexSnapshot.skipped.methods_without_code) `
+        "without_code=$($dexSnapshot.skipped.methods_without_code)"
+
+    # The selectors of one view must be REJECTED by the other (ADR-0021):
+    # ignoring --member on asm-intel would hand back a plausible-looking file.
+    $mixedSelector = Invoke-ApiJson -PathAndQuery '/api/export?format=asm-intel&member=classes.dex' -Token $script:token
+    Check 'a DEX selector on a machine-code format is a 400' ($mixedSelector.Status -eq 400) "status=$($mixedSelector.Status)"
+    Check 'the mixed-selector error names the selector' ((Get-ErrorMessage $mixedSelector) -match 'member') `
+        (Get-ErrorMessage $mixedSelector)
+
+    $mixedOption = Invoke-ApiJson -PathAndQuery '/api/export?format=dex-json&member=classes.dex&function=401000' -Token $script:token
+    Check 'an address on a DEX format is a 400' ($mixedOption.Status -eq 400) "status=$($mixedOption.Status)"
+    Check 'the address error names the option' ((Get-ErrorMessage $mixedOption) -match 'function') `
+        (Get-ErrorMessage $mixedOption)
+
+    $smaliExport = Invoke-Api -Uri ("$exportBase" + "?format=dex-smali&member=classes.dex&limit=2000000&class=" + (Get-Escaped $descriptor)) -Token $script:token
+    Check 'dex-smali answers 200 as a self-describing text' `
+        (($smaliExport.Status -eq 200) -and ($smaliExport.Body.StartsWith('# bitflip-export v1 format=dex-smali'))) `
+        "status=$($smaliExport.Status)"
+    # The header promise that this is NOT assemblable smali input. Spelled with
+    # [char] codes on purpose: every .ps1 in this repo must stay ASCII-only
+    # (CLAUDE.md section 6.1), so a Chinese literal cannot live here.
+    $notAssemblable = [string]([char]0x4E0D) + [char]0x662F + [char]0x53EF + [char]0x56DE + [char]0x6C47 + [char]0x7F16
+    Check 'dex-smali says it is not assemblable input' ($smaliExport.Body -match $notAssemblable) `
+        'looked for the leading warning line'
+    # The renderer already prefixes every instruction with its code-unit offset;
+    # the exporter must not add a second one (it used to: "0000: 0000: ...").
+    Check 'dex-smali does not repeat the code-unit prefix' `
+        (-not ($smaliExport.Body -match '(?m)^\s+[0-9a-f]{4}: [0-9a-f]{4}: ')) 'looked for a doubled prefix'
+
+    $dotExport = Invoke-Api -Uri ("$exportBase" + "?format=dex-dot-cfg&member=classes.dex&class=" + (Get-Escaped $descriptor)) -Token $script:token
+    Check 'dex-dot-cfg answers 200' ($dotExport.Status -eq 200) "status=$($dotExport.Status)"
+    Check 'dex-dot-cfg is a balanced digraph' `
+        ((($dotExport.Body -match 'digraph bitflip \{') -and (($dotExport.Body.ToCharArray() | Where-Object { $_ -eq '{' }).Count -eq ($dotExport.Body.ToCharArray() | Where-Object { $_ -eq '}' }).Count))) `
+        "braces=$(($dotExport.Body.ToCharArray() | Where-Object { $_ -eq '{' }).Count)/$(($dotExport.Body.ToCharArray() | Where-Object { $_ -eq '}' }).Count)"
+    Check 'the entry block is marked with peripheries, not a bogus shape' `
+        (($dotExport.Body -match 'peripheries=2') -and (-not ($dotExport.Body -match 'shape="box,'))) `
+        'looked for peripheries=2'
+
+    # ---- 7. the served SPA really contains the DEX view
     $bundle = Invoke-Api -Uri "http://127.0.0.1:$Port/assets/app.js" -Token ''
     Check 'the embedded bundle is served' (($bundle.Status -eq 200) -and ($bundle.Body.Length -gt 100000)) `
         "status=$($bundle.Status) bytes=$($bundle.Body.Length)"

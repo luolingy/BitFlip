@@ -28,7 +28,9 @@ UI 走 Web 是为了跨平台，不需要为每个平台维护原生 GUI 外壳�
   每个标签页下只挂它自己的解析说明（降级跟着来源走），"没有字节码"（抽象 / `native`
   方法）会写清是合法结论。**选中的标签页 / 类 / 方法 / 搜索词保存在 URL 的 hash 里**，
   刷新不丢、链接可分享（`#dex=1&member=classes.dex&class=…&method=…`）。
-  DEX 进 `export` 的**形状已定、实现未做**（`docs/APK-DEX-DESIGN.md` §M2c、ADR-0021）。
+  DEX 也进 `export`（M2c）：`--format dex-json` / `dex-smali` / `dex-dot-cfg`，
+  选择器 `--member` / `--class` / `--search` / `--method`，用机器码格式名导 DEX
+  会**报错**（DEX 没有线性地址空间，详见 `docs/APK-DEX-DESIGN.md` §M2c、ADR-0021）。
   其余能力（解码、函数识别、交叉引用、注释持久化……）按里程碑推进，
   **界面上未实现的入口一律置灰并标注里程碑**。
 
@@ -72,6 +74,15 @@ cargo build --release -p bitflip-app
 # 混淆过的 APK：先列类、再按子串找（--search 隐含 --list-classes）
 ./target/release/bitflip-cli dex path/to/app.apk --member classes.dex --list-classes --limit 20
 ./target/release/bitflip-cli dex path/to/app.apk --search Activity
+
+# 导出：机器码与 DEX 共用一个 export 子命令，视图由 --format 决定
+./target/release/bitflip-cli export sample.exe --format asm-intel --out disasm.txt
+./target/release/bitflip-cli export app.apk --format dex-json --member classes.dex \
+    --class 'Lcom/example/Foo;' --out foo.json
+./target/release/bitflip-cli export app.apk --format dex-smali --member classes.dex \
+    --method 'Lcom/example/Foo;->bar(I)V' --out bar.smali
+# 选择器与视图不匹配会报错（不静默忽略）：DEX 没有线性地址空间
+./target/release/bitflip-cli export app.apk --format dex-json --function 0x401000   # 报错
 ```
 
 `--arch` / `--mode` / `--endian` / `--base` 是**公共覆盖参数**，`info`、`functions`、

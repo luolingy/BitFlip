@@ -424,14 +424,22 @@ pub fn project_code_item(code: &CodeItem) -> Result<DexMethodView, DexViewError>
 /// 这三列（块内指令、出边、前驱）与 [`DexInstructions::source_offsets`] 用**同一个**
 /// 约定：开头先压一个 `0`，其后每个块压一个**结束位置** —— 所以第 `index` 段是
 /// `offsets[index]..offsets[index + 1]`，列长比块数多 1。
-fn column_range(offsets: &[usize], index: usize, total: usize) -> Option<std::ops::Range<usize>> {
+pub fn column_range(
+    offsets: &[usize],
+    index: usize,
+    total: usize,
+) -> Option<std::ops::Range<usize>> {
     let start = *offsets.get(index)?;
     let end = *offsets.get(index + 1)?;
     (start <= end && end <= total).then_some(start..end)
 }
 
 /// 边类别 → 给人看的标签。
-fn edge_label(kind: DexEdgeKind, switch_key: Option<i32>, exception_type: Option<u32>) -> String {
+pub fn edge_label(
+    kind: DexEdgeKind,
+    switch_key: Option<i32>,
+    exception_type: Option<u32>,
+) -> String {
     match kind {
         DexEdgeKind::FallThrough => "落空".to_owned(),
         DexEdgeKind::Branch => "分支".to_owned(),

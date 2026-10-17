@@ -1895,7 +1895,8 @@ async fn export(
                 StatusCode::BAD_REQUEST,
                 &format!(
                     "查询参数无法解析：{rejection}。可用参数：{}",
-                    "format、from、to、function、bytes、source、max_functions、limit"
+                    "format、from、to、function、bytes、source、max_functions、limit、\
+                     member、class、search、method、instructions、cfg"
                 ),
             );
         }
@@ -1975,18 +1976,42 @@ async fn export(
             None => Some(bitflip_core::DEFAULT_EXPORT_BYTE_LIMIT),
         },
         keep_partial: true,
+        // DEX 选择器：给了却用在机器码格式上时**核心层会报错**，不在这里悄悄丢掉。
+        member: query.member.clone(),
+        class: query.class.clone(),
+        search: query.search.clone(),
+        method: query.method.clone(),
+        include_instructions: query.instructions.unwrap_or(true),
+        include_cfg: query.cfg.unwrap_or(true),
+        no_symbols: query.symbols.is_some_and(|enabled| !enabled),
     };
 
-    // 复用 `AppState` 已经缓存的反汇编：一次导出不该触发重扫
-    // （服务端每次滚动都在用同一份，重扫的代价在真实目标上是秒级）。
-    // 核心层只有一条写文本的路径，所以这里不存在"服务端另拼一份"的漂移。
-    let disasm = match state.disasm() {
-        Ok(disasm) => disasm,
-        Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+    // 选项与视图的匹配**先查一遍**，而且必须在取反汇编之前：非 DEX 格式下面
+    // 会去要一份缓存的 `Disasm`，而归档目标上那一步自己就会失败
+    // （"成员清单保存在文件末尾的中央目录里"）—— 那条消息会盖掉"选择器给错了"
+    // 这条真正有用的信息。实测：真实 APK 上 `format=asm-intel&member=classes.dex`
+    // 原先报的是 ZIP 内部结构，而不是"member 是 DEX 视图的选择器"。
+    // 核心层在导出路径里还会再查一次（纯函数，无害）。
+    if let Err(error) = bitflip_core::check_options(format, &options) {
+        return export_error_response(&error);
+    }
+
+    // DEX 格式**不走反汇编**：归档 / `.dex` 目标没有可反汇编的线性地址空间，
+    // 在这里去要一份反汇编只会先得到一个"目标没有反汇编"的 400（ADR-0021）。
+    let export_result = if format.is_dex() {
+        bitflip_core::export(&session, format, &options)
+    } else {
+        // 复用 `AppState` 已经缓存的反汇编：一次导出不该触发重扫
+        // （服务端每次滚动都在用同一份，重扫的代价在真实目标上是秒级）。
+        // 核心层只有一条写文本的路径，所以这里不存在"服务端另拼一份"的漂移。
+        let disasm = match state.disasm() {
+            Ok(disasm) => disasm,
+            Err(reason) => return error_response(StatusCode::BAD_REQUEST, &reason),
+        };
+        bitflip_core::export_with_disasm(&session, &disasm, format, &options)
     };
 
-    let (text, report) = match bitflip_core::export_with_disasm(&session, &disasm, format, &options)
-    {
+    let (text, report) = match export_result {
         Ok(result) => result,
         Err(error) => return export_error_response(&error),
     };
@@ -2099,6 +2124,20 @@ struct ExportQuery {
     max_functions: Option<usize>,
     /// 字节上限；`0` = 不限。
     limit: Option<u64>,
+    /// 看哪个 DEX 输入（归档成员名）。多于一个 DEX 且不给就是 400。
+    member: Option<String>,
+    /// 只导出这个类（smali 描述符，精确匹配）。
+    class: Option<String>,
+    /// 只导出描述符含该子串（大小写不敏感）的类。
+    search: Option<String>,
+    /// 只导出这个方法（smali 标识，精确匹配）。
+    method: Option<String>,
+    /// `dex-json` 是否带指令数组；缺省 `true`。
+    instructions: Option<bool>,
+    /// 是否带 CFG；缺省 `true`。
+    cfg: Option<bool>,
+    /// 指令文本是否解析符号；缺省 `true`（`false` = 输出原始池索引）。
+    symbols: Option<bool>,
 }
 
 fn default_export_format() -> String {

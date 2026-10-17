@@ -1440,15 +1440,84 @@ MSVC 修饰名反修饰、静态库 PDB。
   （不新开端点，否则"字节预算 + 截断报告 + 部分保留"那套会被抄第二遍然后分叉）、
   机器码格式名用于 DEX 要**报错**、`--function`/`--range` 对 DEX 无意义要报错而
   **不是静默忽略**、`format_versions.dex` 非 DEX 时是 `null` 不是 `0`、
-  导出必须**确定性**（同类输入逐字节相同，CI 靠它做差分）。**实现未做。**
+  导出必须**确定性**（同类输入逐字节相同，CI 靠它做差分）。**已于同日第四轮实现**（见下）。
 * **验证（数据层）**：CLI 合成样本用例 8 → 12 条（列类 / 搜索命中 / 搜索落空 /
   三条互斥错误路径 / `class_list` JSON 形状）；真实 APK 的 `#[ignore]` 用例扩到
   77 秒，实测 `classes.dex` 扫描 7643 个类、`--search ArtificialStackFrames` 命中 1、
   搜不存在的子串命中 0；`scripts/check-dex-url.mjs` 10 条断言全过；
   `npm run typecheck` 过；fmt / clippy / 架构分层 / 许可闸门全过。
-* **仍未做**：DEX `export` 的实现（形状已定）、覆盖率引导模糊测试、长时间 soak。
+* **仍未做**：覆盖率引导模糊测试、长时间 soak。
   已知问题（与本阶段无关，用户明确"先不管"）：
   `bitflip-analyze/tests/callgraph_scale.rs` 的 10k 函数用例在慢机器上会超 3000 ms 门槛。
+
+**进展 · M2c DEX 进 `export`（2026-10-16，同日第四轮，据实记录）**：
+上一轮只定了形状（§M2c + ADR-0021），这一轮按形状把它实现完，CLI 与
+`GET /api/export` 两条路都通。
+
+* **核心**（`crates/bitflip-core/src/export.rs`）：`ExportFormat` 增
+  `DexJson` / `DexSmali` / `DexDotCfg`；`ExportOptions` 增
+  `member` / `class` / `search` / `method` / `include_instructions` /
+  `include_cfg` / `no_symbols`；`ExportMeta` 增 `member`，
+  `FormatVersions` 增 `dex: Option<u32>`（**非 DEX 是 `null`，不是 0**）。
+  `check_options(format, options)` 是导出路径的**第一条语句**：视图与选择器不匹配
+  时一个字节都不写（ADR-0021）。DEX 侧的输入解析、类筛选、指令渲染全部复用
+  `crate::dex` 与 loader 的 `DexStructure` / `DexCfgView`，没有第二套解析器。
+* **先查选项、再建反汇编**（本轮发现并修掉的顺序问题，两条路各修一次）：
+  1. 核心层原来 `check_options` 只在 `export_with_disasm_prebuilt` 里，而 `export()`
+     会先给 `asm-*` 建反汇编 —— 于是"给 `.dex` 目标传 `--member`"得到的是
+     "这个目标不能反汇编"，真正有用的那句（选择器给错了）被盖掉。现在
+     `export()` 第一句就查。这条被 CLI 的合成样本用例钉住。
+  2. 服务端为复用缓存的反汇编，会在 `export_with_disasm` 之前先取一份 `Disasm`，
+     而归档目标上那一步自己就先失败（"成员清单保存在文件末尾的中央目录里"）——
+     **这条是 `scripts/smoke-dex-http.ps1` 抓出来的**：真实 APK 上
+     `format=asm-intel&member=classes.dex` 报的是 ZIP 内部结构，不是选择器。
+     修法是把 `bitflip_core::check_options` 公开、由服务端处理函数开头先调一次
+     （这也是它公开的唯一理由）。假数据（合成样本）永远不会暴露这条：
+     它只有在"归档 + 非 DEX 格式 + DEX 选择器"三者同时出现时才现形。
+* **三处形状更正**（都已回写 §M2c，理由在那里）：
+  1. `dex-json` **没有** `truncated` 块 —— JSON 是单个文档，超预算直接
+     `ExportError::OverBudget`（半份 JSON 解析不了）；需要流式截断 + 截断账目的是
+     `dex-smali` / `dex-dot-cfg`（走 M9 的 `ExportWriter`）。
+  2. `symbols` 里"没有这回事"的项是 **`null` 不是 0**（`--no-instructions` 时整个
+     `symbols` 为 `null`；`--no-symbols` 时计数为 `null`）—— 0 会被读成
+     "解析过、全都没问题"。
+  3. **筛空是错误**：`--class` / `--search` / `--method` 一个都没命中就报错，
+     因为"写出了一个空文件"与"筛错了"在结果上分不出（列表命令 `dex --search`
+     搜不到仍是合法答案，那里输出里写着"扫描 N 个、匹配 0 个"）。
+* **两处实现决定**：`--method` **也筛类**（第一版没筛，真实 APK 上输出是
+  7643 段 `.class` 陪 1 个方法 —— 看起来像"整个 dex 的清单"）；`class` 与 `search`
+  可以叠加，两个过滤条件是**与**的关系（它们是同一集合上的过滤，不像 `dex` 子命令里
+  "列表"与"看一个类"那样是两种视图）。
+* **CLI**（`crates/bitflip-cli/src/cli.rs` / `export.rs`）：`--member` / `--class` /
+  `--search` / `--method` / `--no-instructions` / `--no-cfg` / `--no-symbols`；
+  `--format` 的帮助文本列全十种格式。归档目标的"先拦一道"（原本对任何归档都报
+  "导出面向单个文件"）改成 `is_archive() && !format.is_dex()` —— 否则 APK 根本走不到
+  DEX 导出；提示语补上 `要看里面的 dex 就用 --format dex-json（必要时加 --member）`。
+* **服务层**（`crates/bitflip-server/src/lib.rs`）：`GET /api/export` 的查询参数增
+  `member` / `class` / `search` / `method` / `instructions` / `cfg` / `symbols`；
+  DEX 格式走 `bitflip_core::export`（不需要反汇编缓存），其余格式照旧走
+  `export_with_disasm`，两条路共用同一个错误处置。查询解析错误的"可用参数"列表也补齐了。
+* **验证（数据层）**：
+  * `crates/bitflip-core/tests/m2c_dex_export.rs`（新，8 条）：合成样本上逐个字段断言
+    `dex-json` 形状（类/字段/方法/CFG 计数/`format_versions.dex`/`member`/`role`）、
+    六种"格式与选择器不匹配"必须报 `MismatchedOptions`、`max_functions=1` 时
+    `skipped.methods_over_limit==1`、筛空三类错误各自的措辞、`byte_limit=64` 报
+    `OverBudget`、`dex-smali` 的地址前缀只出现一次、`dex-dot-cfg` 括号配对与
+    `peripheries`、非 DEX 导出时 `format_versions.dex` 是 `null`。
+  * **确定性实测**：同一目标连导两次，`Compare-Object` 只报出 `generated_at` 一行不同
+    （测试按"差异只允许出现在这一行"写，避免把时间戳当成不稳定）。
+  * CLI：`export` 的解析用例（新参数 + 默认值）、单文件 DEX 目标的
+    `dex-json`/`dex-smali` 落盘、两条错配报错；真实 APK 的 `#[ignore]` 用例扩到
+    119 秒，实测给 `--member classes.dex --class …` 导出 **1 个类 / 3 个方法 / 5956 字节**，
+    不给 `--member` 时**报错并列出** `classes.dex、classes2.dex、classes3.dex`。
+  * `scripts/smoke-dex-http.ps1`（真进程 + 真 APK）新增一节：归档目标走
+    `GET /api/export?format=dex-json&member=classes.dex&class=…` 拿到 200 + 合法 JSON
+    （含 `header.class_count` 与 `/api/dex/inputs` 一致）、
+    `format=asm-intel&member=…` 与 `format=dex-json&function=…` 都是 400 且错误点名字段、
+    `dex-smali` 的告警头 + 无重复地址前缀、`dex-dot-cfg` 的括号配对与 `peripheries`。
+* **文档**：§M2c 由"形状已定"改为"已实现"并记录三处更正与两处实现决定；
+  DECISIONS 的 ADR-0021 补"已实现"；README 的 `--format` 例子加 DEX；
+  ARCHITECTURE 的导出一节说明"一个端点、两种视图"；CHANGELOG 记本次改动。
 
 **目标**：能打开一个 `.apk` 并看到"这个 App 里有哪些代码、代码长什么样、谁调用了谁"。
 

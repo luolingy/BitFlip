@@ -92,16 +92,25 @@ pub fn run_export(args: &ExportArgs) -> anyhow::Result<()> {
         max_functions: args.max_functions,
         byte_limit,
         keep_partial: true,
+        member: args.member.clone(),
+        class: args.class.clone(),
+        search: args.search.clone(),
+        method: args.method.clone(),
+        include_instructions: !args.no_instructions,
+        include_cfg: !args.no_cfg,
+        no_symbols: args.no_symbols,
     };
 
     let session = Session::open(&args.target, args.raw.to_open_options()?)?;
 
-    if session.info().is_archive() {
+    if session.info().is_archive() && !format.is_dex() {
         // 归档没有函数、没有反汇编：直接说清并给替代做法，而不是导出
         // 一个空文件让用户以为"分析完成但什么都没有"（CLAUDE.md §7）。
+        // DEX 格式**不走这条**：APK 正是 DEX 的主要容器（ADR-0021）。
         anyhow::bail!(
             "{} 是归档（{} 个成员）：容器本身没有可导出的内容。\
-             先用 `members` 子命令看有哪些成员，然后导出具体的成员文件。",
+             先用 `members` 子命令看有哪些成员，然后导出具体的成员文件；\
+             要看里面的 dex 就用 `--format dex-json`（必要时加 `--member`）。",
             session.info().path,
             session.members().len()
         );

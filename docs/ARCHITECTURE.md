@@ -172,8 +172,9 @@ COFF 没有。
 
 | 要加的东西 | 落点 | 是否需要改通用层 |
 |-----------|------|------------------|
-| DEX 给 CLI / 服务端用 | `bitflip_core::dex`（新模块：原样重导出 loader 的 DEX 入口、`Session::member_bytes` 按成员名取原始字节、名字判据 `is_dex_member_name`、APK 角色标签 `apk_role_label`） | 否。`ObjectKind::Dex` 仍无解析器、`parse_object` 仍拒绝 DEX、`Disasm` 未改；cli/server 也不需要新增 loader 依赖 |
+| DEX 给 CLI / 服务端用 | `bitflip_core::dex`（新模块：原样重导出 loader 的 DEX 入口、`Session::member_bytes` 按成员名取原始字节、名字判据 `is_dex_member_name`、APK 角色标签 `apk_role_label`；M2c 加 `input_names` / `read_input` / `target_file_name` —— 后者把"归档成员名"与"单文件目标用文件名"两个身份收敛到一处，导出与网页 tab 因此说的是同一个名字） | 否。`ObjectKind::Dex` 仍无解析器、`parse_object` 仍拒绝 DEX、`Disasm` 未改；cli/server 也不需要新增 loader 依赖 |
 | HTTP 出口 | `bitflip-server/src/dex.rs`（`/api/dex/{inputs,classes,class,method}` + 按成员名的解析 memo） | 否。`AppState` 只多了一个缓存字段与两个取值方法；没有动 `/api/sections` / `/api/insns` 的形状 |
+| DEX 导出（M2c） | 复用现有的 `bitflip_core::export`（三个新格式名 + `ExportOptions` 的 DEX 选择器），**不新开端点、不在 server 里另拼一份** | 否。核心层只是多了一个视图分支，机器码那六个格式一个字没改；`check_options` 是纯函数，公开只为让服务端能**在取反汇编之前**先查一遍 |
 
 **判据仍然是**："format/ 外面要改的文件越少，边界划得越对"。上表里被标"是"的四处
 都是**容器与执行模型**层面的扩展（那是通用层的正当职责），没有一处是"因为某个格式
@@ -343,7 +344,7 @@ impl Session {
 - 查询返回**视图**（`InsnView`/`NameView`）而不是拷贝所有权类型，避免大对象复制。
 - 所有地址参数/返回值都是 `u64`；字符串化只发生在渲染层。
 
-### 7.1 导出：已经落地的实际形态（M9）
+### 7.1 导出：已经落地的实际形态（M9 / M2c）
 
 上面那段是**目标形态的草图**，其中补丁与写回（`set_patch` / `apply_patches`）**尚未实现**。
 已经落地的是导出，实际接口与草图有出入，以本节为准：
@@ -352,16 +353,27 @@ impl Session {
 /// 导出格式版本。与 `format_version` 一起构成对外契约。
 pub const EXPORT_FORMAT_VERSION: u32 = 1;
 
-pub enum ExportFormat { AsmIntel, AsmAtt, JsonFunctions, JsonSymbols, JsonXrefs, DotCfg }
+pub enum ExportFormat {
+    AsmIntel, AsmAtt, JsonFunctions, JsonSymbols, JsonXrefs, DotCfg,   // 机器码视图
+    DexJson, DexSmali, DexDotCfg,                                      // DEX 视图（M2c）
+}
 
 pub struct ExportOptions {
-    pub range: Option<(u64, u64)>,   // 半开区间
-    pub function: Option<u64>,       // 与 range 互斥
+    pub range: Option<(u64, u64)>,   // 半开区间（DEX 视图不支持）
+    pub function: Option<u64>,       // 与 range 互斥（DEX 视图不支持）
     pub include_bytes: bool,
     pub include_source: bool,
-    pub max_functions: usize,
+    pub max_functions: usize,        // DEX 视图下是"最多多少个方法"
     pub byte_limit: Option<u64>,     // None = 不限
     pub keep_partial: bool,
+    // M2c：DEX 视图的选择器。给机器码格式就是错，`check_options` 会报错。
+    pub member: Option<String>,
+    pub class: Option<String>,
+    pub search: Option<String>,
+    pub method: Option<String>,
+    pub include_instructions: bool,
+    pub include_cfg: bool,
+    pub no_symbols: bool,
 }
 
 pub fn export(
@@ -377,6 +389,13 @@ pub fn export_with_disasm(
     format: ExportFormat,
     options: &ExportOptions,
 ) -> Result<(String, ExportReport), BitflipError>;
+
+/// 选项与所选视图是否匹配；不匹配就报错（ADR-0021）。
+///
+/// 导出路径自己会先调一遍。**另外单独公开**是因为调用方可能在这之前先做别的事：
+/// 服务端为复用缓存的反汇编会先取一份 `Disasm`，而归档目标上那一步自己就会失败，
+/// 于是"选择器给错了"会被一条更早的错误盖掉（真实 APK 上实测踩到过）。
+pub fn check_options(format: ExportFormat, options: &ExportOptions) -> Result<(), BitflipError>;
 ```
 
 与草图的三点差异，各有理由：
@@ -388,6 +407,15 @@ pub fn export_with_disasm(
   正文要被重定向或落盘，报告要被看见，混在一起两边都做不好。
 - **`format_version` 独立演进**（`EXPORT_FORMAT_VERSION`），不跟 `CORE_API_VERSION` 绑。
   字段含义变一次就递增一次，外部消费方据此判断能不能直接吃。
+
+**一个入口、两种视图**（M2c / ADR-0021）：DEX 不新开 `dex export` 或
+`/api/dex/export`，而是把 `dex-json` / `dex-smali` / `dex-dot-cfg` 三个格式名交给同一个
+`export`，视图由 `format` 判别。理由是"字节预算 + 截断报告 + 部分保留"这套机器只该有
+一份：第二个入口会把它抄一遍，然后在某次改动里开始分叉（一个说"已截断"、另一个不说）。
+两条硬规则：机器码格式名用于 DEX 目标、或 `--function`/`--range` 用于 DEX 视图，
+都必须**报错**（静默忽略等于把"我按你说的做了"变成假话）；`format_versions.dex`
+在非 DEX 导出时是 `null` 而不是 `0`（`0` 会被读成"这是 DEX 版本 0"）。
+形状与字段级契约见 `docs/APK-DEX-DESIGN.md` §M2c。
 
 ## 8. `bitflip-server`：HTTP/WS 协议
 
@@ -421,13 +449,21 @@ pub fn export_with_disasm(
 > 而不是上表的 `/api/sessions/:id/...`。上表是目标形态（多会话），
 > 条目与已实现路由的对应关系以本节末的统一说明为准。
 >
-> 已落地的导出端点（M9）：`GET /api/export?format=&from=&to=&function=&bytes=&source=&max_functions=&limit=`
+> 已落地的导出端点（M9，M2c 扩了 DEX）：
+> `GET /api/export?format=&from=&to=&function=&bytes=&source=&max_functions=&limit=`
+> （DEX 格式再加 `member=&class=&search=&method=&instructions=&cfg=&symbols=`）
 > - 正文**就是导出的字节**（`text/plain` 或 `application/json`），可以直接落盘；
 > - 元信息走响应头：`x-bitflip-format`、`x-bitflip-export-format-version`、`x-bitflip-items`、
 >   `x-bitflip-truncated`、`x-bitflip-warning-N`（说明里的中文按 `%XX` 编码，HTTP 头是 ASCII）；
 > - **参数名一律单词且 `deny_unknown_fields`**：`serde_urlencoded` 默认忽略不认识的字段，
 >   那样 `/api/export?limit-bytes=1000` 会返回 200 和一份**没被限制大小**的响应。
 >   写错的键现在返回 400 并列出可用参数。
+> - **DEX 视图走同一个端点**（M2c / ADR-0021）：`format=dex-json|dex-smali|dex-dot-cfg`
+>   就是 DEX 视图，`member` 指 `classes*.dex`。机器码格式名配上 DEX 选择器、
+>   或 DEX 格式名配上 `function`/`from`/`to`，都是 400（**不静默忽略**）。
+>   这里有个只在服务端出现的顺序问题：非 DEX 格式会去取缓存的 `Disasm`，
+>   而归档目标上那一步自己就先失败（"成员清单在文件末尾"）—— 所以处理函数
+>   在取反汇编**之前**先调 `bitflip_core::check_options`，让"选择器给错了"浮到最上面。
 >
 > 已落地的差分端点（M9）：`GET /api/diff?against=<path>&scope=&only=&entries=`
 > - 返回 `DiffReport` JSON，正文里带 `format_version` / `normalization` / 两个镜像基址；

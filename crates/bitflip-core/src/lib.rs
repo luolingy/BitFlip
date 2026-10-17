@@ -35,8 +35,9 @@ pub use disasm::{
 };
 pub use error::BitflipError;
 pub use export::{
-    export, export_with_disasm, ExportError, ExportFormat, ExportMeta, ExportOptions, ExportReport,
-    FormatVersions, Truncation, DEFAULT_EXPORT_BYTE_LIMIT, EXPORT_FORMAT_VERSION,
+    check_options, export, export_with_disasm, ExportError, ExportFormat, ExportMeta,
+    ExportOptions, ExportReport, FormatVersions, Truncation, DEFAULT_EXPORT_BYTE_LIMIT,
+    EXPORT_FORMAT_VERSION,
 };
 
 /// 一并重新导出 APK 成员角色：它由**成员名**判定（纯字符串，不读字节），

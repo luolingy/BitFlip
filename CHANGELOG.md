@@ -11,6 +11,55 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — DEX 进 `export`：`dex-json` / `dex-smali` / `dex-dot-cfg`（M2c 完成）
+
+按 `docs/APK-DEX-DESIGN.md` §M2c 与 ADR-0021 把上一轮定下的形状实现完：
+**同一个 `export` 入口，视图由 `format` 判别**，不新开端点。
+
+- **三种新格式**（`crates/bitflip-core/src/export.rs`）：`dex-json`（结构快照：
+  类 / 字段 / 方法 / 指令 / CFG 计数）、`dex-smali`（我们用自己渲染路径拼出的
+  smali 风格文本，**不是可回汇编的源文件**）、`dex-dot-cfg`（一个方法的 CFG）。
+  导出 DEX **不许**套 `asm-intel` / `asm-att` / `pseudo-c`：DEX 没有线性地址空间，
+  套上去只会产出"看着像反汇编"的东西（ADR-0020 第一条）。
+- **选项扩展**：`member` / `class` / `search` / `method` /
+  `include_instructions` / `include_cfg` / `no_symbols`，CLI 与
+  `GET /api/export` 两条路同步（`--member`、`--class`、`--search`、`--method`、
+  `--no-instructions`、`--no-cfg`、`--no-symbols`）。`max_functions` 对 DEX 是
+  "最多多少个**方法**"的口径（不新增 `max_methods`）。
+- **信封**：`ExportMeta.member` 记录实际导出的成员；`FormatVersions.dex` 是
+  `Option<u32>`，**非 DEX 导出时是 `null` 而不是 `0`** —— `0` 会被读成
+  "这个文件是 DEX 版本 0"。
+- **视图与选择器不匹配一律报错，不静默忽略**（ADR-0021）：`asm-*` + DEX 选择器、
+  `dex-*` + `--function`/`--range` 都报 `ExportError::MismatchedOptions`，
+  错误里点名是哪个选项、并给可用替代。顺带修掉一处顺序问题：`export()` 原本先给
+  `asm-*` 建反汇编、后查选项，于是"给 `.dex` 传 `--member`"得到的是
+  "这个目标不能反汇编"，真正有用的那句被盖掉；现在选项检查是导出路径的第一条语句。
+- **降级进文件**：`notes`（解析期容忍式跳过）、`skipped`
+  （`methods_without_code` / `methods_over_limit` / `methods_parse_failed`）、
+  `symbols`（`unsupported_operands` / `unavailable_operands` / `render_failures`）。
+  `--no-instructions` 时 `symbols` 的每一项都是 `null`（对象还在，字段才是 `null`）、
+  `--no-symbols` 时两个计数为 `null`：给 0 会被读成"解析过、全都没问题"，
+  而事实是我们**没解析**。
+- **`dex-json` 没有 `truncated` 块**：JSON 是单个文档，超预算直接
+  `ExportError::OverBudget`（半份 JSON 解析不了，M9 早已定下这条），报错里给缩小
+  范围的办法；需要流式截断账目的是 `dex-smali` / `dex-dot-cfg`（复用 M9 的
+  `ExportWriter` / `Truncation`）。
+- **筛空是错误**：`--class` / `--search` / `--method` 一个都没命中就报错并说清
+  （"导出一个空文件"与"筛错了"在结果上分不出）。对照：列表命令 `dex --search`
+  搜不到仍是合法答案，那里输出里写着"扫描 N 个、匹配 0 个"。另外 `--method`
+  **也筛类**（第一版没筛，真实 APK 上输出是 7643 段 `.class` 陪 1 个方法）。
+- **截断建议随视图而定**：文本格式被预算截断时，`Truncation.hint` 原来一律说
+  "用 `--from/--to` 按地址段分批导出" —— 对 DEX 是**错的建议**（`--from/--to`
+  用在 DEX 上会被选项检查拒绝）。DEX 改成"用 `--class` / `--search` 缩小范围"，
+  测试同时要求它**不**出现 `--from`。
+- **确定性**：成员按容器顺序、类按 `class_defs` 顺序、方法按 `method_idx` 顺序，
+  无 `HashMap` 迭代。实测同一输入连导两次**除 `meta.generated_at` 外逐字节相同**。
+- **验证**：新增 `crates/bitflip-core/tests/m2c_dex_export.rs`（8 条，合成样本逐字段 +
+  六种错配报错 + 超预算 + smali/DOT 形态）；CLI 合成样本导出用例 + 真实 APK
+  `#[ignore]` 用例（给 `--member` 导出 1 类 / 3 方法 / 5956 字节；不给 `--member`
+  报错并列出三个 DEX 名）；`scripts/smoke-dex-http.ps1` 新增一节（真进程 + 真 APK 上
+  归档目标走同一端点拿到 200、两类错配都是 400、文本/DOT 形态逐条断言）。
+
 ### 新增 — `dex` 子命令的类列表与搜索；DEX 视图状态进 URL；DEX 导出形状定案
 
 M2b 的第三轮（用户 2026-10-16 点名的五件事）：CLI 补搜索、网页标签页与状态支持 URL、

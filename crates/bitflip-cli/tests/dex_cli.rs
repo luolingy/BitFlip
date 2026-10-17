@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
-use bitflip_cli::{build_dex_json, build_dex_text, DexArgs};
+use bitflip_cli::{
+    build_dex_json, build_dex_text, run_export, DexArgs, ExportArgs, RawOverrideArgs,
+};
 
 // 与 loader 的结构黄金测试共用的合成样本。`allow(dead_code)`：CLI 测试只用其中的
 // `build()`，其余常量与辅助函数是 loader 侧要用的，不该为了这里再删一遍。
@@ -42,6 +44,94 @@ fn write_minimal_dex(dir: &tempfile::TempDir) -> PathBuf {
     let path = dir.path().join("minimal.dex");
     std::fs::write(&path, fixture::build()).expect("写入合成样本");
     path
+}
+
+/// 一个只填了本测试会用到字段的 `export` 参数集（M2c）。
+///
+/// `format` 缺省是 `asm-intel`（与 CLI 的缺省一致）：要测 DEX 那条路时显式改它，
+/// 这样才能顺带断言"机器码格式 + DEX 选择器"会被拒绝。
+fn export_args(target: &Path) -> ExportArgs {
+    ExportArgs {
+        target: target.to_path_buf(),
+        format: "asm-intel".to_owned(),
+        out: None,
+        from: None,
+        to: None,
+        function: None,
+        member: None,
+        class: None,
+        search: None,
+        method: None,
+        no_instructions: false,
+        no_cfg: false,
+        no_symbols: false,
+        no_bytes: false,
+        no_source: false,
+        max_functions: 512,
+        limit_bytes: None,
+        force: false,
+        summary: true,
+        verbose: false,
+        raw: RawOverrideArgs::default(),
+    }
+}
+
+/// M2c：`export` 的 DEX 选择器（合成样本，默认就跑）。
+///
+/// 这里盯的是**这一层**的责任：开关 → `ExportOptions` 的映射、把结果写到文件、
+/// 以及"选择器用错格式就报错"。快照本身的字段由 core 的测试逐项钉住。
+#[test]
+fn the_export_command_writes_a_dex_snapshot_and_refuses_mixed_selectors() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let target = write_minimal_dex(&dir);
+
+    let json_out = dir.path().join("foo.json");
+    let mut json_args = export_args(&target);
+    json_args.format = "dex-json".to_owned();
+    json_args.class = Some("Lcom/example/Foo;".to_owned());
+    json_args.out = Some(json_out.clone());
+    run_export(&json_args).expect("导出 DEX 快照");
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_out).expect("读回导出"))
+            .expect("合法 JSON");
+    assert_eq!(document["member"], "minimal.dex");
+    assert_eq!(document["classes"][0]["descriptor"], "Lcom/example/Foo;");
+    assert_eq!(document["meta"]["format_versions"]["dex"], 1);
+    assert_eq!(document["totals"]["methods_written"], 2);
+
+    let smali_out = dir.path().join("foo.smali");
+    let mut smali_args = export_args(&target);
+    smali_args.format = "dex-smali".to_owned();
+    smali_args.class = Some("Lcom/example/Foo;".to_owned());
+    smali_args.out = Some(smali_out.clone());
+    run_export(&smali_args).expect("导出 smali 风格文本");
+    let text = std::fs::read_to_string(&smali_out).expect("读回 smali");
+    assert!(
+        text.starts_with("# bitflip-export v1 format=dex-smali"),
+        "文本格式也要自述头：{text}"
+    );
+    assert!(text.contains(".class Lcom/example/Foo;"));
+
+    // 机器码格式 + DEX 选择器：**报错**，不静默忽略。
+    // （这条同时钉住"选项检查要在建反汇编之前"：`.dex` 目标建不出反汇编，
+    //   若顺序反了，用户看到的会是"这个目标不能反汇编"。）
+    let mut wrong = export_args(&target);
+    wrong.member = Some("minimal.dex".to_owned());
+    let error = run_export(&wrong).expect_err("--member 给 asm-intel 必须报错");
+    assert!(
+        error.to_string().contains("member"),
+        "要点名是哪个选择器：{error}"
+    );
+
+    // DEX 格式 + 机器码选择器：同样报错。
+    let mut wrong = export_args(&target);
+    wrong.format = "dex-json".to_owned();
+    wrong.function = Some("0x100".to_owned());
+    let error = run_export(&wrong).expect_err("--function 给 dex-json 必须报错");
+    assert!(
+        error.to_string().contains("--function"),
+        "要点名是哪个选项：{error}"
+    );
 }
 
 #[test]
@@ -569,4 +659,48 @@ fn the_real_apk_renders_a_method_from_a_real_dex_member() {
             .is_some_and(|d| d.starts_with('L')),
         "{value}"
     );
+
+    // ── M2c：`export` 的 DEX 这条路在**真实 APK**上也要走通
+    //    （单文件目标由合成样本那条测试覆盖，这里专门验归档容器）。
+    let dir = tempfile::tempdir().expect("临时目录");
+    let out = dir.path().join("real.dex.json");
+    let mut dex_export = export_args(&apk);
+    dex_export.format = "dex-json".to_owned();
+    dex_export.member = Some("classes.dex".to_owned());
+    dex_export.class = Some(descriptor.to_owned());
+    dex_export.limit_bytes = Some(4 * 1024 * 1024);
+    dex_export.out = Some(out.clone());
+    run_export(&dex_export).expect("从真实 APK 导出 DEX 快照");
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("读回导出")).expect("合法 JSON");
+    assert_eq!(document["member"], "classes.dex");
+    assert_eq!(document["role"], "主 dex");
+    assert_eq!(document["meta"]["format_versions"]["dex"], 1);
+    assert_eq!(document["classes"][0]["descriptor"], descriptor);
+    assert!(
+        document["classes"][0]["methods"]
+            .as_array()
+            .is_some_and(|methods| !methods.is_empty()),
+        "真实类应当有方法：{document}"
+    );
+    println!(
+        "---- 真实 APK：dex-json 导出 {} 个类 / {} 个方法（{} 字节）----",
+        document["totals"]["classes_written"],
+        document["totals"]["methods_written"],
+        std::fs::metadata(&out).map(|meta| meta.len()).unwrap_or(0)
+    );
+
+    // 归档里有多个 DEX 时不给 `--member` 必须**报错并列出名字**：
+    // 猜一个（通常猜 classes.dex）会让用户拿到一份别的文件的内容，
+    // 而文件名还写着目标名。
+    let mut ambiguous = export_args(&apk);
+    ambiguous.format = "dex-json".to_owned();
+    let error = run_export(&ambiguous).expect_err("多 DEX 不给 --member 必须报错");
+    let message = error.to_string();
+    assert!(message.contains("缺少 member 参数"), "{message}");
+    assert!(
+        message.contains("classes.dex") && message.contains("classes2.dex"),
+        "报错要把可选名字列出来：{message}"
+    );
+    println!("---- 真实 APK：不给 --member -> {message} ----");
 }

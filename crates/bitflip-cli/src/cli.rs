@@ -376,10 +376,14 @@ pub struct SignatureInfoArgs {
 /// 服务端同一路径。**不要让 CLI 自己拼文本** —— 那早晚会和界面漂移。
 #[derive(Debug, Args)]
 pub struct ExportArgs {
-    /// 目标文件；归档可用 `--member` 指定成员
+    /// 目标文件；导出 DEX 时用 `--member` 指定看哪个成员
     #[arg(value_name = "TARGET")]
     pub target: PathBuf,
-    /// 导出格式：asm-intel、asm-att、json-functions、json-symbols、json-xrefs、dot-cfg
+    /// 导出格式：asm-intel、asm-att、json-functions、json-symbols、json-xrefs、
+    /// dot-cfg、pseudo-c、dex-json、dex-smali、dex-dot-cfg
+    ///
+    /// 前七个是机器码视图（按地址选），后三个是 DEX 视图（按类 / 方法选）。
+    /// 两套选择器不能混用：把 `--function` 给 DEX 格式会**报错**，不静默忽略。
     #[arg(long, value_name = "FORMAT", default_value = "asm-intel")]
     pub format: String,
     /// 输出文件；缺省写标准输出
@@ -396,6 +400,32 @@ pub struct ExportArgs {
     /// 与 `--from/--to` 互斥：两者都要就没有"哪个更具体"的合理答案。
     #[arg(long, value_name = "ADDR")]
     pub function: Option<String>,
+    /// 看哪个 DEX 输入（归档成员名，如 `classes2.dex`）
+    ///
+    /// 目标只有一个 DEX 时可以不写；多于一个又没写就报错并把可选名字列出来 ——
+    /// 猜错的表现是导出了一份**别的文件**的内容。
+    #[arg(long, value_name = "NAME")]
+    pub member: Option<String>,
+    /// 只导出这一个类（smali 描述符，如 `Lcom/Foo;`；精确匹配）
+    #[arg(long, value_name = "DESCRIPTOR")]
+    pub class: Option<String>,
+    /// 只导出描述符含该子串的类（大小写不敏感）
+    ///
+    /// 与 `--class` 互斥：一个要精确、一个要模糊，同时给就说不清"命中哪一个"。
+    #[arg(long, value_name = "TEXT")]
+    pub search: Option<String>,
+    /// 只导出这一个方法（smali 标识，如 `Lcom/Foo;->bar(I)V`；精确匹配）
+    #[arg(long, value_name = "SIGNATURE")]
+    pub method: Option<String>,
+    /// DEX 导出不带指令列（只看结构与 CFG 计数）
+    #[arg(long)]
+    pub no_instructions: bool,
+    /// DEX 导出不带 CFG
+    #[arg(long)]
+    pub no_cfg: bool,
+    /// 指令文本不解析符号，保留原始池索引（`string@12` 这类）
+    #[arg(long)]
+    pub no_symbols: bool,
     /// 反汇编文本不带机器码列
     #[arg(long)]
     pub no_bytes: bool,
@@ -815,6 +845,55 @@ mod tests {
                 assert!(args.no_bytes && args.no_source);
                 assert_eq!(args.max_functions, 8);
                 assert!(args.summary && args.force);
+            }
+            other => panic!("期望 export，得到 {other:?}"),
+        }
+    }
+
+    /// M2c：`export` 的 DEX 选择器（`--member` / `--class` / `--search` / `--method`）。
+    ///
+    /// 默认值必须是"都给、都不带"：DEX 导出缺省带指令与 CFG，缺省解析符号 ——
+    /// 反过来（缺省关掉）会让用户以为导出的文本"本来就没有符号"。
+    #[test]
+    fn export_command_parses_dex_selectors() {
+        let cli = Cli::try_parse_from(["bitflip-cli", "export", "app.apk", "--format", "dex-json"])
+            .expect("解析 DEX 导出");
+        match cli.command {
+            Command::Export(args) => {
+                assert_eq!(args.format, "dex-json");
+                assert!(args.member.is_none() && args.class.is_none());
+                assert!(args.search.is_none() && args.method.is_none());
+                assert!(!args.no_instructions, "缺省带指令");
+                assert!(!args.no_cfg, "缺省带 CFG");
+                assert!(!args.no_symbols, "缺省解析符号");
+            }
+            other => panic!("期望 export，得到 {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "export",
+            "app.apk",
+            "--format",
+            "dex-smali",
+            "--member",
+            "classes2.dex",
+            "--search",
+            "Activity",
+            "--method",
+            "Lcom/example/Foo;->bar(I)V",
+            "--no-instructions",
+            "--no-cfg",
+            "--no-symbols",
+        ])
+        .expect("解析带选择器的 DEX 导出");
+        match cli.command {
+            Command::Export(args) => {
+                assert_eq!(args.member.as_deref(), Some("classes2.dex"));
+                assert_eq!(args.search.as_deref(), Some("Activity"));
+                assert_eq!(args.method.as_deref(), Some("Lcom/example/Foo;->bar(I)V"));
+                assert!(args.class.is_none());
+                assert!(args.no_instructions && args.no_cfg && args.no_symbols);
             }
             other => panic!("期望 export，得到 {other:?}"),
         }

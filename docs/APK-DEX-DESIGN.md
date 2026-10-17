@@ -333,10 +333,11 @@ DEX **不是**"另一种可执行格式"，不要硬塞进现有分析层：
 >     实测（真实 APK，3 个 DEX）：`classes.dex` 扫描 7643 个类、
 >     `--search ArtificialStackFrames` 命中 1、搜不存在的子串命中 0。
 
-### M2c — DEX 进 `export`（**形状已定，未实现**，2026-10-16）
+### M2c — DEX 进 `export`（已实现，2026-10-16）
 
-> 用户 2026-10-16 的决定：**先定形状**（"dex导出先定形状"）。本节就是那份形状，
-> 只写契约，不写实现；实现时照这里写，要改先改这里。
+> 用户 2026-10-16 的决定：**先定形状，再实现**（"dex导出先定形状"）。本节先记了那份
+> 形状，随后照它实现；下面凡与最初形状不同的地方，都在**「实现时的三处更正」**
+> 里写清了为什么改。契约以本节为准，要改先改这里。
 
 **放在哪个入口**：**沿用现有的 `export` 子命令与 `GET /api/export`**，不新开
 `dex export` / `/api/dex/export`。理由是 M9 那套"字节预算 + 截断报告 + 部分保留"
@@ -365,8 +366,11 @@ DEX 没有线性地址空间、没有"函数入口"，套上去只会产出"看�
 
 **沿用**：`byte_limit` / `keep_partial` 照旧生效（对 DEX 按**已写出的字节**计数）；
 `max_functions` 对 DEX 是"最多导出多少个**方法**"的口径（**不新增 `max_methods`**，
-两个名字说的是同一件事）；`range`、`function` 对 DEX **不适用**；
-`include_bytes` 只在 `dex-smali` 下表示"每条指令附原始码元"。
+两个名字说的是同一件事）；`range`、`function` 对 DEX **不适用**。
+`include_bytes` / `include_source` 在 DEX 视图上**没有对应物**（文本导出里没有
+"字节"列，也没有源码行 —— `debug_info` 还没解析）：关上它们不会让输出少任何东西，
+所以不是"静默忽略选择器"，但也不会看起来生效了 —— 用了 `--no-bytes` / `--no-source`
+时会在 `notes` 里写明"对 DEX 视图没有影响"。
 
 **选项与视图不匹配时报错，不忽略**：`--format dex-json --function 0x401000` 要
 `ExportError`，说清"DEX 没有地址空间，请用 `--class` / `--method`"。CLAUDE.md §7：
@@ -383,44 +387,67 @@ DEX 没有线性地址空间、没有"函数入口"，套上去只会产出"看�
 * `range_from` / `range_to` / `function` = `null`。
 
 **`dex-json` 的数据形状**（字段名 snake_case，与 `/api/dex/*` 的 DTO 保持一致，
-不复用机器码那套 `functions` / `xrefs` 名字）：
+不复用机器码那套 `functions` / `xrefs` 名字）。下面是**实际产出**的样子
+（键按字母序：`serde_json` 用 BTreeMap，这本身也是确定性的一部分）：
 
 ```json
 {
-  "format_version": 1,
-  "member": "classes.dex",
-  "role": "主 dex",
-  "size": 8834567,
-  "header": { "class_count": 7643, "method_count": 53906 },
-  "notes": ["…"],
   "classes": [
     {
-      "descriptor": "Lcom/Foo;",
-      "short_name": "Foo",
-      "superclass": "Ljava/lang/Object;",
-      "source_file": "Foo.java",
-      "access_flags": 1,
-      "fields": [{ "name": "x", "type": "I", "access_flags": 8, "is_static": true }],
+      "access_flags": 17,
+      "descriptor": "Lcom/example/Foo;",
+      "fields": [
+        { "access_flags": 2, "index": 0, "is_static": false, "name": "s",
+          "type_descriptor": "Ljava/lang/String;" }
+      ],
       "methods": [
         {
-          "signature": "Lcom/Foo;->bar(I)V",
           "access_flags": 1,
+          "cfg": { "blocks": 3, "edges": 4, "unresolved_edge_targets": 0 },
           "code_off": "00000000001894e0",
           "has_code": true,
-          "registers_size": 2,
+          "index": 1,
           "ins_size": 2,
+          "is_direct": false,
+          "name": "bar",
           "outs_size": 1,
+          "registers_size": 2,
+          "signature": "Lcom/Foo;->bar(I)V",
           "instructions": [
-            { "code_unit": "0000000000000000", "text": "invoke-direct {v0}, …" }
-          ],
-          "cfg": { "blocks": 3, "edges": 4, "unresolved_edge_targets": 0 }
+            { "code_unit": "0000000000000000", "text": "0000: invoke-direct {v0}, …" }
+          ]
         }
-      ]
+      ],
+      "short_name": "Foo",
+      "source_file": "Foo.java",
+      "superclass": "Ljava/lang/Object;"
     }
   ],
-  "skipped": { "classes_without_descriptor": 0, "methods_without_code": 1204 },
-  "symbols": { "enabled": true, "unsupported_operands": 17, "unavailable_operands": 0 },
-  "truncated": { "what": "instructions", "written": 1200000, "dropped": 43120, "hint": "…" }
+  "format_version": 1,
+  "header": { "class_count": 7643, "method_count": 53906, "method_count_with_code": 50934 },
+  "member": "classes.dex",
+  "meta": {
+    "arch": null,
+    "file_size": 32987157,
+    "format": "dex-json",
+    "format_versions": { "analysis": 1, "dex": 1, "disasm": 1, "export": 1, "info": 1 },
+    "function": null,
+    "generated_at": "2026-10-16T15:38:13Z",
+    "member": "classes.dex",
+    "producer": "bitflip 0.0.1",
+    "range_from": null,
+    "range_to": null,
+    "target": "…/ah-app-release.apk"
+  },
+  "notes": ["…"],
+  "producer": "bitflip 0.0.1",
+  "role": "主 dex",
+  "size": 8800484,
+  "skipped": { "methods_over_limit": 0, "methods_parse_failed": 0, "methods_without_code": 0 },
+  "symbols": { "enabled": true, "instructions": 8, "render_failures": 0,
+               "unavailable_operands": 0, "unsupported_operands": 0 },
+  "totals": { "classes_written": 1, "filtered_by_class": false, "filtered_by_method": true,
+              "filtered_by_search": false, "instructions_written": 8, "methods_written": 1 }
 }
 ```
 
@@ -431,26 +458,108 @@ DEX 没有线性地址空间、没有"函数入口"，套上去只会产出"看�
    `unsupported_operands` / `unavailable_operands` 两个计数放进 `symbols`。
    ADR-0020 的更正（`droidsaw` 写 `"?"` / `"<invalid>"`）在这里同样成立：
    导出文件是给别人解析的，占位符进去就再也分不出真假。
-2. **降级进文件。** 解析期 `notes`、`skipped`、`symbols`、`truncated` 四样都在
-   JSON 顶层；截断复用 M9 的 `Truncation`（`what`/`written`/`dropped`/`hint`），
-   不做第二套说法。
-3. **确定性。** 同一个输入导出两次必须逐字节相同：成员按容器顺序、类按
-   `class_defs` 顺序、方法按 `method_idx` 顺序、字段按声明顺序 —— 不许出现
-   `HashMap` 迭代顺序。CI 靠这条做差分，顺序不定就等于没法比对。
+2. **降级进文件。** 解析期 `notes`、`skipped`、`symbols` 三样都在 JSON 顶层
+   （截断那一项见下面的更正 1）。CLAUDE.md §7 的意思不是"必须叫 truncated"，
+   而是"少给了什么必须写在文件里"。
+3. **确定性。** 成员按容器顺序、类按 `class_defs` 顺序、方法按 `method_idx` 顺序、
+   字段按声明顺序 —— 不许出现 `HashMap` 迭代顺序。实测同一输入连导两次，
+   **除 `meta.generated_at` 外逐字节相同**（时间戳是信封的一部分，别的格式也一样）；
+   测试就是按"差异只允许出现在 `generated_at` 那一行"来写的。
 4. **`code_off` 用定长 16 位小写十六进制**（与项目里所有 wire 地址一致，
    虽然它是**码元偏移**不是地址，见 §6）。`code_off == 0` 的方法是合法结论
    （抽象 / native），导出 `has_code: false` 并计入
    `skipped.methods_without_code`，不是错误、也不是空数组。
 
-**验收（实现时按这几条写测试，现在只登记）**：
+**实现时的三处更正**（改的是形状，不是立场；改完回写到这里）：
 
-* 合成样本：`dex-json` 的每个字段逐个断言（含 `format_versions.dex == 1`、
-  非 DEX 导出时它是 `null`）；
+1. **`dex-json` 没有 `truncated` 块。** JSON 是**单个文档**，截断它只会得到解析不了
+   的半份 —— M9 早已定下这条规矩（`write_document` 超预算直接
+   `ExportError::OverBudget`）。所以 `dex-json` 的截断通道是**报错**，报错信息里
+   给缩小范围的办法（`--class` / `--search` / `--max-functions`）。
+   需要"流式截断 + `truncated` 账目"的是文本格式：`dex-smali` / `dex-dot-cfg`
+   走 M9 的 `ExportWriter`，超预算时保留已写出的部分并在报告里给出
+   `what` / `written` / `dropped` / `hint`。
+2. **`symbols` 里关掉的项是 `null` 而不是 0。** `--no-instructions` 时 `symbols` 的
+   每一项都是 `null`（对象还在，字段才是 `null` —— 没渲染指令，也就没有符号这回事）；
+   `--no-symbols` 时 `enabled` 是 `false`、两个计数是 `null`。给 0 会被读成
+   "解析过、全都没问题"，而事实是我们**没解析**。`instructions` / `render_failures`
+   照旧给数。
+3. **筛空是错误，不是"导出了 0 个类"。** 一份空文件与"类名打错 / 子串筛错"
+   在结果上长得一模一样，而"写出了一个文件"会让人以为就是这样。所以
+   `--class` 找不到类、`--search` 一个都没命中、`--method` 找不到方法，三条都
+   **报错**（错误信息里带上这个 DEX 有多少个类）。
+   对照：CLI 的 `dex --search`（一条**列表**命令）搜不到是合法答案 —— 那里
+   输出里写着"扫描 N 个、匹配 0 个"，导出没有那行输出。
+
+**另外三处实现决定**（形状没说，实现时必须挑一个，记在这里）：
+
+* **`--method` 也筛类**：只导出方法所属的那个类。第一版没筛，结果一个真实 APK 的
+  输出里是 7643 段 `.class` 陪 1 个方法 —— 那份文件看起来像"整个 dex 的清单"，
+  而用户只问了一个方法。
+* **`class` 与 `search` 可以同时给**，两个过滤条件是**与**的关系（`--class` 精确、
+  `--search` 子串）。它们作用在同一个集合上，叠加起来有确定含义；不像
+  `dex` 子命令里"列类"与"看一个类"那样是两种**视图**，混在一起才说不清命中哪个。
+* **截断建议随视图而定**。文本格式被预算截断时，`Truncation.hint` 原来一律是
+  "用 `--from/--to` 按地址段分批导出" —— 这句话对 DEX 是**错的建议**：
+  `--from/--to` 用在 DEX 上会被我们自己的选项检查拒绝。DEX 的 hint 现在是
+  "用 `--class` / `--search` 缩小范围，或调大 `--limit-bytes`"，
+  并被一条测试钉住（既要求提到 `--class`/`--search`，也要求**不**出现 `--from`）。
+
+**`dex-smali` 的样子**（文本，`#` 是注释）：
+
+```text
+# bitflip-export v1 format=dex-smali target=… member=classes.dex dex v1 generated_at=…
+# 这是 smali **风格**的清单，不是可回汇编的 smali 源文件：
+#   - 没有注解、`.line`、调试信息、泛型签名等属性；
+#   - 指令文本来自 BitFlip 自己的渲染路径，解析不出符号时保留可数的池索引…
+.class Lcom/Foo;   super=Ljava/lang/Object;   source_file=Foo.java
+.field instance Ljava/lang/String; s   # access_flags=0x2
+.method Lcom/Foo;->bar(I)V   # code_off=00000000001894e0 registers=2 ins=2 outs=1
+    0000: invoke-direct {v0}, Ljava/lang/Object;-><init>()V
+# CFG：3 个块、4 条边、0 个未连上的目标（入口块 0）
+# 块 0 @0000（2 条指令）  前驱：无
+.end method
+```
+
+两条容易写错的细节，都已钉在测试里：**地址前缀只出现一次**（`render_instruction*`
+已经写了 `0000: `，导出层再加一次就成了 `0000: 0000: …`）；CFG 段落**逐行加 `#`**，
+免得它看起来像 smali 语法。
+
+**`dex-dot-cfg`** 与 `dot-cfg` 同形：一个方法一个 `subgraph cluster_m<方法下标>`，
+节点是基本块（标签是码元偏移，DEX 没有线性地址），入口块用**独立属性**
+`peripheries=2` 标出（塞进 `shape="box, peripheries=2"` 会被 Graphviz 当成一个
+不认识的形状），异常边画虚线，未连上的目标画成橙色虚线框（不连边，但不能不画）。
+
+**选项在两条路上的名字**（同一条规则，两种拼写；`deny_unknown_fields` 让写错的
+键报错而不是被静默吞掉）：
+
+| `ExportOptions` | CLI | `GET /api/export` |
+| --- | --- | --- |
+| `member` | `--member NAME` | `member=classes.dex` |
+| `class` | `--class 'Lcom/Foo;'` | `class=Lcom%2FFoo%3B` |
+| `search` | `--search TEXT` | `search=Activity` |
+| `method` | `--method 'Lcom/Foo;->bar(I)V'` | `method=…` |
+| `include_instructions` | `--no-instructions` | `instructions=false` |
+| `include_cfg` | `--no-cfg` | `cfg=false` |
+| `no_symbols` | `--no-symbols` | `symbols=false` |
+
+**验收（已按这几条写成测试，2026-10-16）**：
+
+* 合成样本（`crates/bitflip-core/tests/m2c_dex_export.rs`，8 条）：`dex-json`
+  的每个字段逐个断言（含 `format_versions.dex == 1`、非 DEX 导出时它是 `null`）、
+  `dex-smali` 的地址前缀只出现一次、`dex-dot-cfg` 的括号配对与 `peripheries`；
 * `--format asm-intel --member classes.dex`、`--format dex-json --function 0x401000`
-  两条**必须报错**，且错误信息里给出可用选项；
-* 确定性：同一输入连导两次，字节相同；
-* 真实 APK：3 个 DEX 时不给 `member` **报错**并列出名字；给了之后
-  `class_count` 与 `/api/dex/inputs` 对得上（两条独立路径必须给出同一个数）。
+  两条**必须报错**，且错误信息里点名是哪个选项 —— 六种组合逐条断言；
+* 确定性：同一输入连导两次，差异只允许是 `generated_at` 那一行；
+* 超预算：`dex-json` 报 `OverBudget`（不是半份文档）；`dex-smali` 保留已写出部分
+  并在报告里记账；
+* CLI（`crates/bitflip-cli/tests/dex_cli.rs`）：单文件 DEX 目标写出
+  `dex-json` / `dex-smali` 文件、选择器用错格式报错；真实 APK 上
+  **3 个 DEX 不给 `member` 报错并列出名字**、给 `member` 后导出成功
+  （`#[ignore]`，实测 1 类 / 3 方法）；
+* 服务层（`scripts/smoke-dex-http.ps1`）：归档目标走 `GET /api/export` 拿到
+  200 + 合法 JSON、`format=asm-intel&member=…` 与 `format=dex-json&function=…`
+  都是 400、`dex-smali` 与 `dex-dot-cfg` 的文本形态逐条断言。
 
 用 `droidsaw-dex` 的 `decode`，**要写的是适配层**：
 
