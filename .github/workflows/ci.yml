@@ -42,6 +42,15 @@ jobs:
       - name: 单元与集成测试
         run: cargo test --workspace
 
+      # 这两道闸门原先只在本机手工跑。它们要扫全仓，挪到 CI 才是该待的地方 ——
+      # 低配机上本机只跑受影响范围的小测试。
+      - name: 依赖许可闸门
+        run: python scripts/check-licenses.py
+
+      - name: 架构分层检查
+        shell: pwsh
+        run: ./scripts/check-arch-layering.ps1
+
   bundle:
     name: 端到端（构建 SPA + 内嵌 + 服务冒烟）
     runs-on: ubuntu-latest

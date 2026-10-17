@@ -65,6 +65,11 @@
 
 ## 5. 提交前自检
 
+> **重型闸门跑在 CI，不在本机。** `cargo test --workspace`、全 workspace 的 clippy、
+> 依赖许可闸门与架构分层检查都已在 `.github/workflows/ci.yml` 里（push / PR / 手动触发）。
+> 本机是低配机（见 §3），只跑**受影响范围**的测试：`cargo test -p <crate> --lib <名字>`
+> 或 `--test <文件名>`。需要全量结论时先说明再跑，不要默认开全量。
+
 一条命令跑完（推荐）：
 
 ```powershell
