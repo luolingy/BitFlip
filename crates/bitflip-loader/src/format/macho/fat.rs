@@ -331,10 +331,9 @@ impl FatSlice {
     /// 光看架构串分不出来，所以补一个后缀。
     #[must_use]
     pub fn member_name(&self) -> String {
-        let arch = self.arch.map_or_else(
-            || "架构未知".to_string(),
-            |spec: ArchSpec| spec.to_string(),
-        );
+        let arch = self
+            .arch
+            .map_or_else(|| "架构未知".to_string(), |spec: ArchSpec| spec.to_string());
         if self.is_arm64e() {
             format!("slice {}: {arch}（arm64e）", self.index)
         } else {
@@ -420,10 +419,10 @@ impl FatFile {
     /// 猜测必须自报家门，否则用户会把它当成文件里写着的事实。
     #[must_use]
     pub fn selection_note(&self, selection: Selection) -> String {
-        let chosen = self
-            .slices
-            .get(selection.index)
-            .map_or_else(|| format!("第 {} 片", selection.index), FatSlice::member_name);
+        let chosen = self.slices.get(selection.index).map_or_else(
+            || format!("第 {} 片", selection.index),
+            FatSlice::member_name,
+        );
         let others = if self.slices.len() > 1 {
             format!(
                 "（全部切片：{}）",

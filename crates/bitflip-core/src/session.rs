@@ -760,9 +760,9 @@ fn fill_fat_members(guess: &mut Guess, bytes: Option<&[u8]>, file_size: u64) {
             }
         }
         Err(error) => {
-            guess
-                .notes
-                .push(format!("fat 切片选择失败：{error} —— 切片本身仍然可用 `members` 查看"));
+            guess.notes.push(format!(
+                "fat 切片选择失败：{error} —— 切片本身仍然可用 `members` 查看"
+            ));
         }
     }
 }
@@ -1198,15 +1198,18 @@ impl Session {
             let selection = container
                 .select(requested)
                 .map_err(|error| format!("fat 选片失败：{error}"))?;
-            let mut object =
-                bitflip_loader::format::macho::fat::parse_slice(bytes, selection.index, ObjectId::Plain)
-                    .map_err(|error| {
-                        format!(
-                            "fat 第 {} 片解析失败：{}",
-                            selection.index,
-                            error.summary_zh()
-                        )
-                    })?;
+            let mut object = bitflip_loader::format::macho::fat::parse_slice(
+                bytes,
+                selection.index,
+                ObjectId::Plain,
+            )
+            .map_err(|error| {
+                format!(
+                    "fat 第 {} 片解析失败：{}",
+                    selection.index,
+                    error.summary_zh()
+                )
+            })?;
             // 这条 note 落在**对象自己**的 notes 里：`info` 把它印在"结构说明"下，
             // 与段/节并列。只放在目标级说明里的话，`--member` 选出来的切片
             // 就不知道自己是第几片了。
@@ -1877,17 +1880,28 @@ mod tests {
 
         // wire 契约：地址必须是定长 16 位
         assert_eq!(info.entry.as_ref().map(String::len), Some(16));
-        // `uuid` / `dylibs` 是 Mach-O 独有的概念：ELF 上必须是"如实未知"
-        // （`null` + 空数组），而不是空串或猜测值（CLAUDE.md §7）。
-        let parsed = session.parsed().expect("ELF 头能解析");
-        assert_eq!(parsed.uuid, None);
-        assert!(parsed.dylibs.is_empty());
+        // 这份样本只有 64 字节的 ELF 文件头（`e_phnum = 0`、`e_shnum = 0`）：
+        // `parse_target` 到不了"能给出对象"的程度，所以 `parsed()` 是 `None`。
+        // 这是 §7 要的行为 —— 解析不了就说，而不是发一个空壳对象让界面看起来完整。
+        // 这里连"原因确实被记下来了"一起断言：`None` 却不带说明，等于静默。
+        assert!(
+            session.parsed().is_none(),
+            "只有文件头的 ELF 不该产出解析结果"
+        );
+        assert!(
+            info.notes.iter().any(|note| note.contains("解析")),
+            "解析不了必须留下原因，实际 notes：{:?}",
+            info.notes
+        );
+        // `uuid` / `dylibs` 是 Mach-O 独有的字段，"如实未知"（`None` + 空表）这一侧
+        // 由 loader 的 Mach-O 用例覆盖（`macho_thin.rs` 里没有 `LC_UUID` 的那份样本）；
+        // 这里没有对象，不拿它来冒充验证。
         let json = serde_json::to_value(info).expect("序列化");
         assert_eq!(json["object"], "elf");
         assert!(json["image_base"].is_null());
-        let parsed_json = serde_json::to_value(parsed).expect("序列化");
-        assert!(parsed_json["uuid"].is_null());
-        assert_eq!(parsed_json["dylibs"].as_array().map(Vec::len), Some(0));
+        // `uuid` / `dylibs` 是 Mach-O 独有的字段，但它们是 `ObjectInfo`（解析结果）
+        // 上的字段，而这份样本**没有**解析结果 —— 所以这里没有可断言的对象。
+        // 不在这里假装验证它：非 Mach-O 的"如实未知"由能解析出对象的那条路覆盖。
     }
 
     #[test]

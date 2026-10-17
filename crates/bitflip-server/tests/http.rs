@@ -97,8 +97,16 @@ async fn health_accepts_header_and_query_token() {
     assert_eq!(body["ok"], Value::Bool(true));
     assert_eq!(body["name"], "bitflip");
     assert_eq!(body["name_zh"], "比特翻转");
-    assert_eq!(body["server_api_version"], 1);
-    assert_eq!(body["core_api_version"], 1);
+    // 版本号用常量比，不写死数字：写死 1 的那两次都因为"版本确实是 2 了"而红，
+    // 而测试的本意是"服务必须把版本带出来"，不是"版本永远是 1"。
+    assert_eq!(
+        body["server_api_version"].as_u64(),
+        Some(u64::from(bitflip_server::SERVER_API_VERSION))
+    );
+    assert_eq!(
+        body["core_api_version"].as_u64(),
+        Some(u64::from(bitflip_core::CORE_API_VERSION))
+    );
     assert_eq!(body["target"], Value::Null);
     assert!(body["version"].is_string());
     assert!(body["uptime_ms"].is_number());

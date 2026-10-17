@@ -102,7 +102,13 @@ async fn dex_inputs_lists_the_single_file_target() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "响应: {body}");
-    assert_eq!(body["server_api_version"], 1, "服务层版本要带上：{body}");
+    // 比常量而不是写死数字：这条断言问的是"服务把版本带出来了吗"，
+    // 不是"版本永远是 1"（`CORE_API_VERSION` 形状变更时这里不该红）。
+    assert_eq!(
+        body["server_api_version"].as_u64(),
+        Some(u64::from(bitflip_server::SERVER_API_VERSION)),
+        "服务层版本要带上：{body}"
+    );
     assert_eq!(body["format_version"], 1, "DEX 报告版本要带上：{body}");
 
     let inputs = body["inputs"].as_array().expect("inputs");
