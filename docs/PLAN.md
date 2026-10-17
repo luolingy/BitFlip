@@ -33,7 +33,7 @@
 | 归档 | ar 长名表 `//`、符号索引 `/` | M5 | 与 `.lib` 同一抽象 |
 | Raw / 固件 | 任意二进制 + 手工基址/段定义 | M2 | 等价 IDA 的 "Binary file" 加载，实用且便宜 |
 | .NET 程序集 | PE + CLI header | 仅识别（M3） | 识别并提示，不做 CIL 反编译 |
-| Mach-O / fat | 可执行 / `.dylib` | **M12** | 含 `LC_FUNCTION_STARTS`（函数边界的权威来源） |
+| Mach-O / fat | 可执行 / `.dylib` | **M12**（第一片已落地） | 已做头/段/节/入口/`LC_UUID`/dylib；`LC_FUNCTION_STARTS`（函数边界的权威来源）与符号表在下一片 |
 | `.app` bundle / `.ipa` | 目录容器 / ZIP 容器 | **M12**（依赖 Mach-O） | 本项目第一次把"目录"当成可打开的目标 |
 | APK / DEX | ZIP 容器 + Dalvik 字节码 | **M11** | 与 M12 无依赖关系，可并行 |
 | APK 内的 `lib/*.so` | 就是 ELF | **M11（复用既有路径）** | 几乎零成本，先做 |
@@ -1694,6 +1694,57 @@ IPA（ZIP 容器）  →  .app（目录容器）  →  Mach-O 可执行文件  �
   fixture 生成不了的部分必须**显式 SKIP 并给出生成命令**，不能静默变绿。
 
 **与 M11 的关系**：不依赖 M11。两者都依赖"容器层支持新格式"这一处接口扩展。
+
+**进展 · M12 · 第一片：Mach-O 结构层（2026-10-17，据实记录）**：
+
+* **做了什么**：`bitflip_loader::format::macho`（薄 Mach-O：头 + 加载命令区 + 段/节 +
+  入口点 + `LC_UUID` + dylib 名）与 `format::macho::fat`（universal 容器的切片枚举与
+  按片解析）。`has_parser(MachO)` 从 `false` 变 `true`，`parse_object` 直接派发过去，
+  `bitflip-core` 里那条"Mach-O 只做识别"的专门分支随之删掉。fat 容器在会话层**明确报错**
+  （"先按架构选一片"），**没有**悄悄挑第 0 片。
+* **覆盖到哪**：`mach_header` / `mach_header_64` 全部字段；`LC_SEGMENT` / `LC_SEGMENT_64`
+  的段与段内节（`sectname` / `segname` / `addr` / `size` / `offset` / `align` / `flags`）；
+  `LC_MAIN`（`entryoff` 是**文件偏移**，按覆盖它的段换算成虚拟地址，换算式写进 `notes`）；
+  `LC_UNIXTHREAD`（x86 / x86_64 / arm / arm64 四种 flavor 解 PC，其余只记录存在性）；
+  `LC_UUID`（16 字节 → 小写十六进制）；`LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB` 的库名。
+* **明确没做**（每条都写进对应解析结果的 `notes`）：符号表 `LC_SYMTAB` / `LC_DYSYMTAB`
+  （所以 `Object::symbols` 是空的）、`LC_FUNCTION_STARTS`（函数边界只能靠反汇编）、
+  dyld 绑定（`Object::imports` 空）、objc/swift 元数据（只列节名不解析）、
+  代码签名（只记存在性，不校验）、`.app` bundle 与 IPA 的容器语义（目录仍是拒绝）、
+  fat 的成员化。
+* **ppc 是"识别但拒绝"**：`bitflip_arch::Arch` 没有 PowerPC 变体、也没有 ppc 解码后端，
+  所以 `cputype = 18 / 0x01000012` 返回 `ParseError::Unsupported` 并点名原因 ——
+  加一个没有解码器的架构变体会让分析层解出垃圾（§7）。这也是"大端结构层能读、
+  现实中走不到"的原因：大端 Mach-O 基本只有 ppc/armeb，而结构层本身按**文件端序**
+  读全部字段（单测用 arm32 大端样本走过一遍），没有"识别成大端却按小端读"的路径。
+* **真实样本实测**（`temp/` 下四份 IPA 全试了；`temp/` 永不入库）：
+  * `LiveContainer.ipa`（2 823 703 字节 / 130 成员）→ 主二进制成员 #39、
+    `Payload/LiveContainer.app/LiveContainer_PleaseDoNotShorten…`（151 648 字节），
+    5 段 / 26 节；
+  * `SideStore.ipa`（28 873 303 字节 / 174 成员）→ `Payload/SideStore.app/SideStore`
+    （19 611 632 字节），5 段 / 54 节；
+  * `Stapxs.QQ.Lite-3.3.3.ipa`（13 090 121 字节 / 176 成员）→ `Payload/App.app/App`
+    （95 920 字节），5 段 / 33 节、13 个 `__objc_*` 节 + 9 个 `__swift*` 节；
+  * `net.kdt.pojavlauncher-2.2-ios.ipa`（108 175 347 字节 / 405 成员）→
+    `Payload/PojavLauncher.app/PojavLauncher`（1 176 816 字节），4 段 / 30 节。
+  四份都是**薄 arm64**（`aarch64/64/le`），`image_base` 都是 `0x100000000`，入口点都由
+  `LC_MAIN` 换算（`0x10000860c` / `0x1000a3410` / `0x100005348` / `0x10000bcd8`），
+  段的文件范围与文件长度自洽（`__LINKEDIT` 的 `fileoff + filesize` 正好等于文件字节数）。
+  **四份里没有一份是 fat**，所以真实数据上只走到薄路径 —— fat 路径完全靠合成样本覆盖，
+  这一点必须说清楚（同一个原因：iOS 13 之后 App Store 只收 arm64 单架构）。
+* **测试**：单测 31 条（薄 Mach-O 22 + fat 9：`__PAGEZERO` 的 `filesize = 0` **不**被拒、
+  截断/越界的加载命令被拒、`ncmds` 装不进 `sizeofcmds` 被拒、`cmdsize` 非 4 的倍数被拒、
+  段/节越界被拒、ppc 点名拒绝、未知 `cputype` 拒绝、大端按文件端序读、`LC_UNIXTHREAD`
+  的 PC 解码与"未知 flavor 不猜"、零填充节没有文件字节、arm64e 的 PAC 语义没还原要说
+  出来、objc/swift 节只列名）；集成 4 条（`macho_thin.rs`，走 `parse_object` 公开入口）；
+  真实样本 1 条（`macho_real_sample.rs`，`#[ignore]`，`BITFLIP_TEST_MACHO_IPA` 或
+  `temp/*.ipa`）。合成样本按规范逐字节拼（`tests/common/macho_fixture.rs`，字段偏移与
+  出处写在文件头），**与单测共用同一个构造器** —— 两份拼法迟早有一份先过时。
+* **踩到的坑（值得记）**：`thread_command.count` 的单位是 **32 位字**，所以
+  `x86_thread_state64_t` 的 `rip`（第 17 个 `uint64`）在"按 32 位字计"的状态数组里是
+  第 **32** 个字，不是第 16 个。第一版单测按 16 写，红了 —— 正好说明这条测试在真验。
+* **下一片**：fat 切片成员化（`ContainerKind::Fat` → `ArchiveMember`）+ `.app` 目录容器
+  + IPA 递归；符号表与 `LC_FUNCTION_STARTS` 是"函数边界"的前提，应排在接反汇编之前。
 
 ---
 

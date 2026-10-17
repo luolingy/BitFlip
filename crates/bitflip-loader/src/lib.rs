@@ -3,13 +3,16 @@
 //! 三层抽象（见 `docs/ARCHITECTURE.md` §3）：
 //!
 //! - **容器（[`ContainerKind`]）**：一个文件里可能装着多个对象 —— 归档（ar / MSVC `.lib`）、
-//!   fat/universal。M0–M9 实现 ar 与 `.lib`，fat 只识别（解析推迟到 M10）。
+//!   fat/universal、ZIP。ar 与 `.lib` 从 M0 起可枚举；fat/universal 的**切片枚举**
+//!   在 M12 第一片落地（[`format::macho::fat`]），但把切片接进成员会话还没做；
+//!   ZIP 只做容器层（[`list_zip_members`] / [`read_zip_member`]）。
 //! - **对象（[`ObjectKind`]）**：可分析的基本单位 —— PE、COFF、ELF、Mach-O、raw。
 //! - **架构（[`bitflip_arch::ArchSpec`]）**：由格式的 machine 字段映射得到。
 //!
-//! 本阶段（M0）实现的是**嗅探**：只读文件头与容器结构，给出可验证的识别结论，
-//! 不做完整解析（段/节/导入导出/符号在 M1）。做不到的地方明确记入 `notes`，
-//! 不猜、不留空白解释。
+//! 各格式的覆盖程度**不一样**，且这种不一样必须能被用户看到：PE/ELF 有导入导出与
+//! 符号，Mach-O 在 M12 第一片只到"段/节/入口"（符号表、dyld 绑定、objc/swift、
+//! 代码签名都没做）。每一处缺失都要落在解析结果的 `notes` 里，见
+//! [`format::macho`] 的模块文档；不猜、不留空白解释。
 //!
 //! # 通用层与格式层的分界
 //!
@@ -18,6 +21,9 @@
 //! **在 `format/` 外面的代码不该出现格式类型名**，新增一种格式也不该改这些文件。
 //! 派发只有一个入口：[`parse_object`]。理由写在 `format/mod.rs` 与
 //! `parse_object` 的文档里（那里记录了这条边界是被什么错误撞出来的）。
+//!
+//! 例外是 `sniff`：它按定义要认得"每个格式的第一眼特征"（魔数、文件头几个字段），
+//! 所以那里会出现格式名 —— 但**只有识别、没有解析**，真正的解析一律在 [`format`]。
 
 mod sniff;
 
@@ -121,9 +127,14 @@ pub enum ContainerKind {
     Zip,
     /// fat / universal 容器（Mach-O，一个文件里多个架构切片）。
     ///
-    /// 解析排期在 M12。这个变体从 M0 就存在，是因为**抽象要提前留出来**：
+    /// 这个变体从 M0 就存在，是因为**抽象要提前留出来**：
     /// fat 与 ar 都是"一个文件多个对象"，但切片**没有名字**（只有架构），
     /// 混进 `Ar` 会让"按名字找成员"这条既有逻辑带上一个说不通的空名字。
+    ///
+    /// **M12 第一片的状态**：切片枚举已经实现（[`format::macho::fat::read`]，
+    /// 有单测与集成测试），但"把切片当成成员让会话去分析"还没做 ——
+    /// 也就是说 `ContainerKind::Fat` **还没被任何调用方产出成员列表**。
+    /// 打开一个 fat 文件仍然会报错（明确报错，不是静默当成原始二进制）。
     Fat,
 }
 
@@ -169,7 +180,12 @@ pub enum ObjectKind {
     /// 产出一堆"看起来正常、实际无意义"的结论。它的结构模型在
     /// [`crate::format::dex`]，入口是 [`crate::parse_dex_structure`]。
     Dex,
-    /// Mach-O（可执行 / `.dylib`；解析排期 M12，见 `docs/PLAN.md` 与 ADR-0017）。
+    /// Mach-O（可执行 / `.dylib`；结构层解析见 [`format::macho`]，M12 第一片）。
+    ///
+    /// "有解析器"覆盖的范围要说清楚：**头/段/节/入口/`LC_UUID`/dylib 名**都在，
+    /// 而符号表、dyld 绑定信息、objc/swift 元数据、代码签名**都不在** ——
+    /// 所以 Mach-O 对象的 `symbols` / `imports` 一定是空的，原因写在
+    /// `notes` 里。别把"能打开"当成"能反汇编出符号"。
     MachO,
     /// 未识别：按原始二进制处理。
     Raw,
@@ -211,13 +227,19 @@ impl ObjectKind {
 /// 让它为 `true` 只会在调用方那里变成一次必然失败的调用，而失败的时机
 /// 还离"谁该为此负责"很远。
 ///
+/// Mach-O 从 M12 第一片起是 `true`：结构层解析已经落地（[`format::macho`]）。
+/// 但它**能解析**不等于**解析得完整** —— 符号表/dyld 绑定/代码签名都没做，
+/// 这一点由解析结果里的 `notes` 说，而不是靠这个布尔值暗示。
+///
 /// `Raw` 是"用户指定按原始二进制处理"——没有头可读，由上层合成对象
-/// （见 `bitflip-core` 的 `parse_raw`）；`Mach-O` 目前只识别不解析。
-/// 这几种都**不该**让 [`parse_object`] 返回一个空对象：那会让上层显示
-/// "分析完成但什么都没有"（CLAUDE.md §7）。
+/// （见 `bitflip-core` 的 `parse_raw`）。它**不该**让 [`parse_object`] 返回一个
+/// 空对象：那会让上层显示"分析完成但什么都没有"（CLAUDE.md §7）。
 #[must_use]
 pub const fn has_parser(kind: ObjectKind) -> bool {
-    matches!(kind, ObjectKind::Pe | ObjectKind::Coff | ObjectKind::Elf)
+    matches!(
+        kind,
+        ObjectKind::Pe | ObjectKind::Coff | ObjectKind::Elf | ObjectKind::MachO
+    )
 }
 
 /// 解析一个对象：**格式派发的唯一入口**。
@@ -243,7 +265,9 @@ pub const fn has_parser(kind: ObjectKind) -> bool {
 /// # Errors
 ///
 /// 具体格式的解析失败原样返回该格式的 [`ParseError`]（调用方按需要包成
-/// "PE 解析失败：…" 这样的说明）；`Raw` / `MachO` 返回 [`ParseError::NoParser`]。
+/// "PE 解析失败：…" 这样的说明）；`Dex` / `Raw` 返回 [`ParseError::NoParser`]。
+/// fat / universal Mach-O 返回 [`ParseError::NotSupported`]：容器里没有"这个文件"
+/// 的单一架构，得先用 [`format::macho::fat::read`] 选切片。
 ///
 /// # Panics
 ///
@@ -265,10 +289,7 @@ pub fn parse_object(
                      它的结构模型在 format::dex，入口是 parse_dex_structure；\
                      接进反汇编/CFG 流水线是 M11 的后续里程碑（见 docs/APK-DEX-DESIGN.md）",
         }),
-        ObjectKind::MachO => Err(ParseError::NoParser {
-            kind: kind.as_str(),
-            detail: "Mach-O 当前只做识别，解析未实现（见 docs/PLAN.md §1.3 的里程碑排期）",
-        }),
+        ObjectKind::MachO => format::macho::parse(bytes, base, id),
         ObjectKind::Raw => Err(ParseError::NoParser {
             kind: kind.as_str(),
             detail: "原始二进制没有可解析的头，由上层按用户给的架构与基址合成对象",

@@ -1,7 +1,10 @@
 //! 格式嗅探：只读文件头与容器结构，给出可验证的识别结论。
 //!
 //! 原则：**拿不到就说拿不到**。识别不出来时字段留 `None`，并在 `notes` 里写清
-//! 判定依据与限制（例如"仅识别 Mach-O，解析推迟到 M10"），绝不用 0 或空值冒充。
+//! 判定依据与限制（例如"仅识别 Mach-O 的容器层"），绝不用 0 或空值冒充。
+//!
+//! 注意这里只做**识别**：真正的解析在 [`crate::format`]。两者会给出相似的话，
+//! 但含义不同 —— 嗅探说"看起来是什么"，解析说"读出来是什么"。
 
 use std::io::Read;
 use std::path::Path;
@@ -522,7 +525,7 @@ fn sniff_coff(bytes: &[u8], g: &mut Guess) {
         .push("COFF 目标文件：语义分析与段/符号解析在 M1/M5".to_string());
 }
 
-// ── Mach-O（M0 只识别） ─────────────────────────────────────────────────────
+// ── Mach-O ─────────────────────────────────────────────────────────────────
 
 fn is_thin_macho(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && macho_thin_kind(bytes).is_some()
@@ -568,7 +571,8 @@ fn sniff_macho(bytes: &[u8], g: &mut Guess) {
         _ => "未知 filetype",
     };
     g.notes.push(format!(
-        "识别为 Mach-O {kind}；完整解析（含 .app bundle 与 fat 容器）排期在 M10（见 docs/PLAN.md）"
+        "识别为 Mach-O {kind}；结构与段/节解析见 format::macho（符号表、dyld 绑定、\
+         objc/swift、代码签名不在第一片范围内）"
     ));
 }
 
@@ -591,9 +595,13 @@ fn sniff_fat(bytes: &[u8], g: &mut Guess) {
     }
 
     g.container = ContainerKind::Fat;
+    // 容器是 fat，但**这一层没有可分析的对象**：fat 里没有"这个文件"的单一架构。
+    // 切片枚举已经实现（format::macho::fat），把它接成成员会话还没做，
+    // 所以对象类别仍是 `Raw` —— 让上层明确报"需要先选切片"，而不是硬套一层。
     g.object = ObjectKind::Raw;
     g.notes.push(format!(
-        "Mach-O universal (fat) 容器，{nfat} 个切片；切片枚举与分析排期在 M10"
+        "Mach-O universal (fat) 容器，{nfat} 个切片；切片枚举已实现（format::macho::fat），\
+         但切片还没接进成员会话：请先按架构选一片"
     ));
 }
 
@@ -1006,7 +1014,15 @@ mod tests {
         let g = sniff_bytes(&thin);
         assert_eq!(g.object, ObjectKind::MachO);
         assert_eq!(g.arch, Some(ArchSpec::x86_64()));
-        assert!(g.notes.iter().any(|n| n.contains("M10")));
+        // 断言"用户能不能看出后面还有解析"，**不断言里程碑编号**
+        // （理由见 `sniff_file_reports_directories_and_missing_files` 那段注释）。
+        assert!(
+            g.notes
+                .iter()
+                .any(|n| n.contains("format::macho") || n.contains("解析")),
+            "Mach-O 的识别结论要指向解析位置：{:?}",
+            g.notes
+        );
 
         let mut fat = vec![0u8; 32];
         fat[0..4].copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);

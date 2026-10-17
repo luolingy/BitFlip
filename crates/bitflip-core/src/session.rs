@@ -1089,15 +1089,24 @@ impl Session {
             ));
         }
 
+        if guess.container == ContainerKind::Fat {
+            // fat/universal 容器里没有"这个文件"的单一架构：同一个文件装着
+            // x86_64 与 arm64 两套代码。切片枚举已经实现（`format::macho::fat`），
+            // 但**选哪一片**是个需要用户决定的事（可能要按设备或按目标架构选），
+            // 所以这里明确拒绝并说清下一步，而不是悄悄挑第 0 片。
+            return Err(
+                "这是 fat/universal Mach-O 容器：文件里有多套架构的切片，没有单一的 \
+                 image_base 与入口点。请先按架构选定要分析的那一片（切片枚举已实现，\
+                 接进会话是后续里程碑）"
+                    .to_string(),
+            );
+        }
+
         // 派发走 `bitflip_loader::parse_object` 这一个入口：新增格式时这里**不必改**
-        // （`kind =>` 兜底臂会自动跟上）。只有两种"没有解析器"的类别要单独说：
-        // 原始二进制由本模块合成对象，Mach-O 还没做。
+        // （`kind =>` 兜底臂会自动跟上）。只有"没有解析器"的类别要单独说：
+        // 原始二进制由本模块合成对象。
         match guess.object {
             ObjectKind::Raw => Self::parse_raw(bytes, guess, opts),
-            ObjectKind::MachO => Err(format!(
-                "{} 解析排期见 docs/PLAN.md §1.3，当前只做识别",
-                guess.object.label_zh()
-            )),
             kind => bitflip_loader::parse_object(kind, bytes, 0, ObjectId::Plain)
                 .map_err(|error| format!("{} 解析失败：{}", kind.label_zh(), error.summary_zh())),
         }
@@ -1415,10 +1424,19 @@ impl Session {
         // 可分析对象 —— 所以这里如实报"这个成员不是可分析对象"，
         // 而不是硬塞一个空对象让上层显示"分析完成但什么都没有"。
         let guess = bitflip_loader::sniff_bytes(slice);
+        // fat/universal 容器当成员时同样没有"单一架构"可言：要先选切片。
+        // 这一条在 `has_parser` 之前判，否则它会被报成"不是可分析对象（识别为
+        // 原始二进制）"—— 那句话说的是"这是垃圾"，而实际情况是"要先选一片"。
+        if guess.container == ContainerKind::Fat {
+            return Err(BitflipError::InvalidInput(format!(
+                "成员 {:?} 是 fat/universal Mach-O 容器：要先把切片选成成员才能分析",
+                member.name
+            )));
+        }
         // 判据就是"这个类别有没有解析器"，而不是枚举 `Raw | MachO`：
         // 归档里可能混有非对象成员（GNU 的长名表 `//`、符号索引 `/`、链接器成员的
         // 元数据），它们本来就不该被当成可分析对象。用 `has_parser` 表达这层意思，
-        // 以后新增格式（比如 Mach-O 解析落地）时这里自动跟上，不必记得回来改。
+        // 以后新增格式时这里自动跟上，不必记得回来改。
         if !bitflip_loader::has_parser(guess.object) {
             return Err(BitflipError::InvalidInput(format!(
                 "成员 {:?} 不是可分析的对象（识别为 {}）：它可能是归档的元数据成员",

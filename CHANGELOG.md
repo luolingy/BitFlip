@@ -11,6 +11,44 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — Mach-O 结构层：头 / 段 / 节 / 入口点（M12 第一片）
+
+能解析 Mach-O（可执行文件、`.dylib`、`.o` 同一个头，差别在 `filetype`），拿到段、节与入口点：
+
+- `bitflip-loader::format::macho`：`read` → `MachOFile`（结构层事实：原始头字段、
+  `LC_UUID`、dylib 名、段的原始字段、节的 `align` / `flags`）；`parse` → `Object`（对象模型）。
+  覆盖 `mach_header` / `mach_header_64` 全部字段、`LC_SEGMENT` / `LC_SEGMENT_64` 的段与段内节、
+  `LC_MAIN`（`entryoff` 是**文件偏移**，按段换算成虚拟地址，换算式写进 `notes`）、
+  `LC_UNIXTHREAD`（x86 / x86_64 / arm / arm64 解 PC，其余只记录存在性）、`LC_UUID`、
+  `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB` 的库名。
+- `format::macho::fat`：universal 容器（`FAT_MAGIC` / `FAT_MAGIC_64`）的**切片枚举** +
+  `parse_slice` 按片解析。`CAFEBABE` 与 Java class 的歧义用"第一个 `cputype` 是不是
+  已知 Mach-O CPU"分开（判据与 `sniff` 一致）。
+- `has_parser(MachO)` 变 `true`，`parse_object` 直接派发；`bitflip-core` 里那条
+  "Mach-O 只做识别"的专门分支随之删掉。fat 容器在会话层**明确报错**（"先按架构选一片"），
+  不悄悄挑第 0 片。
+
+**如实记录的边界**（每条都落在解析结果的 `notes` 里，不是文档里的口头承诺）：符号表
+`LC_SYMTAB` / `LC_DYSYMTAB` **没有解析**（`Object::symbols` 空，`is_stripped` 只按
+"这条命令在不在"判断）、`LC_FUNCTION_STARTS` 没做（函数边界只能靠反汇编）、dyld 绑定没做
+（`Object::imports` 空）、objc / swift 元数据只列节名、代码签名只记存在性**不校验**、
+`.app` 目录与 IPA 的第二层没接进会话、fat 切片还没成员化（所以 fat 文件**仍然打不开**）。
+**ppc 识别但拒绝**：`bitflip_arch` 没有 PowerPC 变体也没有 ppc 解码后端，`cputype = 18 /
+0x01000012` 返回 `Unsupported` 并点名原因 —— 加一个没有解码器的架构变体会让分析层解出垃圾（§7）。
+
+真实样本（`temp/` 下**四份** IPA 全试了，均薄 arm64、`aarch64/64/le`、
+`image_base = 0x100000000`）：`LiveContainer.ipa` 主二进制 151 648 字节（5 段 / 26 节，
+入口 `0x10000860c`）、`SideStore.ipa` 19 611 632 字节（5 段 / 54 节，入口 `0x1000a3410`）、
+`Stapxs.QQ.Lite-3.3.3.ipa` 95 920 字节（5 段 / 33 节，入口 `0x100005348`）、
+`net.kdt.pojavlauncher-2.2-ios.ipa` 1 176 816 字节（4 段 / 30 节，入口 `0x10000bcd8`）；
+四份的 `__LINKEDIT` 都是 `fileoff + filesize` 正好等于文件字节数。**四份里没有一份是
+fat** —— 那条路径只有合成样本覆盖，这点必须说清楚。
+
+测试：单测 31 条（薄 Mach-O 22 + fat 9）、集成 4 条（走 `parse_object` 这条公开入口）、
+真实样本 1 条（`#[ignore]`，`BITFLIP_TEST_MACHO_IPA` 或 `temp/*.ipa`）。合成样本按规范
+逐字节拼在 `crates/bitflip-loader/tests/common/macho_fixture.rs`（字段偏移与规范出处写在
+文件头），**与单测共用同一个构造器** —— 两份拼法迟早有一份先过时。无新增依赖。
+
 ### 新增 — APK 清单视图：AXML 解析与 `apk` 子命令（M11 · M3 第一片）
 
 `AndroidManifest.xml` 是**二进制 XML**（AXML），不是文本。新增一条从字节到可用结论的路：

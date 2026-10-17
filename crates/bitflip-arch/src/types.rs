@@ -145,7 +145,12 @@ impl Arch {
         })
     }
 
-    /// Mach-O `cputype` → 架构与模式（仅识别用，Mach-O 解析推迟到 M10）。
+    /// Mach-O `cputype` → 架构与模式。
+    ///
+    /// 覆盖 x86(7) / x86_64(0x01000007) / arm(12) / arm64(0x0100000c)。
+    /// **没有 PowerPC**（`CPU_TYPE_POWERPC` 18 / 0x01000012）：本 crate 没有 ppc
+    /// 变体也没有 ppc 解码器，返回 `None` 让调用方明确报"这一层解析不了"，
+    /// 而不是塞进一个不存在的架构里。
     pub const fn from_macho_cputype(cputype: u32) -> Option<(Self, Mode)> {
         Some(match cputype {
             7 => (Self::X86, Mode::M32),               // CPU_TYPE_X86

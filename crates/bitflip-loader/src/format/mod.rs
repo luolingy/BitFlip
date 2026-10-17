@@ -35,14 +35,20 @@
 //! | [`zip`] | ZIP 容器（APK / JAR / XAPK 外壳） | 单文件。**只做容器层**：成员枚举与按需取出 |
 //! | [`dex`] | DEX（Dalvik Executable） | 单文件。**只做结构模型**：类/字段/方法清单，不解码字节码、不建 CFG |
 //! | [`axml`] | AXML（Android 二进制 XML） | 单文件。**只解清单**：`AndroidManifest.xml` 的字段摘要；不读 `resources.arsc`，`@` 引用原样保留 |
+//! | [`macho`] | Mach-O（thin）+ fat 容器 | **M12 第一片**：头/段/节/入口/`LC_UUID`/dylib；符号表、dyld 绑定、objc/swift、代码签名**都没有**。fat 切片能枚举（[`macho::fat`]）但没接进会话 |
 //!
 //! ELF 的内部拆分**故意没和 PE 一起做**：PE 那一次是纯粹的搬移（逐字节校验过），
 //! 一次只搬一个文件，出问题时能立刻定位。ELF 的拆分是同一类工作，单独一轮做，
 //! 免得两处一起动、出了问题分不清是哪一处。
+//!
+//! Mach-O 也拆成了两个文件（`mod` = 薄 Mach-O，`fat` = universal 容器），
+//! 理由同 PE 的拆分：读的时候解决的是两个不同问题 —— "这一层对象长什么样"与
+//! "一个文件里有几层、该选哪层"。
 
 pub mod axml;
 pub mod coff;
 pub mod dex;
 pub mod elf;
+pub mod macho;
 pub mod pe;
 pub mod zip;

@@ -168,6 +168,20 @@ COFF 没有。
 所以真正落地的只有 `format/dex/`（结构模型 + 布局校验 + 解码投影 + 自建 CFG + 渲染），
 `bitflip-arch` 一行未改。判据因此仍然成立：**新格式只在一个新目录里落地，通用层没被特判**。
 
+**实测兑现情况（2026-10-17，M12 的 Mach-O 部分）**：上表"Mach-O 解析"一行**兑现了** ——
+`format/macho/`（`mod.rs` = 薄 Mach-O，`fat.rs` = universal 容器），通用层的改动只有
+`parse_object` 的 `match` 与 `has_parser` 两处，外加一处**删除**：`bitflip-core` 里那条
+"Mach-O 只做识别，解析排期见 PLAN"的专门分支本来就该消失（它正是"派发漏了一处"的化石）。
+`sniff` 的结论与 `format/macho` 的判断是两套代码，但判据相同（`CAFEBABE` 的 Java 歧义都用
+"第一个 `cputype` 是不是已知 CPU"）。
+
+**"fat/universal 容器"一行只兑现了一半**：切片枚举落地在 `format/macho/fat`（有单测与
+集成测试），但 `ContainerKind::Fat` **仍然不产出成员列表** —— 打开一个 fat 文件依旧报错。
+做的时候才发现原因：切片**没有名字**（只有 cputype），而成员会话是按名字定位的
+（`--member <名字>`、`ObjectId::ArchiveMember(String)`）。所以"填实已预留的抽象"这句话
+低估了这一格：它不是填一个 `Vec`，是要给"无名成员"一个稳定的显示名与选择规则。拆成
+下一片，理由记在 `format/macho/fat` 的模块文档里。"目录容器（`.app`）"一行**完全未动**。
+
 产品出口（M2b）同理只加了一个模块：
 
 | 要加的东西 | 落点 | 是否需要改通用层 |

@@ -15,8 +15,8 @@
    这些是 IDA 靠几十年积累攒出来的长尾，对"分析现代桌面/移动二进制"的目标几乎没有价值。
 3. **反编译器覆盖**：IDA 官方有 12 种架构的反编译器，我们 **0 种**（本轮刚开始）。
 
-**真正该追的只有三件事**（见 §5）：Mach-O 落地（M12 已排期）、DEX（M11 已排期）、
-以及反编译器的**有界子集**。
+**真正该追的只有三件事**（见 §5）：Mach-O 落地（M12 进行中，结构层已完成）、
+DEX 接进分析流水线（M11 结构层已完成）、以及反编译器的**有界子集**。
 
 ## 2. 文件格式：官方原文逐条对照
 
@@ -33,9 +33,9 @@ IDA 官方文档明确说这个列表**不完整**（"The list contains some, bu
 | Linear Executable (LE) | ✗ |
 | **Portable Executable (PE)** (x86, x64, ARM, etc) | **✓ 已解析** |
 | Windows CE PE (ARM, SH-3, SH-4, MIPS) | ✗ |
-| **Mach-O for OS X and iOS** (x86, x64, ARM, PPC) | **△ 仅识别**（M12 排期） |
+| **Mach-O for OS X and iOS** (x86, x64, ARM, PPC) | **△ 结构层已解析**（M12 第一片：头/段/节/入口/`LC_UUID`/dylib；符号表、dyld 绑定、objc/swift、代码签名**未做**，ppc 明确拒绝） |
 | Apple Dyld Shared Cache (DSC) | ✗ |
-| **Dalvik Executable (DEX)** | ✗（M11 排期） |
+| **Dalvik Executable (DEX)** | **△ 结构层已解析**（M11：清单/调用图/`dex-smali`/`dex-dot-cfg`；**不**接机器码反汇编流水线） |
 | EPOC (Symbian OS executable) | ✗ |
 | Windows Crash Dump (DMP) | ✗ |
 | XBOX Executable (XBE) | ✗ |
@@ -66,11 +66,12 @@ IDA 官方文档明确说这个列表**不完整**（"The list contains some, bu
 | IDA | BitFlip |
 | --- | --- |
 | 静态库 `.a` / `.lib`（选成员） | **✓ 已支持**（`Ar` / `MsvcLib`，可列成员） |
-| ZIP archive（选包内文件） | ✗ |
-| Fat/universal Mach-O（选架构切片） | **△ 仅识别**（`ContainerKind::Fat`，M12） |
+| ZIP archive（选包内文件） | **✓ 可列成员、按成员分析**（`ContainerKind::Zip`） |
+| Fat/universal Mach-O（选架构切片） | **△ 切片可枚举**（`format::macho::fat`，有测试；**还没接进会话**，所以还打不开） |
 
 **格式层面的结论**：现代主流三件套（PE / ELF / COFF）+ 归档已经齐了。
-差的是 Mach-O（已排期 M12）、DEX（已排期 M11）、以及一大片历史/嵌入式格式。
+差的是 Mach-O 的**深度**（结构层已落地，符号表/dyld 绑定在下一片）、
+DEX 接进分析流水线（结构层已有），以及一大片历史/嵌入式格式。
 
 ## 3. 处理器架构：这是数量级的差距
 
@@ -143,7 +144,7 @@ x86/x64、ARM/ARM64、MIPS/MIPS64、PowerPC/PPC64、RISC-V/RV64。
 
 | 优先级 | 事项 | 状态 | 理由 |
 | --- | --- | --- | --- |
-| P0 | **Mach-O 解析落地** | M12 已排期 | iOS/macOS 目标的前提；`.app`/IPA 都压在它上面 |
+| P0 | **Mach-O 解析落地** | M12 进行中（第一片：结构层） | iOS/macOS 目标的前提；`.app`/IPA 都压在它上面 |
 | P0 | **DEX/Dalvik** | M11 已排期 | Android 主线；且 DEX 是**字节码**，不需要"反汇编到指令"这一步 |
 | P1 | **反编译器的有界子集** | 本轮评估 | 见 `docs/DECOMPILER-SCOPE.md` |
 | P2 | APK/IPA 容器解包 | M11/M12 从属 | 本质是 ZIP + 清单，成本远低于上面的分析工作 |
