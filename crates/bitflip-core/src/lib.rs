@@ -11,6 +11,7 @@
 //! 下层永不反向依赖（CLAUDE.md §4）。
 
 mod analysis;
+pub mod axml;
 pub mod dex;
 mod diff;
 mod disasm;

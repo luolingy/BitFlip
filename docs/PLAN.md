@@ -1524,6 +1524,27 @@ MSVC 修饰名反修饰、静态库 PDB。
   DECISIONS 的 ADR-0021 补"已实现"；README 的 `--format` 例子加 DEX；
   ARCHITECTURE 的导出一节说明"一个端点、两种视图"；CHANGELOG 记本次改动。
 
+**进展 · M11 · M3 第一片：AXML 清单（2026-10-17，同日第五轮，据实记录）**：
+
+* **做了什么**：`bitflip-loader::format::axml`（AXML → 可读 XML + 字段摘要）、
+  `bitflip-core::axml::read_manifest`（归档成员 / 单文件两条取字节的路，单文件按
+  **文件大小**先判 `MAX_AXML_BYTES = 32 MiB`）、`bitflip-cli apk`（摘要 / `--xml` / `--json`）。
+* **依赖与地板**：新增 `apk-info-axml` 1.0.13 + `apk-info-xml` 1.0.13（都是 Apache-2.0，
+  许可闸门覆盖）。它们声明 `rust-version = "1.93.0"`（edition 2024），
+  `[workspace.package] rust-version` 因此 **1.87 → 1.93**。这是**用户可见**的改动：
+  1.87–1.92 的工具链从此编不过本仓库。CI 用 stable，不会替我们发现"声明的 MSRV 编不过"。
+* **没读 `resources.arsc`**：引用类属性（`@7f0d0001`）原样保留 + 列进
+  `unresolved_references` + `notes` 说明。**不是**解析失败，也不是空值。
+* **真实样本实测**（`ah-app-release.apk`）：清单 45 400 字节 → 28 851 字节 XML；
+  `com.weavi.ahh` / 72 / 1.6.3 / minSdk 21 / targetSdk 29；107 activity、11 service、
+  2 receiver、3 provider、26 权限；入口 `com.weavi.ahh.SplashActivity`；58 处解不出的引用。
+  设计文档里那句"29 392 字节"是当初 `apk-info` 转换器的渲染结果，与我们的
+  `get_xml_string` 缩进不同 —— 量级一致，**不是数据丢了**。
+* **测试**：合成样本 3 条（`axml_manifest.rs`，按规范逐字节拼，含"根不是 manifest"分支）、
+  单元测试 3 条（上限、魔数判据、垃圾输入）、真实样本 1 条（`axml_real_apk.rs`，`#[ignore]`）。
+* **仍未做**：`resources.arsc`、HTTP `GET /api/apk/manifest`、网页里的清单视图 ——
+  这三项是 M3 的下一片。
+
 **进展 · DEX 的放大攻击面（2026-10-17，据实记录）**：M1 推迟验收里的第 3 条
 （"解析预算没接，恶意构造的 DEX 可以靠超大计数顶内存"）核实并关掉了，但**结论
 与当初写的不一样**，据实记：

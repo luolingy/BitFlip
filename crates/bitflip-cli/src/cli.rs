@@ -78,6 +78,8 @@ pub enum Command {
     Members(MembersArgs),
     /// 查看 DEX（APK 或 .dex）：列类、看方法指令与文本 CFG
     Dex(DexArgs),
+    /// 查看 APK 清单（AXML）：包名、版本、组件、权限，或还原出的 XML
+    Apk(ApkArgs),
     /// 列出识别出的函数
     Functions(FunctionsArgs),
     /// 在目标里定位一个符号（函数名或地址）
@@ -92,6 +94,26 @@ pub enum Command {
     Serve(ServeArgs),
     /// 打印版本与 API 版本
     Version,
+}
+
+/// `apk` 参数（M11 · M3 的第一片：只看清单）。
+#[derive(Debug, Args)]
+pub struct ApkArgs {
+    /// 目标：APK，或一个独立的 AXML 文件（AndroidManifest.xml）
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 归档成员名；默认 APK 里的 `AndroidManifest.xml`
+    #[arg(long, value_name = "NAME")]
+    pub member: Option<String>,
+    /// 打印还原出的 XML 文本，而不是字段摘要
+    #[arg(long)]
+    pub xml: bool,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
 }
 
 /// 打开目标时的通用输入参数。

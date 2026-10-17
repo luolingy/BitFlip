@@ -11,6 +11,30 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — APK 清单视图：AXML 解析与 `apk` 子命令（M11 · M3 第一片）
+
+`AndroidManifest.xml` 是**二进制 XML**（AXML），不是文本。新增一条从字节到可用结论的路：
+
+- `bitflip-loader::format::axml`：`looks_like_axml` / `parse` → `AxmlDocument`（可读 XML +
+  `ManifestFacts`）。单份上限 `MAX_AXML_BYTES = 32 MiB`，**解析前**判。
+- `bitflip-core::axml::read_manifest`：归档走成员取出、单文件按**文件大小**先判上限；
+  非 AXML 明确报错（纯文本 XML 解不了，这话要说出来）。
+- `bitflip-cli apk <TARGET> [--member NAME] [--xml] [--json]`：摘要 / 还原的 XML / 稳定 JSON。
+
+**如实记录的边界**：`resources.arsc` **没有读**。所以 `@7f0d0001` 这类引用类属性**原样保留**，
+并列进 `unresolved_references`、在 `notes` 里说明 —— 不是解析失败，也不是空值。HTTP
+（`GET /api/apk/manifest`）与网页视图还没有。
+
+真实样本（`ah-app-release.apk`，与 DEX 同一份）实测：清单 45 400 字节 → 28 851 字节 XML，
+`com.weavi.ahh` / versionCode 72 / versionName 1.6.3 / minSdk 21 / targetSdk 29，
+107 activity / 11 service / 2 receiver / 3 provider / 26 条权限，入口
+`com.weavi.ahh.SplashActivity`，58 处解不出的引用。
+
+**工具链地板抬到 1.93**：新依赖 `apk-info-axml` 1.0.13（Apache-2.0）声明
+`rust-version = "1.93.0"`（edition 2024）。`[workspace.package] rust-version` 从 1.87 改成 1.93 ——
+CI 用 stable，不会替我们发现"声明的 MSRV 已经编不过"。`apk-info-xml` 也显式列进依赖，
+因为我们的代码直接遍历它的 `Element`。
+
 ### 加固 — DEX 的放大攻击面：计数守卫钉死 + 输入上限 256 MiB
 
 关闭 M1 推迟验收的第 3 条（"解析预算没接，恶意构造的 DEX 可以靠超大计数顶内存"）。

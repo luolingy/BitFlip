@@ -597,6 +597,25 @@ DEX 没有线性地址空间、没有"函数入口"，套上去只会产出"看�
 versionName / minSdk / targetSdk / permissions / activities / services /
 主 activity / 签名条目数。价值中等（元信息与字符串为主，不是代码逻辑）。
 
+> **进展（2026-10-17）：第一片（只解清单、不读资源表）已实现并接入 CLI。**
+>
+> * **选型定在 `apk-info-axml` 1.0.13（Apache-2.0）**：三个候选都在本机 registry 里，
+>   只有它的输出在真实上架 APK 上被验证过。它的 `Element` 来自 `apk-info-xml`，
+>   所以那个 crate 也被显式列进依赖（不靠传递依赖）。
+> * **它把 MSRV 从 1.87 抬到 1.93**（`rust-version = "1.93.0"`、edition 2024）。
+>   `[workspace.package] rust-version` 已同步改成 1.93 —— CI 用 stable，不会替我们
+>   发现"声明的地板是编的"。
+> * 真实样本（`ah-app-release.apk`，与 DEX 那边同一个）实测：清单成员 45 400 字节，
+>   还原出 **28 851** 字节 XML（上面那句 29 392 是当初用 `apk-info` 的 XML 转换器
+>   得到的，我们的适配层走库的 `get_xml_string`，渲染缩进不同 —— 数据量级一致，
+>   **差值不是数据丢了**）；包名 `com.weavi.ahh`、versionCode 72、versionName 1.6.3、
+>   minSdk 21 / targetSdk 29、107 activity / 11 service / 2 receiver / 3 provider、
+>   26 条权限、入口 `com.weavi.ahh.SplashActivity`、58 处解不出的资源引用。
+> * `resources.arsc` **还没读**。所以引用类属性（`@7f0d0001`）**原样保留**并列进
+>   `unresolved_references`，`notes` 里如实说明 —— 不是"解析失败"，也不是空值。
+> * 出口：`bitflip-cli apk <TARGET> [--member NAME] [--xml] [--json]`。
+>   HTTP（`GET /api/apk/manifest`）与网页视图**还没有**，是下一片。
+
 ### 暂不排期
 
 - **v041 容器 DEX**：本机两个真实样本都是 035。等遇到真实 v041 样本再做

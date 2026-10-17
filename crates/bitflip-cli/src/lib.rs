@@ -1,5 +1,6 @@
 //! BitFlip 命令行实现（`bitflip` 与 `bitflip-cli` 共用）。
 
+mod apk;
 mod browser;
 mod cli;
 mod dex;
@@ -15,6 +16,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+pub use apk::run_apk;
 pub use cli::{
     Cli, Command, DexArgs, DiffArgs, ExportArgs, FunctionsArgs, InfoArgs, MembersArgs, OpenCli,
     RawOverrideArgs, ServeArgs, SignatureArgs, SignatureBuildArgs, SignatureCommand,
@@ -58,6 +60,7 @@ pub fn cli_main() -> ExitCode {
         Command::Info(args) => report(run_info(&args.target, args.json, args.verbose, &args.raw)),
         Command::Members(args) => report(run_members(&args)),
         Command::Dex(args) => report(run_dex(&args)),
+        Command::Apk(args) => report(run_apk(&args)),
         Command::Functions(args) => report(run_functions(&args)),
         Command::Symbol(args) => report(run_symbol(&args)),
         Command::Signature(args) => report(run_signature(&args)),

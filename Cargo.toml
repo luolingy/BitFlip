@@ -5,9 +5,14 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-# 1.87 是 `rquickjs` 的 MSRV（ADR-0013 选定的脚本引擎）。继续声明更低的版本
-# 会变成一句谎话：装到 1.85 的机器上根本编不过。
-rust-version = "1.87"
+# 这个数字必须是**当前**的地板，不是"我们希望的地板"。
+#
+# * 1.87 曾是 `rquickjs` 的 MSRV（ADR-0013 选定的脚本引擎）；
+# * 2026-10-17 起地板抬到 1.93：M3 的 AXML 解析器 `apk-info-axml` 1.0.13 声明
+#   `rust-version = "1.93.0"`（edition 2024）。继续声明 1.87 会变成一句谎话 ——
+#   装 1.87 的机器上根本编不过，而 CI 用的是 stable，不会替我们发现这一点。
+#   选型与替代方案见 `docs/APK-DEX-DESIGN.md` §M3 的进展块。
+rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bitflip/bitflip"
 homepage = "https://github.com/bitflip/bitflip"
@@ -76,6 +81,27 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2-zli
 # 构建期安不安全：它的 `build.rs` 只读**本 crate 内**的文件做锁步校验，
 # 不联网、不写外部路径（`lief` 就是因为在构建期下载才被否掉的）。
 droidsaw-dex = "2"
+
+# AXML（Android 二进制 XML）与 `resources.arsc`（M11 的 M3）。
+#
+# Apache-2.0 —— 许可闸门已覆盖（`apk-info` 那一族同许可）。三个候选都在本机
+# registry 里：`apk-info-axml` / `rusty-axml` / `resand`。选它的理由是**实测**：
+# 它是设计文档里唯一在真实上架 APK 上验证过能还原出可读 XML 的那个
+# （`docs/APK-DEX-DESIGN.md` §M3），而且属性名表是 phf 预编译的 —— 属性名
+# 解析不靠 `match` 猜。
+#
+# **它把 MSRV 抬到 1.93**（本 crate 声明 `rust-version = "1.93.0"`，edition 2024）。
+# 这不是能悄悄忽略的事：`[workspace.package] rust-version` 因此跟着改成 1.93，
+# 见那里的说明与 `docs/APK-DEX-DESIGN.md` §M3。
+#
+# 只关默认特性（`converter` 会拉 quick-xml + serde，我们不用它的转换器 ——
+# 把库的"另存为 XML 文件"工具链接进来只会多一份可说不可控的路径）。
+apk-info-axml = { version = "1.0.13", default-features = false }
+# `apk-info-axml` 的 `Element`（元素/属性树）就在这里。**显式列出来而不是靠传递依赖**：
+# 我们的代码直接 `use apk_info_xml::Element` 走树，那就得在清单里承认这件事 ——
+# 靠传递依赖能编过，但升级 `apk-info-axml` 时 `Element` 一换来源，报错会出现在
+# 与版本无关的地方。同 Apache-2.0。
+apk-info-xml = { version = "1.0.13", default-features = false }
 
 # 仅测试用
 tempfile = "3"

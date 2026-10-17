@@ -12,6 +12,11 @@ categories.workspace = true
 
 [dependencies]
 bitflip-arch = { workspace = true }
+# AXML/ARSC 的事实层（M11 · M3）。选型理由与本 crate 的"只用事实层"边界
+# 都写在 workspace 的 Cargo.toml 里，这里只留一句：**不接它的转换器**。
+apk-info-axml = { workspace = true }
+# `Element`（AXML 的元素/属性树）来自这里 —— 我们直接遍历它，理由见 workspace 清单。
+apk-info-xml = { workspace = true }
 droidsaw-dex = { workspace = true }
 thiserror = { workspace = true }
 zip = { workspace = true }

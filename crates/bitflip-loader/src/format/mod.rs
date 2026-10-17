@@ -34,11 +34,13 @@
 //! | [`elf`] | ELF32/64（exe/`.so`/`.o`） | 单文件（约 1950 行）。内部拆分未做 —— 见下 |
 //! | [`zip`] | ZIP 容器（APK / JAR / XAPK 外壳） | 单文件。**只做容器层**：成员枚举与按需取出 |
 //! | [`dex`] | DEX（Dalvik Executable） | 单文件。**只做结构模型**：类/字段/方法清单，不解码字节码、不建 CFG |
+//! | [`axml`] | AXML（Android 二进制 XML） | 单文件。**只解清单**：`AndroidManifest.xml` 的字段摘要；不读 `resources.arsc`，`@` 引用原样保留 |
 //!
 //! ELF 的内部拆分**故意没和 PE 一起做**：PE 那一次是纯粹的搬移（逐字节校验过），
 //! 一次只搬一个文件，出问题时能立刻定位。ELF 的拆分是同一类工作，单独一轮做，
 //! 免得两处一起动、出了问题分不清是哪一处。
 
+pub mod axml;
 pub mod coff;
 pub mod dex;
 pub mod elf;
