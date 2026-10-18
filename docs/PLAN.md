@@ -1795,6 +1795,40 @@ IPA（ZIP 容器）  →  .app（目录容器）  →  Mach-O 可执行文件  �
   集成 1 条（走 `parse_object`）；CLI 侧 1 条（`--arch` 短名表与 `Arch::as_str` 往返，
   顺带发现 `--arch ppc` 此前根本没接上）。
 
+**进展 · M12 · 性能底账：指令被解了两遍（2026-10-17，据实记录）**：
+
+`BITFLIP_TIMING=1` 在 `temp/LiveContainer.ipa` 的主二进制（151 648 字节、15 694 条指令、
+debug 构建）上量到的分阶段数据，是"下一步该改哪"的直接依据：
+
+| 阶段 | 耗时 |
+|---|---|
+| `Disasm::build` · 线性扫描（建立共享解码账本） | 867 944 µs |
+| `Disasm::build` · 递归下降（**从账本里选**，不再重解） | 153 526 µs |
+| `Disasm::build` 合计 | 1 023 714 µs |
+| `TargetAnalysis::build` · **解码指令索引（唯一一遍）** | 620 099 µs |
+| `TargetAnalysis::build` · 其余八个阶段合计 | ~110 000 µs |
+
+两条结论：
+
+1. **`Disasm::build` 内部的两遍已经合并完了**（递归下降那行写着"从账本里选"，
+   153 ms 是选取与可达标记的成本，不是重解）。先前把"合并两次解码"当成下一步是
+   过期的判断，作废。
+2. **真正的重复在更外层**：`Disasm::build` 的线性扫描解了一遍（867 ms），
+   `TargetAnalysis::build` 又用 `decode_indexed_insns` 把同一批指令**再解一遍**
+   （620 ms）。端到端 1.9 s 里有约三分之一是"同一件事做了两次"。
+
+**卡在哪里（需要一次设计决定，不是纯机械改动）**：`DecodeLedger` 是每条 24 字节的
+扁平定长记录，注释写明了它**故意不持有 `DecodedInsn`**（后者更大）；而
+`TargetAnalysis` 的 CFG 构建要 `&[DecodedInsn]`。所以复用只有两条路：
+
+* **甲**：把全量 `DecodedInsn` 留在 `Disasm` 里（15 694 条 × 约 56 B ≈ 0.9 MB；
+  15 万条的 PojavLauncher 约 8 MB），换掉 620 ms；
+* **乙**：扩宽扁平账本，让 CFG 也能从记录里建，一个字节的 `DecodedInsn` 都不留。
+
+甲快但违背那条注释的原意（内存换时间，且 PojavLauncher 那种规模要 8 MB 常驻）；
+乙干净但要改 CFG 的输入契约。**这一条不给结论，留待用户定**，因为它是内存/时间/
+API 形状的三方取舍，不该由一次收尾顺手决定。
+
 **进展 · M12 · 第三片：符号表与函数起点（2026-10-17，据实记录）**：
 
 * **做了什么**：`LC_SYMTAB`（`symtab_command`）与 `LC_FUNCTION_STARTS`
