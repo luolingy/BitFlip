@@ -7,7 +7,19 @@
 //!
 //! 优先级沿用 `bitflip-symbols::SymbolSource`（符号 > 展开 > 调用目标 > prologue）。
 //! 冲突不静默吞掉：边界不一致的候选全部保留，合并结果附 `notes`。
+//!
+//! # 边界可能不是"读出来的"
+//!
+//! 有一种来源只给起点不给终点：Mach-O 的 `LC_FUNCTION_STARTS`。它的结束地址是按
+//! "下一个起点"推出来的（见 [`derive_function_starts`]）。这条推导**不许**跟
+//! "文件里写着"混为一谈（CLAUDE.md §7），所以：
+//!
+//! * 它有自己的来源名 [`SymbolSource::FunctionStart`]（"函数起点表"），界面能如实显示；
+//! * 推出的结束地址仍然走既有的 `<name>\t<end-hex>` 编码，与展开表/调试信息同一条
+//!   通道 —— 不新开一套；
+//! * 推不出来时（起点落不进任何节）宁可留 `None`，不拿"到节尾"或"下一个节"凑数。
 
+use bitflip_loader::object::Object;
 use bitflip_symbols::{preferred, validate, SymbolCandidate, SymbolSource};
 
 /// 一个函数的最终识别结论。
@@ -66,9 +78,16 @@ impl ConflictKind {
 pub fn merge_candidates(addr: u64, candidates: Vec<SymbolCandidate>) -> Function {
     // 先选出名字。名字必须非空（`validate` 拒空名）：一个空名候选不该
     // 赢下"这个函数叫什么"这个问题。
+    //
+    // 但**只有边界标记**的名字（`"\t<end>"`）不算名字 —— 那是把结束地址编码进
+    // `name` 字段的既有约定（展开表、调试信息、函数起点表都用它）。只做 `validate`
+    // 不够：`"\t1010".trim()` 不是空串，于是这种候选会挤掉真正无名的候选、赢下
+    // "名字来源"这个位置。实测后果是 Mach-O 的入口点函数显示"来源 = 函数起点表"、
+    // PE 上显示"来源 = 展开表"，而它真正的证据是"对象头里写着程序从这里进入"。
+    // 所以这里按"剥掉边界标记之后还有没有名字"来判断。
     let named: Vec<SymbolCandidate> = candidates
         .iter()
-        .filter(|c| validate(c).is_ok())
+        .filter(|c| validate(c).is_ok() && has_display_name(&c.name))
         .cloned()
         .collect();
     let chosen = preferred(&named).cloned();
@@ -148,6 +167,15 @@ pub fn merge_candidates(addr: u64, candidates: Vec<SymbolCandidate>) -> Function
     }
 }
 
+/// 这个名字里有没有**真的名字**（不只是 `<name>\t<end>` 里的边界编码）。
+///
+/// 展开表、调试信息、函数起点表都把结束地址编码在 `name` 后面。剥掉那一段之后
+/// 什么都不剩的候选，是"只提供边界、不提供名字"——它不该被当成"这个函数有名字"。
+fn has_display_name(name: &str) -> bool {
+    let real = name.rsplit_once('\t').map_or(name, |(real, _end)| real);
+    !real.trim().is_empty()
+}
+
 /// 从展开表条目直接构造函数候选（`.pdata` RUNTIME_FUNCTION / ELF FDE）。
 ///
 /// 展开表的边界是编译器/链接器写死的，置信度高（85）；
@@ -163,6 +191,125 @@ pub fn unwind_candidates(entries: &[bitflip_loader::object::UnwindEntry]) -> Vec
             // 别让这个编码格式漏到界面上。
             name: format!("\t{:x}", e.end),
             source: SymbolSource::Unwind,
+            confidence: 85,
+        })
+        .collect()
+}
+
+/// 由相邻起点推出的一个函数边界。
+///
+/// # 只有 `start` 是文件里的字节
+///
+/// `LC_FUNCTION_STARTS` 写的全是**起点**。结束地址是这样定的：第 i 个函数到
+/// 第 i+1 个起点为止；最后一个到它所在节的末尾为止；落不进任何节的那个连末尾
+/// 都没有 —— 那是 [`DerivedEnd::Unknown`]。把这条推导当成"文件里写着的大小"
+/// 就是在说谎（CLAUDE.md §7），所以结束地址必须带着它的来处一起走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionStartBound {
+    /// 起点（文件里写着的）。
+    pub start: u64,
+    /// 结束地址是怎么来的。
+    pub end: DerivedEnd,
+}
+
+/// 推导出的结束地址的来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedEnd {
+    /// 同一张表里的下一个起点 —— 两个数都是文件里的，最硬的一种。
+    NextStart(u64),
+    /// 表里没有下一个起点了，取所在节的末尾。
+    SectionEnd(u64),
+    /// 这个起点落不进任何节，表里也没有下一个起点：边界**未知**，不猜。
+    Unknown,
+}
+
+impl DerivedEnd {
+    /// 推出的结束地址（不含）；推不出来时 `None`。
+    #[must_use]
+    pub const fn value(self) -> Option<u64> {
+        match self {
+            Self::NextStart(end) | Self::SectionEnd(end) => Some(end),
+            Self::Unknown => None,
+        }
+    }
+
+    /// 结束地址是不是取自相邻起点（而不是节末尾）。
+    #[must_use]
+    pub const fn is_next_start(self) -> bool {
+        matches!(self, Self::NextStart(_))
+    }
+}
+
+/// 从起点序列推出函数边界。
+///
+/// `section_end` 回答"这个地址所在节的末尾（不含）在哪"；不在任何节里返回 `None`。
+///
+/// 起点序列**按输入顺序**处理，不排序也不去重：`Object::function_starts` 的契约
+/// 就是升序，这里再排一次会把"表没按规范装出来"这种问题悄悄盖住。序列不升时也
+/// 不猜 —— 一个不比自己大的数不能当上界（会长出长度为 0 甚至为负的函数），
+/// 那种情况退回节的末尾规则。
+#[must_use]
+pub fn derive_function_starts(
+    starts: &[u64],
+    section_end: impl Fn(u64) -> Option<u64>,
+) -> Vec<FunctionStartBound> {
+    let mut bounds = Vec::with_capacity(starts.len());
+    for (index, &start) in starts.iter().enumerate() {
+        // 下一个起点必须**严格更大**才配当上界。
+        let next = starts.get(index + 1).copied().filter(|&next| next > start);
+        let end = match next {
+            Some(next) => DerivedEnd::NextStart(next),
+            None => match section_end(start).filter(|&end| end > start) {
+                Some(end) => DerivedEnd::SectionEnd(end),
+                None => DerivedEnd::Unknown,
+            },
+        };
+        bounds.push(FunctionStartBound { start, end });
+    }
+    bounds
+}
+
+/// 某个地址所在节的末尾（虚拟地址，不含）；不在任何节里返回 `None`。
+///
+/// 用节的**文件大小**：那才是加载后真正有字节的那一段（`Section` 只有 `file.size`，
+/// 没有虚拟大小；对 Mach-O 的 `__text` 两者相等）。
+#[must_use]
+pub fn section_end_of(object: &Object, addr: u64) -> Option<u64> {
+    let section = object.section_at(addr)?;
+    section.vaddr.checked_add(section.file.size)
+}
+
+/// 从对象的函数起点表推出边界。
+///
+/// 非 Mach-O（PE / ELF / DEX / raw）与剥光的 Mach-O 上 `function_starts` 是空表，
+/// 这里返回空 —— 调用方据此**什么都不做**（不加候选、不加 notes）。
+#[must_use]
+pub fn derive_function_start_bounds(object: &Object) -> Vec<FunctionStartBound> {
+    derive_function_starts(&object.function_starts, |addr| section_end_of(object, addr))
+}
+
+/// 把推导出的边界变成函数候选。
+///
+/// 名字恒为空：起点表里根本没有名字。一个没有名字的函数就是"未识别"，
+/// 不生成 `func_xxx` 之类的占位名（CLAUDE.md §7）。
+///
+/// 边界走既有的编码约定 `<name>\t<end-hex>`（与展开表、调试信息同一条），
+/// [`merge_candidates`] 解析出 end 后会把它从名字里剥掉；推不出边界时名称为空串，
+/// 那个函数就如实"只知道起点"。
+#[must_use]
+pub fn function_start_candidates(bounds: &[FunctionStartBound]) -> Vec<SymbolCandidate> {
+    bounds
+        .iter()
+        .map(|bound| SymbolCandidate {
+            addr: bound.start,
+            name: match bound.end.value() {
+                Some(end) => format!("\t{end:x}"),
+                None => String::new(),
+            },
+            source: SymbolSource::FunctionStart,
+            // 置信度与展开表同档（85）：两者都是工具链在文件里写下的边界事实。
+            // "结束地址是推导的"这件事已经由**来源**（rank 52，比展开表低一档）
+            // 表达，不在这里再打一次折 —— 否则同一个信息被记两笔账。
             confidence: 85,
         })
         .collect()
@@ -322,5 +469,239 @@ mod tests {
         // 名字部分为空，边界部分能被 merge 还原
         let f = merge_candidates(0x1400, cands);
         assert_eq!(f.end, Some(0x1440));
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 函数起点表（`LC_FUNCTION_STARTS`）
+    // ─────────────────────────────────────────────────────────────
+
+    /// 合成一个只带一个 `__text` 节的对象（节的虚拟范围 `0x1000..0x1060`）。
+    ///
+    /// 按**规格**拼而不是照解析代码拼：这里填的是对象模型（分析层看到的视图），
+    /// 字段含义见 `bitflip_loader::object::Section`。Mach-O 的 `__text` 文件大小与
+    /// 虚拟大小相等，所以节的末尾就是 `vaddr + file.size`。
+    fn synthetic_object(function_starts: &[u64], entry: Option<u64>) -> Object {
+        use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
+        use bitflip_loader::object::{ContentKind, FileRange, ObjectId, Perms, Section};
+
+        let mut object = Object::new(
+            ObjectId::Plain,
+            bitflip_loader::ObjectKind::MachO,
+            ArchSpec::from_arch(Arch::X86_64, Mode::M64, Endian::Little),
+            Endian::Little,
+        );
+        object.entry = entry;
+        object.sections.push(Section {
+            name: "__text".into(),
+            vaddr: 0x1000,
+            file: FileRange::new(0x4000, 0x60),
+            perms: Perms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            kind: ContentKind::Code,
+            loaded: true,
+        });
+        object.function_starts = function_starts.to_vec();
+        object
+    }
+
+    /// 与 `bitflip-core` 的 `TargetAnalysis::build` 同一套分组：地址 → 候选列表。
+    /// 分组是去重的唯一机制，所以测试必须走同一条路。
+    fn merge_by_addr(candidates: Vec<SymbolCandidate>) -> Vec<Function> {
+        let mut by_addr: std::collections::BTreeMap<u64, Vec<SymbolCandidate>> =
+            std::collections::BTreeMap::new();
+        for candidate in candidates {
+            by_addr.entry(candidate.addr).or_default().push(candidate);
+        }
+        by_addr
+            .into_iter()
+            .map(|(addr, candidates)| merge_candidates(addr, candidates))
+            .collect()
+    }
+
+    /// 三个起点 → 三个函数，大小由**相邻起点**推出，最后一个用节的末尾。
+    #[test]
+    fn function_starts_yield_one_function_per_start_with_derived_sizes() {
+        let object = synthetic_object(&[0x1000, 0x1010, 0x1030], None);
+        let bounds = derive_function_start_bounds(&object);
+
+        // 推导本身：前两个的上界是下一个起点，最后一个取节末尾（0x1000+0x60）。
+        assert_eq!(
+            bounds.iter().map(|b| (b.start, b.end)).collect::<Vec<_>>(),
+            vec![
+                (0x1000, DerivedEnd::NextStart(0x1010)),
+                (0x1010, DerivedEnd::NextStart(0x1030)),
+                (0x1030, DerivedEnd::SectionEnd(0x1060)),
+            ],
+            "结束地址的来源必须逐条记清楚，不能只剩一个数字"
+        );
+
+        let candidates = function_start_candidates(&bounds);
+        assert_eq!(candidates.len(), 3);
+        assert!(
+            candidates.iter().all(|c| c.name.starts_with('\t')),
+            "边界编码在名字里（与展开表同一条通道）"
+        );
+
+        let functions = merge_by_addr(candidates);
+        assert_eq!(functions.len(), 3, "三个起点就是三个函数");
+        assert_eq!(functions[0].start, 0x1000);
+        assert_eq!(functions[0].end, Some(0x1010));
+        assert_eq!(functions[0].end.map(|e| e - 0x1000), Some(0x10));
+        assert_eq!(functions[1].end, Some(0x1030));
+        assert_eq!(functions[1].end.map(|e| e - 0x1010), Some(0x20));
+        assert_eq!(functions[2].end, Some(0x1060));
+        assert_eq!(functions[2].end.map(|e| e - 0x1030), Some(0x30));
+
+        // 来源：权威的"函数起点表"，不是"分析推断"。
+        for f in &functions {
+            assert_eq!(
+                f.name_source,
+                SymbolSource::FunctionStart,
+                "{:#x} 的来源必须是函数起点表",
+                f.start
+            );
+            assert!(
+                f.name.is_empty(),
+                "起点表里没有名字 —— 不许编（CLAUDE.md §7），实际 {:?}",
+                f.name
+            );
+            assert_eq!(
+                f.candidates
+                    .iter()
+                    .filter(|c| c.source == SymbolSource::FunctionStart)
+                    .count(),
+                1,
+                "落选候选保留，且只有一个函数起点候选"
+            );
+        }
+    }
+
+    /// 起点落不进任何节、表里又没有下一个 → 边界未知，**不猜**。
+    #[test]
+    fn last_start_outside_every_section_keeps_unknown_end() {
+        let object = synthetic_object(&[0x1000, 0x1020, 0x9000], None);
+        let bounds = derive_function_start_bounds(&object);
+        assert_eq!(bounds[1].end, DerivedEnd::NextStart(0x9000));
+        assert_eq!(
+            bounds[2].end,
+            DerivedEnd::Unknown,
+            "0x9000 不在 __text 里，推不出末尾 —— 不许拿一个附近的值凑"
+        );
+        assert_eq!(bounds[2].end.value(), None);
+
+        let functions = merge_by_addr(function_start_candidates(&bounds));
+        assert_eq!(functions.len(), 3);
+        assert_eq!(
+            functions[2].end, None,
+            "推不出边界就留 None（只知道起点），不填 0 也不填下一个节"
+        );
+    }
+
+    /// 起点正好是入口点：**不能**多出一个函数，入口函数要拿到权威边界。
+    #[test]
+    fn a_start_equal_to_the_entry_point_does_not_duplicate_it() {
+        let object = synthetic_object(&[0x1000, 0x1010], Some(0x1000));
+        let mut candidates = function_start_candidates(&derive_function_start_bounds(&object));
+        // 入口点来源（与 `bitflip-core` 的"来源 3.5"同样：无名、置信度 75）
+        candidates.push(SymbolCandidate {
+            addr: 0x1000,
+            name: String::new(),
+            source: SymbolSource::EntryPoint,
+            confidence: 75,
+        });
+
+        let functions = merge_by_addr(candidates);
+        assert_eq!(
+            functions.len(),
+            2,
+            "入口点已经是函数起点表里的一条，不该多出第三个函数"
+        );
+        assert_eq!(functions[0].start, 0x1000);
+        assert_eq!(
+            functions[0].end,
+            Some(0x1010),
+            "入口函数也要拿到函数起点表给的边界"
+        );
+        assert_eq!(
+            functions[0].candidates.len(),
+            2,
+            "两个来源在同一地址上合并成一个函数，候选都留着"
+        );
+        // 来源按既有优先级：入口点(45) 比函数起点表(52) 硬，所以显示"入口点"。
+        // 这里还依赖另一条规则：只有边界编码（`"\t<end>"`）的候选**不算有名字**，
+        // 否则它会挤掉诚实的无名候选、赢下"名字来源"（见 `has_display_name`）。
+        assert_eq!(functions[0].name_source, SymbolSource::EntryPoint);
+        assert!(
+            functions[0].name.is_empty(),
+            "入口点不提供名字，名字仍是空的"
+        );
+    }
+
+    /// 空表 = 没有这样一张表：不产生候选、不产生函数。
+    ///
+    /// 与"字段从未被填过"的对象逐字段比对 —— 两者必须**完全一样**，
+    /// 否则 PE/ELF/DEX 会凭空多出一条"函数起点表为空"的噪声。
+    #[test]
+    fn empty_function_starts_change_nothing() {
+        let empty = synthetic_object(&[], None);
+        let untouched = synthetic_object(&[], None);
+        assert_eq!(empty.function_starts, untouched.function_starts);
+
+        let bounds = derive_function_start_bounds(&empty);
+        assert!(bounds.is_empty());
+        assert!(function_start_candidates(&bounds).is_empty());
+        assert!(
+            merge_by_addr(function_start_candidates(&bounds)).is_empty(),
+            "没有候选就不该有函数"
+        );
+    }
+
+    /// **冲突**：符号落在推导出的范围里。
+    ///
+    /// 文档化的结果是"边界不动、矛盾上报"，不是"把边界截到符号那里"：
+    ///
+    /// * `LC_FUNCTION_STARTS` 说的是"这些是**函数起点**"。被夹在中间的那个地址
+    ///   不在这张表里，它只是符号表里的一个地址；截断到它等于让一个没有边界
+    ///   主张的来源（`nlist` 里根本没有 size）去改写一个文件里写着的起点序列，
+    ///   而截出来的那个数字**没有任何来源断言过**。
+    /// * 两个函数因此在地址上重叠 —— 这件事必须让用户看见（由上层写进 notes），
+    ///   不能靠"悄悄截断"抹平。
+    #[test]
+    fn a_symbol_strictly_inside_a_derived_range_does_not_truncate_the_boundary() {
+        let object = synthetic_object(&[0x1000, 0x1040], None);
+        let mut candidates = function_start_candidates(&derive_function_start_bounds(&object));
+        candidates.push(SymbolCandidate {
+            addr: 0x1020,
+            name: "inner_label".to_string(),
+            source: SymbolSource::SymbolTable,
+            confidence: 70,
+        });
+
+        let functions = merge_by_addr(candidates);
+        assert_eq!(
+            functions.len(),
+            3,
+            "0x1000、0x1020（符号）、0x1040（表里第二个起点）各是一个函数 —— \
+             符号是**新增**的一个候选地址，不是替换掉某个起点"
+        );
+
+        let outer = &functions[0];
+        assert_eq!(outer.start, 0x1000);
+        assert_eq!(
+            outer.end,
+            Some(0x1040),
+            "推导出的边界不许被夹在中间的符号截断"
+        );
+
+        let inner = &functions[1];
+        assert_eq!(inner.start, 0x1020);
+        assert_eq!(
+            inner.end, None,
+            "符号表不提供边界（nlist 没有 size 字段），所以这个函数只知道起点"
+        );
+        assert_eq!(inner.name, "inner_label", "有符号就用符号名，照旧");
     }
 }

@@ -36,6 +36,22 @@ pub enum SymbolSource {
     EntryPoint,
     /// 异常/展开表：PE `.pdata`、ELF `.eh_frame` FDE。
     Unwind,
+    /// 链接器写下的函数起点表（Mach-O 的 `LC_FUNCTION_STARTS`）。
+    ///
+    /// # 为什么排在这里（展开表之后、导入桩之前）
+    ///
+    /// 与 [`Self::Unwind`] 是**同一类**证据：都在链接/编译期由工具链写死进文件，
+    /// 不是从字节形状猜的，也不是"被谁调用过"推的。所以它必须排在
+    /// [`Self::Discovery`]、[`Self::Heuristic`] 这些推断之前。
+    ///
+    /// 但它比展开表弱**一档**：展开表的每条记录同时写着 begin 与 end，而这张表
+    /// 只写**起点** —— 结束地址是由"下一个起点"推出来的（最后一个取所在节的
+    /// 末尾，见 `bitflip_analyze::derive_function_starts`）。一个写在文件里的事实
+    /// 比一个算出来的事实更硬，所以它在 `priority` 上紧随展开表之后。
+    ///
+    /// 与 [`Self::SymbolTable`] 的关系是分工而不是竞争：符号表给**名字**（顺序在
+    /// 这一个之前，`priority` 更小），这张表给**边界**（符号表里根本没有 size 字段）。
+    FunctionStart,
     /// 导入 thunk（IAT/PLT 桩）。
     ImportThunk,
     /// 编译器内置模式：由固定字节形状认出的编译器/运行时生成函数（M8 交付物 3）。
@@ -68,6 +84,7 @@ impl SymbolSource {
             Self::SymbolTable => "symbol-table",
             Self::EntryPoint => "entry-point",
             Self::Unwind => "unwind",
+            Self::FunctionStart => "function-start",
             Self::ImportThunk => "import-thunk",
             Self::RelocPointer => "reloc-pointer",
             Self::BuiltinPattern => "builtin-pattern",
@@ -87,6 +104,7 @@ impl SymbolSource {
             Self::SymbolTable => "符号表",
             Self::EntryPoint => "入口点",
             Self::Unwind => "展开表",
+            Self::FunctionStart => "函数起点表",
             Self::ImportThunk => "导入桩",
             Self::RelocPointer => "重定位指针表",
             Self::BuiltinPattern => "编译器模式",
@@ -108,6 +126,9 @@ impl SymbolSource {
             // 但不确定是不是函数边界。
             Self::EntryPoint => 45,
             Self::Unwind => 50,
+            // 函数起点表：同为链接期写死的事实，但只有起点是真的，结束边界是
+            // 由相邻起点推出来的 —— 比展开表弱一档，比下面那些推断都强。
+            Self::FunctionStart => 52,
             Self::ImportThunk => 60,
             // 重定位指针表：加载器必须往这个槽位写一个地址，所以"这里是
             // 指针"是确定的；但"这个指针指向函数"仍是推断（也可能是数据
@@ -216,9 +237,20 @@ mod tests {
         assert!(SymbolSource::DebugInfo.priority() < SymbolSource::Export.priority());
         assert!(SymbolSource::Export.priority() < SymbolSource::SymbolTable.priority());
         assert!(SymbolSource::SymbolTable.priority() < SymbolSource::Unwind.priority());
+        // 函数起点表紧随展开表：同类事实，但展开表的 end 是文件里写着的，
+        // 这张表的 end 是推出来的 —— 顺序不能反过来。
+        assert!(SymbolSource::Unwind.priority() < SymbolSource::FunctionStart.priority());
+        assert!(SymbolSource::FunctionStart.priority() < SymbolSource::ImportThunk.priority());
+        assert!(SymbolSource::FunctionStart.priority() < SymbolSource::Discovery.priority());
         assert!(SymbolSource::Unwind.priority() < SymbolSource::Discovery.priority());
         assert!(SymbolSource::Discovery.priority() < SymbolSource::Heuristic.priority());
+        assert!(
+            SymbolSource::User.priority() < SymbolSource::FunctionStart.priority(),
+            "用户的说法仍然最高 —— 加新来源不能动这条"
+        );
         assert_eq!(SymbolSource::Unwind.as_str(), "unwind");
+        assert_eq!(SymbolSource::FunctionStart.as_str(), "function-start");
         assert_eq!(SymbolSource::Export.label_zh(), "导出表");
+        assert_eq!(SymbolSource::FunctionStart.label_zh(), "函数起点表");
     }
 }

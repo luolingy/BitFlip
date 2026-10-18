@@ -16,7 +16,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bitflip_analyze::{
-    merge_candidates, scan_jump_tables, unwind_candidates, Cfg, JumpTableScan, StringOptions,
+    derive_function_start_bounds, function_start_candidates, merge_candidates, scan_jump_tables,
+    unwind_candidates, Cfg, FunctionStartBound, JumpTableScan, StringOptions,
 };
 use bitflip_arch::Flow;
 use bitflip_debug::DebugInfo;
@@ -702,9 +703,72 @@ impl TargetAnalysis {
                     confidence: 80,
                 });
         }
-        // 来源 3：展开表（PE .pdata / ELF FDE）—— 唯一带边界的来源
+        // 来源 3：展开表（PE .pdata / ELF FDE）—— 少数带边界的来源之一
+        // （另一处是调试信息，以及下面的 Mach-O 函数起点表）。
         for c in unwind_candidates(&object.unwind) {
             by_addr.entry(c.addr).or_default().push(c);
+        }
+
+        // ── 来源 3.6：链接器写下的函数起点表（Mach-O 的 `LC_FUNCTION_STARTS`）──
+        //
+        // 这是与展开表**同类**的事实：工具链生成镜像时把"每个函数的起点"写进
+        // `__LINKEDIT`，dyld 自己就是按这张表按需建立函数边界的。在此之前分析层
+        // 把它整张丢掉，于是 Mach-O 的函数边界只能靠反汇编猜 —— 而权威的边界
+        // 就躺在文件里（M12 第三片已经解出来了，第四片接上）。
+        //
+        // 三条必须说清的边界：
+        //
+        // 1. **只有起点是文件事实**。结束地址由**下一个起点**推出（最后一个取所在
+        //    节的末尾，落不进任何节就未知），见 `derive_function_starts`。所以来源
+        //    标成 `FunctionStart`（rank 52）：比展开表弱一档（展开表的 end 写在记录
+        //    里，这里的 end 是算出来的），比导入桩 / 重定位指针 / 调用目标推断都硬
+        //    （那些要么是字节形状，要么只是"被调用过"）。推导这件事同时写进 notes。
+        // 2. **不抢名字**：这里的候选一律无名。符号表（rank 40）/ 调试信息 / 签名库
+        //    照旧按优先级给名字；没有名字覆盖的就如实"未识别"，不生成 `func_xxx`。
+        // 3. **空表什么都不做**：PE / ELF / DEX / raw 没有这张表，剥光的 Mach-O 也
+        //    可能解不出东西。那种情况下不加候选、也不加 notes —— 一条"函数起点表
+        //    为空"的噪声只会让 PE 看起来缺了一块。
+        //
+        // 起点不在已映射地址空间里时不建函数（表被截断或镜像基址算错时会这样，
+        // 在那里建函数等于造一个点不开的空壳），但这个数必须报出来，不能悄悄少几个。
+        let mut derived_function_ends: HashMap<u64, u64> = HashMap::new();
+        let mut unmapped_starts: Vec<u64> = Vec::new();
+        if !object.function_starts.is_empty() {
+            let mut bounds: Vec<FunctionStartBound> = Vec::new();
+            for bound in derive_function_start_bounds(object) {
+                // `read_u8` 不分配：这里只问"这个地址被映射了吗"（59 487 个起点的
+                // 真实样本上，逐条分配一个小 `Vec` 是白花钱）。
+                if disasm.space.read_u8(bound.start).is_none() {
+                    unmapped_starts.push(bound.start);
+                    continue;
+                }
+                if let Some(end) = bound.end.value() {
+                    derived_function_ends.insert(bound.start, end);
+                }
+                bounds.push(bound);
+            }
+            for candidate in function_start_candidates(&bounds) {
+                by_addr.entry(candidate.addr).or_default().push(candidate);
+            }
+            if !bounds.is_empty() {
+                let from_next = bounds.iter().filter(|b| b.end.is_next_start()).count();
+                let unknown = bounds.iter().filter(|b| b.end.value().is_none()).count();
+                let from_section = bounds.len() - from_next - unknown;
+                notes.push(format!(
+                    "函数起点表（LC_FUNCTION_STARTS）给出 {} 个函数起点：{from_next} 个的结束地址\
+                     由下一个起点推出、{from_section} 个取所在节的末尾、{unknown} 个推不出边界\
+                     （起点落不进任何节）—— 结束地址是**推导**的，文件里只写着起点",
+                    bounds.len()
+                ));
+            }
+            if !unmapped_starts.is_empty() {
+                notes.push(format!(
+                    "有 {} 个函数起点不落在已映射的地址空间里（表可能被截断，或镜像基址与实际\
+                     不符），未作为函数；第一个是 {:#x}",
+                    unmapped_starts.len(),
+                    unmapped_starts[0]
+                ));
+            }
         }
 
         // 来源 3.5：入口点。
@@ -1284,6 +1348,51 @@ impl TargetAnalysis {
             ));
         }
 
+        // ── 推导边界与已知起点的矛盾（只在函数起点表存在时检查）──
+        //
+        // `LC_FUNCTION_STARTS` 断言"这些是函数起点"。若另一个来源（符号表里的局部
+        // 标签、调用目标、重定位指针）在同一个区间里又给出一个起点，就会得到两个
+        // 地址重叠的"函数"。规则两条，都是既有冲突规则的延续（`merge_candidates`：
+        // 边界取可信来源的最小上界，异见全部保留并上报）：
+        //
+        // 1. **边界不动**。被夹在中间的地址不在这张表里，它本身没有任何边界主张
+        //    （`nlist` 连 size 字段都没有）。截断到它，结束地址就变成一个**没有
+        //    任何来源断言过**的数字 —— 那比"两个函数重叠"更难解释。
+        // 2. **矛盾必须报出来**：notes 里给计数与一个具体例子，否则用户看到两个
+        //    重叠的函数却不知道谁跟谁不一致。
+        if !derived_function_ends.is_empty() {
+            let mut overlaps: Vec<(u64, u64, u64)> = Vec::new(); // (上一个起点, 上界, 内层起点)
+            for pair in functions.windows(2) {
+                let Some(prev_start) = parse_address(&pair[0].start) else {
+                    continue;
+                };
+                let Some(prev_end) = pair[0].end.as_deref().and_then(parse_address) else {
+                    continue;
+                };
+                let Some(next_start) = parse_address(&pair[1].start) else {
+                    continue;
+                };
+                if prev_end <= next_start {
+                    continue;
+                }
+                // 只报"上界正好等于函数起点表推出的那个值"的情况：展开表/调试信息
+                // 本来就有自己的边界规则，这一片不去动它们的冲突处理。
+                if derived_function_ends.get(&prev_start) != Some(&prev_end) {
+                    continue;
+                }
+                overlaps.push((prev_start, prev_end, next_start));
+            }
+            if let Some(&(prev_start, prev_end, next_start)) = overlaps.first() {
+                notes.push(format!(
+                    "有 {} 个函数起点落在上一个函数由 LC_FUNCTION_STARTS 推出的范围里\
+                     （例如 {next_start:#x} 落在 {prev_start:#x}..{prev_end:#x}）：\
+                     边界**仍按相邻起点**，没有截断 —— 起点表是这些边界唯一的来源，\
+                     被夹在中间的地址只是符号表/调用目标里的一个地址，不是这张表里的起点",
+                    overlaps.len()
+                ));
+            }
+        }
+
         // ── 字符串提取（流式，分块）──
         let mut strings: Vec<StringWire> = Vec::new();
         let mut oversized_runs = 0usize;
@@ -1293,10 +1402,23 @@ impl TargetAnalysis {
             if seg.perms.execute || seg.vsize == 0 {
                 continue;
             }
+            // 只扫**文件里真有字节**的那一段（`ByteSource::len()` 对零填充段是 0）。
+            // 按 `vsize` 扫会把零填充扫进来：那些字节在文件里根本不存在（读出来
+            // 全是 0），不可能藏着字符串。
+            //
+            // 这不是省事，是实测出来的卡死：Mach-O 可执行文件的 `__PAGEZERO` 是
+            // 一个 vsize = 0x1_0000_0000（4 GiB）的零填充段，按 vsize 逐块 `read`
+            // 会真去处理 40 亿个字节 —— 一个 151 KB 的真实样本因此几分钟都不出结果
+            // （`tests/macho_real_analysis.rs` 就是这么发现的；此前没有测试对
+            // Mach-O **可执行文件**跑过完整分析，所以一直没暴露）。
+            let scan_len = seg.source.len().min(seg.vsize);
+            if scan_len == 0 {
+                continue;
+            }
             let mut scanner = StringScanner::new(seg.vaddr, opts);
             let mut offset = 0u64;
-            while offset < seg.vsize {
-                let len = SCAN_CHUNK.min((seg.vsize - offset) as usize);
+            while offset < scan_len {
+                let len = SCAN_CHUNK.min((scan_len - offset) as usize);
                 let Some(data) = disasm.space.read(seg.vaddr + offset, len) else {
                     notes.push(format!(
                         "段 {}（{:#x}+{:#x}）读取失败，字符串扫描在该处截断",

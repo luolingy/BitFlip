@@ -514,7 +514,7 @@ impl Iterator for Cursor<'_> {
 
 /// 收集控制流种子。
 ///
-/// 来源按可信度排序：入口点 > 导出 > 函数符号。**只收真实存在的**，
+/// 来源按可信度排序：入口点 > 导出 > 函数符号 > 展开表 > 函数起点表。**只收真实存在的**，
 /// 不用启发式猜出来的地址（那会让"可达"这个标记失去意义）。
 fn collect_seeds(object: &Object) -> Vec<u64> {
     let mut seeds = Vec::new();
@@ -541,6 +541,21 @@ fn collect_seeds(object: &Object) -> Vec<u64> {
     // strip 过，148/154 的边界来自 .eh_frame。
     for entry in &object.unwind {
         seeds.push(entry.begin);
+    }
+
+    // 链接器写下的函数起点表（Mach-O 的 `LC_FUNCTION_STARTS`）。
+    //
+    // 与展开表同样的理由：这些地址是**文件里写着的**函数起点（dyld 自己也按这张表
+    // 建函数边界），递归下降从它们进去，那些函数才算"可达"。不收的话，Mach-O 上
+    // "可达 / 仅线性覆盖"这个诚实标记会把整个程序标成仅线性 —— 等于把一个已知
+    // 事实丢掉，再让用户去猜为什么全灰。
+    //
+    // 这里只取**起点**：起点表不提供终点（终点由分析层按相邻起点推，见
+    // `bitflip_analyze::derive_function_starts`），而递归下降不需要边界。
+    // 空表（PE / ELF / DEX / raw，或剥光的 Mach-O）时这一段什么都不做 ——
+    // 行为与这条来源出现之前完全一样。
+    for &start in &object.function_starts {
+        seeds.push(start);
     }
 
     seeds.sort_unstable();

@@ -45,7 +45,11 @@ pub use frames::{
     scan_frames, summarize_frames, FrameInference, FrameScan, FrameSource, MAX_PROLOGUE_BYTES,
     MAX_PROLOGUE_INSNS,
 };
-pub use functions::{merge_candidates, unwind_candidates, ConflictKind, Function};
+pub use functions::{
+    derive_function_start_bounds, derive_function_starts, function_start_candidates,
+    merge_candidates, section_end_of, unwind_candidates, ConflictKind, DerivedEnd, Function,
+    FunctionStartBound,
+};
 pub use job::{
     run_guarded, CancelToken, EventSink, JobError, JobEvent, JobHandle, JobId, JobState, NullSink,
     Progress, StageId,
@@ -67,4 +71,9 @@ pub use strings::{extract_strings, StringEncoding, StringEntry, StringOptions};
 pub use xref::{xrefs_of, xrefs_of_all, Xref, XrefKind};
 
 /// 本 crate 的公共 API 版本。
-pub const ANALYZE_API_VERSION: u32 = 1;
+///
+/// v2（M12 第四片）：`SymbolSource` 多出 `FunctionStart` 变体（Mach-O 的
+/// `LC_FUNCTION_STARTS`）。这个类型通过 [`Function::name_source`] 出现在本 crate 的
+/// 公开 API 里，加变体会让下游的 `match` 编不过 —— 所以它不是"纯增量"，版本号 +1。
+/// 新增的 [`derive_function_starts`] 等函数本身是纯增量，不需要单独记。
+pub const ANALYZE_API_VERSION: u32 = 2;
