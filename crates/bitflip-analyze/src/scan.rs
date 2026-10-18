@@ -12,10 +12,36 @@
 //! "仅线性扫到" 与 "递归下降可达"，UI 才能把可信度不同的指令分开显示，
 //! 而不是把两者混成一锅粥假装都可信（CLAUDE.md §7）。
 //!
+//! ## 一次解码，两次选择
+//!
+//! 两种策略要的逐条结论是同一份：`(地址, 长度, flow, 目标)`。早先的实现让它们
+//! **各自**解码一遍，于是同一份字节、同一个地址被 capstone 解了两次 —— 实测
+//! （LiveContainer 151 KB，debug）线性 533 ms + 递归 466 ms，而递归解出的
+//! 8 334 条**全部**都在线性索引里（100% 重叠）。同一份工作做两遍。
+//!
+//! 现在 [`scan_linear_with_ledger`] 边扫边把每一条结论写进 [`DecodeLedger`]
+//! （定长 POD 的扁平 `Vec`，没有文本、没有操作数、没有逐条堆分配），
+//! [`scan_recursive_with_ledger`] 变成对账本的**选择**：命中的地址直接取结论，
+//! 账本里没有的地址才现场解码（那只在线性扫描被上限截断时才会发生）。
+//!
+//! 三条规则保证这个共享不会偷偷改变语义：
+//!
+//! 1. **账本在递归下降开始后只读。** 递归下降现场解出的地址不写回账本，
+//!    所以"线性扫描看到的"与"递归下降读到的"是同一份，不存在谁覆盖谁。
+//! 2. **两条选择仍然各自可区分。** 账本只记"这个地址解出来是什么"，
+//!    不记"这个地址算不算可达" —— 可达/仅线性仍然由 [`ScanCoverage`] 分开记。
+//!    线性扫描在数据区解出的伪指令与递归下降在同一个地址上的判定互不覆盖：
+//!    地址相同就同一条结论（本来就是同一份字节），地址不同就各记各的。
+//! 3. **边界分歧原样保留。** 线性扫描在 A 处解出一条 5 字节指令，不代表 A+2
+//!    不是指令起点：账本按**起点地址**索引，递归下降从 A+2 进入时账本若没有
+//!    A+2 就现场解码（与旧行为逐字节相同），两条结论同时存在于索引与覆盖集里。
+//!
 //! ## 不物化
 //!
 //! 扫描产出的是 [`InsnIndex`]（地址 → 长度），不是 `Vec<DecodedInsn>`。
 //! 指令本身按需解码 —— 100MB 级目标上，前者的内存是后者的百分之一量级。
+//! 账本也是扁平的定长记录（每条 24 字节），不持有 `DecodedInsn`（它有
+//! `Vec<Operand>`），并且在 `Disasm::build` 返回前就被丢弃。
 
 use std::collections::HashSet;
 
@@ -146,24 +172,189 @@ impl ScanCoverage {
     }
 }
 
+/// 账本里一条结论的只读视图。
+///
+/// 从 [`DecodeLedger::get`] 拿到。字段与 [`DecodedInsn`] 里扫描真正用到的那几列
+/// 一致 —— 扫描器不看助记符、不看操作数，所以账本也不存它们。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedSummary {
+    /// 指令地址（账本的键）。
+    pub addr: u64,
+    /// 编码长度（字节）。
+    pub len: u8,
+    /// 控制流语义。
+    pub flow: Flow,
+    /// 直接控制流目标（间接跳转/调用为 `None`）。
+    pub target: Option<u64>,
+}
+
+/// 共享解码账本的一行。
+///
+/// 定长 POD：**没有文本、没有操作数、没有 `String`/`Vec`**（CLAUDE.md §4 的
+/// 内存纪律）。目标地址用 `has_target` 显式区分，"没有目标"绝不写成 0 ——
+/// 0 是一个合法的地址。
+#[derive(Debug, Clone, Copy)]
+struct LedgerEntry {
+    addr: u64,
+    target: u64,
+    len: u8,
+    has_target: bool,
+    flow: Flow,
+}
+
+/// 一次线性扫描解出来的逐条结论（地址 → 长度 / 控制流 / 直接目标）。
+///
+/// 这是"两份选择共用的那一份索引"：线性选择把它记下来，递归选择按地址查它。
+/// 条目按地址升序（[`DecodeLedger::finish`] 负责排序与去重），查询是二分。
+///
+/// 只在一次 `Disasm::build` 里活着：`build` 返回时它已经被丢弃，不挂到会话上。
+/// 存活期间的常驻内存是每条 24 字节（15 694 条 ≈ 377 KB），远小于物化
+/// `DecodedInsn` 的量级。
+#[derive(Debug, Clone, Default)]
+pub struct DecodeLedger {
+    /// 按地址升序；同一地址只保留一份（重复的解码结论必然相同 —— 同一个地址
+    /// 空间、同一个解码器，`read_window` 永远从同一个段读同样的字节）。
+    entries: Vec<LedgerEntry>,
+}
+
+impl DecodeLedger {
+    /// 空账本。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 账本里的结论条数。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 是否为空。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 某个地址的解码结论。**没解过**（不是"解失败"）返回 `None`。
+    ///
+    /// 这里没有"解失败"这个状态：线性扫描在某个地址解码失败时不会写入账本，
+    /// 于是递归下降到同一个地址会自己再解一次并同样失败 —— 失败只发生在
+    /// 账本之外，两条路径的结论因此不会被"缓存"改变。
+    #[must_use]
+    pub fn get(&self, addr: u64) -> Option<DecodedSummary> {
+        let index = self
+            .entries
+            .binary_search_by_key(&addr, |entry| entry.addr)
+            .ok()?;
+        let entry = &self.entries[index];
+        Some(DecodedSummary {
+            addr: entry.addr,
+            len: entry.len,
+            flow: entry.flow,
+            target: entry.has_target.then_some(entry.target),
+        })
+    }
+
+    /// 记一条结论（线性扫描在**接受**这条指令时调用）。
+    fn push(&mut self, insn: &DecodedInsn) {
+        self.entries.push(LedgerEntry {
+            addr: insn.addr,
+            target: insn.target.unwrap_or(0),
+            len: insn.len,
+            has_target: insn.target.is_some(),
+            flow: insn.flow,
+        });
+    }
+
+    /// 拼接另一份账本（分段并行时每段各积一份）。
+    fn append(&mut self, other: Self) {
+        self.entries.extend(other.entries);
+    }
+
+    /// 收尾：按地址排序并去重。
+    ///
+    /// 单段（绝大多数目标）时本来就是升序的 —— 线性扫描按地址递增前进 ——
+    /// 这时只付一次 O(n) 的有序性检查，不做排序。
+    fn finish(&mut self) {
+        let sorted = self
+            .entries
+            .windows(2)
+            .all(|pair| pair[0].addr <= pair[1].addr);
+        if !sorted {
+            self.entries.sort_unstable_by_key(|entry| entry.addr);
+        }
+        // 同一地址的重复结论必然相同（同一个地址空间 + 同一个解码器），
+        // 保留第一条即可 —— 与 `InsnIndex::insert` 的"保留首条"一致。
+        self.entries.dedup_by_key(|entry| entry.addr);
+    }
+}
+
+/// 递归下降对共享账本的选择结果。
+///
+/// 与旧 [`scan_recursive`] 的区别只有一个：**账本里已有的地址不重复登记**。
+/// 那些地址的 `(地址, 长度)` 已经在调用方手上的线性索引里了，再建一份
+/// `InsnIndex` 只是把同一批键插入 BTreeMap 两遍。所以这里只带回
+/// **线性选择给不出的**那部分。
+#[derive(Debug, Clone, Default)]
+pub struct RecursiveSelection {
+    /// 账本之外现场解出的地址（按解出顺序）。正常情况下为空 —— 只有线性扫描
+    /// 被上限截断、或者某段没能扫完时才会出现。合并索引时补进线性索引即可。
+    pub external: Vec<(u64, u8)>,
+    /// 这次选择覆盖的可达指令条数（含账本命中的与现场解出的）。
+    pub selected: usize,
+    /// 统计。`decoded == selected`；失败与截断的口径与旧 [`scan_recursive`] 相同。
+    pub stats: ScanStats,
+}
+
+impl RecursiveSelection {
+    /// 把选择结果并进线性索引，得到与旧路径逐条相同的那份并集索引。
+    ///
+    /// 账本命中的地址**不用**插入：它们本来就在线性索引里（同一份账本就是从
+    /// 那份索引旁边产出的），长度也必然相同。
+    pub fn merge_into(&self, index: &mut InsnIndex) {
+        for (addr, len) in &self.external {
+            index.insert(*addr, *len);
+        }
+    }
+}
+
 /// 线性扫描一段连续代码。
 ///
 /// 每个可执行段独立扫描；段内按顺序解码，遇到非法编码时（可选）逐字节步进
 /// 重新同步。**不跨段**：段边界往往是代码与数据/不同权限内存的分界。
+///
+/// 这是不要共享账本的入口（等价于 [`scan_linear_with_ledger`] 丢掉账本）。
 pub fn scan_linear(
     space: &AddrSpace,
     decoder: &dyn Decoder,
     options: ScanOptions,
     coverage: &mut ScanCoverage,
 ) -> (InsnIndex, ScanStats) {
+    let (index, stats, _ledger) = scan_linear_with_ledger(space, decoder, options, coverage);
+    (index, stats)
+}
+
+/// 线性扫描，并把逐条结论留在共享解码账本里。
+///
+/// 返回值第三项就是 [`scan_recursive_with_ledger`] 的输入。除"多记一份账本"
+/// 之外，行为与 [`scan_linear`] 完全一致（后者就是它丢掉账本）。
+pub fn scan_linear_with_ledger(
+    space: &AddrSpace,
+    decoder: &dyn Decoder,
+    options: ScanOptions,
+    coverage: &mut ScanCoverage,
+) -> (InsnIndex, ScanStats, DecodeLedger) {
     let mut stats = ScanStats::default();
     let segments = space.executable_segments();
 
-    // 逐段并行：段之间天然独立，且不需要共享索引
-    let per_segment: Vec<(InsnIndex, ScanStats)> = segments
+    // 逐段并行：段之间天然独立，且不需要共享索引。
+    // 账本也按段各积一份（并行阶段不共享可变状态，落地后再拼接）。
+    let per_segment: Vec<(InsnIndex, ScanStats, DecodeLedger)> = segments
         .par_iter()
         .map(|segment| {
             let mut index = InsnIndex::new();
+            let mut ledger = DecodeLedger::new();
             let mut stats = ScanStats {
                 segments_scanned: 1,
                 ..ScanStats::default()
@@ -175,14 +366,16 @@ pub fn scan_linear(
                 segment.end(),
                 &options,
                 &mut index,
+                &mut ledger,
                 &mut stats,
             );
-            (index, stats)
+            (index, stats, ledger)
         })
         .collect();
 
     let mut index = InsnIndex::new();
-    for (segment_index, segment_stats) in per_segment {
+    let mut ledger = DecodeLedger::new();
+    for (segment_index, segment_stats, segment_ledger) in per_segment {
         index.merge(&segment_index);
         stats.decoded += segment_stats.decoded;
         stats.decode_failures += segment_stats.decode_failures;
@@ -192,13 +385,21 @@ pub fn scan_linear(
         for (addr, _) in segment_index.range(0, u64::MAX) {
             coverage.mark_linear_only(addr);
         }
+        ledger.append(segment_ledger);
     }
     stats.segments_scanned = segments.len();
+    ledger.finish();
 
-    (index, stats)
+    (index, stats, ledger)
 }
 
 /// 扫描单个地址区间。
+///
+/// 参数多这件事是**已知的丑**，不是设计：三个 `&mut` 汇（`index` / `ledger` /
+/// `stats`）加上四个只读输入，本可以收成一个结构体。暂时不收，是因为下一次改动
+/// （把线性扫描与递归下降合到同一份解码索引上）就要重排这里的形状 —— 为了消一条
+/// lint 先改一遍、再改一遍，等于两次风险换零收益。合并完成时这个 `allow` 应当消失。
+#[allow(clippy::too_many_arguments)]
 fn scan_one_segment(
     space: &AddrSpace,
     decoder: &dyn Decoder,
@@ -206,6 +407,7 @@ fn scan_one_segment(
     end: u64,
     options: &ScanOptions,
     index: &mut InsnIndex,
+    ledger: &mut DecodeLedger,
     stats: &mut ScanStats,
 ) {
     let mut addr = start;
@@ -238,6 +440,9 @@ fn scan_one_segment(
                         break;
                     }
                     index_insn(index, &insn);
+                    // 账本记的是"这条指令解出来是什么"，与索引**同时**登记：
+                    // 两者必须逐条对应，否则递归下降会看到线性扫描没接受过的地址。
+                    ledger.push(&insn);
                     stats.decoded += 1;
                     count += 1;
                     offset += usize::from(insn.len);
@@ -272,6 +477,9 @@ fn scan_one_segment(
 ///
 /// 间接跳转/调用（`target == None`）**不**继续跟进 —— 解析跳转表是 M3 的工作。
 /// 这里宁可少走，也不猜一个假目标扩大污染面。
+///
+/// 这是**不带账本**的入口：每个地址都自己解一次。要与线性扫描共享解码结论，
+/// 用 [`scan_recursive_with_ledger`]。
 pub fn scan_recursive(
     space: &AddrSpace,
     decoder: &dyn Decoder,
@@ -279,8 +487,43 @@ pub fn scan_recursive(
     options: ScanOptions,
     coverage: &mut ScanCoverage,
 ) -> (InsnIndex, ScanStats) {
+    // 空账本 = 全部现场解码，与引入共享账本之前的路径逐字节等价。
+    let no_ledger = DecodeLedger::new();
+    let selection =
+        scan_recursive_with_ledger(space, decoder, seeds, options, coverage, &no_ledger);
     let mut index = InsnIndex::new();
-    let mut stats = ScanStats::default();
+    selection.merge_into(&mut index);
+    (index, selection.stats)
+}
+
+/// 递归下降：优先从共享解码账本里**选**结论，账本没有的地址才现场解码。
+///
+/// # 与线性选择的分工
+///
+/// 账本命中的地址不再登记进返回的索引（`(地址, 长度)` 本来就在调用方手上的
+/// 线性索引里，长度也必然相同 —— 同一份账本就是从那份索引旁边产出的）。
+/// 返回值里只带账本之外的地址，见 [`RecursiveSelection`]。
+///
+/// # 共享账本不会改变任何判定
+///
+/// 1. **只读**：这里不往账本里写任何东西。递归下降现场解出的地址不进账本，
+///    所以线性选择看到的那份账本在递归下降期间是常量。
+/// 2. **失败不被缓存**：账本里只有"解出来了"的地址；某个地址线性扫描解失败时
+///    账本没有它，递归下降到同一个地址会自己再解一次、同样失败、同样计入
+///    `decode_failures`。失败路径上没有"缓存命中"能让结论变甜。
+/// 3. **边界分歧保留**：账本按**起点地址**索引。线性扫描在 A 处解出 5 字节指令，
+///    并不代表 A+2 是/不是起点 —— 递归下降从 A+2 进入时账本若没有 A+2 就现场
+///    解码（与旧行为完全一致），两条结论各记各的，索引取并集、覆盖集分开记。
+/// 4. **上限照旧**：预算/深度/访问量检查一条不少，检查位置也没有移动。
+pub fn scan_recursive_with_ledger(
+    space: &AddrSpace,
+    decoder: &dyn Decoder,
+    seeds: &[u64],
+    options: ScanOptions,
+    coverage: &mut ScanCoverage,
+    ledger: &DecodeLedger,
+) -> RecursiveSelection {
+    let mut selection = RecursiveSelection::default();
 
     // 显式栈而不是递归：畸形控制流可以把深度推到栈溢出
     let mut stack: Vec<(u64, usize)> = seeds.iter().map(|a| (*a, 0)).collect();
@@ -288,7 +531,7 @@ pub fn scan_recursive(
 
     while let Some((mut addr, depth)) = stack.pop() {
         if depth > options.max_depth || visited.len() > options.max_visited {
-            stats.truncated += 1;
+            selection.stats.truncated += 1;
             continue;
         }
 
@@ -296,7 +539,7 @@ pub fn scan_recursive(
         let mut budget = options.max_insns_per_block;
         loop {
             if budget == 0 {
-                stats.truncated += 1;
+                selection.stats.truncated += 1;
                 break;
             }
             // 全局访问量上限必须在**块内每一条指令**处检查，而不只在出栈时检查：
@@ -305,7 +548,7 @@ pub fn scan_recursive(
             // 预算被一整条链绕过。测试 `recursive_scan_honors_max_visited_budget`
             // 固化了这条约束。
             if visited.len() >= options.max_visited {
-                stats.truncated += 1;
+                selection.stats.truncated += 1;
                 break;
             }
             if !visited.insert(addr) {
@@ -322,37 +565,48 @@ pub fn scan_recursive(
                 break;
             }
 
-            let Some((window, _)) = space.read_window(addr, 16) else {
-                break;
+            // 共享账本在前：同一个地址、同一份字节，线性选择已经解过了。
+            // 命中的结论与现场解码得到的逐字段相同（长度 / flow / 直接目标）。
+            let (len, flow, target) = match ledger.get(addr) {
+                Some(summary) => (summary.len, summary.flow, summary.target),
+                None => {
+                    let Some((window, _)) = space.read_window(addr, 16) else {
+                        break;
+                    };
+                    let Ok(insn) = decoder.decode_one(&window, addr) else {
+                        selection.stats.decode_failures += 1;
+                        break;
+                    };
+                    if insn.len == 0 {
+                        break;
+                    }
+                    // 账本之外的地址：线性索引里没有它，合并时补进去。
+                    selection.external.push((addr, insn.len));
+                    (insn.len, insn.flow, insn.target)
+                }
             };
-            let Ok(insn) = decoder.decode_one(&window, addr) else {
-                stats.decode_failures += 1;
-                break;
-            };
-            if insn.len == 0 {
-                break;
-            }
 
-            index_insn(&mut index, &insn);
-            stats.decoded += 1;
+            selection.stats.decoded += 1;
+            selection.selected += 1;
             coverage.mark_reachable(addr);
             budget -= 1;
 
-            let next = insn.next_addr();
+            // 与 `DecodedInsn::next_addr` 同一算式（`addr + len`，不用饱和加法）
+            let next = addr + u64::from(len);
 
-            match insn.flow {
+            match flow {
                 Flow::Fallthrough => {
                     addr = next;
                 }
                 Flow::Call => {
                     // 调用目标作为新种子入栈；调用本身有顺序后继
-                    if let Some(target) = insn.target {
+                    if let Some(target) = target {
                         stack.push((target, depth + 1));
                     }
                     addr = next;
                 }
                 Flow::Branch { conditional } => {
-                    if let Some(target) = insn.target {
+                    if let Some(target) = target {
                         stack.push((target, depth + 1));
                     }
                     if conditional {
@@ -369,7 +623,7 @@ pub fn scan_recursive(
     }
 
     coverage.normalize();
-    (index, stats)
+    selection
 }
 
 /// 合并两次扫描的结果。

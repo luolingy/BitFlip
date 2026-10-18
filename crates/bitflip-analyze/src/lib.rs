@@ -64,8 +64,9 @@ pub use pseudo::{
     PSEUDO_FORMAT_VERSION,
 };
 pub use scan::{
-    combine, control_flow_targets, scan_linear, scan_recursive, ScanCoverage, ScanOptions,
-    ScanStats,
+    combine, control_flow_targets, scan_linear, scan_linear_with_ledger, scan_recursive,
+    scan_recursive_with_ledger, DecodeLedger, DecodedSummary, RecursiveSelection, ScanCoverage,
+    ScanOptions, ScanStats,
 };
 pub use strings::{extract_strings, StringEncoding, StringEntry, StringOptions};
 pub use xref::{xrefs_of, xrefs_of_all, Xref, XrefKind};

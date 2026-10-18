@@ -15,11 +15,14 @@
 use std::sync::Arc;
 
 use bitflip_analyze::{
-    scan_linear, scan_recursive, AddrSpace, InsnIndex, ScanCoverage, ScanOptions, ScanStats,
+    scan_linear_with_ledger, scan_recursive_with_ledger, AddrSpace, InsnIndex, ScanCoverage,
+    ScanOptions, ScanStats,
 };
 use bitflip_arch::{format_insn_with, CapstoneDecoder, Decoder, Flow};
 use bitflip_loader::object::Object;
 use serde::{Deserialize, Serialize};
+
+use crate::timing::Stages;
 
 /// 反汇编页的 wire 格式版本。
 pub const DISASM_FORMAT_VERSION: u32 = 1;
@@ -171,6 +174,10 @@ impl Disasm {
     /// 种子来自对象里一切可用的入口信息：入口点、导出地址、函数符号。
     /// **没有种子时不猜** —— 只做线性扫描，并在统计里如实反映可达数为 0。
     pub fn build(object: &Object, bytes: Arc<[u8]>, options: ScanOptions) -> Self {
+        // 与 `TargetAnalysis::build` 同一套分阶段打点（`BITFLIP_TIMING=1`，默认关闭，
+        // release 里是空结构体）：分析流水线的另一半成本就在这个函数里，两处打点必须
+        // 用同一种格式，才能把"整份 1.9 秒花在哪"拼起来看。
+        let mut timing = Stages::new();
         let mut notes = Vec::new();
 
         let spec = object.arch;
@@ -213,11 +220,16 @@ impl Disasm {
                 }
             }
         };
+        timing.mark("地址空间与解码器");
 
         let mut coverage = ScanCoverage::new();
-        let linear = scan_linear(&space, decoder.as_ref(), options, &mut coverage);
+        // 线性选择：扫全部可执行字节，同时把逐条结论记进共享解码账本。
+        let (mut index, mut stats, ledger) =
+            scan_linear_with_ledger(&space, decoder.as_ref(), options, &mut coverage);
+        timing.mark("线性扫描（建立共享解码账本）");
 
         let seeds = collect_seeds(object);
+        timing.mark("种子收集（入口/导出/符号/展开表/起点表）");
         if seeds.is_empty() {
             notes.push(
                 "没有可用的控制流种子（无入口点/导出/函数符号），只做了线性扫描：\
@@ -225,23 +237,29 @@ impl Disasm {
                     .to_string(),
             );
         }
-        let recursive = if options.recursive && !seeds.is_empty() {
-            let mut recursive_coverage = ScanCoverage::new();
-            let result = scan_recursive(
+
+        // 递归选择：同一个地址不再解码一次，而是从账本里取结论。
+        //
+        // 两条选择的分工写在 `bitflip_analyze::scan` 的模块文档里：账本只记
+        // "这个地址解出来是什么"，可达/仅线性仍由 `coverage` 分开记；账本之外
+        // 的地址（只有线性扫描被上限截断才可能出现）才现场解码。
+        if options.recursive && !seeds.is_empty() {
+            let selection = scan_recursive_with_ledger(
                 &space,
                 decoder.as_ref(),
                 &seeds,
                 options,
-                &mut recursive_coverage,
+                &mut coverage,
+                &ledger,
             );
-            coverage.merge(&recursive_coverage);
-            coverage.normalize();
-            result
-        } else {
-            (InsnIndex::new(), ScanStats::default())
-        };
-
-        let (index, stats) = bitflip_analyze::combine(linear, recursive);
+            timing.mark("递归下降（从账本里选，含可达标记）");
+            // 账本命中的地址本来就在线性索引里；只有账本之外的地址要补。
+            selection.merge_into(&mut index);
+            stats.decode_failures += selection.stats.decode_failures;
+            stats.truncated += selection.stats.truncated;
+        }
+        // 与原来 `combine` 的口径一致：解码条数按**去重后的索引**算。
+        stats.decoded = index.len();
         let index = Arc::new(index);
 
         // 把最终索引**同步回地址空间**。
@@ -269,6 +287,8 @@ impl Disasm {
                 stats.decode_failures
             ));
         }
+
+        timing.report("Disasm::build");
 
         Self {
             space,

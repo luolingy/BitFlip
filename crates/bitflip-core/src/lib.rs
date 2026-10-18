@@ -18,6 +18,7 @@ mod disasm;
 mod error;
 mod export;
 mod session;
+mod timing;
 
 pub use analysis::{
     xref_source, AliasWire, ArgInferenceWire, ArgScanWire, BlockWire, CallEdgeWire,
