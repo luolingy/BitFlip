@@ -43,11 +43,16 @@ fn parse_object_dispatches_macho_to_the_structure_parser() {
 
     // 这份样本的 LC_SYMTAB 是 nsyms = 0（命令在、表是空的），所以 symbols 为空是
     // **文件里的事实**；它与"没有这条命令"在 notes 里说得不一样（§7）。
+    // 它的 LC_DYLD_INFO_ONLY 的 bind / lazy_bind 也是空的，所以导入表同样为空 ——
+    // notes 必须说清是"命令在、流是空的"，不是"没解析"。
     assert!(object.symbols.is_empty());
     assert!(object.imports.is_empty());
     let notes = object.notes.join("\n");
     assert!(notes.contains("符号表"), "{notes}");
-    assert!(notes.contains("dyld"), "{notes}");
+    assert!(
+        notes.contains("LC_DYLD_INFO") && notes.contains("两段都是空的"),
+        "{notes}"
+    );
 }
 
 #[test]

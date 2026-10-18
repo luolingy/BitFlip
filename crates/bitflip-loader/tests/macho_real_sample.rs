@@ -338,7 +338,42 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
         facts.stab_symbols,
         facts.symbols.len()
     );
-    assert!(object.imports.is_empty(), "本片没有 dyld 绑定解析");
+    // 导入表从 M12 第五片起**真的会解析**：有 dyld 绑定流（bind / lazy_bind）就必须
+    // 解出导入；没有就必须为空、且 notes 说清是哪一种"没有"（新版二进制走
+    // LC_DYLD_CHAINED_FIXUPS，本片不解析那条路）。空与不空各自有说法（§7）。
+    // 具体计数由 `real_binaries_report_exports_and_imports` 打印并把关。
+    let has_bind_data = facts
+        .dyld_info
+        .is_some_and(|info| info.bind_size > 0 || info.lazy_bind_size > 0);
+    if has_bind_data {
+        assert!(
+            !object.imports.is_empty(),
+            "主二进制有非空的 bind / lazy_bind 流，却一条导入都没解出来"
+        );
+    } else {
+        assert!(
+            object.imports.is_empty(),
+            "没有可解的绑定数据却解出了 {} 条导入",
+            object.imports.len()
+        );
+        assert!(
+            object
+                .notes
+                .iter()
+                .any(|note| note.contains("LC_DYLD_INFO")),
+            "导入为空时必须说明原因（没有这条命令 / 流是空的 / 没解析链式修复）：{:?}",
+            object.notes
+        );
+    }
+    // 导出 trie：两种承载命令都认；有表就得解出东西，没表也要说明。
+    assert!(
+        object
+            .notes
+            .iter()
+            .any(|note| note.contains("导出 trie") || note.contains("导出")),
+        "notes 必须交代导出这一项的状态：{:?}",
+        object.notes
+    );
 
     // LC_UUID：dyld 用它标识镜像，Xcode 产出的可执行文件一定有；这里顺带验证
     // "16 字节 → 32 个小写十六进制字符"的转换没把高位丢掉、没把大小写弄反。
@@ -538,6 +573,175 @@ fn real_binaries_report_symbols_and_function_starts() {
                 "{}：能读出符号的二进制不该只有 {} 条（可能是符号名解析错了）",
                 row.name,
                 row.symbols
+            );
+        }
+    }
+}
+
+/// 一份真实样本的导出 / 导入计数（第五片交付报告里那张表就是它打印的）。
+#[derive(Debug)]
+struct DyldCounts {
+    /// 样本文件名。
+    name: String,
+    /// 主二进制解压后多少字节。
+    binary_bytes: usize,
+    /// 链接的 dylib 条数（`LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB`）。
+    dylibs: usize,
+    /// 有没有 `LC_DYLD_INFO(_ONLY)`。
+    has_dyld_info: bool,
+    /// 导出 trie 的字节数（没有这张表 / 表是空的都可能是 0）。
+    export_trie_bytes: u64,
+    /// 导出条数。
+    exports: usize,
+    /// 普通绑定条数。
+    imports_regular: usize,
+    /// 惰性绑定条数。
+    imports_lazy: usize,
+    /// 去重后的被导入库数。
+    import_libraries: usize,
+    /// notes 里提到导入 / 导出 / 链式修复了吗。
+    notes_mention_imports: bool,
+    notes_mention_exports: bool,
+    notes_mention_chained_fixups: bool,
+}
+
+fn measure_dyld(path: &std::path::Path) -> DyldCounts {
+    let ipa =
+        std::fs::read(path).unwrap_or_else(|error| panic!("读不到 {}：{error}", path.display()));
+    let listing = zip::list_members(&ipa)
+        .unwrap_or_else(|error| panic!("IPA 应当是能列成员的 ZIP：{}", error.summary_zh()));
+    let (_index, _name, binary) = pick_main_binary(&ipa, &listing);
+    let (_how, facts, object) = parse_one_image(&binary);
+    let joined = object.notes.join("\n");
+
+    let mut libraries = std::collections::BTreeSet::new();
+    let mut regular = 0usize;
+    let mut lazy = 0usize;
+    for import in &facts.imports {
+        libraries.insert(import.dylib.clone());
+        match import.kind {
+            macho::BindKind::Regular => regular += 1,
+            macho::BindKind::Lazy => lazy += 1,
+        }
+    }
+    let export_trie_bytes = facts
+        .export_trie
+        .map_or(0, |source| source.datasize)
+        .max(facts.dyld_info.map_or(0, |info| info.export_size));
+
+    DyldCounts {
+        name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        binary_bytes: binary.len(),
+        dylibs: facts.dylibs.len(),
+        has_dyld_info: facts.dyld_info.is_some(),
+        export_trie_bytes,
+        exports: object.exports.len(),
+        imports_regular: regular,
+        imports_lazy: lazy,
+        import_libraries: libraries.len(),
+        notes_mention_imports: joined.contains("导入"),
+        notes_mention_exports: joined.contains("导出"),
+        notes_mention_chained_fixups: joined.contains("LC_DYLD_CHAINED_FIXUPS"),
+    }
+}
+
+/// 四份真实 IPA：导出 trie 与 dyld 绑定的计数必须自洽，且与命令组合对得上。
+///
+/// 这条测试要回答的问题（也是交付报告里那张表的来源）：
+///
+/// * 新版 Xcode 产物（`LC_DYLD_CHAINED_FIXUPS` + `LC_DYLD_EXPORTS_TRIE`）导出照解、
+///   导入如实为空 —— 空得有理由，而不是"解析没跑"；
+/// * 旧式产物（`LC_DYLD_INFO_ONLY`）才是导入数成百上千的那一类。
+///
+/// 提示里"SideStore 链接 79 个 dylib，导入应当上百"这个预期**被实测否定**了：
+/// 它用的是链式修复，本片不解析那条路，所以它的导入是 0（notes 里写明原因）。
+/// 有绑定流的 PojavLauncher 才是 1 382 + 165 = 1 547 条导入的那一份。
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_binaries_report_exports_and_imports() {
+    let paths = all_sample_paths();
+    let counts: Vec<DyldCounts> = paths.iter().map(|path| measure_dyld(path)).collect();
+
+    eprintln!(
+        "{:<44} {:>10} {:>6} {:>7} {:>10} {:>6} {:>7} {:>6} {:>8}",
+        "样本", "二进制字节", "dylib", "dyld_info", "trie字节", "导出", "普通导入", "惰性", "库数"
+    );
+    for row in &counts {
+        eprintln!(
+            "{:<44} {:>10} {:>6} {:>7} {:>10} {:>6} {:>7} {:>6} {:>8}",
+            row.name,
+            row.binary_bytes,
+            row.dylibs,
+            if row.has_dyld_info { "有" } else { "无" },
+            row.export_trie_bytes,
+            row.exports,
+            row.imports_regular,
+            row.imports_lazy,
+            row.import_libraries
+        );
+    }
+
+    for row in &counts {
+        assert!(
+            row.dylibs > 0,
+            "{}：真实的 iOS 应用不可能不带 dylib（否则 ordinal 解析无从谈起）",
+            row.name
+        );
+        assert!(
+            row.notes_mention_exports,
+            "{}：notes 必须交代导出这一项的状态",
+            row.name
+        );
+        assert!(
+            row.notes_mention_imports,
+            "{}：notes 必须交代导入这一项的状态",
+            row.name
+        );
+
+        // 有表就该解出东西：导出 trie 的根节点没有 terminal，所以"有表但 0 条导出"
+        // 只可能是解析漏了或者表确实是空的 —— 真实 app 二进制不会是后者。
+        if row.export_trie_bytes > 0 {
+            assert!(
+                row.exports > 0,
+                "{}：导出 trie 有 {} 字节却 0 条导出 —— trie 没解开",
+                row.name,
+                row.export_trie_bytes
+            );
+        }
+
+        let imports = row.imports_regular + row.imports_lazy;
+        if imports == 0 {
+            // 空得有理由：要么根本没有 LC_DYLD_INFO（新版走链式修复），要么它的
+            // 绑定流是空的 —— 两种情形 notes 里说得不一样，所以这里只打印实际值，
+            // 让"0 条导入"在报告里带着原因出现，而不是一个孤零零的 0。
+            eprintln!(
+                "{}：导入为 0（LC_DYLD_INFO = {}；链式修复说明 = {}）—— 这是文件里的事实，\
+                 不是解析没跑",
+                row.name,
+                if row.has_dyld_info { "有" } else { "无" },
+                if row.notes_mention_chained_fixups {
+                    "有"
+                } else {
+                    "无"
+                }
+            );
+        } else {
+            assert!(
+                row.import_libraries > 0,
+                "{}：有 {} 条导入却 0 个库 —— 库序号没解析成库名",
+                row.name,
+                imports
+            );
+            // 每条导入都指向一个具体的库名（特殊序号也有名字），不是空串。
+            assert!(
+                row.import_libraries <= row.dylibs + 3,
+                "{}：被导入的库({}) 比链接的 dylib({}) 多出 3 个以上 —— 序号解析错位了",
+                row.name,
+                row.import_libraries,
+                row.dylibs
             );
         }
     }

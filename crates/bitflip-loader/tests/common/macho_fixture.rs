@@ -127,6 +127,24 @@
 //!     uint32_t dataoff;      +8
 //!     uint32_t datasize;     +12
 //!   };
+//!   struct dyld_info_command {            // LC_DYLD_INFO 0x22 / LC_DYLD_INFO_ONLY 0x80000022
+//!     uint32_t cmd;            +0         // 48 字节
+//!     uint32_t cmdsize;        +4
+//!     uint32_t rebase_off;     +0x08
+//!     uint32_t rebase_size;    +0x0C
+//!     uint32_t bind_off;       +0x10
+//!     uint32_t bind_size;      +0x14
+//!     uint32_t weak_bind_off;  +0x18
+//!     uint32_t weak_bind_size; +0x1C
+//!     uint32_t lazy_bind_off;  +0x20
+//!     uint32_t lazy_bind_size; +0x24
+//!     uint32_t export_off;     +0x28
+//!     uint32_t export_size;    +0x2C
+//!   };
+//! ```
+//!
+//! 导出 trie 与 dyld 绑定操作码的编码见本文件后半段对应的构造器（那里同样逐条
+//! 写了规范里的一句话依据）。
 //!
 //! mach-o/nlist.h 的 `n_type` 位（注意 `N_SECT` 是 `N_TYPE` 里的**取值** 0xe，
 //! 不是单独的一位）：
@@ -210,6 +228,8 @@ pub const LC_SYMTAB: u32 = 0x2;
 pub const LC_FUNCTION_STARTS: u32 = 0x26;
 /// `LC_DYLD_INFO_ONLY`（带 `LC_REQ_DYLD` 位的 `LC_DYLD_INFO`）。
 pub const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
+/// `LC_DYLD_EXPORTS_TRIE`（导出 trie 的独立命令形式）。
+pub const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000_0033;
 
 /// `nlist.n_type` 的位（`mach-o/nlist.h`）。
 pub const N_STAB: u8 = 0xe0;
@@ -1323,4 +1343,702 @@ pub fn malformed_ncmds_too_big() -> Vec<u8> {
     let mut bytes = demo_thin64();
     patch_u32(&mut bytes, 16, 0xffff, true);
     bytes
+}
+
+// ── 导出 trie 与 dyld 绑定（LC_DYLD_INFO / LC_DYLD_EXPORTS_TRIE） ───────────
+
+/// ULEB128 编码一个值（低 7 位有效、最高位表示还有下一字节，小端顺序）。
+fn push_uleb(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let low = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+
+/// 编码一个值需要几个字节（布局计算用）。
+fn uleb_len(value: u64) -> usize {
+    let mut len = 1;
+    let mut rest = value >> 7;
+    while rest != 0 {
+        len += 1;
+        rest >>= 7;
+    }
+    len
+}
+
+/// SLEB128 编码一个有符号值：与 ULEB 的区别是"最后一个字节的 bit6 是符号位"，
+/// 所以正数在最坏情况下要多一个 `0x00` 字节来避免被解读成负数。
+fn push_sleb(out: &mut Vec<u8>, mut value: i64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+        if done {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY`（`dyld_info_command`，48 字节）。
+///
+/// 字段偏移见模块文档：五组 `(off, size)` 依次是 rebase / bind / weak_bind /
+/// lazy_bind / export，从 `+8` 开始每 4 字节一个，到 `+0x2C` 为止。
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn lc_dyld_info(
+    rebase_off: u32,
+    rebase_size: u32,
+    bind_off: u32,
+    bind_size: u32,
+    weak_bind_off: u32,
+    weak_bind_size: u32,
+    lazy_bind_off: u32,
+    lazy_bind_size: u32,
+    export_off: u32,
+    export_size: u32,
+    little: bool,
+) -> RawCommand {
+    let mut bytes = vec![0u8; 48];
+    put_u32(&mut bytes, 0, LC_DYLD_INFO_ONLY, little);
+    put_u32(&mut bytes, 4, 48, little);
+    put_u32(&mut bytes, 8, rebase_off, little);
+    put_u32(&mut bytes, 12, rebase_size, little);
+    put_u32(&mut bytes, 16, bind_off, little);
+    put_u32(&mut bytes, 20, bind_size, little);
+    put_u32(&mut bytes, 24, weak_bind_off, little);
+    put_u32(&mut bytes, 28, weak_bind_size, little);
+    put_u32(&mut bytes, 32, lazy_bind_off, little);
+    put_u32(&mut bytes, 36, lazy_bind_size, little);
+    put_u32(&mut bytes, 40, export_off, little);
+    put_u32(&mut bytes, 44, export_size, little);
+    RawCommand { bytes }
+}
+
+/// `LC_DYLD_EXPORTS_TRIE`（`linkedit_data_command`，16 字节）。
+#[must_use]
+pub fn lc_exports_trie(dataoff: u32, datasize: u32, little: bool) -> RawCommand {
+    let mut bytes = vec![0u8; 16];
+    put_u32(&mut bytes, 0, LC_DYLD_EXPORTS_TRIE, little);
+    put_u32(&mut bytes, 4, 16, little);
+    put_u32(&mut bytes, 8, dataoff, little);
+    put_u32(&mut bytes, 12, datasize, little);
+    RawCommand { bytes }
+}
+
+/// 一条导出的 terminal 规格。
+///
+/// 规范里 terminal 的字段顺序（ld64 `ExportFile` 写、dyld `ExportInfo` 读）：
+/// `flags` 先读，再由 `REEXPORT` 决定后面是"序号 + 名字"还是"地址"。
+#[derive(Debug, Clone)]
+pub enum TrieTerminalSpec {
+    /// 普通导出：`flags = 0`，后跟 `address`（相对镜像基址的偏移）。
+    Regular {
+        /// 相对镜像基址的偏移。
+        address: u64,
+    },
+    /// `EXPORT_SYMBOL_FLAGS_REEXPORT = 0x08`：`flags`、库序号（1 基）、原始名字 C 串。
+    /// 原始名字可以是空串（规范里表示"与导出名同名"）。
+    Reexport {
+        /// `LC_LOAD_DYLIB` 的 1 基序号。
+        ordinal: u64,
+        /// 原始名字（空串 = 同名）。
+        original: &'static str,
+    },
+    /// `EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER = 0x10`：`flags`、`address`、`other`。
+    StubAndResolver {
+        /// 第一个地址（相对基址）。
+        address: u64,
+        /// 第二个地址（就是规范里的 `other` 字段）。
+        other: u64,
+    },
+}
+
+/// 一个 trie 节点：可选的 terminal + 若干（边标签, 子节点下标）。
+#[derive(Debug, Clone)]
+pub struct TrieNodeSpec {
+    /// 本节点的 terminal；`None` = 没有导出（规范里 `terminal_size = 0`）。
+    pub terminal: Option<TrieTerminalSpec>,
+    /// 子节点：`(边标签, nodes 里的下标)`。
+    pub children: Vec<(&'static str, usize)>,
+}
+
+impl TrieNodeSpec {
+    /// 一个只有 terminal 的叶子。
+    #[must_use]
+    pub fn leaf(terminal: TrieTerminalSpec) -> Self {
+        Self {
+            terminal: Some(terminal),
+            children: Vec::new(),
+        }
+    }
+
+    /// 一个没有 terminal、只有子节点的内部节点。
+    #[must_use]
+    pub fn branch(children: Vec<(&'static str, usize)>) -> Self {
+        Self {
+            terminal: None,
+            children,
+        }
+    }
+}
+
+/// 按规范拼一张导出 trie（节点按数组顺序**紧邻排列**，子节点偏移由此算出）。
+///
+/// 布局：每个节点 = `uleb128(terminal_size)` + terminal + `uint8 child_count` +
+/// `child_count × (cstring edge_label + uleb128 child_offset)`。
+/// 子节点偏移是"相对 trie 起点"的绝对位置，所以要先把布局迭代到不动点
+/// （偏移变了，ULEB 的字节数可能跟着变）。
+#[must_use]
+pub fn build_export_trie(nodes: &[TrieNodeSpec]) -> Vec<u8> {
+    let terminals: Vec<Vec<u8>> = nodes
+        .iter()
+        .map(|node| match &node.terminal {
+            None => Vec::new(),
+            Some(TrieTerminalSpec::Regular { address }) => {
+                let mut out = Vec::new();
+                push_uleb(&mut out, 0);
+                push_uleb(&mut out, *address);
+                out
+            }
+            Some(TrieTerminalSpec::Reexport { ordinal, original }) => {
+                let mut out = Vec::new();
+                push_uleb(&mut out, 0x08);
+                push_uleb(&mut out, *ordinal);
+                out.extend_from_slice(original.as_bytes());
+                out.push(0);
+                out
+            }
+            Some(TrieTerminalSpec::StubAndResolver { address, other }) => {
+                let mut out = Vec::new();
+                push_uleb(&mut out, 0x10);
+                push_uleb(&mut out, *address);
+                push_uleb(&mut out, *other);
+                out
+            }
+        })
+        .collect();
+
+    // 迭代到不动点：先假设所有偏移是 1 字节 ULEB，再按新偏移重算。
+    let mut offsets = vec![0usize; nodes.len()];
+    for _ in 0..16 {
+        let mut cursor = 0usize;
+        let mut next = Vec::with_capacity(nodes.len());
+        for (index, node) in nodes.iter().enumerate() {
+            next.push(cursor);
+            cursor += uleb_len(terminals[index].len() as u64);
+            cursor += terminals[index].len();
+            cursor += 1;
+            for (label, child) in &node.children {
+                cursor += label.len() + 1;
+                cursor += uleb_len(offsets[*child] as u64);
+            }
+        }
+        if next == offsets {
+            break;
+        }
+        offsets = next;
+    }
+
+    let mut out = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        // 构造器自己校验布局：写出每个节点时它必须正好落在算好的偏移上。
+        assert_eq!(
+            out.len(),
+            offsets[index],
+            "trie 布局迭代没收敛：节点 {index} 应当落在 +{:#x}，实际在 +{:#x}",
+            offsets[index],
+            out.len()
+        );
+        push_uleb(&mut out, terminals[index].len() as u64);
+        out.extend_from_slice(&terminals[index]);
+        out.push(node.children.len() as u8);
+        for (label, child) in &node.children {
+            out.extend_from_slice(label.as_bytes());
+            out.push(0);
+            push_uleb(&mut out, offsets[*child] as u64);
+        }
+    }
+    out
+}
+
+/// 三符号以上的导出 trie：`_main` / `_helper` 普通导出（落在 `__TEXT,__text` 里）、
+/// `_reexported`（re-export 到 1 号库、原始名 `_originalImpl`）、
+/// `_stub`（stub + resolver，两个地址）。
+///
+/// 子节点的书写顺序是 main / helper / reexported / stub，解出来的顺序与它一致
+/// （解析器不额外排序）。
+#[must_use]
+pub fn demo_export_trie() -> Vec<u8> {
+    build_export_trie(&[
+        // 根：没有导出，只有一条边 "_"。
+        TrieNodeSpec::branch(vec![("_", 1)]),
+        TrieNodeSpec::branch(vec![
+            ("main", 2),
+            ("helper", 3),
+            ("reexported", 4),
+            ("stub", 5),
+        ]),
+        TrieNodeSpec::leaf(TrieTerminalSpec::Regular { address: 0xF00 }),
+        TrieNodeSpec::leaf(TrieTerminalSpec::Regular { address: 0xF80 }),
+        TrieNodeSpec::leaf(TrieTerminalSpec::Reexport {
+            ordinal: 1,
+            original: "_originalImpl",
+        }),
+        TrieNodeSpec::leaf(TrieTerminalSpec::StubAndResolver {
+            address: 0xF40,
+            other: 0x1200,
+        }),
+    ])
+}
+
+/// 只有一条导出的**手写** trie（不经构造器），逐字节钉住规范布局：
+///
+/// ```text
+/// +0x00  00              terminal_size = 0（根没有导出）
+/// +0x01  01              child_count = 1
+/// +0x02  5F 6D 61 69 6E  edge label "_main"（5 字节，到 +0x06）
+/// +0x07  00              edge label 的 NUL 终止符
+/// +0x08  09              child node offset = 9
+/// +0x09  02              terminal_size = 2（flags 1 字节 + address 1 字节）
+/// +0x0A  00              flags = 0（普通导出）
+/// +0x0B  10              address = 0x10（相对镜像基址）
+/// +0x0C  00              child_count = 0
+/// ```
+#[must_use]
+pub fn hand_written_export_trie() -> Vec<u8> {
+    vec![
+        0x00, 0x01, b'_', b'm', b'a', b'i', b'n', 0x00, 0x09, 0x02, 0x00, 0x10, 0x00,
+    ]
+}
+
+/// 环状 trie：节点 1 的子节点指回根节点 0 —— 必须被**拒绝**，不许无限循环。
+#[must_use]
+pub fn cyclic_export_trie() -> Vec<u8> {
+    build_export_trie(&[
+        TrieNodeSpec::branch(vec![("_", 1)]),
+        // 指回 0：遍历会永远在 0 → 1 → 0 → 1 之间打转。
+        TrieNodeSpec::branch(vec![("cycle", 0)]),
+    ])
+}
+
+/// 自引用 trie：根节点的子节点就是根自己。
+#[must_use]
+pub fn self_referencing_export_trie() -> Vec<u8> {
+    build_export_trie(&[TrieNodeSpec::branch(vec![("a", 0)])])
+}
+
+/// 截断的 ULEB128：`terminal_size` 的最后一个字节续位仍是 1，后面没有字节了。
+#[must_use]
+pub fn truncated_uleb_export_trie() -> Vec<u8> {
+    vec![0x80]
+}
+
+/// terminal 声称 2 字节但只给了 1 字节（表被裁剪）。
+#[must_use]
+pub fn truncated_terminal_export_trie() -> Vec<u8> {
+    vec![0x02, 0x00]
+}
+
+/// 一条绑定流里的操作（对应 dyld `enum BindOpcode`）。
+#[derive(Debug, Clone)]
+pub enum BindOp {
+    /// `0x00`。
+    Done,
+    /// `0x10` + 立即数：库序号（0 = self）。
+    SetDylibOrdinalImm(u8),
+    /// `0x20` + uleb：库序号。
+    SetDylibOrdinalUleb(u64),
+    /// `0x30` + 立即数：特殊序号。立即数只有 4 位，dyld 用 `0xF0 | imm` 按 8 位补码
+    /// 解释 —— 所以 main-executable(-1) 的立即数是 `0x0F`（字节 `0x3F`）、
+    /// flat lookup(-2) 是 `0x0E`、weak lookup(-3) 是 `0x0D`。
+    SetDylibSpecialImm(u8),
+    /// `0x40` + 立即数（flags）+ C 串（符号名）。
+    SetSymbol {
+        /// `BIND_SYMBOL_FLAGS_*`（0 = 普通）。
+        flags: u8,
+        /// 符号名。
+        name: &'static str,
+    },
+    /// `0x50` + 立即数：绑定类型。
+    SetTypeImm(u8),
+    /// `0x60` + sleb：加数。
+    SetAddendSleb(i64),
+    /// `0x70` + 立即数（段序号）+ uleb（段内偏移）。
+    SetSegmentAndOffsetUleb {
+        /// 段序号（0 基，按加载命令顺序）。
+        segment: u8,
+        /// 段内偏移。
+        offset: u64,
+    },
+    /// `0x80` + uleb：段内偏移 += 操作数（不绑定）。
+    AddAddrUleb(u64),
+    /// `0x90`：把当前符号绑到当前槽位。
+    DoBind,
+    /// `0xA0` + uleb：先 `DO_BIND`，再 偏移 += 操作数。
+    DoBindAddAddrUleb(u64),
+    /// `0xB0` + 立即数：先 `DO_BIND`，再 偏移 += 立即数 × 指针大小。
+    DoBindAddAddrImmScaled(u8),
+    /// `0xC0` + uleb（次数）+ uleb（跳过量，**单位是字节**）：重复绑定。
+    DoBindUlebTimesSkippingUleb {
+        /// 次数。
+        count: u64,
+        /// 每次之后的跳过量（字节；dyld 会再加一个指针让槽位前进）。
+        skip: u64,
+    },
+}
+
+/// 按规范把一串操作编码成绑定流（`bind.h` 的高 4 位/低 4 位约定）。
+#[must_use]
+pub fn bind_stream(ops: &[BindOp]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for op in ops {
+        match op {
+            BindOp::Done => out.push(0x00),
+            BindOp::SetDylibOrdinalImm(value) => out.push(0x10 | (value & 0x0f)),
+            BindOp::SetDylibOrdinalUleb(value) => {
+                out.push(0x20);
+                push_uleb(&mut out, *value);
+            }
+            BindOp::SetDylibSpecialImm(value) => out.push(0x30 | (value & 0x0f)),
+            BindOp::SetSymbol { flags, name } => {
+                out.push(0x40 | (flags & 0x0f));
+                out.extend_from_slice(name.as_bytes());
+                out.push(0);
+            }
+            BindOp::SetTypeImm(value) => out.push(0x50 | (value & 0x0f)),
+            BindOp::SetAddendSleb(value) => {
+                out.push(0x60);
+                push_sleb(&mut out, *value);
+            }
+            BindOp::SetSegmentAndOffsetUleb { segment, offset } => {
+                out.push(0x70 | (segment & 0x0f));
+                push_uleb(&mut out, *offset);
+            }
+            BindOp::AddAddrUleb(value) => {
+                out.push(0x80);
+                push_uleb(&mut out, *value);
+            }
+            BindOp::DoBind => out.push(0x90),
+            BindOp::DoBindAddAddrUleb(value) => {
+                out.push(0xa0);
+                push_uleb(&mut out, *value);
+            }
+            BindOp::DoBindAddAddrImmScaled(value) => out.push(0xb0 | (value & 0x0f)),
+            BindOp::DoBindUlebTimesSkippingUleb { count, skip } => {
+                out.push(0xc0);
+                push_uleb(&mut out, *count);
+                push_uleb(&mut out, *skip);
+            }
+        }
+    }
+    out
+}
+
+/// 普通绑定流：跨 2 个库 + 特殊序号 + `DO_BIND_ULEB_TIMES_SKIPPING_ULEB`。
+///
+/// 段序号 2 = `__DATA`（0 是 `__PAGEZERO`、1 是 `__TEXT`），指针 8 字节。按 dyld 的
+/// 语义（每条 `DO_BIND` 之后槽位前移一个指针；带跳过的操作码再加跳过量），槽位是：
+///
+/// * `_objc_msgSend` @ `__DATA+0x100` → 地址 `0x1_0000_2100`（1 号库 libSystem）
+/// * `_malloc` @ `0x108`、`0x118` —— `DO_BIND_ULEB_TIMES_SKIPPING_ULEB{count=2, skip=8}`：
+///   每次绑完 `偏移 += 8 + 8`（skip 是字节数），所以两次之间差 16 字节
+/// * `_main_ref` @ `0x128`，特殊序号 0x3F（= 0xFF）= main-executable
+/// * `_UIKitRef` @ `0x130`，2 号库 UIKit、加数 -4；`DO_BIND_ADD_ADDR_ULEB(0x20)` 之后
+///   `偏移 += 0x20 + 8` → `0x158`
+/// * `_UIKitScaled` @ `0x158`，`DO_BIND_ADD_ADDR_IMM_SCALED(2)` 之后 `偏移 += 2×8 + 8`
+///
+/// 共 6 条绑定、3 个 module（libSystem / main-executable / UIKit）。
+#[must_use]
+pub fn demo_bind_stream() -> Vec<u8> {
+    bind_stream(&[
+        BindOp::SetSegmentAndOffsetUleb {
+            segment: 2,
+            offset: 0x100,
+        },
+        BindOp::SetDylibOrdinalImm(1),
+        BindOp::SetTypeImm(1),
+        BindOp::SetSymbol {
+            flags: 0,
+            name: "_objc_msgSend",
+        },
+        BindOp::DoBind,
+        BindOp::SetSymbol {
+            flags: 0,
+            name: "_malloc",
+        },
+        BindOp::DoBindUlebTimesSkippingUleb { count: 2, skip: 8 },
+        BindOp::SetDylibSpecialImm(0x0f),
+        BindOp::SetSymbol {
+            flags: 0,
+            name: "_main_ref",
+        },
+        BindOp::DoBind,
+        BindOp::SetDylibOrdinalUleb(2),
+        BindOp::SetAddendSleb(-4),
+        BindOp::SetSymbol {
+            flags: 0,
+            name: "_UIKitRef",
+        },
+        BindOp::DoBindAddAddrUleb(0x20),
+        BindOp::SetAddendSleb(0),
+        BindOp::SetSymbol {
+            flags: 0x1,
+            name: "_UIKitScaled",
+        },
+        BindOp::DoBindAddAddrImmScaled(2),
+        BindOp::Done,
+    ])
+}
+
+/// 惰性绑定流：两条 entry，**每条以 `DONE` 结尾**，各自从头设状态。
+#[must_use]
+pub fn demo_lazy_bind_stream() -> Vec<u8> {
+    bind_stream(&[
+        BindOp::SetSegmentAndOffsetUleb {
+            segment: 2,
+            offset: 0x200,
+        },
+        BindOp::SetDylibOrdinalImm(1),
+        BindOp::SetSymbol {
+            flags: 0,
+            name: "_lazyOne",
+        },
+        BindOp::DoBind,
+        BindOp::Done,
+        // 第二条自己重设段/库/符号：DONE 之后状态归零（dyld 每条 entry 一个局部状态）。
+        BindOp::SetSegmentAndOffsetUleb {
+            segment: 2,
+            offset: 0x208,
+        },
+        BindOp::SetDylibOrdinalUleb(2),
+        BindOp::SetSymbol {
+            flags: 0,
+            name: "_lazyTwo",
+        },
+        BindOp::DoBind,
+        BindOp::Done,
+    ])
+}
+
+/// 拼一份带 dyld 信息的 64 位样本，返回字节与"命令/数据在文件里的位置"。
+///
+/// 布局与真实文件同一形状：`__PAGEZERO` + `__TEXT`（含一个 `__text`）+
+/// `__DATA`，两条 `LC_LOAD_DYLIB`，然后是承载 trie 的命令（`LC_DYLD_INFO_ONLY`
+/// 或 `LC_DYLD_EXPORTS_TRIE`），最后把 trie / bind / lazy_bind 三段数据追加到文件尾。
+pub struct DyldImage {
+    /// 完整文件字节。
+    pub bytes: Vec<u8>,
+    /// `LC_DYLD_INFO_ONLY` 命令的文件偏移（用这条命令时是 `Some`）。
+    pub dyld_info_offset: Option<usize>,
+    /// `LC_DYLD_EXPORTS_TRIE` 命令的文件偏移（用这条命令时是 `Some`）。
+    pub exports_trie_offset: Option<usize>,
+    /// 导出 trie 数据在文件里的偏移。
+    pub export_dataoff: u64,
+    /// bind 流在文件里的偏移。
+    pub bind_dataoff: u64,
+    /// lazy bind 流在文件里的偏移。
+    pub lazy_bind_dataoff: u64,
+}
+
+/// 样本里的镜像基址（`__TEXT.vmaddr`）。
+pub const DYLD_TEXT_VMADDR: u64 = 0x1_0000_0000;
+/// 样本里 `__DATA` 的 `vmaddr`（绑定槽位都落在这里）。
+pub const DYLD_DATA_VMADDR: u64 = 0x1_0000_2000;
+
+/// dyld 样本的骨架（两条 dylib 的顺序就是库序号的顺序）。
+fn dyld_base64() -> ThinSpec {
+    ThinSpec::new64(CPU_TYPE_X86_64, 3)
+        .segment(SegmentSpec::new("__PAGEZERO", 0, 0x1_0000_0000, 0, 0).perms(0, 0))
+        .segment(
+            SegmentSpec::new("__TEXT", DYLD_TEXT_VMADDR, 0x2000, 0, 0x2000)
+                .perms(RX, RX)
+                .section(
+                    SectionSpec::new("__text", "__TEXT", DYLD_TEXT_VMADDR + 0xF00, 0x100)
+                        .align(4)
+                        .flags(CODE_FLAGS),
+                ),
+        )
+        .segment(SegmentSpec::new("__DATA", DYLD_DATA_VMADDR, 0x2000, 0x2000, 0x2000).perms(RW, RW))
+        .command(lc_load_dylib("/usr/lib/libSystem.B.dylib", false, true))
+        .command(lc_load_dylib(
+            "/System/Library/Frameworks/UIKit.framework/UIKit",
+            false,
+            true,
+        ))
+        .min_file_size(0x4000)
+}
+
+/// 命令在命令区里的文件偏移（段命令在前，其余命令按给出的顺序）。
+fn command_offset_in(spec: &ThinSpec, index: usize) -> usize {
+    let mut offset = spec.header_size();
+    for segment in &spec.segments {
+        offset += spec.segment_command_size(segment);
+    }
+    for command in spec.commands.iter().take(index) {
+        offset += command.bytes.len() as u64;
+    }
+    offset as usize
+}
+
+/// 拼一份带导出 trie 与绑定的样本。
+///
+/// `exports_trie_command` 决定用哪条命令承载 trie：`true` 用
+/// `LC_DYLD_EXPORTS_TRIE`（iOS 13+ 的形式），`false` 用 `LC_DYLD_INFO_ONLY`。
+fn dyld_image(exports_trie_command: bool, trie: &[u8], bind: &[u8], lazy_bind: &[u8]) -> DyldImage {
+    // 第一遍：占位（数据偏移全 0），只为拿到"命令区结束时文件多长"。
+    let placeholder = if exports_trie_command {
+        dyld_base64().command(lc_exports_trie(0, 0, true))
+    } else {
+        dyld_base64().command(lc_dyld_info(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, true))
+    };
+    let layout = build(&placeholder);
+
+    // 三段数据依次追加，各自 8 字节对齐。
+    let mut cursor = layout.len() as u64;
+    let export_dataoff = {
+        let at = align_up(cursor, 8);
+        cursor = at + trie.len() as u64;
+        at
+    };
+    let bind_dataoff = {
+        let at = align_up(cursor, 8);
+        cursor = at + bind.len() as u64;
+        at
+    };
+    let lazy_bind_dataoff = {
+        let at = align_up(cursor, 8);
+        cursor = at + lazy_bind.len() as u64;
+        at
+    };
+
+    // 第二遍：填真偏移。命令字节数不变，所以布局与第一遍完全相同。
+    let spec = if exports_trie_command {
+        dyld_base64().command(lc_exports_trie(
+            export_dataoff as u32,
+            trie.len() as u32,
+            true,
+        ))
+    } else {
+        dyld_base64().command(lc_dyld_info(
+            0,
+            0,
+            bind_dataoff as u32,
+            bind.len() as u32,
+            0,
+            0,
+            lazy_bind_dataoff as u32,
+            lazy_bind.len() as u32,
+            export_dataoff as u32,
+            trie.len() as u32,
+            true,
+        ))
+    };
+    let command_index = spec.commands.len() - 1;
+    let command_offset = command_offset_in(&spec, command_index);
+
+    let mut bytes = build(&spec);
+    let total = cursor as usize;
+    if bytes.len() < total {
+        bytes.resize(total, 0);
+    }
+    bytes[export_dataoff as usize..export_dataoff as usize + trie.len()].copy_from_slice(trie);
+    bytes[bind_dataoff as usize..bind_dataoff as usize + bind.len()].copy_from_slice(bind);
+    bytes[lazy_bind_dataoff as usize..lazy_bind_dataoff as usize + lazy_bind.len()]
+        .copy_from_slice(lazy_bind);
+
+    DyldImage {
+        bytes,
+        dyld_info_offset: if exports_trie_command {
+            None
+        } else {
+            Some(command_offset)
+        },
+        exports_trie_offset: if exports_trie_command {
+            Some(command_offset)
+        } else {
+            None
+        },
+        export_dataoff,
+        bind_dataoff,
+        lazy_bind_dataoff,
+    }
+}
+
+/// 同 [`demo_dyld_info64`]，但导出 trie 用调用方给的字节。
+///
+/// 单测靠它把"手写 trie / 环 / 截断"这些样本塞进同一个镜像骨架里 ——
+/// 骨架（段表、两条 dylib、绑定流）只写一份。
+#[must_use]
+pub fn dyld_image_with_trie(trie: &[u8]) -> DyldImage {
+    dyld_image(false, trie, &demo_bind_stream(), &demo_lazy_bind_stream())
+}
+
+/// 同 [`demo_dyld_info64`]，但绑定流用调用方给的字节（普通绑定）。
+#[must_use]
+pub fn dyld_image_with_bind(bind: &[u8]) -> DyldImage {
+    dyld_image(false, &demo_export_trie(), bind, &[])
+}
+
+/// 完整样本：`LC_DYLD_INFO_ONLY` 承载导出 trie + 普通绑定 + 惰性绑定。
+#[must_use]
+pub fn demo_dyld_info64() -> DyldImage {
+    dyld_image(
+        false,
+        &demo_export_trie(),
+        &demo_bind_stream(),
+        &demo_lazy_bind_stream(),
+    )
+}
+
+/// 同上的 `LC_DYLD_EXPORTS_TRIE` 形式（没有绑定数据）。
+#[must_use]
+pub fn demo_exports_trie64() -> DyldImage {
+    dyld_image(true, &demo_export_trie(), &[], &[])
+}
+
+/// 畸形样本：导出 trie 的 `export_off` 指向文件末尾之外 —— 必须拒绝。
+#[must_use]
+pub fn malformed_export_off_past_eof() -> Vec<u8> {
+    let image = demo_dyld_info64();
+    let mut bytes = image.bytes;
+    let command = image
+        .dyld_info_offset
+        .expect("样本用的是 LC_DYLD_INFO_ONLY");
+    let past_eof = (bytes.len() + 0x100) as u32;
+    // `export_off` 在 dyld_info_command 的 +0x28（见模块文档的字段偏移）。
+    patch_u32(&mut bytes, command + 0x28, past_eof, true);
+    bytes
+}
+
+/// 畸形样本：`bind_size` 声称的范围越过文件末尾 —— 必须拒绝。
+#[must_use]
+pub fn malformed_bind_off_past_eof() -> Vec<u8> {
+    let image = demo_dyld_info64();
+    let mut bytes = image.bytes;
+    let command = image
+        .dyld_info_offset
+        .expect("样本用的是 LC_DYLD_INFO_ONLY");
+    let past_eof = (bytes.len() + 0x100) as u32;
+    patch_u32(&mut bytes, command + 0x14, 0x40, true); // bind_size
+    patch_u32(&mut bytes, command + 0x10, past_eof, true); // bind_off
+    bytes
+}
+
+/// 畸形样本：绑定流以 `SET_DYLIB_ORDINAL_ULEB 0x80` 结尾（ULEB128 被截断）。
+#[must_use]
+pub fn malformed_bind_truncated_uleb() -> Vec<u8> {
+    dyld_image(false, &[], &[0x20, 0x80], &[]).bytes
+}
+
+/// 畸形样本：绑定流指向段 #15，但样本只有 3 个段。
+#[must_use]
+pub fn malformed_bind_segment_out_of_range() -> Vec<u8> {
+    dyld_image(false, &[], &[0x7f, 0x00], &[]).bytes
 }

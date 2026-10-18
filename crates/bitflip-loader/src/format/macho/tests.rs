@@ -686,8 +686,14 @@ fn unimplemented_capabilities_are_stated_in_notes() {
         joined.contains("没有 LC_FUNCTION_STARTS"),
         "缺哪张表就说哪张表，而不是让空表冒充\"没有函数\"：{joined}"
     );
-    // 样本里没有 LC_DYLD_INFO / LC_CODE_SIGNATURE，所以那两条不该出现。
+    // 样本里没有 LC_CODE_SIGNATURE，所以那条不该出现。
     assert!(!joined.contains("LC_CODE_SIGNATURE"), "{joined}");
+    // 样本里**有**一条空的 LC_DYLD_INFO_ONLY：那是"命令在、流是空的"，必须与
+    // "没有这条命令"说得不一样 —— 它的导入表为空是文件里的事实。
+    assert!(
+        joined.contains("LC_DYLD_INFO") && joined.contains("bind / lazy_bind 两段都是空的"),
+        "空绑定流这件事必须说出来：{joined}"
+    );
 }
 
 #[test]
@@ -759,4 +765,284 @@ fn objc_and_swift_sections_are_listed_but_not_parsed() {
     let joined = object.notes.join("\n");
     assert!(joined.contains("__objc_*"), "{joined}");
     assert!(joined.contains("__swift*"), "{joined}");
+}
+
+// ── 导出 trie（LC_DYLD_INFO.export_off / LC_DYLD_EXPORTS_TRIE） ─────────────
+
+#[test]
+fn an_export_trie_yields_names_addresses_and_reexports() {
+    let image = fixture::demo_dyld_info64();
+    let file = read(&image.bytes).expect("合成样本必须能解析");
+
+    let names: Vec<&str> = file.exports.iter().map(|item| item.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["_main", "_helper", "_reexported", "_stub"],
+        "名字是根到节点的边标签拼出来的，顺序就是 trie 里边出现的顺序（这里不额外排序）"
+    );
+
+    let main = &file.exports[0];
+    assert_eq!(main.address, Some(fixture::DYLD_TEXT_VMADDR + 0xF00));
+    assert!(!main.is_reexport());
+    assert!(!main.is_stub_and_resolver());
+
+    // re-export：terminal 里**没有**地址字段，所以 address 是 None（不是 0）。
+    let reexport = &file.exports[2];
+    assert!(reexport.is_reexport());
+    assert_eq!(reexport.address, None);
+    assert_eq!(reexport.reexport_ordinal, Some(1));
+    assert_eq!(
+        reexport.reexport_library.as_deref(),
+        Some("/usr/lib/libSystem.B.dylib"),
+        "库序号必须解析成库名，不能把裸序号留给上层"
+    );
+    assert_eq!(reexport.reexport_name.as_deref(), Some("_originalImpl"));
+
+    let stub = &file.exports[3];
+    assert!(stub.is_stub_and_resolver(), "flags 0x10 必须认出来");
+    assert_eq!(stub.address, Some(fixture::DYLD_TEXT_VMADDR + 0xF40));
+    assert_eq!(stub.other, Some(fixture::DYLD_TEXT_VMADDR + 0x1200));
+
+    let source = file.export_trie.expect("样本有 LC_DYLD_INFO_ONLY");
+    assert_eq!(source.command, LC_DYLD_INFO_ONLY);
+    assert_eq!(source.dataoff, image.export_dataoff);
+
+    let joined = file.notes.join("\n");
+    assert!(joined.contains("已解析导出 trie"), "{joined}");
+    assert!(
+        joined.contains("STUB_AND_RESOLVER") && joined.contains("other"),
+        "第二个地址在对象模型里放不下，必须逐条写进 notes：{joined}"
+    );
+}
+
+#[test]
+fn lc_dyld_exports_trie_is_accepted_as_the_other_source() {
+    let image = fixture::demo_exports_trie64();
+    let file = read(&image.bytes).expect("LC_DYLD_EXPORTS_TRIE 形式的样本必须能解析");
+    assert_eq!(file.exports.len(), 4);
+    let source = file.export_trie.expect("有导出 trie");
+    assert_eq!(
+        source.command, LC_DYLD_EXPORTS_TRIE,
+        "来处要如实记成这条命令，而不是笼统的\"有 trie\""
+    );
+    assert!(file.imports.is_empty(), "这份样本没有绑定流");
+    assert!(file.dyld_info.is_none());
+    let joined = file.notes.join("\n");
+    assert!(joined.contains("没有 LC_DYLD_INFO"), "{joined}");
+}
+
+#[test]
+fn a_hand_written_trie_pins_the_spec_layout() {
+    // 手写字节（见 fixture 里那段逐字节注释）：1 条导出 `_main` @ 基址 + 0x10。
+    let image = fixture::dyld_image_with_trie(&fixture::hand_written_export_trie());
+    let file = read(&image.bytes).expect("能解析");
+    assert_eq!(file.exports.len(), 1);
+    assert_eq!(file.exports[0].name, "_main");
+    assert_eq!(
+        file.exports[0].address,
+        Some(fixture::DYLD_TEXT_VMADDR + 0x10)
+    );
+}
+
+#[test]
+fn a_cyclic_trie_is_rejected_instead_of_looping_forever() {
+    let image = fixture::dyld_image_with_trie(&fixture::cyclic_export_trie());
+    let error = read(&image.bytes).expect_err("环状 trie 必须拒绝");
+    assert!(matches!(error, ParseError::Inconsistent(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("第二次访问"), "{message}");
+    assert!(message.contains("环"), "{message}");
+}
+
+#[test]
+fn a_self_referencing_trie_is_rejected() {
+    let image = fixture::dyld_image_with_trie(&fixture::self_referencing_export_trie());
+    let error = read(&image.bytes).expect_err("自引用 trie 必须拒绝");
+    assert!(matches!(error, ParseError::Inconsistent(_)), "{error:?}");
+    assert!(error.to_string().contains("第二次访问"), "{error}");
+}
+
+#[test]
+fn a_truncated_uleb_in_the_trie_is_rejected() {
+    let image = fixture::dyld_image_with_trie(&fixture::truncated_uleb_export_trie());
+    let error = read(&image.bytes).expect_err("截断的 ULEB128 必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("ULEB128 被截断"), "{message}");
+    assert!(message.contains("续位"), "{message}");
+}
+
+#[test]
+fn a_terminal_that_overruns_the_trie_is_rejected() {
+    let image = fixture::dyld_image_with_trie(&fixture::truncated_terminal_export_trie());
+    let error = read(&image.bytes).expect_err("terminal 越过表尾必须拒绝");
+    assert!(error.to_string().contains("超出表尾"), "{error}");
+}
+
+#[test]
+fn an_export_trie_past_the_end_of_the_file_is_rejected() {
+    let bytes = fixture::malformed_export_off_past_eof();
+    let error = read(&bytes).expect_err("export_off 越界必须拒绝");
+    assert!(matches!(error, ParseError::Inconsistent(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("导出 trie"), "{message}");
+    assert!(message.contains("超出文件大小"), "{message}");
+}
+
+// ── dyld 绑定操作码（bind / lazy_bind → Object.imports） ────────────────────
+
+#[test]
+fn bind_opcodes_yield_imports_with_resolved_libraries() {
+    let image = fixture::demo_dyld_info64();
+    let file = read(&image.bytes).expect("合成样本必须能解析");
+
+    let regular: Vec<&BindImport> = file
+        .imports
+        .iter()
+        .filter(|item| item.kind == BindKind::Regular)
+        .collect();
+    let names: Vec<&str> = regular.iter().map(|item| item.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "_objc_msgSend",
+            "_malloc",
+            "_malloc",
+            "_main_ref",
+            "_UIKitRef",
+            "_UIKitScaled"
+        ],
+        "绑定顺序就是流里的执行顺序"
+    );
+
+    // DO_BIND_ULEB_TIMES_SKIPPING_ULEB{2, 1}：两次绑定，每次之后 +8+8=16 字节。
+    assert_eq!(regular[1].address, fixture::DYLD_DATA_VMADDR + 0x108);
+    assert_eq!(regular[2].address, fixture::DYLD_DATA_VMADDR + 0x118);
+
+    assert_eq!(regular[0].dylib, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(
+        regular[3].dylib_ordinal, -1,
+        "SET_DYLIB_SPECIAL_IMM 的立即数 0x0F 要按 (0xF0|imm) 的 8 位补码解成 -1"
+    );
+    assert_eq!(regular[3].dylib, "<main-executable>");
+    assert_eq!(
+        regular[4].dylib,
+        "/System/Library/Frameworks/UIKit.framework/UIKit"
+    );
+    assert_eq!(regular[4].addend, -4, "SET_ADDEND_SLEB 解出来的加数");
+    assert_eq!(
+        regular[5].segment_offset, 0x158,
+        "DO_BIND_ADD_ADDR_ULEB 之后的槽位"
+    );
+    assert_eq!(regular[5].trailing_flags, 0x1, "SET_SYMBOL 的尾随 flags");
+}
+
+#[test]
+fn lazy_bind_entries_restart_state_at_each_done() {
+    let image = fixture::demo_dyld_info64();
+    let file = read(&image.bytes).expect("能解析");
+    let lazy: Vec<&BindImport> = file
+        .imports
+        .iter()
+        .filter(|item| item.kind == BindKind::Lazy)
+        .collect();
+    assert_eq!(
+        lazy.len(),
+        2,
+        "两条 entry 都要解，不许因为 DONE 就整条流停下"
+    );
+    assert_eq!(lazy[0].name, "_lazyOne");
+    assert_eq!(lazy[1].name, "_lazyTwo");
+    assert_eq!(lazy[0].dylib, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(
+        lazy[1].dylib, "/System/Library/Frameworks/UIKit.framework/UIKit",
+        "DONE 之后状态必须归零，第二条才能用自己设的序号 2"
+    );
+    assert_eq!(lazy[1].address, fixture::DYLD_DATA_VMADDR + 0x208);
+}
+
+#[test]
+fn imports_and_exports_reach_the_object_model() {
+    let image = fixture::demo_dyld_info64();
+    let object = parse_bytes(&image.bytes).expect("能解析");
+
+    assert_eq!(object.exports.len(), 4, "Object.exports 不再是空的");
+    let reexport = object
+        .exports
+        .iter()
+        .find(|item| item.name == "_reexported")
+        .expect("有 _reexported");
+    assert_eq!(
+        reexport.forwarder.as_deref(),
+        Some("/usr/lib/libSystem.B.dylib#_originalImpl"),
+        "re-export 的转发目标要写清库名与原始名"
+    );
+    assert_eq!(reexport.address, 0, "re-export 没有本地地址");
+    assert!(!reexport.is_code);
+    let main_export = object
+        .exports
+        .iter()
+        .find(|item| item.name == "_main")
+        .expect("有 _main");
+    assert!(
+        main_export.is_code,
+        "落在 __TEXT,__text 里的导出按节的指令标志推成代码"
+    );
+
+    assert_eq!(object.imports.len(), 8, "6 条普通绑定 + 2 条惰性绑定");
+    let msg_send = object
+        .imports
+        .iter()
+        .find(|item| item.name.as_deref() == Some("_objc_msgSend"))
+        .expect("有 _objc_msgSend");
+    assert_eq!(msg_send.module, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(
+        msg_send.iat_slot,
+        Some(fixture::DYLD_DATA_VMADDR + 0x100),
+        "iat_slot 就是被写入的指针槽地址"
+    );
+    assert_eq!(msg_send.ordinal, None, "库序号不是\"导入符号的序号\"");
+
+    let joined = object.notes.join("\n");
+    assert!(joined.contains("已解析 dyld 绑定：8 条导入"), "{joined}");
+    assert!(joined.contains("普通 6 + 惰性 2"), "{joined}");
+}
+
+#[test]
+fn a_bind_stream_with_a_truncated_uleb_is_rejected() {
+    let image = fixture::dyld_image_with_bind(&[0x20, 0x80]);
+    let error = read(&image.bytes).expect_err("截断的 ULEB128 必须拒绝");
+    assert!(matches!(error, ParseError::Inconsistent(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("ULEB128 被截断"), "{message}");
+}
+
+#[test]
+fn a_bind_stream_pointing_at_a_missing_segment_is_rejected() {
+    let image = fixture::dyld_image_with_bind(&[0x7f, 0x00]);
+    let error = read(&image.bytes).expect_err("段序号越界必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("指向段 #15"), "{message}");
+    assert!(message.contains("3 个段"), "{message}");
+}
+
+#[test]
+fn a_bind_stream_off_past_the_end_of_the_file_is_rejected() {
+    let bytes = fixture::malformed_bind_off_past_eof();
+    let error = read(&bytes).expect_err("bind_off 越界必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("bind 流的范围"), "{message}");
+    assert!(message.contains("超出文件大小"), "{message}");
+}
+
+#[test]
+fn a_bind_do_bind_without_a_symbol_is_rejected() {
+    // 只有 SET_SEGMENT + DO_BIND，没有 SET_SYMBOL：dyld 会在这里报错。
+    let image = fixture::dyld_image_with_bind(&[0x72, 0x00, 0x90]);
+    let error = read(&image.bytes).expect_err("没有符号名的 DO_BIND 必须拒绝");
+    assert!(
+        error
+            .to_string()
+            .contains("没有 SET_SYMBOL_TRAILING_FLAGS_IMM"),
+        "{error}"
+    );
 }

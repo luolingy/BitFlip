@@ -12,15 +12,24 @@
 //! | `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB` | 同上 `dylib_command` | 依赖库名 |
 //! | `LC_SYMTAB` | 同上 `symtab_command` + `mach-o/nlist.h` 的 `nlist` / `nlist_64` | 符号名/地址/节/外部性；32 位与 64 位各自按表项宽度（12 / 16 字节）解 |
 //! | `LC_FUNCTION_STARTS` | 同上 `linkedit_data_command` + ULEB128 增量 | 函数起点（绝对虚拟地址，升序） |
+//! | `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY` | 同上 `dyld_info_command` | 导出 trie（`export_off`）+ bind / lazy_bind 操作码流 |
+//! | `LC_DYLD_EXPORTS_TRIE` | 同上 `linkedit_data_command` | 导出 trie 的另一种来处（iOS 13+ 的命令形式） |
 //! | fat / universal | `mach-o/fat.h` | 见 [`fat`]：切片枚举 + 选片 + `parse_slice`，已接进容器与会话 |
 //!
 //! # 明确没做的（不要以为有）
 //!
-//! - **`LC_DYSYMTAB`**：动态符号表/间接符号表没有解析。`LC_SYMTAB` 已经把
-//!   `undefined` 符号（`N_UNDF`）标成未定义，但"这条未定义符号最终绑定到哪个库的
-//!   哪个地址"是 dyld 的事，本模块不下结论。
-//! - **dyld 绑定信息**（`LC_DYLD_INFO*` / `LC_DYLD_CHAINED_FIXUPS`）：没有解析，
-//!   因此 [`Object::imports`] 是**空**的 —— 这是与 PE/ELF 的已知差距。
+//! - **`LC_DYSYMTAB`**：动态符号表/间接符号表没有解析。
+//! - **`LC_DYLD_CHAINED_FIXUPS`**：链式修复（iOS 13 之后的新格式）**没有解析**。
+//!   这一点对导入表影响很大：新版 Xcode 产出的可执行文件把绑定写进链式修复数据，
+//!   `LC_DYLD_INFO` 的 bind 流**整条不存在**。实测 `temp/` 下四份 IPA 里三份是这样
+//!   （SideStore / LiveContainer / Stapxs），它们的 [`Object::imports`] 因此**如实为
+//!   空**，`notes` 写明"绑定在链式修复里，本片没有解"—— 不是"这个程序没有导入"。
+//!   只有 `net.kdt.pojavlauncher…ipa` 那种老格式（`LC_DYLD_INFO_ONLY`）才有经典
+//!   bind 流，它是本片导入表的真实样本依据（1 382 + 165 条）。
+//! - **weak bind**（`weak_bind_off` / `weak_bind_size`）：操作码语言与普通 bind 相同，
+//!   但语义是"弱定义解析"，本片没有接（`notes` 会说明存在但没解）。
+//! - **arm64e 的线程化绑定**（`BIND_OPCODE_THREADED` 的 APPLY 分支）：要用线程化指针表
+//!   与 rebase 信息，本片不解；遇到时记 `notes` 并停止那条流。
 //! - **objc / swift 元数据**（`__objc_classname`、`__swift5_*` 等）：按普通节列出，
 //!   不解析内容。
 //! - **代码签名**（`LC_CODE_SIGNATURE`）：只记录存在性，**不做校验**。
@@ -67,6 +76,15 @@
 //!    终止。没有 `__TEXT` 段时基址未知，函数起点留空并在 `notes` 里说明 ——
 //!    delta 无从还原成地址，猜一个基址等于编造地址。payload 没遇到终止符时
 //!    记一条"可能被截断"，不静默返回短表。
+//! 9. **导出与导入走 `Object.exports` / `Object.imports`，不是只写 `notes`。**
+//!    导出 trie 解成 [`Object::exports`]（`address` 是**基址 + trie 里的偏移**），
+//!    bind / lazy_bind 操作码流解成 [`Object::imports`]（`iat_slot` 就是被写入的
+//!    指针槽地址，`module` 是**解析后的库名**，不是裸序号）。re-export 没有本地地址，
+//!    所以它的 `address` 是 0 —— 那是"trie 里没有地址字段"的如实表达，`forwarder`
+//!    给出"库名#原始名"。`STUB_AND_RESOLVER` 的第二个地址保留在
+//!    [`MachOExport::other`]，并且**逐条**写进 `notes`（对象模型里 `Export` 只有一个
+//!    `address` 字段，放不下两个 —— 宁可用 notes 说清楚，也不丢第二条地址）。
+//!    `LC_DYLD_CHAINED_FIXUPS` 没有解，所以那些文件的导入表是空的，`notes` 会说原因。
 //!
 //! # 解析纪律（与 PE/ELF 一致）
 //!
@@ -79,13 +97,18 @@ use std::fmt::Write as _;
 use bitflip_arch::{Arch, ArchSpec, Endian};
 
 use crate::object::{
-    ContentKind, FileRange, FormatInfo, Object, ObjectId, Perms, RawSymbol, Section, Segment,
-    SymbolTableSource,
+    ContentKind, Export, FileRange, FormatInfo, Import, Object, ObjectId, Perms, RawSymbol,
+    Section, Segment, SymbolTableSource,
 };
 use crate::reader::{Endianness, ParseError, Reader};
 use crate::ObjectKind;
 
+pub mod bind;
+pub mod export_trie;
 pub mod fat;
+
+pub use bind::{BindImport, BindKind};
+pub use export_trie::MachOExport;
 
 // ── 魔数（`mach-o/loader.h`） ───────────────────────────────────────────────
 //
@@ -142,6 +165,11 @@ pub const LC_MAIN: u32 = 0x8000_0028;
 pub const LC_FUNCTION_STARTS: u32 = 0x26;
 /// `LC_DYLD_CHAINED_FIXUPS`：新版 dyld 的链式绑定信息。
 pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+/// `LC_DYLD_EXPORTS_TRIE`：导出 trie 的独立命令（`linkedit_data_command` 形式）。
+///
+/// iOS 13 之后 Xcode 不再写 `LC_DYLD_INFO`（绑定改走链式修复），但导出 trie 仍然要
+/// 有，于是它搬到了这条带 `LC_REQ_DYLD` 位的独立命令里。
+pub const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000_0033;
 
 /// `sizeof(struct segment_command)`（32 位，不含节）：8 + 16 + 8×4。
 pub const SEGMENT_COMMAND32_SIZE: u64 = 56;
@@ -338,8 +366,73 @@ pub struct MachOFile {
     pub function_starts: Vec<u64>,
     /// 是否存在 `LC_SYMTAB`。**只代表命令存在**；符号是否解析出来看 [`Self::symbols`]。
     pub has_symtab: bool,
+    /// `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY` 的十条字段（`dyld_info_command`）。
+    ///
+    /// `None` = 没有这条命令。新版 Xcode 的产物通常没有它（改走
+    /// `LC_DYLD_CHAINED_FIXUPS` + `LC_DYLD_EXPORTS_TRIE`），所以 `None` 不代表
+    /// "这个文件没有绑定信息"，只代表"不是这种写法"。
+    pub dyld_info: Option<DyldInfo>,
+    /// 导出 trie 的文件范围与实际来处。
+    pub export_trie: Option<ExportTrieSource>,
+    /// 导出 trie 解出的导出（**按 trie 里边出现的顺序**）。
+    ///
+    /// ld64 写出来时这个顺序就是字典序，但本层**不额外排序** —— 再排一次会把
+    /// "trie 没按规范解出来"这种问题盖住。
+    ///
+    /// 空表有三种含义，`notes` 里分得清：没有这张表 / 表是空的 / 没有镜像基址
+    /// 算不出地址。
+    pub exports: Vec<MachOExport>,
+    /// `bind` + `lazy_bind` 解出的导入（按流里的执行顺序）。
+    ///
+    /// 空表同样不止一种含义：没有 `LC_DYLD_INFO`（新版走链式修复）、
+    /// 流是空的、或流里遇到本片不解的 `THREADED`（`notes` 会写）。
+    pub imports: Vec<BindImport>,
     /// 解析过程中的说明（降级、跳过、没做的部分）。
     pub notes: Vec<String>,
+}
+
+/// `dyld_info_command` 的十个 `uint32` 字段（`mach-o/loader.h`）。
+///
+/// 字段偏移：`rebase_off +0x8`、`rebase_size +0xC`、`bind_off +0x10`、
+/// `bind_size +0x14`、`weak_bind_off +0x18`、`weak_bind_size +0x1C`、
+/// `lazy_bind_off +0x20`、`lazy_bind_size +0x24`、`export_off +0x28`、
+/// `export_size +0x2C`（命令本身 48 字节）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DyldInfo {
+    /// 原始 `cmd` 值（[`LC_DYLD_INFO`] 还是 [`LC_DYLD_INFO_ONLY`]）。
+    pub command: u32,
+    /// rebase 流的文件偏移与大小（本片**没有**执行 rebase 流）。
+    pub rebase_off: u64,
+    /// rebase 流的字节数。
+    pub rebase_size: u64,
+    /// bind 流的文件偏移。
+    pub bind_off: u64,
+    /// bind 流的字节数。
+    pub bind_size: u64,
+    /// weak bind 流的文件偏移（本片**没有**解它）。
+    pub weak_bind_off: u64,
+    /// weak bind 流的字节数。
+    pub weak_bind_size: u64,
+    /// lazy bind 流的文件偏移。
+    pub lazy_bind_off: u64,
+    /// lazy bind 流的字节数。
+    pub lazy_bind_size: u64,
+    /// 导出 trie 的文件偏移。
+    pub export_off: u64,
+    /// 导出 trie 的字节数。
+    pub export_size: u64,
+}
+
+/// 导出 trie 的来处：哪条命令、什么范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportTrieSource {
+    /// 给出这张表的加载命令（[`LC_DYLD_EXPORTS_TRIE`] 或 [`LC_DYLD_INFO`] /
+    /// [`LC_DYLD_INFO_ONLY`]）。
+    pub command: u32,
+    /// 文件偏移。
+    pub dataoff: u64,
+    /// 字节数。
+    pub datasize: u64,
 }
 
 /// 一个 Mach-O 段（`LC_SEGMENT` / `LC_SEGMENT_64`）。
@@ -660,7 +753,10 @@ struct CommandFacts {
     unix_thread: Option<UnixThread>,
     symtab: Option<SymtabCommand>,
     function_starts: Option<LinkeditData>,
-    has_dyld_info: bool,
+    /// `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY` 的十条字段。
+    dyld_info: Option<DyldInfo>,
+    /// `LC_DYLD_EXPORTS_TRIE` 的 `linkedit_data_command`。
+    exports_trie: Option<LinkeditData>,
     has_chained_fixups: bool,
     has_codesig: bool,
     unhandled: Vec<u32>,
@@ -843,6 +939,13 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
         }
     };
 
+    // ── 导出 trie 与导入（bind / lazy_bind） ───────────────────────────
+    //
+    // 放在符号表之后：这两段都要镜像基址（导出地址是"基址 + 偏移"）与段表
+    // （绑定槽位是"段基址 + 段内偏移"），而段表与基址在这一步之前已经定了。
+    let (export_trie, exports) = decode_exports(reader, &facts, image_base, &mut notes)?;
+    let imports = decode_imports(reader, &facts, &header, &mut notes)?;
+
     // ── 没做的部分：一律写进 notes，不让界面看起来"完整" ────────────────
     match facts.symtab {
         None => notes.push(
@@ -881,12 +984,124 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
             image_base.unwrap_or(0)
         ));
     }
-    if facts.has_dyld_info || facts.has_chained_fixups {
-        notes.push(
-            "存在 dyld 绑定信息（LC_DYLD_INFO* / LC_DYLD_CHAINED_FIXUPS）：**没有解析**，\
-             导入表（Object.imports）因此是空的 —— 这是与 PE/ELF 的已知差距"
+    // ── 导出：解出多少、没解什么，都要说 ──────────────────────────────
+    match &export_trie {
+        Some(source) => {
+            if !exports.is_empty() {
+                let reexports = exports.iter().filter(|item| item.is_reexport()).count();
+                let stubs = exports
+                    .iter()
+                    .filter(|item| item.is_stub_and_resolver())
+                    .count();
+                notes.push(format!(
+                    "已解析导出 trie（{:#010x}，文件范围 {:#x}..{:#x}）：{} 条导出\
+                     {}{}（地址 = 镜像基址 {:#x} + trie 里的偏移）",
+                    source.command,
+                    source.dataoff,
+                    source.dataoff + source.datasize,
+                    exports.len(),
+                    if reexports > 0 {
+                        format!("，其中 {reexports} 条是 re-export（转发到别的库，没有本地地址）")
+                    } else {
+                        String::new()
+                    },
+                    if stubs > 0 {
+                        format!("，{stubs} 条是 STUB_AND_RESOLVER（带第二个地址）")
+                    } else {
+                        String::new()
+                    },
+                    image_base.unwrap_or(0)
+                ));
+            }
+            // `STUB_AND_RESOLVER` 的第二个地址在对象模型里放不下（`Export` 只有一个
+            // `address`）：逐条写进 notes，不丢。真实二进制里这种导出很少。
+            for item in exports.iter().filter(|item| item.is_stub_and_resolver()) {
+                notes.push(format!(
+                    "导出 {} 带第二个地址（STUB_AND_RESOLVER 的 `other` 字段）：\
+                     address = {:#x} / other = {:#x}。规范没有说明哪个是 stub、哪个是 \
+                     resolver，所以这里只报两个地址，不替它下结论",
+                    item.name,
+                    item.address.unwrap_or(0),
+                    item.other.unwrap_or(0)
+                ));
+            }
+        }
+        None => notes.push(
+            "没有导出 trie（既没有 LC_DYLD_EXPORTS_TRIE，也没有 LC_DYLD_INFO 的 \
+             export_off/export_size）：Object.exports 为空 —— 那是\"这个文件没有这张表\"，\
+             不是没解析"
                 .to_string(),
-        );
+        ),
+    }
+
+    // ── 导入：哪些解了、哪些在这份文件里根本没有 ──────────────────────
+    match facts.dyld_info {
+        Some(info) => {
+            let regular = imports
+                .iter()
+                .filter(|item| item.kind == BindKind::Regular)
+                .count();
+            let lazy = imports.len() - regular;
+            if imports.is_empty() {
+                if info.bind_size > 0 || info.lazy_bind_size > 0 {
+                    notes.push(format!(
+                        "有 LC_DYLD_INFO 的绑定流（bind {} 字节 / lazy_bind {} 字节），\
+                         但一条导入都没解出来：流里只有段/符号的设置而没有 DO_BIND ——\
+                         这是文件里的事实，不是没解析",
+                        info.bind_size, info.lazy_bind_size
+                    ));
+                } else {
+                    notes.push(
+                        "有 LC_DYLD_INFO，但 bind / lazy_bind 两段都是空的：这个文件没有经典\
+                         绑定数据，Object.imports 因此为空（不是\"没有导入\"，是这份文件\
+                         没写这种数据）"
+                            .to_string(),
+                    );
+                }
+            } else {
+                let libraries = imports
+                    .iter()
+                    .map(|item| item.dylib.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                notes.push(format!(
+                    "已解析 dyld 绑定：{} 条导入（普通 {regular} + 惰性 {lazy}），\
+                     分布在 {libraries} 个库里（库序号已按 LC_LOAD_DYLIB 的顺序解析成库名；\
+                     槽位地址 = 段 vmaddr + 段内偏移）",
+                    imports.len()
+                ));
+            }
+            if info.weak_bind_size > 0 {
+                notes.push(format!(
+                    "有 weak bind 流（{} 字节）：本片**没有**解它（弱定义的语义与普通 bind \
+                     不同），这部分导入不在 Object.imports 里",
+                    info.weak_bind_size
+                ));
+            }
+            if info.rebase_size > 0 {
+                notes.push(format!(
+                    "有 rebase 流（{} 字节）：本片**没有**执行它。rebase 写的是本镜像内部\
+                     指针，不是导入，所以不影响 Object.imports",
+                    info.rebase_size
+                ));
+            }
+        }
+        None => {
+            if facts.has_chained_fixups {
+                notes.push(
+                    "有 LC_DYLD_CHAINED_FIXUPS（链式修复）而没有 LC_DYLD_INFO：新版 Xcode \
+                     的产物把绑定写进链式修复数据，本片**没有**解析它 —— Object.imports \
+                     因此如实为空。这是与 PE/ELF 的已知差距，不是\"这个程序没有导入\""
+                        .to_string(),
+                );
+            } else {
+                notes.push(
+                    "没有 LC_DYLD_INFO：Mach-O 的导入表只存在于 dyld 绑定流（或链式修复\
+                     数据）里，这份文件两种都没有 —— Object.imports 为空是文件里的事实"
+                        .to_string(),
+                );
+            }
+        }
     }
     if facts.has_codesig {
         notes.push("存在 LC_CODE_SIGNATURE：只记录存在性，**没有做签名校验**".to_string());
@@ -944,6 +1159,10 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
         stab_symbols,
         function_starts,
         has_symtab: facts.symtab.is_some(),
+        dyld_info: facts.dyld_info,
+        export_trie,
+        exports,
+        imports,
         notes,
     })
 }
@@ -1030,10 +1249,35 @@ fn read_commands(
                         .notes
                         .push("有多条 LC_FUNCTION_STARTS：只用第一条，其余忽略".to_string());
                 } else {
-                    facts.function_starts = Some(read_linkedit_data(&view, endianness)?);
+                    facts.function_starts = Some(read_linkedit_data(
+                        &view,
+                        endianness,
+                        "linkedit_data_command（LC_FUNCTION_STARTS）",
+                    )?);
                 }
             }
-            LC_DYLD_INFO | LC_DYLD_INFO_ONLY => facts.has_dyld_info = true,
+            LC_DYLD_INFO | LC_DYLD_INFO_ONLY => {
+                if facts.dyld_info.is_some() {
+                    facts.notes.push(format!(
+                        "有多条 LC_DYLD_INFO：只用第一条，{cmd:#010x} 这条的其余字段忽略"
+                    ));
+                } else {
+                    facts.dyld_info = Some(read_dyld_info(&view, endianness, cmd)?);
+                }
+            }
+            LC_DYLD_EXPORTS_TRIE => {
+                if facts.exports_trie.is_some() {
+                    facts
+                        .notes
+                        .push("有多条 LC_DYLD_EXPORTS_TRIE：只用第一条，其余忽略".to_string());
+                } else {
+                    facts.exports_trie = Some(read_linkedit_data(
+                        &view,
+                        endianness,
+                        "linkedit_data_command（LC_DYLD_EXPORTS_TRIE）",
+                    )?);
+                }
+            }
             LC_DYLD_CHAINED_FIXUPS => facts.has_chained_fixups = true,
             LC_CODE_SIGNATURE => facts.has_codesig = true,
             // LC_ID_DYLIB 是"我是谁"，不是依赖；其余命令本片不解析。
@@ -1243,21 +1487,57 @@ fn read_symtab(view: &Reader<'_>, endianness: Endianness) -> Result<SymtabComman
     })
 }
 
-/// 读 `linkedit_data_command`（`LC_FUNCTION_STARTS`）：`dataoff +8` / `datasize +0xC`。
+/// 读 `linkedit_data_command`（`LC_FUNCTION_STARTS` / `LC_DYLD_EXPORTS_TRIE`）：
+/// `dataoff +8` / `datasize +0xC`。
 fn read_linkedit_data(
     view: &Reader<'_>,
     endianness: Endianness,
+    what: &'static str,
 ) -> Result<LinkeditData, ParseError> {
     if view.len() < LINKEDIT_DATA_COMMAND_SIZE {
         return Err(ParseError::Truncated {
-            what: "linkedit_data_command（LC_FUNCTION_STARTS）",
+            what,
             needed: LINKEDIT_DATA_COMMAND_SIZE,
             actual: view.len(),
         });
     }
     Ok(LinkeditData {
-        dataoff: u64::from(view.u32(8, endianness, "LC_FUNCTION_STARTS.dataoff")?),
-        datasize: u64::from(view.u32(12, endianness, "LC_FUNCTION_STARTS.datasize")?),
+        dataoff: u64::from(view.u32(8, endianness, "linkedit_data_command.dataoff")?),
+        datasize: u64::from(view.u32(12, endianness, "linkedit_data_command.datasize")?),
+    })
+}
+
+/// 读 `dyld_info_command` 的十个 `uint32` 字段（共 48 字节）。
+///
+/// 字段偏移出自 `mach-o/loader.h`（见 [`DyldInfo`] 的文档）。这里只读字段，
+/// 真正解释 `bind_off` / `export_off` 指向的数据在 [`bind::parse`] /
+/// [`export_trie::parse`] 里（那里才拿得到文件长度与段表）。
+fn read_dyld_info(
+    view: &Reader<'_>,
+    endianness: Endianness,
+    command: u32,
+) -> Result<DyldInfo, ParseError> {
+    /// `sizeof(struct dyld_info_command)`：cmd + cmdsize + 10 个 `uint32`。
+    const DYLD_INFO_COMMAND_SIZE: u64 = 48;
+    if view.len() < DYLD_INFO_COMMAND_SIZE {
+        return Err(ParseError::Truncated {
+            what: "dyld_info_command（LC_DYLD_INFO*）",
+            needed: DYLD_INFO_COMMAND_SIZE,
+            actual: view.len(),
+        });
+    }
+    Ok(DyldInfo {
+        command,
+        rebase_off: u64::from(view.u32(8, endianness, "dyld_info.rebase_off")?),
+        rebase_size: u64::from(view.u32(12, endianness, "dyld_info.rebase_size")?),
+        bind_off: u64::from(view.u32(16, endianness, "dyld_info.bind_off")?),
+        bind_size: u64::from(view.u32(20, endianness, "dyld_info.bind_size")?),
+        weak_bind_off: u64::from(view.u32(24, endianness, "dyld_info.weak_bind_off")?),
+        weak_bind_size: u64::from(view.u32(28, endianness, "dyld_info.weak_bind_size")?),
+        lazy_bind_off: u64::from(view.u32(32, endianness, "dyld_info.lazy_bind_off")?),
+        lazy_bind_size: u64::from(view.u32(36, endianness, "dyld_info.lazy_bind_size")?),
+        export_off: u64::from(view.u32(40, endianness, "dyld_info.export_off")?),
+        export_size: u64::from(view.u32(44, endianness, "dyld_info.export_size")?),
     })
 }
 
@@ -1767,6 +2047,156 @@ fn decode_function_starts(
     Ok(out)
 }
 
+// ── 导出 trie 与 dyld 绑定（导入表） ────────────────────────────────────────
+
+/// 决定导出 trie 从哪来，并把它解出来。
+///
+/// 两种来处都要认：`LC_DYLD_EXPORTS_TRIE`（iOS 13+ 的独立命令）与
+/// `LC_DYLD_INFO(_ONLY).export_off`。两者同时存在时用前者并说明 —— 新版工具链
+/// 只写后者时也照解，不因为"命令形式"不同就把导出集丢掉。
+///
+/// 这里只做**范围校验**与"基址有没有"两件事，trie 内部的结构问题交给
+/// [`export_trie::parse`]（它是纯函数，能单测）。
+fn decode_exports(
+    reader: &Reader<'_>,
+    facts: &CommandFacts,
+    image_base: Option<u64>,
+    notes: &mut Vec<String>,
+) -> Result<(Option<ExportTrieSource>, Vec<MachOExport>), ParseError> {
+    let source = if let Some(range) = facts.exports_trie {
+        if facts.dyld_info.is_some() {
+            notes.push(
+                "同时存在 LC_DYLD_EXPORTS_TRIE 与 LC_DYLD_INFO：导出 trie 取前者\
+                 （新版工具链的形式），后者只用来解绑定流"
+                    .to_string(),
+            );
+        }
+        ExportTrieSource {
+            command: LC_DYLD_EXPORTS_TRIE,
+            dataoff: range.dataoff,
+            datasize: range.datasize,
+        }
+    } else if let Some(info) = facts.dyld_info {
+        ExportTrieSource {
+            command: info.command,
+            dataoff: info.export_off,
+            datasize: info.export_size,
+        }
+    } else {
+        return Ok((None, Vec::new()));
+    };
+
+    if source.datasize == 0 {
+        notes.push(format!(
+            "导出 trie 的范围是空的（{:#010x} 的 export_off/export_size 为 0）：\
+             Object.exports 为空 —— 命令在、表没内容，不是没解析",
+            source.command
+        ));
+        return Ok((Some(source), Vec::new()));
+    }
+
+    let end = source.dataoff.checked_add(source.datasize).ok_or_else(|| {
+        ParseError::Overflow(format!(
+            "导出 trie：dataoff {:#x} + datasize {:#x}",
+            source.dataoff, source.datasize
+        ))
+    })?;
+    if end > reader.len() {
+        return Err(ParseError::Inconsistent(format!(
+            "导出 trie 的范围 {:#x}..{end:#x}（dataoff + datasize）超出文件大小 {:#x}：\
+             文件被裁剪或头字段被人为改过",
+            source.dataoff,
+            reader.len()
+        )));
+    }
+
+    // 地址是"基址 + 偏移"。没有 __TEXT 就没有基址 —— 那时**不**拿偏移冒充地址。
+    let Some(base) = image_base else {
+        notes.push(
+            "有导出 trie，但没有 __TEXT 段、镜像基址未知：trie 里的地址是相对基址的偏移，\
+             基址都没有就无从还原成地址 —— Object.exports 留空（不猜）"
+                .to_string(),
+        );
+        return Ok((Some(source), Vec::new()));
+    };
+
+    let payload = reader.slice(source.dataoff, source.datasize, "导出 trie")?;
+    let exports = export_trie::parse(payload, base, &facts.dylibs)?;
+    Ok((Some(source), exports))
+}
+
+/// 把 `bind` 与 `lazy_bind` 两条流解成导入表。
+///
+/// 没有 `LC_DYLD_INFO` 就是"这个文件不是这种写法"（新版是链式修复），返回空表；
+/// 原因由调用方写进 `notes`（它才知道 `LC_DYLD_CHAINED_FIXUPS` 在不在）。
+fn decode_imports(
+    reader: &Reader<'_>,
+    facts: &CommandFacts,
+    header: &MachHeader,
+    notes: &mut Vec<String>,
+) -> Result<Vec<BindImport>, ParseError> {
+    let Some(info) = facts.dyld_info else {
+        return Ok(Vec::new());
+    };
+    // 槽位宽度由**文件位宽**决定（不是架构）：32 位 Mach-O 的指针就是 4 字节。
+    let pointer_size = if header.is_64 { 8 } else { 4 };
+
+    let mut out = Vec::new();
+    if info.bind_size > 0 {
+        out.extend(read_bind_stream(
+            reader,
+            (info.bind_off, info.bind_size),
+            &facts.segments,
+            &facts.dylibs,
+            pointer_size,
+            BindKind::Regular,
+            notes,
+        )?);
+    }
+    if info.lazy_bind_size > 0 {
+        out.extend(read_bind_stream(
+            reader,
+            (info.lazy_bind_off, info.lazy_bind_size),
+            &facts.segments,
+            &facts.dylibs,
+            pointer_size,
+            BindKind::Lazy,
+            notes,
+        )?);
+    }
+    Ok(out)
+}
+
+/// 切一条绑定流并解它（范围校验在这里做，操作码解码在 [`bind::parse`]）。
+///
+/// `range` 是 `(dataoff, datasize)` —— 两个值总是一起用，所以合成一个参数
+/// （函数参数已经够多了，`clippy::too_many_arguments` 是对的）。
+fn read_bind_stream(
+    reader: &Reader<'_>,
+    range: (u64, u64),
+    segments: &[MachOSegment],
+    dylibs: &[String],
+    pointer_size: u64,
+    kind: BindKind,
+    notes: &mut Vec<String>,
+) -> Result<Vec<BindImport>, ParseError> {
+    let (dataoff, datasize) = range;
+    let end = dataoff
+        .checked_add(datasize)
+        .ok_or_else(|| ParseError::Overflow(format!("{}：dataoff + datasize", kind.as_str())))?;
+    if end > reader.len() {
+        return Err(ParseError::Inconsistent(format!(
+            "{} 流的范围 {:#x}..{end:#x}（dataoff + datasize）超出文件大小 {:#x}：\
+             文件被裁剪或头字段被人为改过",
+            kind.as_str(),
+            dataoff,
+            reader.len()
+        )));
+    }
+    let payload = reader.slice(dataoff, datasize, "dyld 绑定流")?;
+    bind::parse(payload, segments, dylibs, pointer_size, kind, notes)
+}
+
 // ── 入口点与对象模型 ────────────────────────────────────────────────────────
 
 /// 决定入口点。
@@ -1896,6 +2326,23 @@ fn is_executable_section(flags: u32) -> bool {
     flags & (SECTION_ATTR_PURE_INSTRUCTIONS | SECTION_ATTR_SOME_INSTRUCTIONS) != 0
 }
 
+/// 地址是否落在**可执行节**里。
+///
+/// 导出 trie 只写"这个名字在哪个地址"，**没有**"这是函数还是数据"的字段
+/// （`EXPORT_SYMBOL_FLAGS_KIND_MASK` 分的是 regular / thread_local / absolute，
+/// 不是 code / data）。所以 `Export::is_code` 是**推出来的**：落在带指令标志的节里
+/// 才算代码。落不进任何节就是 `false`（未知不当成代码）。
+fn address_is_code(segments: &[MachOSegment], address: u64) -> bool {
+    segments
+        .iter()
+        .flat_map(|segment| segment.sections.iter())
+        .any(|section| {
+            address >= section.addr
+                && address - section.addr < section.size
+                && is_executable_section(section.flags)
+        })
+}
+
 /// 段的内容类别。
 ///
 /// Mach-O 的段**没有** ELF 那种 `sh_type` 语义，只有名字与权限可用 ——
@@ -1997,6 +2444,53 @@ fn build_object(file: &MachOFile, id: ObjectId) -> Object {
             bind,
             section: symbol.section.clone(),
             source: SymbolTableSource::Static,
+        });
+    }
+
+    // 导出 trie → `Object.exports`。
+    //
+    // `address` 是**基址 + 偏移**（trie 里存的是相对镜像基址的偏移）。re-export 的
+    // terminal 里没有地址字段，那时记 0 并把转发目标写进 `forwarder` —— 0 在这里是
+    // "文件里没有这个字段"的如实表达，`forwarder` 是它真正说明"去哪找"的地方。
+    for export in &file.exports {
+        let is_code = export
+            .address
+            .is_some_and(|address| address_is_code(&file.segments, address));
+        let forwarder = match (&export.reexport_library, &export.reexport_name) {
+            (Some(library), Some(original)) => {
+                // 规范允许 original 为空串（= 与导出名同名）；空串就直接写导出名，
+                // 但 `#` 右边空着会让人以为是解析失败，所以这里补上实际名字。
+                let target = if original.is_empty() {
+                    export.name.as_str()
+                } else {
+                    original.as_str()
+                };
+                Some(format!("{library}#{target}"))
+            }
+            _ => None,
+        };
+        object.exports.push(Export {
+            name: export.name.clone(),
+            // Mach-O 的导出 trie 里**没有**"导出序号"这个概念（那是 PE 的）。
+            ordinal: None,
+            address: export.address.unwrap_or(0),
+            forwarder,
+            is_code,
+        });
+    }
+
+    // dyld 绑定 → `Object.imports`。
+    //
+    // `iat_slot` 就是被写入的指针槽地址（分析层做交叉引用要的就是它）；
+    // `module` 是解析后的库名；`ordinal` 留空 —— 那个字段在 `Import` 里是
+    // "按序号导入的符号序号"（PE 的序号导入），不是库序号，两者不能混。
+    for import in &file.imports {
+        object.imports.push(Import {
+            module: import.dylib.clone(),
+            name: Some(import.name.clone()),
+            ordinal: None,
+            iat_slot: Some(import.address),
+            thunk: None,
         });
     }
 
