@@ -254,14 +254,48 @@ struct NameResolver<'a> {
     /// 按编号缓存。键里**不需要**再混架构：一个 `NameResolver` 只服务
     /// 一个 `AbiSpec`，缓存的生命周期与它一致。
     mnemonic_cache: RefCell<BTreeMap<u32, Option<String>>>,
+    /// ABI 名表里每个名字对应的编号，**建一次**。
+    ///
+    /// # 为什么不能每次现查
+    ///
+    /// `AbiSpec::reg_id` 的文档写着"调用方会在分析开始时解析一次"，但这里
+    /// 一度每条寄存器就 `reg_id` 一次。而 `reg_id` 每次都会**新建一个
+    /// capstone 引擎**，再线性扫到该架构的寄存器编号上界（几百个 FFI 调用）。
+    /// 实测单次约 300 µs —— 311 个函数的样本上就是 600 ms，占整份分析的
+    /// 三分之一。名字→编号是静态事实，建一次表就够。
+    ///
+    /// 顺序就是优先级顺序（sp → fp → ret → 参数寄存器 → 被调用者保存），
+    /// 与原先逐条 `if` 的顺序一致，所以「同一个编号有多个名字时返回哪个」
+    /// 不会变。
+    abi_ids: Vec<(RegId, String)>,
+    /// 栈指针 / 帧指针的编号（前导扫描每次都要用，同样不现查）。
+    sp: Option<RegId>,
+    fp: Option<RegId>,
 }
 
 impl<'a> NameResolver<'a> {
     fn new(abi: &'a AbiSpec, decoder: Option<CapstoneDecoder>) -> Self {
+        let mut names: Vec<&str> = Vec::new();
+        names.push(abi.stack_pointer_name);
+        if let Some(fp) = abi.frame_pointer_name {
+            names.push(fp);
+        }
+        names.push(abi.ret_reg_name);
+        names.extend(abi.arg_reg_names.iter().copied());
+        names.extend(abi.callee_saved_names.iter().copied());
+        let abi_ids: Vec<(RegId, String)> = names
+            .into_iter()
+            .filter_map(|name| abi.reg_id(name).map(|id| (id, name.to_string())))
+            .collect();
+        let sp = abi.reg_id(abi.stack_pointer_name);
+        let fp = abi.frame_pointer_name.and_then(|n| abi.reg_id(n));
         Self {
             abi,
             decoder,
             mnemonic_cache: RefCell::new(BTreeMap::new()),
+            abi_ids,
+            sp,
+            fp,
         }
     }
 
@@ -281,26 +315,10 @@ impl<'a> NameResolver<'a> {
     /// 寄存器名。
     fn name(&self, reg: RegId) -> Option<String> {
         // 先查 ABI 表：这些名字是契约的一部分，且不需要 FFI。
-        if self.abi.reg_id(self.abi.stack_pointer_name) == Some(reg) {
-            return Some(self.abi.stack_pointer_name.to_string());
-        }
-        if let Some(fp) = self.abi.frame_pointer_name {
-            if self.abi.reg_id(fp) == Some(reg) {
-                return Some(fp.to_string());
-            }
-        }
-        if self.abi.reg_id(self.abi.ret_reg_name) == Some(reg) {
-            return Some(self.abi.ret_reg_name.to_string());
-        }
-        for n in self.abi.arg_reg_names {
-            if self.abi.reg_id(n) == Some(reg) {
-                return Some((*n).to_string());
-            }
-        }
-        for n in self.abi.callee_saved_names {
-            if self.abi.reg_id(n) == Some(reg) {
-                return Some((*n).to_string());
-            }
+        // 表在上面**建过一次**（顺序 = sp → fp → ret → 参数 → 被调用者保存），
+        // 这里只是一次线性比较，不再每次调 `reg_id` 现查。
+        if let Some((_, name)) = self.abi_ids.iter().find(|(id, _)| *id == reg) {
+            return Some(name.clone());
         }
         // 表外寄存器：向真实后端问（例如 AArch64 的 x30 链接寄存器）。
         self.decoder.as_ref().and_then(|d| d.register_name(reg))
@@ -429,11 +447,8 @@ fn infer_frame(
 fn scan_prologue(body: &[DecodedInsn], resolver: &NameResolver<'_>) -> PrologueScan {
     let mut scan = PrologueScan::default();
 
-    let sp = resolver.abi.reg_id(resolver.abi.stack_pointer_name);
-    let fp = resolver
-        .abi
-        .frame_pointer_name
-        .and_then(|n| resolver.abi.reg_id(n));
+    let sp = resolver.sp;
+    let fp = resolver.fp;
 
     // 一个寄存器压栈占几个字节。这是架构的事实，属于 ABI 层 ——
     // 在这里按 `arch` 分支会违反分层（架构差异必须收敛在 bitflip-arch），
