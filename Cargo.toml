@@ -119,6 +119,17 @@ missing_docs = "allow"
 all = { level = "warn", priority = -1 }
 # pedantic 留到 M1 稳定后按需逐条开启；一次全开会把真实问题淹没在噪音里。
 
+# 调试构建里，capstone 的 C 端默认按 `-O0` 编。实测单条解码约 40~55 µs
+# （151 KB 样本 15 694 条 = 867 ms），比优化过的解码器慢一个数量级以上 ——
+# 于是"本机跑一遍真实样本"变成没人愿意做的事，而那正是我们最需要经常做的事。
+# 只抬这两个包：capstone-sys 是 C 本体，capstone 是 Rust 侧的操作数转换。
+# 其余依赖仍是 `-O0`，增量编译与可调试性不受影响。
+[profile.dev.package.capstone-sys]
+opt-level = 3
+
+[profile.dev.package.capstone]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
