@@ -14,18 +14,22 @@
 //! | `LC_FUNCTION_STARTS` | 同上 `linkedit_data_command` + ULEB128 增量 | 函数起点（绝对虚拟地址，升序） |
 //! | `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY` | 同上 `dyld_info_command` | 导出 trie（`export_off`）+ bind / lazy_bind 操作码流 |
 //! | `LC_DYLD_EXPORTS_TRIE` | 同上 `linkedit_data_command` | 导出 trie 的另一种来处（iOS 13+ 的命令形式） |
+//! | `LC_DYLD_CHAINED_FIXUPS` | `mach-o/fixup-chains.h`（`dyld_chained_fixups_header` + 三种 `dyld_chained_import*`） | **只解导入表**（名字 / 库 / weak / 加数），见 [`chained`]：**没有走指针链**，所以没有每条导入的槽位地址 |
 //! | fat / universal | `mach-o/fat.h` | 见 [`fat`]：切片枚举 + 选片 + `parse_slice`，已接进容器与会话 |
 //!
 //! # 明确没做的（不要以为有）
 //!
 //! - **`LC_DYSYMTAB`**：动态符号表/间接符号表没有解析。
-//! - **`LC_DYLD_CHAINED_FIXUPS`**：链式修复（iOS 13 之后的新格式）**没有解析**。
-//!   这一点对导入表影响很大：新版 Xcode 产出的可执行文件把绑定写进链式修复数据，
-//!   `LC_DYLD_INFO` 的 bind 流**整条不存在**。实测 `temp/` 下四份 IPA 里三份是这样
-//!   （SideStore / LiveContainer / Stapxs），它们的 [`Object::imports`] 因此**如实为
-//!   空**，`notes` 写明"绑定在链式修复里，本片没有解"—— 不是"这个程序没有导入"。
-//!   只有 `net.kdt.pojavlauncher…ipa` 那种老格式（`LC_DYLD_INFO_ONLY`）才有经典
-//!   bind 流，它是本片导入表的真实样本依据（1 382 + 165 条）。
+//! - **`LC_DYLD_CHAINED_FIXUPS` 的指针链没有走。** 链式修复（iOS 13 之后的新格式）
+//!   把绑定写进 `LC_DYLD_CHAINED_FIXUPS`，`LC_DYLD_INFO` 的 bind 流**整条不存在** ——
+//!   实测 `temp/` 下四份 IPA 里三份是这样（SideStore / LiveContainer / Stapxs）。
+//!   本片解的是它的**导入表**（[`chained`]：`imports_offset` / 符号池），所以
+//!   "导入了哪些符号、来自哪个库、是否 weak、带不带加数"现在是真实的。**没做的**
+//!   是 `starts_offset` 描述的指针链（以及按 `pointer_format` 还原指针）：沿链走
+//!   才知道每条导入写进哪个槽位，所以 [`Object::imports`] 里这些导入的
+//!   `iat_slot` 是 `None`（未知），不是 0。`notes` 会把这两件事分开说。
+//!   老格式（`LC_DYLD_INFO_ONLY`，如 `net.kdt.pojavlauncher…ipa`）仍走 bind 流，
+//!   那条路上 `iat_slot` 是有地址的（1 382 + 165 条）。
 //! - **weak bind**（`weak_bind_off` / `weak_bind_size`）：操作码语言与普通 bind 相同，
 //!   但语义是"弱定义解析"，本片没有接（`notes` 会说明存在但没解）。
 //! - **arm64e 的线程化绑定**（`BIND_OPCODE_THREADED` 的 APPLY 分支）：要用线程化指针表
@@ -84,7 +88,10 @@
 //!    给出"库名#原始名"。`STUB_AND_RESOLVER` 的第二个地址保留在
 //!    [`MachOExport::other`]，并且**逐条**写进 `notes`（对象模型里 `Export` 只有一个
 //!    `address` 字段，放不下两个 —— 宁可用 notes 说清楚，也不丢第二条地址）。
-//!    `LC_DYLD_CHAINED_FIXUPS` 没有解，所以那些文件的导入表是空的，`notes` 会说原因。
+//!    `LC_DYLD_CHAINED_FIXUPS` 的导入表同样进 [`Object::imports`]（`module` 是解析后
+//!    的库名），但它**没有地址**：对象模型里 `iat_slot` 因此是 `None`，而 weak 与
+//!    addend 在 `Import` 里没有字段，条数与样例写进 `notes`（结构化细节保留在
+//!    [`MachOFile::chained_fixups`]）。
 //!
 //! # 解析纪律（与 PE/ELF 一致）
 //!
@@ -104,10 +111,12 @@ use crate::reader::{Endianness, ParseError, Reader};
 use crate::ObjectKind;
 
 pub mod bind;
+pub mod chained;
 pub mod export_trie;
 pub mod fat;
 
 pub use bind::{BindImport, BindKind};
+pub use chained::{ChainedFixups, ChainedImport};
 pub use export_trie::MachOExport;
 
 // ── 魔数（`mach-o/loader.h`） ───────────────────────────────────────────────
@@ -387,6 +396,14 @@ pub struct MachOFile {
     /// 空表同样不止一种含义：没有 `LC_DYLD_INFO`（新版走链式修复）、
     /// 流是空的、或流里遇到本片不解的 `THREADED`（`notes` 会写）。
     pub imports: Vec<BindImport>,
+    /// `LC_DYLD_CHAINED_FIXUPS` 的导入表（iOS 13 之后 Xcode 的绑定写法）。
+    ///
+    /// `None` = 没有这条命令；`Some` 而 [`ChainedFixups::imports`] 为空 = 文件里
+    /// 明确写着 `imports_count = 0` —— 两种含义不同，别读成同一件事。
+    ///
+    /// 这些条目**没有地址**：本片只解导入表，没有走 `starts_offset` 描述的指针链
+    /// （见 [`chained`]），所以它给的是"导入了什么"，不是"写到了哪"。
+    pub chained_fixups: Option<ChainedFixups>,
     /// 解析过程中的说明（降级、跳过、没做的部分）。
     pub notes: Vec<String>,
 }
@@ -757,7 +774,8 @@ struct CommandFacts {
     dyld_info: Option<DyldInfo>,
     /// `LC_DYLD_EXPORTS_TRIE` 的 `linkedit_data_command`。
     exports_trie: Option<LinkeditData>,
-    has_chained_fixups: bool,
+    /// `LC_DYLD_CHAINED_FIXUPS` 的 `linkedit_data_command`。
+    chained_fixups: Option<LinkeditData>,
     has_codesig: bool,
     unhandled: Vec<u32>,
     /// 命令本身合法、但需要说明的事（重复命令等）。逐条走到 `notes` 里。
@@ -945,6 +963,8 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
     // （绑定槽位是"段基址 + 段内偏移"），而段表与基址在这一步之前已经定了。
     let (export_trie, exports) = decode_exports(reader, &facts, image_base, &mut notes)?;
     let imports = decode_imports(reader, &facts, &header, &mut notes)?;
+    // 链式修复的**导入表**（不是指针链）：新版 Xcode 产物的导入只在这里。
+    let chained_fixups = decode_chained_fixups(reader, &facts, &mut notes)?;
 
     // ── 没做的部分：一律写进 notes，不让界面看起来"完整" ────────────────
     match facts.symtab {
@@ -1087,20 +1107,111 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
             }
         }
         None => {
-            if facts.has_chained_fixups {
+            if facts.chained_fixups.is_some() {
                 notes.push(
-                    "有 LC_DYLD_CHAINED_FIXUPS（链式修复）而没有 LC_DYLD_INFO：新版 Xcode \
-                     的产物把绑定写进链式修复数据，本片**没有**解析它 —— Object.imports \
-                     因此如实为空。这是与 PE/ELF 的已知差距，不是\"这个程序没有导入\""
+                    "没有 LC_DYLD_INFO：新版 Xcode 的产物把绑定写进 LC_DYLD_CHAINED_FIXUPS，\
+                     导入改从它的**导入表**解（链式修复那条说明里写了条数与\"没有走链\"的\
+                     限制）—— 这里缺的是\"经典 bind 流\"，不是\"没有导入\""
                         .to_string(),
                 );
             } else {
                 notes.push(
-                    "没有 LC_DYLD_INFO：Mach-O 的导入表只存在于 dyld 绑定流（或链式修复\
-                     数据）里，这份文件两种都没有 —— Object.imports 为空是文件里的事实"
+                    "没有 LC_DYLD_INFO，也没有 LC_DYLD_CHAINED_FIXUPS：Mach-O 的导入表只存在\
+                     于这两种数据里，这份文件两种都没有 —— Object.imports 为空是文件里的事实"
                         .to_string(),
                 );
             }
+        }
+    }
+
+    // ── 链式修复（LC_DYLD_CHAINED_FIXUPS）：解了导入表，没走指针链 ──────
+    //
+    // 两件事必须分开说（CLAUDE.md §7）："导入了什么"这次是真的解出来了；
+    // "写进哪个槽位"要靠沿链走 + pointer_format 还原，本片没做 —— 所以对象模型里
+    // 这些导入的 iat_slot 是 None（未知），不是 0。
+    if let Some(fixups) = &chained_fixups {
+        if fixups.imports.is_empty() {
+            notes.push(format!(
+                "有 LC_DYLD_CHAINED_FIXUPS（imports_format = {} / {}，symbols_format = {}），\
+                 但头里写着 imports_count = 0、解出 0 条导入：Object.imports 为空是文件里的\
+                 事实，不是没解析",
+                fixups.imports_format,
+                fixups.imports_format_name(),
+                fixups.symbols_format
+            ));
+        } else {
+            let libraries = fixups
+                .imports
+                .iter()
+                .map(|item| item.dylib.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            notes.push(format!(
+                "已解析 LC_DYLD_CHAINED_FIXUPS 的**导入表**（imports_format = {} / {}，\
+                 symbols_format = {}，imports_count = {}）：{} 条导入，分布在 {libraries} 个库里\
+                 （lib_ordinal 已按 LC_LOAD_DYLIB 的顺序解析成库名；0xFF/0xFFFF = \
+                 <main-executable>、0xFE/0xFFFE = <flat-lookup>）",
+                fixups.imports_format,
+                fixups.imports_format_name(),
+                fixups.symbols_format,
+                fixups.imports_count,
+                fixups.imports.len()
+            ));
+
+            // 对象模型的 `Import` 没有 weak / addend 字段：不编字段，改成有界的说明
+            // （条数 + 前几条样例），结构化细节仍在 `MachOFile::chained_fixups` 里。
+            let weak: Vec<&str> = fixups
+                .imports
+                .iter()
+                .filter(|item| item.weak_import)
+                .map(|item| item.name.as_str())
+                .collect();
+            if !weak.is_empty() {
+                notes.push(format!(
+                    "导入表里有 {} 条 weak_import（位 8 / 位 16）。对象模型的 `Import` 没有\
+                     weak 字段，这里只给条数与样例（前 {} 条：{}），结构化事实保留在 \
+                     `MachOFile::chained_fixups.imports[].weak_import` 里",
+                    weak.len(),
+                    weak.len().min(5),
+                    weak[..weak.len().min(5)].join("、")
+                ));
+            }
+            let with_addend: Vec<String> = fixups
+                .imports
+                .iter()
+                .filter_map(|item| {
+                    item.addend
+                        .map(|addend| format!("{} ({addend})", item.name))
+                })
+                .collect();
+            if !with_addend.is_empty() {
+                notes.push(format!(
+                    "导入表里有 {} 条带 addend（imports_format {} 的第二个字段）。对象模型的 \
+                     `Import` 没有 addend 字段 —— 把加数硬塞进 iat_slot 等于编造地址，\
+                     所以它只保留在 `MachOFile::chained_fixups.imports[].addend` 里\
+                     （前 {} 条：{}）",
+                    with_addend.len(),
+                    fixups.imports_format,
+                    with_addend.len().min(5),
+                    with_addend[..with_addend.len().min(5)].join("、")
+                ));
+            }
+        }
+
+        if fixups.has_starts() {
+            notes.push(format!(
+                "LC_DYLD_CHAINED_FIXUPS 的 starts_offset = {:#x}：文件里确实有指针链描述，\
+                 但本片**没有走链**（那要按 starts_in_segment 与 pointer_format 逐条还原）——\
+                 因此每条导入写进哪个指针槽未知，Object.imports 里这些导入的 iat_slot 是 \
+                 None（不是 0）；链里的 rebase 指针也不在 Object 里",
+                fixups.starts_offset
+            ));
+        } else {
+            notes.push(
+                "LC_DYLD_CHAINED_FIXUPS 的 starts_offset = 0：这份文件没有链描述（只有导入表\
+                 与符号池），所以\"导入没有地址\"不是本片没走链，而是文件里就没有链"
+                    .to_string(),
+            );
         }
     }
     if facts.has_codesig {
@@ -1163,6 +1274,7 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
         export_trie,
         exports,
         imports,
+        chained_fixups,
         notes,
     })
 }
@@ -1278,7 +1390,19 @@ fn read_commands(
                     )?);
                 }
             }
-            LC_DYLD_CHAINED_FIXUPS => facts.has_chained_fixups = true,
+            LC_DYLD_CHAINED_FIXUPS => {
+                if facts.chained_fixups.is_some() {
+                    facts
+                        .notes
+                        .push("有多条 LC_DYLD_CHAINED_FIXUPS：只用第一条，其余忽略".to_string());
+                } else {
+                    facts.chained_fixups = Some(read_linkedit_data(
+                        &view,
+                        endianness,
+                        "linkedit_data_command（LC_DYLD_CHAINED_FIXUPS）",
+                    )?);
+                }
+            }
             LC_CODE_SIGNATURE => facts.has_codesig = true,
             // LC_ID_DYLIB 是"我是谁"，不是依赖；其余命令本片不解析。
             LC_ID_DYLIB => {}
@@ -1487,8 +1611,8 @@ fn read_symtab(view: &Reader<'_>, endianness: Endianness) -> Result<SymtabComman
     })
 }
 
-/// 读 `linkedit_data_command`（`LC_FUNCTION_STARTS` / `LC_DYLD_EXPORTS_TRIE`）：
-/// `dataoff +8` / `datasize +0xC`。
+/// 读 `linkedit_data_command`（`LC_FUNCTION_STARTS` / `LC_DYLD_EXPORTS_TRIE` /
+/// `LC_DYLD_CHAINED_FIXUPS`）：`dataoff +8` / `datasize +0xC`。
 fn read_linkedit_data(
     view: &Reader<'_>,
     endianness: Endianness,
@@ -2197,6 +2321,44 @@ fn read_bind_stream(
     bind::parse(payload, segments, dylibs, pointer_size, kind, notes)
 }
 
+/// 切 `LC_DYLD_CHAINED_FIXUPS` 的 payload 并解它的**导入表**。
+///
+/// 返回 `None` 表示文件里没有这条命令（不是"有这条命令但 0 条导入"—— 那种情形
+/// 是 `Some` + 空 `imports`，`notes` 里说得不一样）。范围校验在这里做（与
+/// [`read_bind_stream`] 同一套），编码细节在 [`chained::parse`]。
+fn decode_chained_fixups(
+    reader: &Reader<'_>,
+    facts: &CommandFacts,
+    notes: &mut Vec<String>,
+) -> Result<Option<ChainedFixups>, ParseError> {
+    let Some(range) = facts.chained_fixups else {
+        return Ok(None);
+    };
+    let end = range.dataoff.checked_add(range.datasize).ok_or_else(|| {
+        ParseError::Overflow("LC_DYLD_CHAINED_FIXUPS：dataoff + datasize".to_string())
+    })?;
+    if end > reader.len() {
+        return Err(ParseError::Inconsistent(format!(
+            "LC_DYLD_CHAINED_FIXUPS 的范围 {:#x}..{end:#x}（dataoff + datasize）超出文件大小 \
+             {:#x}：文件被裁剪或头字段被人为改过",
+            range.dataoff,
+            reader.len()
+        )));
+    }
+    if range.datasize == 0 {
+        // `datasize = 0` 是"这条命令没写数据"：没有头可解，如实记 None 之外的一件事
+        // —— 由 notes 说明，而不是把空 payload 当成一张空导入表。
+        notes.push(
+            "有 LC_DYLD_CHAINED_FIXUPS，但 dataoff/datasize 指向 0 字节：没有链式修复数据可解\
+             （Object.imports 因此拿不到任何导入，这是文件里的事实）"
+                .to_string(),
+        );
+        return Ok(None);
+    }
+    let payload = reader.slice(range.dataoff, range.datasize, "LC_DYLD_CHAINED_FIXUPS")?;
+    chained::parse(payload, &facts.dylibs).map(Some)
+}
+
 // ── 入口点与对象模型 ────────────────────────────────────────────────────────
 
 /// 决定入口点。
@@ -2492,6 +2654,22 @@ fn build_object(file: &MachOFile, id: ObjectId) -> Object {
             iat_slot: Some(import.address),
             thunk: None,
         });
+    }
+
+    // 链式修复的**导入表** → `Object.imports`（新版 Xcode 产物的导入只在这里）。
+    //
+    // `iat_slot` 是 `None`：本片**没有走指针链**，每条导入写进哪个槽位在文件里不是
+    // 一张表，而是一串指针链 —— 没走就给 None（未知），绝不填 0（CLAUDE.md §7）。
+    if let Some(fixups) = &file.chained_fixups {
+        for import in &fixups.imports {
+            object.imports.push(Import {
+                module: import.dylib.clone(),
+                name: Some(import.name.clone()),
+                ordinal: None,
+                iat_slot: None,
+                thunk: None,
+            });
+        }
     }
 
     for state in &file.segments {

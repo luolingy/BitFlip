@@ -168,6 +168,54 @@ fn powerpc_binaries_parse_through_the_public_entry() {
 }
 
 #[test]
+fn chained_fixup_imports_reach_the_object_model() {
+    // 新版 Xcode 的产物没有 LC_DYLD_INFO，导入只在 LC_DYLD_CHAINED_FIXUPS 里 ——
+    // 从 crate 外面走公开入口，验证它们真的进了 Object.imports。
+    let image = fixture::demo_chained_fixups64();
+    let object = parse_object(ObjectKind::MachO, &image.bytes, 0, ObjectId::Plain)
+        .expect("链式修复样本必须能解析");
+
+    assert_eq!(
+        object
+            .imports
+            .iter()
+            .map(|import| import.name.as_deref().unwrap_or("<按序号导入>"))
+            .collect::<Vec<_>>(),
+        vec![
+            "_objc_msgSend",
+            "_UIApplicationMain",
+            "_dispatch_async",
+            "_mainRef"
+        ],
+        "导入名来自链式修复的符号池"
+    );
+    assert_eq!(object.imports[0].module, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(
+        object.imports[3].module, "<main-executable>",
+        "lib_ordinal 0xFF 是主可执行文件，不是第 255 个库"
+    );
+    assert!(
+        object
+            .imports
+            .iter()
+            .all(|import| import.iat_slot.is_none()),
+        "没有走指针链：地址未知（None），不是 0"
+    );
+
+    let notes = object.notes.join("\n");
+    assert!(notes.contains("已解析 LC_DYLD_CHAINED_FIXUPS"), "{notes}");
+    assert!(notes.contains("iat_slot 是"), "{notes}");
+}
+
+#[test]
+fn a_chained_fixups_import_format_we_do_not_know_is_rejected() {
+    let bytes = fixture::malformed_chained_imports_format();
+    let error = parse_object(ObjectKind::MachO, &bytes, 0, ObjectId::Plain)
+        .expect_err("imports_format = 9 必须明确报错，不许猜");
+    assert!(error.to_string().contains("imports_format"), "{error}");
+}
+
+#[test]
 fn a_malformed_sizeofcmds_is_rejected_not_guessed() {
     let bytes = fixture::malformed_sizeofcmds_too_big();
     let error =

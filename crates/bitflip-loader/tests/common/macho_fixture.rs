@@ -230,6 +230,8 @@ pub const LC_FUNCTION_STARTS: u32 = 0x26;
 pub const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
 /// `LC_DYLD_EXPORTS_TRIE`（导出 trie 的独立命令形式）。
 pub const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000_0033;
+/// `LC_DYLD_CHAINED_FIXUPS`（链式修复；`linkedit_data_command` 形式，iOS 13+）。
+pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
 
 /// `nlist.n_type` 的位（`mach-o/nlist.h`）。
 pub const N_STAB: u8 = 0xe0;
@@ -1432,6 +1434,19 @@ pub fn lc_exports_trie(dataoff: u32, datasize: u32, little: bool) -> RawCommand 
     RawCommand { bytes }
 }
 
+/// `LC_DYLD_CHAINED_FIXUPS`（也是 `linkedit_data_command`，字段布局与
+/// `LC_FUNCTION_STARTS` / `LC_DYLD_EXPORTS_TRIE` 完全相同：`cmd +0`、`cmdsize +4`、
+/// `dataoff +8`、`datasize +0xC`）。
+#[must_use]
+pub fn lc_chained_fixups(dataoff: u32, datasize: u32, little: bool) -> RawCommand {
+    let mut bytes = vec![0u8; 16];
+    put_u32(&mut bytes, 0, LC_DYLD_CHAINED_FIXUPS, little);
+    put_u32(&mut bytes, 4, 16, little);
+    put_u32(&mut bytes, 8, dataoff, little);
+    put_u32(&mut bytes, 12, datasize, little);
+    RawCommand { bytes }
+}
+
 /// 一条导出的 terminal 规格。
 ///
 /// 规范里 terminal 的字段顺序（ld64 `ExportFile` 写、dyld `ExportInfo` 读）：
@@ -2041,4 +2056,468 @@ pub fn malformed_bind_truncated_uleb() -> Vec<u8> {
 #[must_use]
 pub fn malformed_bind_segment_out_of_range() -> Vec<u8> {
     dyld_image(false, &[], &[0x7f, 0x00], &[]).bytes
+}
+
+// ── LC_DYLD_CHAINED_FIXUPS（链式修复的导入表） ──────────────────────────────
+//
+// 规范出处：Apple XNU 的 `EXTERNAL_HEADERS/mach-o/fixup-chains.h`。下半段构造器
+// 逐字节按那里面的结构声明写，**不**调用解析代码（CLAUDE.md §6.11）。
+//
+// ```text
+// struct dyld_chained_fixups_header {          // 28 字节，小端
+//     uint32_t fixups_version;   // +0x00
+//     uint32_t starts_offset;    // +0x04
+//     uint32_t imports_offset;   // +0x08
+//     uint32_t symbols_offset;   // +0x0C
+//     uint32_t imports_count;    // +0x10
+//     uint32_t imports_format;   // +0x14  1 / 2 / 3
+//     uint32_t symbols_format;   // +0x18  0 = 未压缩，1 = zlib
+// };
+//
+// struct dyld_chained_import {                 // 4 字节
+//     uint32_t lib_ordinal : 8,                // bits  0..8
+//              weak_import : 1,                // bit   8
+//              name_offset : 23;               // bits  9..32
+// };
+// struct dyld_chained_import_addend {          // 8 字节
+//     uint32_t lib_ordinal : 8, weak_import : 1, name_offset : 23;
+//     int32_t  addend;                         // +4
+// };
+// struct dyld_chained_import_addend64 {        // 16 字节
+//     uint64_t lib_ordinal : 16,               // bits  0..16
+//              weak_import : 1,                // bit   16
+//              reserved    : 15,               // bits 17..32
+//              name_offset : 32;               // bits 32..64
+//     uint64_t addend;                         // +8
+// };
+// #define DYLD_CHAINED_IMPORT          1
+// #define DYLD_CHAINED_IMPORT_ADDEND   2
+// #define DYLD_CHAINED_IMPORT_ADDEND64 3
+// ```
+//
+// 位域在 Little-endian 上是 **LSB-first** 排布的：`lib_ordinal : 8, weak_import : 1,
+// name_offset : 23` 的声明意味着 lib_ordinal 占最低 8 位、weak 占第 8 位、
+// name_offset 从第 9 位开始 —— 所以一个 `u32` 可以写成
+// `(name_offset << 9) | (weak << 8) | lib_ordinal`。链式修复数据本身在真实
+// Apple 平台上只有小端（arm64 / x86_64），所以这里固定按小端拼。
+
+/// `DYLD_CHAINED_IMPORT`：`u32` 位域，4 字节。
+pub const DYLD_CHAINED_IMPORT: u32 = 1;
+/// `DYLD_CHAINED_IMPORT_ADDEND`：`u32` 位域 + `int32_t`，8 字节。
+pub const DYLD_CHAINED_IMPORT_ADDEND: u32 = 2;
+/// `DYLD_CHAINED_IMPORT_ADDEND64`：`u64` 位域 + `uint64_t`，16 字节。
+pub const DYLD_CHAINED_IMPORT_ADDEND64: u32 = 3;
+/// `DYLD_CHAINED_SYMBOLS_UNCOMPRESSED`。
+pub const SYMBOLS_FORMAT_UNCOMPRESSED: u32 = 0;
+/// `DYLD_CHAINED_SYMBOLS_ZLIB`（本片不解；样本用来验证"明确拒绝"）。
+pub const SYMBOLS_FORMAT_ZLIB: u32 = 1;
+
+/// 一条导入表条目的规格（位域值按"未做符号扩展的原始值"给）。
+#[derive(Debug, Clone)]
+pub struct ChainedImportSpec {
+    /// `lib_ordinal` 位域（8 位或 16 位，按 `imports_format` 截断写入）。
+    /// `0xFF` = 主可执行文件、`0xFE` = flat lookup（二补码的 -1 / -2）。
+    pub lib_ordinal: u32,
+    /// `weak_import` 位。
+    pub weak_import: bool,
+    /// 符号池内的名字偏移。
+    pub name_offset: u32,
+    /// 加数：`imports_format` 2 写成 `i32`、3 写成 `u64`；格式 1 **不写**（字段不存在）。
+    pub addend: i64,
+}
+
+/// 一份 `LC_DYLD_CHAINED_FIXUPS` payload 的规格。
+#[derive(Debug, Clone)]
+pub struct ChainedFixupsSpec {
+    /// `fixups_version`（规范只定义 0）。
+    pub fixups_version: u32,
+    /// `imports_format`（1 / 2 / 3；畸形样本可以给别的值）。
+    pub imports_format: u32,
+    /// `symbols_format`（0 = 未压缩；1 = zlib）。
+    pub symbols_format: u32,
+    /// `starts_offset` 指向的链描述字节。空 = 没有链（`starts_offset = 0`）。
+    pub starts: Vec<u8>,
+    /// 导入表条目。
+    pub imports: Vec<ChainedImportSpec>,
+    /// 符号池字节（NUL 结尾名字的拼接，见 [`symbol_pool`]）。
+    pub symbols: Vec<u8>,
+    /// 覆盖头里的 `imports_offset`（畸形样本）。
+    pub imports_offset_override: Option<u32>,
+    /// 覆盖头里的 `symbols_offset`（畸形样本）。
+    pub symbols_offset_override: Option<u32>,
+    /// 覆盖头里的 `imports_count`（畸形样本）。
+    pub imports_count_override: Option<u32>,
+}
+
+impl ChainedFixupsSpec {
+    /// 一份空的规格（没有链描述、没有导入、空符号池）。
+    #[must_use]
+    pub fn new(imports_format: u32) -> Self {
+        Self {
+            fixups_version: 0,
+            imports_format,
+            symbols_format: SYMBOLS_FORMAT_UNCOMPRESSED,
+            starts: Vec::new(),
+            imports: Vec::new(),
+            symbols: Vec::new(),
+            imports_offset_override: None,
+            symbols_offset_override: None,
+            imports_count_override: None,
+        }
+    }
+
+    /// 一条导入表条目（顺序就是表里的顺序）。
+    #[must_use]
+    pub fn import(mut self, entry: ChainedImportSpec) -> Self {
+        self.imports.push(entry);
+        self
+    }
+
+    /// 设置符号池与链描述（链描述用 [`minimal_starts_in_image`]）。
+    #[must_use]
+    pub fn pool(mut self, symbols: Vec<u8>, starts: Vec<u8>) -> Self {
+        self.symbols = symbols;
+        self.starts = starts;
+        self
+    }
+
+    /// 单个条目的字节宽度（`fixup-chains.h` 里的 `sizeof`）。
+    #[must_use]
+    pub fn entry_size(&self) -> usize {
+        match self.imports_format {
+            DYLD_CHAINED_IMPORT => 4,
+            DYLD_CHAINED_IMPORT_ADDEND => 8,
+            DYLD_CHAINED_IMPORT_ADDEND64 => 16,
+            // 未知格式在真实文件里不存在；畸形样本用它验证"明确拒绝"，
+            // 这里沿用 4 字节（关键是**头里的 imports_format**）。
+            _ => 4,
+        }
+    }
+}
+
+/// 符号池 + 每个名字的 `name_offset`（相对池起点）。
+///
+/// 名字按给定顺序拼成 NUL 结尾的串，偏移由拼接本身算出来 —— 手写数字容易错一位。
+#[must_use]
+pub fn symbol_pool(names: &[&str]) -> (Vec<u8>, Vec<u32>) {
+    let mut pool: Vec<u8> = Vec::new();
+    let mut offsets: Vec<u32> = Vec::with_capacity(names.len());
+    for name in names {
+        offsets.push(pool.len() as u32);
+        pool.extend_from_slice(name.as_bytes());
+        pool.push(0);
+    }
+    (pool, offsets)
+}
+
+/// 最小的 `dyld_chained_starts_in_image`（`mach-o/fixup-chains.h`）：
+///
+/// ```text
+/// struct dyld_chained_starts_in_image {
+///     uint32_t seg_count;                  // +0
+///     uint32_t seg_info_offset[seg_count]; // +4，每项相对**本结构**起点
+/// };
+/// ```
+///
+/// 每个段的偏移都给 0 = 这个段没有链。fixture 只验证导入表，所以链描述给这段
+/// 最小的合法内容：`starts_offset` 有真实指向，同时不假装解过链。
+#[must_use]
+pub fn minimal_starts_in_image(seg_count: u32) -> Vec<u8> {
+    let mut bytes = vec![0u8; 4 + 4 * seg_count as usize];
+    put_u32(&mut bytes, 0, seg_count, true);
+    bytes
+}
+
+/// 按 `mach-o/fixup-chains.h` 拼一段 `LC_DYLD_CHAINED_FIXUPS` 的 payload。
+///
+/// 布局：`header(28)` → 链描述（若有）→ 导入表 → 符号池。三个偏移**由布局算出来**，
+/// 覆盖字段只改头里的值、不改实际布局（畸形样本要的正是"头说的与实际不一致"）。
+#[must_use]
+pub fn build_chained_fixups(spec: &ChainedFixupsSpec) -> Vec<u8> {
+    let entry_size = spec.entry_size();
+    let header_size = 28usize;
+
+    // 头与链描述：头里 `starts_offset` 指向紧随其后的链描述（没有链时写 0）。
+    let starts_offset = if spec.starts.is_empty() {
+        0u32
+    } else {
+        header_size as u32
+    };
+    let starts_end = header_size + spec.starts.len();
+    // 导入表按 4 字节对齐（规范没有强制，但真实链接器都这么做；不影响解析）。
+    let imports_offset = if spec.imports.is_empty() {
+        starts_end
+    } else {
+        align_up(starts_end as u64, 4) as usize
+    };
+    let table_end = imports_offset + spec.imports.len() * entry_size;
+    let symbols_offset = if spec.symbols.is_empty() {
+        table_end
+    } else {
+        align_up(table_end as u64, 4) as usize
+    };
+
+    let total = (symbols_offset + spec.symbols.len()).max(header_size);
+    let mut out = vec![0u8; total];
+
+    // 七个 u32，偏移见上面的结构声明。
+    let written_imports_offset = spec
+        .imports_offset_override
+        .unwrap_or(imports_offset as u32);
+    let written_symbols_offset = spec
+        .symbols_offset_override
+        .unwrap_or(symbols_offset as u32);
+    let written_count = spec
+        .imports_count_override
+        .unwrap_or(spec.imports.len() as u32);
+    put_u32(&mut out, 0x00, spec.fixups_version, true);
+    put_u32(&mut out, 0x04, starts_offset, true);
+    put_u32(&mut out, 0x08, written_imports_offset, true);
+    put_u32(&mut out, 0x0C, written_symbols_offset, true);
+    put_u32(&mut out, 0x10, written_count, true);
+    put_u32(&mut out, 0x14, spec.imports_format, true);
+    put_u32(&mut out, 0x18, spec.symbols_format, true);
+
+    if !spec.starts.is_empty() {
+        out[header_size..header_size + spec.starts.len()].copy_from_slice(&spec.starts);
+    }
+
+    // 条目：位域按 LSB-first 拼。`imports_offset` 用**实际**布局（覆盖只影响头），
+    // 否则畸形样本会写到随机位置。
+    for (index, entry) in spec.imports.iter().enumerate() {
+        let at = imports_offset + index * entry_size;
+        match spec.imports_format {
+            DYLD_CHAINED_IMPORT => {
+                let word = ((entry.name_offset & 0x7F_FFFF) << 9)
+                    | (u32::from(entry.weak_import) << 8)
+                    | (entry.lib_ordinal & 0xFF);
+                put_u32(&mut out, at, word, true);
+            }
+            DYLD_CHAINED_IMPORT_ADDEND => {
+                let word = ((entry.name_offset & 0x7F_FFFF) << 9)
+                    | (u32::from(entry.weak_import) << 8)
+                    | (entry.lib_ordinal & 0xFF);
+                put_u32(&mut out, at, word, true);
+                put_u32(&mut out, at + 4, entry.addend as i32 as u32, true);
+            }
+            DYLD_CHAINED_IMPORT_ADDEND64 => {
+                let low = (u64::from(entry.name_offset) << 32)
+                    | (u64::from(entry.weak_import) << 16)
+                    | u64::from(entry.lib_ordinal & 0xFFFF);
+                put_u64(&mut out, at, low, true);
+                put_u64(&mut out, at + 8, entry.addend as u64, true);
+            }
+            _ => {
+                // 未知格式：畸形样本只关心头里的 imports_format 被拒绝，条目内容无关。
+                put_u32(&mut out, at, entry.name_offset, true);
+            }
+        }
+    }
+
+    if !spec.symbols.is_empty() {
+        out[symbols_offset..symbols_offset + spec.symbols.len()].copy_from_slice(&spec.symbols);
+    }
+    out
+}
+
+/// 带链式修复数据的样本：字节 + 命令/数据在文件里的位置。
+pub struct ChainedImage {
+    /// 完整文件字节。
+    pub bytes: Vec<u8>,
+    /// `LC_DYLD_CHAINED_FIXUPS` 命令的文件偏移（改头字段的畸形样本要用）。
+    pub command_offset: usize,
+    /// payload 在文件里的偏移。
+    pub dataoff: u64,
+}
+
+/// 把一段 `LC_DYLD_CHAINED_FIXUPS` payload 装进 [`dyld_base64`] 那个骨架。
+///
+/// 骨架有三段（`__PAGEZERO` / `__TEXT` / `__DATA`）与两条 `LC_LOAD_DYLIB`
+/// （1 = `libSystem.B.dylib`、2 = `UIKit`），所以库序号的期望值是确定的。
+/// payload 追加在骨架之后（8 字节对齐），与真实文件的 `__LINKEDIT` 位置同一形状。
+#[must_use]
+pub fn chained_image(payload: &[u8]) -> ChainedImage {
+    // 第一遍：占位，只为拿到"骨架本身多长"。
+    let placeholder = dyld_base64().command(lc_chained_fixups(0, 0, true));
+    let layout = build(&placeholder);
+    let dataoff = align_up(layout.len() as u64, 8);
+
+    // 第二遍：填真偏移。命令字节数不变，所以布局与第一遍相同。
+    let spec = dyld_base64().command(lc_chained_fixups(
+        dataoff as u32,
+        payload.len() as u32,
+        true,
+    ));
+    let command_offset = command_offset_in(&spec, spec.commands.len() - 1);
+    let mut bytes = build(&spec);
+    let total = dataoff as usize + payload.len();
+    if bytes.len() < total {
+        bytes.resize(total, 0);
+    }
+    bytes[dataoff as usize..total].copy_from_slice(payload);
+
+    ChainedImage {
+        bytes,
+        command_offset,
+        dataoff,
+    }
+}
+
+/// 完整样本：`imports_format = 1`，4 条导入跨 2 个库 —— 其中 `_UIApplicationMain`
+/// 是 weak，`_mainRef` 的库序号是 `0xFF`（二补码 -1 = 主可执行文件）。
+#[must_use]
+pub fn demo_chained_fixups64() -> ChainedImage {
+    let (symbols, offsets) = symbol_pool(&[
+        "_objc_msgSend",
+        "_UIApplicationMain",
+        "_dispatch_async",
+        "_mainRef",
+    ]);
+    let spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT)
+        .pool(symbols, minimal_starts_in_image(3))
+        .import(ChainedImportSpec {
+            lib_ordinal: 1, // libSystem
+            weak_import: false,
+            name_offset: offsets[0],
+            addend: 0,
+        })
+        .import(ChainedImportSpec {
+            lib_ordinal: 2, // UIKit
+            weak_import: true,
+            name_offset: offsets[1],
+            addend: 0,
+        })
+        .import(ChainedImportSpec {
+            lib_ordinal: 1, // libSystem
+            weak_import: false,
+            name_offset: offsets[2],
+            addend: 0,
+        })
+        .import(ChainedImportSpec {
+            lib_ordinal: 0xFF, // -1 = main executable
+            weak_import: false,
+            name_offset: offsets[3],
+            addend: 0,
+        });
+    chained_image(&build_chained_fixups(&spec))
+}
+
+/// `imports_format = 2`（`DYLD_CHAINED_IMPORT_ADDEND`）：带 `i32` 加数。
+#[must_use]
+pub fn demo_chained_addend64() -> ChainedImage {
+    let (symbols, offsets) = symbol_pool(&["_firstSight", "_scaled"]);
+    let spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT_ADDEND)
+        .pool(symbols, minimal_starts_in_image(3))
+        .import(ChainedImportSpec {
+            lib_ordinal: 1,
+            weak_import: false,
+            name_offset: offsets[0],
+            addend: -4,
+        })
+        .import(ChainedImportSpec {
+            lib_ordinal: 2,
+            weak_import: true,
+            name_offset: offsets[1],
+            addend: 0x20,
+        });
+    chained_image(&build_chained_fixups(&spec))
+}
+
+/// `imports_format = 3`（`DYLD_CHAINED_IMPORT_ADDEND64`）：16 位库序号 + 64 位加数。
+#[must_use]
+pub fn demo_chained_addend64_wide() -> ChainedImage {
+    let (symbols, offsets) = symbol_pool(&["_wideOne"]);
+    let spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT_ADDEND64)
+        .pool(symbols, minimal_starts_in_image(3))
+        .import(ChainedImportSpec {
+            lib_ordinal: 2,
+            weak_import: false,
+            name_offset: offsets[0],
+            addend: 0x100,
+        });
+    chained_image(&build_chained_fixups(&spec))
+}
+
+/// 畸形：`imports_format = 9`（规范里不存在）—— 必须明确报错。
+#[must_use]
+pub fn malformed_chained_imports_format() -> Vec<u8> {
+    let (symbols, offsets) = symbol_pool(&["_x"]);
+    let spec = ChainedFixupsSpec::new(9)
+        .pool(symbols, minimal_starts_in_image(3))
+        .import(ChainedImportSpec {
+            lib_ordinal: 1,
+            weak_import: false,
+            name_offset: offsets[0],
+            addend: 0,
+        });
+    chained_image(&build_chained_fixups(&spec)).bytes
+}
+
+/// 畸形：`name_offset` 指向符号池之外 —— 必须拒绝（不许读越界的字节）。
+#[must_use]
+pub fn malformed_chained_name_offset_outside_pool() -> Vec<u8> {
+    let (symbols, _offsets) = symbol_pool(&["_x"]);
+    let spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT)
+        .pool(symbols, minimal_starts_in_image(3))
+        .import(ChainedImportSpec {
+            lib_ordinal: 1,
+            weak_import: false,
+            // 池只有 3 字节（"_x\0"），这里指到 0x7FFF。
+            name_offset: 0x7FFF,
+            addend: 0,
+        });
+    chained_image(&build_chained_fixups(&spec)).bytes
+}
+
+/// 畸形：`symbols_format = 1`（zlib）—— 这是"本片没实现"，必须明确报错。
+#[must_use]
+pub fn malformed_chained_symbols_zlib() -> Vec<u8> {
+    let (symbols, offsets) = symbol_pool(&["_x"]);
+    let mut spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT)
+        .pool(symbols, minimal_starts_in_image(3))
+        .import(ChainedImportSpec {
+            lib_ordinal: 1,
+            weak_import: false,
+            name_offset: offsets[0],
+            addend: 0,
+        });
+    spec.symbols_format = SYMBOLS_FORMAT_ZLIB;
+    chained_image(&build_chained_fixups(&spec)).bytes
+}
+
+/// 畸形：payload 只有 12 字节，装不下 28 字节的头 —— 必须报截断。
+#[must_use]
+pub fn malformed_chained_truncated_header() -> Vec<u8> {
+    chained_image(&[0u8; 12]).bytes
+}
+
+/// 畸形：头里 `imports_count = 64`，实际只有 1 条 —— 表越过 payload，必须拒绝。
+#[must_use]
+pub fn malformed_chained_imports_count_past_payload() -> Vec<u8> {
+    let (symbols, offsets) = symbol_pool(&["_x"]);
+    let mut spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT)
+        .pool(symbols, minimal_starts_in_image(3))
+        .import(ChainedImportSpec {
+            lib_ordinal: 1,
+            weak_import: false,
+            name_offset: offsets[0],
+            addend: 0,
+        });
+    spec.imports_count_override = Some(64);
+    chained_image(&build_chained_fixups(&spec)).bytes
+}
+
+/// 畸形：库序号 7，但样本只链接了 2 个 dylib —— 必须报错而不是静默索引。
+#[must_use]
+pub fn malformed_chained_ordinal_out_of_range() -> Vec<u8> {
+    let (symbols, offsets) = symbol_pool(&["_x"]);
+    let spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT)
+        .pool(symbols, minimal_starts_in_image(3))
+        .import(ChainedImportSpec {
+            lib_ordinal: 7,
+            weak_import: false,
+            name_offset: offsets[0],
+            addend: 0,
+        });
+    chained_image(&build_chained_fixups(&spec)).bytes
 }

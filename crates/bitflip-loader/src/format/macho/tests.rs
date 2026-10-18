@@ -1046,3 +1046,185 @@ fn a_bind_do_bind_without_a_symbol_is_rejected() {
         "{error}"
     );
 }
+
+// ── LC_DYLD_CHAINED_FIXUPS 的导入表（chained.rs） ────────────────────────────
+//
+// 样本按 `mach-o/fixup-chains.h` 拼在 fixture 里（位域布局与偏移那里有出处）。
+// 这一组只验证"导入表解出来的东西对不对"，**不**验证指针链（本片没有走链）。
+
+#[test]
+fn chained_fixup_imports_resolve_libraries_weakness_and_specials() {
+    let image = fixture::demo_chained_fixups64();
+    let file = read(&image.bytes).expect("合成样本必须能解析");
+    let fixups = file
+        .chained_fixups
+        .as_ref()
+        .expect("样本里有 LC_DYLD_CHAINED_FIXUPS");
+
+    assert_eq!(fixups.imports_format, fixture::DYLD_CHAINED_IMPORT);
+    assert_eq!(fixups.symbols_format, fixture::SYMBOLS_FORMAT_UNCOMPRESSED);
+    assert_eq!(fixups.imports_count, 4);
+    assert!(fixups.has_starts(), "样本的 starts_offset 指向链描述");
+
+    let names: Vec<&str> = fixups
+        .imports
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "_objc_msgSend",
+            "_UIApplicationMain",
+            "_dispatch_async",
+            "_mainRef"
+        ],
+        "导入顺序就是表里的顺序；名字来自符号池"
+    );
+
+    // 库序号 1 = 第一条 LC_LOAD_DYLIB，2 = 第二条（1 基，与 bind 流同一套编号）。
+    assert_eq!(fixups.imports[0].dylib, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(
+        fixups.imports[1].dylib,
+        "/System/Library/Frameworks/UIKit.framework/UIKit"
+    );
+    assert!(fixups.imports[1].weak_import, "weak_import 是 bit 8");
+    assert!(!fixups.imports[0].weak_import);
+
+    // 0xFF 是 8 位二补码的 -1 = 主可执行文件。**不许**当成第 255 个库去索引。
+    assert_eq!(fixups.imports[3].lib_ordinal, 0xFF);
+    assert_eq!(fixups.imports[3].dylib, "<main-executable>");
+
+    assert_eq!(
+        fixups.imports[0].addend, None,
+        "imports_format 1 的表里**没有** addend 字段 —— None 是\"文件里没写\""
+    );
+}
+
+#[test]
+fn chained_import_addend_formats_carry_their_addend() {
+    // imports_format = 2：u32 位域 + int32_t（有符号）。
+    let image = fixture::demo_chained_addend64();
+    let file = read(&image.bytes).expect("format 2 样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    assert_eq!(fixups.imports_format, fixture::DYLD_CHAINED_IMPORT_ADDEND);
+    assert_eq!(fixups.imports.len(), 2);
+    assert_eq!(fixups.imports[0].addend, Some(-4), "int32_t 按二补码解");
+    assert_eq!(fixups.imports[1].addend, Some(0x20));
+    assert!(fixups.imports[1].weak_import);
+
+    // imports_format = 3：u64 位域（库序号 16 位）+ uint64_t 加数。
+    let image = fixture::demo_chained_addend64_wide();
+    let file = read(&image.bytes).expect("format 3 样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    assert_eq!(fixups.imports_format, fixture::DYLD_CHAINED_IMPORT_ADDEND64);
+    assert_eq!(fixups.imports[0].addend, Some(0x100));
+    assert_eq!(
+        fixups.imports[0].dylib, "/System/Library/Frameworks/UIKit.framework/UIKit",
+        "16 位库序号的解析规则与 8 位相同"
+    );
+}
+
+#[test]
+fn chained_imports_reach_the_object_model_without_addresses() {
+    let image = fixture::demo_chained_fixups64();
+    let object = parse_bytes(&image.bytes).expect("能解析");
+
+    assert_eq!(object.imports.len(), 4, "4 条链式修复导入进了对象模型");
+    let msg_send = object
+        .imports
+        .iter()
+        .find(|item| item.name.as_deref() == Some("_objc_msgSend"))
+        .expect("有 _objc_msgSend");
+    assert_eq!(msg_send.module, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(
+        msg_send.iat_slot, None,
+        "没有走指针链就没有地址：None 是\"未知\"，0 会变成一条假地址（§7）"
+    );
+    assert_eq!(msg_send.ordinal, None, "库序号不是\"导入符号的序号\"");
+
+    let joined = object.notes.join("\n");
+    assert!(
+        joined.contains("已解析 LC_DYLD_CHAINED_FIXUPS"),
+        "notes 必须说清导入表解出来了：{joined}"
+    );
+    assert!(
+        joined.contains("weak_import"),
+        "weak 在 Import 里没有字段，必须写进 notes：{joined}"
+    );
+    assert!(
+        joined.contains("没有走链"),
+        "notes 必须说明指针链没走、地址未知：{joined}"
+    );
+    assert!(
+        joined.contains("没有 LC_DYLD_INFO"),
+        "没有经典 bind 流这件事也要说：{joined}"
+    );
+}
+
+#[test]
+fn a_chained_import_format_that_is_unknown_is_rejected() {
+    let bytes = fixture::malformed_chained_imports_format();
+    let error = read(&bytes).expect_err("imports_format = 9 必须拒绝");
+    assert!(matches!(error, ParseError::Inconsistent(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("imports_format = 9"), "{message}");
+    assert!(message.contains("不猜"), "{message}");
+}
+
+#[test]
+fn a_chained_name_offset_outside_the_symbol_pool_is_rejected() {
+    let bytes = fixture::malformed_chained_name_offset_outside_pool();
+    let error = read(&bytes).expect_err("name_offset 越界必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("name_offset"), "{message}");
+    assert!(message.contains("符号池"), "{message}");
+}
+
+#[test]
+fn a_chained_zlib_symbol_pool_is_not_supported() {
+    let bytes = fixture::malformed_chained_symbols_zlib();
+    let error = read(&bytes).expect_err("symbols_format = 1 必须明确报\"暂不支持\"");
+    assert!(
+        matches!(error, ParseError::NotSupported { .. }),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("zlib"), "{message}");
+}
+
+#[test]
+fn a_truncated_chained_fixups_header_is_rejected() {
+    let bytes = fixture::malformed_chained_truncated_header();
+    let error = read(&bytes).expect_err("12 字节的 payload 装不下 28 字节的头");
+    match error {
+        ParseError::Truncated {
+            what,
+            needed,
+            actual,
+        } => {
+            assert_eq!(what, "dyld_chained_fixups_header");
+            assert_eq!(needed, 28);
+            assert_eq!(actual, 12);
+        }
+        other => panic!("期望 Truncated，实际是 {other:?}"),
+    }
+}
+
+#[test]
+fn a_chained_imports_count_past_the_payload_is_rejected() {
+    let bytes = fixture::malformed_chained_imports_count_past_payload();
+    let error = read(&bytes).expect_err("imports_count = 64 但只有 1 条必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("链式修复导入表"), "{message}");
+    assert!(message.contains("超出 payload"), "{message}");
+}
+
+#[test]
+fn a_chained_ordinal_out_of_range_is_rejected() {
+    let bytes = fixture::malformed_chained_ordinal_out_of_range();
+    let error = read(&bytes).expect_err("库序号 7 超过 2 个 dylib 必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("lib_ordinal = 7"), "{message}");
+    assert!(message.contains("只有 2 条"), "{message}");
+}

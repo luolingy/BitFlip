@@ -338,10 +338,11 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
         facts.stab_symbols,
         facts.symbols.len()
     );
-    // 导入表从 M12 第五片起**真的会解析**：有 dyld 绑定流（bind / lazy_bind）就必须
-    // 解出导入；没有就必须为空、且 notes 说清是哪一种"没有"（新版二进制走
-    // LC_DYLD_CHAINED_FIXUPS，本片不解析那条路）。空与不空各自有说法（§7）。
-    // 具体计数由 `real_binaries_report_exports_and_imports` 打印并把关。
+    // 导入表从 M12 第五片起**真的会解析**：有 dyld 绑定流（bind / lazy_bind）就解它；
+    // 没有经典绑定流时，新版产物（LC_DYLD_CHAINED_FIXUPS）的**导入表**是第六片的来源 ——
+    // 两者都没有才允许为空，且 notes 必须说清是哪一种"没有"（§7）。
+    // 具体计数由 `real_binaries_report_exports_and_imports` 与
+    // `real_binaries_report_chained_fixup_imports` 打印并把关。
     let has_bind_data = facts
         .dyld_info
         .is_some_and(|info| info.bind_size > 0 || info.lazy_bind_size > 0);
@@ -351,19 +352,28 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
             "主二进制有非空的 bind / lazy_bind 流，却一条导入都没解出来"
         );
     } else {
-        assert!(
-            object.imports.is_empty(),
-            "没有可解的绑定数据却解出了 {} 条导入",
-            object.imports.len()
+        // 没有经典绑定流：导入只能来自链式修复的导入表。
+        let chained_imports = facts
+            .chained_fixups
+            .as_ref()
+            .map_or(0, |fixups| fixups.imports.len());
+        assert_eq!(
+            object.imports.len(),
+            chained_imports,
+            "没有 bind 流时 Object.imports 应当正好等于链式修复导入表的条数（实际 {} vs 链式 {}）",
+            object.imports.len(),
+            chained_imports
         );
-        assert!(
-            object
-                .notes
-                .iter()
-                .any(|note| note.contains("LC_DYLD_INFO")),
-            "导入为空时必须说明原因（没有这条命令 / 流是空的 / 没解析链式修复）：{:?}",
-            object.notes
-        );
+        if chained_imports == 0 {
+            assert!(
+                object
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("LC_DYLD_INFO")),
+                "导入为空时必须说明原因（没有这两种数据 / 表里写着 0 条）：{:?}",
+                object.notes
+            );
+        }
     }
     // 导出 trie：两种承载命令都认；有表就得解出东西，没表也要说明。
     assert!(
@@ -648,17 +658,19 @@ fn measure_dyld(path: &std::path::Path) -> DyldCounts {
     }
 }
 
-/// 四份真实 IPA：导出 trie 与 dyld 绑定的计数必须自洽，且与命令组合对得上。
+/// 四份真实 IPA：导出 trie 与**经典 dyld 绑定流**的计数必须自洽。
 ///
 /// 这条测试要回答的问题（也是交付报告里那张表的来源）：
 ///
-/// * 新版 Xcode 产物（`LC_DYLD_CHAINED_FIXUPS` + `LC_DYLD_EXPORTS_TRIE`）导出照解、
-///   导入如实为空 —— 空得有理由，而不是"解析没跑"；
+/// * 新版 Xcode 产物（`LC_DYLD_CHAINED_FIXUPS` + `LC_DYLD_EXPORTS_TRIE`）导出照解，
+///   `LC_DYLD_INFO` 的 bind 段**整条不存在** —— 这里打印的"普通 / 惰性导入"因此是 0；
+///   它们的导入由链式修复的导入表提供，计数在
+///   `real_binaries_report_chained_fixup_imports` 里（两条测试分开，才说得清
+///   "这份文件没写这种数据"与"表没解出来"）。
 /// * 旧式产物（`LC_DYLD_INFO_ONLY`）才是导入数成百上千的那一类。
 ///
-/// 提示里"SideStore 链接 79 个 dylib，导入应当上百"这个预期**被实测否定**了：
-/// 它用的是链式修复，本片不解析那条路，所以它的导入是 0（notes 里写明原因）。
-/// 有绑定流的 PojavLauncher 才是 1 382 + 165 = 1 547 条导入的那一份。
+/// PojavLauncher 是 1 382 + 165 = 1 547 条经典绑定的那一份；SideStore / LiveContainer /
+/// Stapxs 的经典绑定是 0，但链式修复导入表不是 0。
 #[test]
 #[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
 fn real_binaries_report_exports_and_imports() {
@@ -714,12 +726,12 @@ fn real_binaries_report_exports_and_imports() {
 
         let imports = row.imports_regular + row.imports_lazy;
         if imports == 0 {
-            // 空得有理由：要么根本没有 LC_DYLD_INFO（新版走链式修复），要么它的
-            // 绑定流是空的 —— 两种情形 notes 里说得不一样，所以这里只打印实际值，
-            // 让"0 条导入"在报告里带着原因出现，而不是一个孤零零的 0。
+            // 经典绑定为 0 有理由：要么根本没有 LC_DYLD_INFO（新版走链式修复，
+            // 导入由新测试计数），要么它的绑定流是空的 —— 两种情形 notes 里说得
+            // 不一样，所以这里打印实际值，让"0 条经典绑定"带着原因出现。
             eprintln!(
-                "{}：导入为 0（LC_DYLD_INFO = {}；链式修复说明 = {}）—— 这是文件里的事实，\
-                 不是解析没跑",
+                "{}：经典绑定导入为 0（LC_DYLD_INFO = {}；链式修复说明 = {}）—— 链式修复导入\
+                 表的计数见 real_binaries_report_chained_fixup_imports",
                 row.name,
                 if row.has_dyld_info { "有" } else { "无" },
                 if row.notes_mention_chained_fixups {
@@ -742,6 +754,205 @@ fn real_binaries_report_exports_and_imports() {
                 row.name,
                 row.import_libraries,
                 row.dylibs
+            );
+        }
+    }
+}
+
+/// 一份真实样本的**链式修复导入表**计数（第八片交付报告里那张表的来源）。
+#[derive(Debug)]
+struct ChainedCounts {
+    /// 样本文件名。
+    name: String,
+    /// 主二进制解压后多少字节。
+    binary_bytes: usize,
+    /// 链接的 dylib 条数。
+    dylibs: usize,
+    /// 有没有 `LC_DYLD_CHAINED_FIXUPS`。
+    has_chained_fixups: bool,
+    /// `imports_format`（1 / 2 / 3）。没有这条命令时是 `None`。
+    imports_format: Option<u32>,
+    /// 链式修复导入表解出多少条。
+    chained_imports: usize,
+    /// 其中 `weak_import` 的条数。
+    weak: usize,
+    /// 其中带 addend 的条数。
+    with_addend: usize,
+    /// 去重后的被导入库数（含 `<main-executable>` 这类标签）。
+    libraries: usize,
+    /// 经典 bind 流的导入条数（老格式样本用）。
+    bind_imports: usize,
+    /// notes 里提到 `LC_DYLD_CHAINED_FIXUPS` 了吗。
+    notes_mention_chained: bool,
+    /// notes 里说"已解析 dyld 绑定"了吗（老格式样本要用）。
+    notes_mention_bind_imports: bool,
+    /// 前几条（名字, 库），给人按 `nm` 风格的常识核对。
+    head: Vec<(String, String)>,
+}
+
+fn measure_chained(path: &std::path::Path) -> ChainedCounts {
+    let ipa =
+        std::fs::read(path).unwrap_or_else(|error| panic!("读不到 {}：{error}", path.display()));
+    let listing = zip::list_members(&ipa)
+        .unwrap_or_else(|error| panic!("IPA 应当是能列成员的 ZIP：{}", error.summary_zh()));
+    let (_index, _name, binary) = pick_main_binary(&ipa, &listing);
+    let (_how, facts, object) = parse_one_image(&binary);
+    let joined = object.notes.join("\n");
+
+    let fixups = facts.chained_fixups.as_ref();
+    let mut libraries = std::collections::BTreeSet::new();
+    let mut weak = 0usize;
+    let mut with_addend = 0usize;
+    let mut head = Vec::new();
+    if let Some(fixups) = fixups {
+        for import in &fixups.imports {
+            libraries.insert(import.dylib.clone());
+            if import.weak_import {
+                weak += 1;
+            }
+            if import.addend.is_some() {
+                with_addend += 1;
+            }
+            if head.len() < 5 {
+                head.push((import.name.clone(), import.dylib.clone()));
+            }
+        }
+    }
+
+    ChainedCounts {
+        name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        binary_bytes: binary.len(),
+        dylibs: facts.dylibs.len(),
+        has_chained_fixups: fixups.is_some(),
+        imports_format: fixups.map(|fixups| fixups.imports_format),
+        chained_imports: fixups.map_or(0, |fixups| fixups.imports.len()),
+        weak,
+        with_addend,
+        libraries: libraries.len(),
+        bind_imports: facts.imports.len(),
+        notes_mention_chained: joined.contains("LC_DYLD_CHAINED_FIXUPS"),
+        notes_mention_bind_imports: joined.contains("已解析 dyld 绑定"),
+        head,
+    }
+}
+
+/// 四份真实 IPA：链式修复的**导入表**必须解出真实的导入集。
+///
+/// 这条测试回答的问题：
+///
+/// * 新版产物（`LC_DYLD_CHAINED_FIXUPS` 而没有 `LC_DYLD_INFO`）此前 `Object.imports`
+///   恒空（"绑定在链式修复里，没解"）。现在它应当给出真实的导入集；
+/// * `LiveContainer`（151 KB 的启动器壳子）应当只有少量导入；
+/// * `SideStore`（19.6 MB、79 个 dylib）应当是**上百条**；
+/// * 老格式的 PojavLauncher 仍走 bind 流，链式修复那边为空 —— 两种写法都要能说清。
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_binaries_report_chained_fixup_imports() {
+    let paths = all_sample_paths();
+    let counts: Vec<ChainedCounts> = paths.iter().map(|path| measure_chained(path)).collect();
+
+    eprintln!(
+        "{:<44} {:>10} {:>6} {:>8} {:>8} {:>8} {:>6} {:>6} {:>6} {:>8}",
+        "样本",
+        "二进制字节",
+        "dylib",
+        "chained",
+        "format",
+        "链式导入",
+        "weak",
+        "addend",
+        "库数",
+        "bind导入"
+    );
+    for row in &counts {
+        eprintln!(
+            "{:<44} {:>10} {:>6} {:>8} {:>8} {:>8} {:>6} {:>6} {:>6} {:>8}",
+            row.name,
+            row.binary_bytes,
+            row.dylibs,
+            if row.has_chained_fixups { "有" } else { "无" },
+            row.imports_format
+                .map_or_else(|| "-".to_string(), |format| format.to_string()),
+            row.chained_imports,
+            row.weak,
+            row.with_addend,
+            row.libraries,
+            row.bind_imports
+        );
+        for (name, library) in &row.head {
+            eprintln!("    {name:<40} ← {library}");
+        }
+    }
+
+    for row in &counts {
+        assert!(
+            row.dylibs > 0,
+            "{}：真实的 iOS 应用不可能不带 dylib（否则库序号无从解析）",
+            row.name
+        );
+
+        if row.has_chained_fixups {
+            assert!(
+                matches!(row.imports_format, Some(1..=3)),
+                "{}：imports_format 只可能是 1 / 2 / 3，实际 {:?}",
+                row.name,
+                row.imports_format
+            );
+            assert!(
+                row.notes_mention_chained,
+                "{}：解了链式修复的导入表，notes 就必须说出来",
+                row.name
+            );
+            // 有链式修复、有 dylib 的真实 app 二进制不可能一条导入都没有：
+            // 那样它连 dyld 的 stub 都填不上。0 只会是"表没解出来"。
+            assert!(
+                row.chained_imports > 0,
+                "{}：有 LC_DYLD_CHAINED_FIXUPS（imports_format = {:?}）却 0 条导入 —— \
+                 imports 段或符号池没解对，这不是\"这个程序没有导入\"",
+                row.name,
+                row.imports_format
+            );
+            assert!(
+                row.libraries <= row.dylibs + 3,
+                "{}：被导入的库({}) 比链接的 dylib({}) 多出 3 个以上 —— 库序号解析错位了",
+                row.name,
+                row.libraries,
+                row.dylibs
+            );
+        } else {
+            // 老格式：链式修复那边没有，导入只能来自 bind 流。
+            assert!(
+                row.bind_imports > 0,
+                "{}：没有 LC_DYLD_CHAINED_FIXUPS 也没有 bind 导入 —— 两种写法都没解出来",
+                row.name
+            );
+            assert!(
+                row.notes_mention_bind_imports,
+                "{}：bind 流解出了 {} 条导入，notes 就必须说\"已解析 dyld 绑定\"",
+                row.name, row.bind_imports
+            );
+        }
+
+        // 下限按样本点名（提示里给的期望：LiveContainer 小、SideStore 上百）。
+        // 不是"把标准降到零"：个位数仍然会红，而那正是"表没解出来"的样子。
+        if row.name.starts_with("LiveContainer") {
+            assert!(
+                row.chained_imports >= 20,
+                "LiveContainer（{} 字节）的链式修复导入只有 {} 条：151 KB 的启动器壳子也不该这么少",
+                row.binary_bytes,
+                row.chained_imports
+            );
+        }
+        if row.name.starts_with("SideStore") {
+            assert!(
+                row.chained_imports >= 100,
+                "SideStore（{} 字节、{} 个 dylib）的链式修复导入只有 {} 条：预期是上百条",
+                row.binary_bytes,
+                row.dylibs,
+                row.chained_imports
             );
         }
     }
