@@ -123,14 +123,28 @@ pub fn infer_args(
     arg_regs: &[RegId],
     abi: &AbiSpec,
 ) -> ArgInference {
+    // 栈指针 / 帧指针的编号在这里解一次。
+    //
+    // AbiSpec::reg_id 每次调用都会新建一个 capstone 引擎再线性扫寄存器名
+    // （实测单次约 300 µs）。批量入口 [infer_args_all] 按函数调用本函数时，
+    // 如果在循环体里现查，5000 个函数上就是 2 秒多 —— 所以在批量入口解一次、
+    // 传进来。单函数入口保持原样：它只解一次，成本可以忽略。
+    let sp_id = abi.reg_id(abi.stack_pointer_name);
+    let fp_id = abi.frame_pointer_name.and_then(|n| abi.reg_id(n));
+    infer_args_with_ids(entry, insns, arg_regs, sp_id, fp_id)
+}
+
+/// 与 [infer_args] 相同，但栈指针/帧指针的编号由调用方解析好。
+fn infer_args_with_ids(
+    entry: u64,
+    insns: &[DecodedInsn],
+    arg_regs: &[RegId],
+    sp_id: Option<RegId>,
+    fp_id: Option<RegId>,
+) -> ArgInference {
     // 每个参数寄存器是否还是"活的入参"（还没被写过）
     let mut still_live: Vec<bool> = vec![true; arg_regs.len()];
     let mut used: BTreeSet<usize> = BTreeSet::new();
-
-    let stack_pointer = abi.stack_pointer_name;
-    let frame_pointer = abi.frame_pointer_name;
-    let sp_id = abi.reg_id(stack_pointer);
-    let fp_id = frame_pointer.and_then(|n| abi.reg_id(n));
 
     let mut reads_stack_args = false;
 
@@ -230,6 +244,15 @@ pub fn infer_args_all(
     let mut sorted: Vec<InsnRange> = functions.to_vec();
     sorted.sort_by_key(|f| f.start);
 
+    // 栈指针 / 帧指针的编号**在这里解一次**，而不是每个函数现查一次。
+    //
+    // 这一条是实测出来的：`AbiSpec::reg_id` 每次调用都会新建一个 capstone 引擎
+    // 再线性扫到该架构的寄存器编号上界，单次约 300 µs。按函数现查 = 每函数两次，
+    // 5000 个函数上 2.2 秒（合成样本实测），151 KB 的真实样本上 199 ms —— 而这
+    // 两个编号在整个批次里是常量。
+    let sp_id = abi.reg_id(abi.stack_pointer_name);
+    let fp_id = abi.frame_pointer_name.and_then(|n| abi.reg_id(n));
+
     let mut out: Vec<ArgInference> = Vec::with_capacity(sorted.len());
     let mut idx = 0usize;
 
@@ -247,7 +270,13 @@ pub fn infer_args_all(
         while idx < insns.len() && insns[idx].addr < limit {
             idx += 1;
         }
-        out.push(infer_args(f.start, &insns[begin..idx], arg_regs, abi));
+        out.push(infer_args_with_ids(
+            f.start,
+            &insns[begin..idx],
+            arg_regs,
+            sp_id,
+            fp_id,
+        ));
     }
 
     out
