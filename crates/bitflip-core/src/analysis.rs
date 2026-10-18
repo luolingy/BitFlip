@@ -28,6 +28,86 @@ use serde::{Deserialize, Serialize};
 
 use crate::disasm::{hex16, parse_address, Disasm};
 
+/// 分阶段计时（`BITFLIP_TIMING=1` 时才开）。
+///
+/// # 为什么留在代码里而不是测完删掉
+///
+/// "这次分析为什么慢"是个会反复出现的问题（151 KB 的真实样本一度要 49 秒）。
+/// 临时打点一旦删掉，下一个人就得从头再测一遍，而结论没法复核。所以它常驻，
+/// 默认关闭、只写 stderr、**不进任何 wire 结构**（不影响响应与黄金快照）。
+#[cfg(debug_assertions)]
+mod timing {
+    use std::time::Instant;
+
+    /// 一个阶段（标签 + 距上一阶段的微秒数）。
+    pub struct Stages {
+        enabled: bool,
+        origin: Instant,
+        last: Instant,
+        marks: Vec<(&'static str, u128)>,
+    }
+
+    impl Stages {
+        pub fn new() -> Self {
+            let enabled = std::env::var_os("BITFLIP_TIMING").is_some();
+            let now = Instant::now();
+            Self {
+                enabled,
+                origin: now,
+                last: now,
+                marks: Vec::new(),
+            }
+        }
+
+        /// 记一个阶段边界。关闭时只是一次分支预测，不留开销。
+        #[inline]
+        pub fn mark(&mut self, label: &'static str) {
+            if !self.enabled {
+                return;
+            }
+            let now = Instant::now();
+            self.marks.push((label, (now - self.last).as_micros()));
+            self.last = now;
+        }
+
+        /// 打表。合计分两行：打点覆盖到的与 `build` 全程（差额是打点之间的事务）。
+        pub fn report(&self) {
+            if !self.enabled {
+                return;
+            }
+            eprintln!("[BITFLIP_TIMING] TargetAnalysis::build 分阶段（µs）:");
+            let mut covered = 0u128;
+            for (label, micros) in &self.marks {
+                covered += *micros;
+                eprintln!("  {label:<34} {micros:>10}");
+            }
+            eprintln!("  {:<34} {covered:>10}", "合计（打点覆盖）");
+            eprintln!(
+                "  {:<34} {:>10}",
+                "合计（build 全程）",
+                self.origin.elapsed().as_micros()
+            );
+        }
+    }
+}
+
+/// 未开 `debug_assertions` 时的空实现（发布构建里连环境变量都不读）。
+#[cfg(not(debug_assertions))]
+mod timing {
+    pub struct Stages;
+
+    impl Stages {
+        pub fn new() -> Self {
+            Self
+        }
+
+        #[inline]
+        pub fn mark(&mut self, _label: &'static str) {}
+
+        pub fn report(&self) {}
+    }
+}
+
 /// wire 格式版本。
 pub const ANALYSIS_FORMAT_VERSION: u32 = 1;
 
@@ -659,6 +739,7 @@ impl TargetAnalysis {
         debug: Option<&DebugInfo>,
     ) -> Self {
         let mut notes = Vec::new();
+        let mut timing = timing::Stages::new();
 
         // ── 函数候选收集（多来源）──
         let mut by_addr: HashMap<u64, Vec<SymbolCandidate>> = HashMap::new();
@@ -798,6 +879,25 @@ impl TargetAnalysis {
             }
         }
 
+        timing.mark("来源1-3.5 符号/导出/展开/起点/入口");
+
+        // ── 指令索引只解码一遍 ──
+        //
+        // 在此之前，这条流水线为了拿到逐条指令的 `flow`/目标/操作数，在**八处**
+        // 各自把整个索引重解一遍（来源4、导入桩、xref 提取、跳转表候选、数据/代码
+        // 判定、调用图、常量/结构体、参数推断、栈帧）。它们的输入完全相同：同一个
+        // 稀疏索引、同一个解码器、同一份字节。实测（LiveContainer 151 KB，debug
+        // 构建）每解一遍约 430 ms，八遍就是全部 6.4 秒里的 3.0 秒。
+        //
+        // 只解一遍，把切片发给各阶段。**峰值内存不变差**：`decode_indexed_insns`
+        // 本来就要物化一整份 `Vec<DecodedInsn>`（它最后那次调用时，函数/xref/CFG
+        // 都已经在了），这里只是让同一份物化活得更久，不是多一份。
+        //
+        // 逐条指令仍然**不缓存文本**：`DecodedInsn` 只有编号与结构化操作数，
+        // 渲染/字符串留在按需查询那一侧（CLAUDE.md §4）。
+        let decoded = decode_indexed_insns(disasm);
+        timing.mark("解码指令索引（唯一一遍）");
+
         // 来源 4：递归下降证明可达的 call 直接目标。
         // 流式：一次解码一条，立刻归约。linear_only 的 call 不算种子 ——
         // 线性扫描会把数据当指令，它的"调用目标"是伪影。
@@ -807,13 +907,8 @@ impl TargetAnalysis {
         // "函数 300340 个" 但 "521869 个函数仅来自调用目标推断" 这种
         // 自相矛盾的结论 —— 数字比总数还大，只会让用户不再相信任何数字。
         let mut call_targets: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for (addr, len) in disasm.index.range(0, u64::MAX) {
-            let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
-                continue;
-            };
-            let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
-                continue;
-            };
+        for insn in &decoded {
+            let addr = insn.addr;
             if insn.flow == Flow::Call && disasm.coverage.is_reachable(addr) {
                 let Some(target) = insn.target else {
                     continue;
@@ -828,6 +923,7 @@ impl TargetAnalysis {
             }
         }
         let call_target_count = call_targets.len();
+        timing.mark("来源4 调用目标（全索引解码）");
 
         // 来源 5：导入桩（import thunk）。
         //
@@ -853,17 +949,12 @@ impl TargetAnalysis {
                     .to_string(),
             );
         } else {
-            for (addr, len) in disasm.index.range(0, u64::MAX) {
+            for insn in &decoded {
+                let addr = insn.addr;
                 // 只对"未识别"的位置找桩：已经认出来的函数不用改来源
                 if by_addr.contains_key(&addr) {
                     continue;
                 }
-                let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
-                    continue;
-                };
-                let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
-                    continue;
-                };
                 // 桩的第一条：无条件跳转，且目标未知（间接 —— 走 IAT）
                 if !matches!(insn.flow, Flow::Branch { conditional: false }) {
                     continue;
@@ -1268,8 +1359,9 @@ impl TargetAnalysis {
         notes.push(format!(
             "编译器内置模式库：1 条判据（GCC x64 逐页栈探测助手 ___chkstk_ms），命中 {builtin_hits} 个函数"
         ));
+        timing.mark("来源5-9 桩/PLT/重定位/调试/签名/内置");
+
         // ── xref 提取（与候选收集同一遍流式解码）──
-        //
         // 每条引用带两个元数据字段（M6 交付物 7）：
         // - `reachable`：发起指令是否被递归下降证明可达。线性扫描会把
         //   数据误认成指令，那条"指令"解出的引用可能是伪影 —— 这是
@@ -1279,14 +1371,8 @@ impl TargetAnalysis {
         let mut xrefs: Vec<XrefWire> = Vec::new();
         let mut xref_by_from: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut xref_by_to: HashMap<u64, Vec<usize>> = HashMap::new();
-        for (addr, len) in disasm.index.range(0, u64::MAX) {
-            let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
-                continue;
-            };
-            let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
-                continue;
-            };
-            for x in bitflip_analyze::xrefs_of(&insn) {
+        for insn in &decoded {
+            for x in bitflip_analyze::xrefs_of(insn) {
                 let idx = xrefs.len();
                 xref_by_from.entry(x.from).or_default().push(idx);
                 xref_by_to.entry(x.to).or_default().push(idx);
@@ -1307,6 +1393,8 @@ impl TargetAnalysis {
                 });
             }
         }
+
+        timing.mark("xref 提取（全索引解码）");
 
         // ── 合并候选 → 函数结论 ──
         let mut addrs: Vec<u64> = by_addr.keys().copied().collect();
@@ -1347,6 +1435,8 @@ impl TargetAnalysis {
                 "有 {call_target_count} 个函数仅来自调用目标推断（无符号/展开表佐证），没有边界与名字"
             ));
         }
+
+        timing.mark("合并候选→函数");
 
         // ── 推导边界与已知起点的矛盾（只在函数起点表存在时检查）──
         //
@@ -1392,6 +1482,8 @@ impl TargetAnalysis {
                 ));
             }
         }
+
+        timing.mark("重叠检查");
 
         // ── 字符串提取（流式，分块）──
         let mut strings: Vec<StringWire> = Vec::new();
@@ -1449,6 +1541,8 @@ impl TargetAnalysis {
         }
         strings.sort_by_key(|s| u64::from_str_radix(&s.address, 16).unwrap_or(0));
 
+        timing.mark("字符串提取");
+
         // ── 基本块 / CFG（M5）──
         //
         // 逐函数建图。函数的 `end` 可能未知（只有入口）：此时**不猜边界**，
@@ -1456,15 +1550,19 @@ impl TargetAnalysis {
         //
         // 注意顺序：CFG 在跳转表**之前**建。跳转表识别的产物是"某条间接
         // 跳转的后继有哪些"，它要回填进 CFG —— 所以先有图，再有边。
-        let cfg_by_function = build_cfgs(disasm, &functions, &mut notes);
+        let cfg_by_function = build_cfgs(decoded.as_slice(), &functions, &mut notes);
+
+        timing.mark("逐函数 CFG");
 
         // ── 跳转表 / switch（M6）──
         //
         // 只在**已索引**的指令上找间接跳转。验证"目标处能解出指令"用
         // 同一个解码器 —— 换一个判定标准会让"能解出"与"被索引"不一致，
         // 于是表目标落在索引之外，回填边时又会丢掉它们。
-        let jump_tables =
-            scan_jump_tables(&disasm.space, &indirect_jump_candidates(disasm), |addr| {
+        let jump_tables = scan_jump_tables(
+            &disasm.space,
+            &indirect_jump_candidates(disasm, &decoded),
+            |addr| {
                 // 目标必须是一条**已索引指令的起点**，而不是"临时解码
                 // 试试看能不能解出点什么"。
                 //
@@ -1480,8 +1578,11 @@ impl TargetAnalysis {
                     .index()
                     .containing(addr)
                     .is_some_and(|(start, _)| start == addr)
-            });
+            },
+        );
         notes.extend(jump_tables.notes.iter().cloned());
+
+        timing.mark("跳转表识别");
 
         // 把跳转表目标**回填进 CFG**。
         //
@@ -1495,6 +1596,8 @@ impl TargetAnalysis {
                 "已把 {backfilled} 条跳转表目标边加入 CFG（间接跳转的后继）"
             ));
         }
+
+        timing.mark("回填 CFG 边");
 
         // 把跳转表目标**回填进 xref 表**（M6 交付物 7：来源可区分）。
         //
@@ -1546,37 +1649,53 @@ impl TargetAnalysis {
             ));
         }
 
+        timing.mark("回填 xref 表");
+
         // 数据/代码判定（M6）。
         //
         // 对**代表性地址**做判定而不是全部：统计分布用抽样，逐地址
         // 判定交给 `/api/code-map` 按需算。全量物化会让这份结构比目标
         // 本身还大（CLAUDE.md §4）。
-        let code_map = build_code_map(disasm, &functions, &mut notes);
+        let code_map = build_code_map(disasm, decoded.as_slice(), &functions, &mut notes);
+
+        timing.mark("数据/代码判定");
 
         // 调用图（M6）：CFG 之外的另一张图 —— 函数之间谁调用谁。
-        let (call_graph, call_graph_raw) = build_call_graph_wire(disasm, &functions, &mut notes);
+        let (call_graph, call_graph_raw) =
+            build_call_graph_wire(decoded.as_slice(), &functions, &mut notes);
+
+        timing.mark("调用图");
 
         // 常量/结构体初步（M6）：字符串引用聚合、内存访问步长、立即数画像。
-        let const_scan = build_const_scan(disasm, &strings, &functions, &mut notes);
+        let const_scan = build_const_scan(decoded.as_slice(), &strings, &functions, &mut notes);
+
+        timing.mark("常量/结构体");
 
         // 调用约定与参数推断（M6）。需要知道目标是 PE 还是 ELF 才能选对
         // x86_64 的两套约定（前四个参数寄存器完全不同），所以按对象
         // 格式判定，不按文件扩展名猜。
         let arg_scan = build_arg_scan(
             disasm,
+            decoded.as_slice(),
             &functions,
             &mut notes,
             object.kind == bitflip_loader::ObjectKind::Pe,
         );
 
+        timing.mark("参数推断");
+
         // 栈帧与局部变量视图（M6）：展开信息 + 前导扫描，两边交叉核对。
         let frame_scan = build_frame_scan(
             disasm,
+            decoded.as_slice(),
             &functions,
             &object.unwind,
             &mut notes,
             object.kind == bitflip_loader::ObjectKind::Pe,
         );
+
+        timing.mark("栈帧扫描");
+        timing.report();
 
         Self {
             functions,
@@ -1942,21 +2061,19 @@ fn parse_hex(s: &str) -> Option<u64> {
 /// 为什么不在整个索引上扫：跳转表识别对每条间接跳转都要向前回溯并
 /// 试读表格，全量扫描在大样本（几十万条间接跳转）上开销可观。先做一次
 /// O(n) 的过滤拿到候选，只对候选附近取指令，代价就与表数成正比。
-fn indirect_jump_candidates(disasm: &Disasm) -> Vec<bitflip_arch::DecodedInsn> {
+fn indirect_jump_candidates(
+    disasm: &Disasm,
+    insns: &[bitflip_arch::DecodedInsn],
+) -> Vec<bitflip_arch::DecodedInsn> {
     let space = &disasm.space;
     let index = &disasm.index;
 
-    // 先把所有间接跳转的地址找出来。
+    // 先把所有间接跳转的地址找出来。用**已经解好的那一遍**（调用方已经拿着
+    // 同一份 `Vec<DecodedInsn>`），不再为这一件事重解整个索引。
     let mut jumps: Vec<u64> = Vec::new();
-    for (addr, len) in index.range(0, u64::MAX) {
-        let Some(bytes) = space.read(addr, usize::from(len)) else {
-            continue;
-        };
-        let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) else {
-            continue;
-        };
+    for insn in insns {
         if matches!(insn.flow, bitflip_arch::Flow::Branch { .. }) && insn.target.is_none() {
-            jumps.push(addr);
+            jumps.push(insn.addr);
         }
     }
     if jumps.is_empty() {
@@ -2083,26 +2200,22 @@ fn backfill_jump_table_edges(
     added
 }
 
-/// 构建调用图的 wire 表示（M6）。
+/// 解码指令索引里的**全部**指令（整份分析只做这一次）。
 ///
-/// # 为什么要在有 `Disasm` 的前提下重扫一遍指令
+/// # 为什么只做一次
 ///
-/// `AnalysisFacts` 那套抽样是为**统计**服务的；调用图需要**全部** call
-/// 指令。所以这里走一遍指令索引 —— 索引只有 `(地址, 长度)`，指令本身
-/// 要重新解码。这是本项目一贯的取舍：不缓存解码结果，用时间换内存
-/// （CLAUDE.md §4 的 SoA 约束）。
+/// 这条流水线有九个阶段要看逐条指令的 `flow`/目标/操作数：来源4（调用目标）、
+/// 导入桩、xref 提取、跳转表候选、数据/代码判定、调用图、常量/结构体、参数
+/// 推断、栈帧。它们的输入**完全相同**（同一个稀疏索引、同一个解码器、同一份
+/// 字节），所以由 [`TargetAnalysis::build`] 解一次、切片发给各处。
 ///
-/// 成本可控：只有 `Flow::Call` 与 `Flow::Branch` 需要看目标，
-/// 但判断 flow 本身就得解码，所以实际是"全部指令解码一次"。
-/// 1 万函数的规模下这是百毫秒级，可以接受。
-/// 解码指令索引里的**全部**指令。
+/// 在此之前是各阶段各解一遍：实测在 151 KB 的 LiveContainer 上（debug 构建）
+/// 每遍约 430 ms，八遍就是 6.4 秒里的 3.0 秒 —— 而八次产出的指令集合逐字节相同。
 ///
-/// # 为什么要抽成一处
-///
-/// 调用图与常量/结构体推断都需要逐条指令的 `operands`/`flow`。两处
-/// 各写一遍"遍历索引 + 读字节 + decode_one"很容易漂移（比如一处改了
-/// 读不到字节时的处理），而那种漂移不会报错，只会让两个功能看到
-/// 不同的指令集合。抽出来就只有一个版本。
+/// 峰值内存**不变差**：这份物化本来就要发生（最后一处调用时，函数/xref/CFG
+/// 都已经在内存里了），现在只是同一份物化活得更久。逐条指令仍然**不缓存文本**：
+/// `DecodedInsn` 只有编号与结构化操作数，渲染与字符串留在按需查询那一侧
+/// （CLAUDE.md §4）。
 ///
 /// 解码失败的地址**跳过**：它们在索引里但不构成一条完整指令
 /// （最后一个字节被截断之类），不是有效分析输入。
@@ -2127,7 +2240,7 @@ fn decode_indexed_insns(disasm: &Disasm) -> Vec<bitflip_arch::DecodedInsn> {
 /// 然后画出悬空节点。它们走 `unresolved` 字段，并计入
 /// `summary.unresolved_indirect` —— 图不完整这件事必须能被量化。
 fn build_call_graph_wire(
-    disasm: &Disasm,
+    insns: &[bitflip_arch::DecodedInsn],
     functions: &[FunctionWire],
     notes: &mut Vec<String>,
 ) -> (CallGraphWire, bitflip_analyze::CallGraph) {
@@ -2142,10 +2255,8 @@ fn build_call_graph_wire(
         })
         .collect();
 
-    // 解码全部指令。解码失败的地址跳过 —— 它们不是调用点。
-    let insns = decode_indexed_insns(disasm);
-
-    let graph = bitflip_analyze::build_call_graph(&insns, &ranges);
+    // 用调用方解好的那一遍（不再为建图重解整个索引）。
+    let graph = bitflip_analyze::build_call_graph(insns, &ranges);
 
     // 输出**已解析**的边。未解析的边单独放 `unresolved`：它们没有目标，
     // 混进 `edges` 会让前端拿到空字符串然后画出悬空节点。
@@ -2227,14 +2338,11 @@ fn build_call_graph_wire(
 /// `bitflip_analyze::consts`。转换失败（理论上不可能）时**跳过该函数**
 /// 而不是当成 0 —— 把解析失败折成 0 会让所有引用都归到一个假函数上。
 fn build_const_scan(
-    disasm: &Disasm,
+    insns: &[bitflip_arch::DecodedInsn],
     strings: &[StringWire],
     functions: &[FunctionWire],
     notes: &mut Vec<String>,
 ) -> ConstScanWire {
-    // 解码全部指令（与调用图共用同一个助手，避免两处逻辑漂移）
-    let insns = decode_indexed_insns(disasm);
-
     // 字符串区间：`(起始地址, 字节长度)`。地址解析失败就跳过该条 ——
     // 编一个 0 会制造一条指向文件开头的假引用。
     let ranges: Vec<(u64, u64)> = strings
@@ -2254,7 +2362,7 @@ fn build_const_scan(
 
     // 立即数画像取前 40 条：再多对"识别魔数/标志位"没有帮助，
     // 反而把响应撑大。
-    let scan = bitflip_analyze::scan_constants(&insns, &ranges, &fn_ranges, IMMEDIATE_TOP_N);
+    let scan = bitflip_analyze::scan_constants(insns, &ranges, &fn_ranges, IMMEDIATE_TOP_N);
 
     for n in &scan.notes {
         notes.push(n.clone());
@@ -2311,6 +2419,7 @@ const IMMEDIATE_TOP_N: usize = 40;
 /// 扩展名是用户随便改的，对象格式是文件头里的事实。
 fn build_arg_scan(
     disasm: &Disasm,
+    insns: &[bitflip_arch::DecodedInsn],
     functions: &[FunctionWire],
     notes: &mut Vec<String>,
     windows: bool,
@@ -2348,8 +2457,6 @@ fn build_arg_scan(
         };
     };
 
-    let insns = decode_indexed_insns(disasm);
-
     let ranges: Vec<bitflip_analyze::ArgInsnRange> = functions
         .iter()
         .filter_map(|f| {
@@ -2359,7 +2466,7 @@ fn build_arg_scan(
         })
         .collect();
 
-    let inferred = bitflip_analyze::infer_args_all(&insns, &ranges, &arg_regs, &abi);
+    let inferred = bitflip_analyze::infer_args_all(insns, &ranges, &arg_regs, &abi);
     let scan = bitflip_analyze::summarize_args(&inferred, Some(&abi), functions.len());
 
     for n in &scan.notes {
@@ -2404,6 +2511,7 @@ fn build_arg_scan(
 /// 真正解出来，并把"解了多少条"如实记进 `notes`。
 fn build_frame_scan(
     disasm: &Disasm,
+    insns: &[bitflip_arch::DecodedInsn],
     functions: &[FunctionWire],
     unwind: &[bitflip_loader::object::UnwindEntry],
     notes: &mut Vec<String>,
@@ -2421,8 +2529,6 @@ fn build_frame_scan(
         };
     };
 
-    let insns = decode_indexed_insns(disasm);
-
     let ranges: Vec<bitflip_analyze::ArgInsnRange> = functions
         .iter()
         .filter_map(|f| {
@@ -2432,7 +2538,7 @@ fn build_frame_scan(
         })
         .collect();
 
-    let scan = bitflip_analyze::scan_frames(&insns, &ranges, unwind, &abi);
+    let scan = bitflip_analyze::scan_frames(insns, &ranges, unwind, &abi);
     let summary = bitflip_analyze::summarize_frames(&scan.functions, Some(&abi));
 
     for n in &scan.notes {
@@ -2480,7 +2586,12 @@ fn build_frame_scan(
 ///
 /// `notes` 里如实写明这是抽样 —— 用户看到的是"抽样得到的分布"，
 /// 不是"全量统计"。
-fn build_code_map(disasm: &Disasm, functions: &[FunctionWire], notes: &mut Vec<String>) -> CodeMap {
+fn build_code_map(
+    disasm: &Disasm,
+    insns: &[bitflip_arch::DecodedInsn],
+    functions: &[FunctionWire],
+    notes: &mut Vec<String>,
+) -> CodeMap {
     // 收集代表性地址：**可执行段与非可执行段分开配额**。
     //
     // 一开始给函数入口留了 512 的上限、段只取 4 个，结果在 ntdll.dll
@@ -2546,15 +2657,11 @@ fn build_code_map(disasm: &Disasm, functions: &[FunctionWire], notes: &mut Vec<S
         .range(0, u64::MAX)
         .map(|(a, _)| a)
         .collect();
+    // 分支目标集合：用调用方解好的那一遍，不再为这一项重解整个索引。
     let mut branch_targets: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for (a, len) in disasm.space.index().range(0, u64::MAX) {
-        let Some(bytes) = disasm.space.read(a, usize::from(len)) else {
-            continue;
-        };
-        if let Ok(insn) = disasm.decoder.decode_one(&bytes, a) {
-            if let Some(t) = insn.target {
-                branch_targets.insert(t);
-            }
+    for insn in insns {
+        if let Some(t) = insn.target {
+            branch_targets.insert(t);
         }
     }
 
@@ -2635,7 +2742,7 @@ fn build_code_map(disasm: &Disasm, functions: &[FunctionWire], notes: &mut Vec<S
 ///
 /// 边界已知（`Some(end)`）时直接按区间切，不存在这个不确定性。
 fn build_cfgs(
-    disasm: &Disasm,
+    insns: &[bitflip_arch::DecodedInsn],
     functions: &[FunctionWire],
     notes: &mut Vec<String>,
 ) -> BTreeMap<u64, CfgWire> {
@@ -2678,22 +2785,16 @@ fn build_cfgs(
             truncated_functions += 1;
         }
 
-        // 收集该范围内的指令。`disasm.index` 是地址→长度的有序索引，
-        // 直接按区间取，不做全表扫描。
-        let mut insns: Vec<bitflip_arch::DecodedInsn> = Vec::new();
-        for (addr, len) in disasm.index.range(entry, upper) {
-            let Some(bytes) = disasm.space.read(addr, usize::from(len)) else {
-                continue;
-            };
-            if let Ok(insn) = disasm.decoder.decode_one(&bytes, addr) {
-                insns.push(insn);
-            }
-        }
-        if insns.is_empty() {
+        // 取范围内的指令：解码结果按地址升序，二分出 `[entry, upper)` 这一段。
+        // 与原先逐函数重解索引等价（同一份索引、同一个解码器），只是不再重解。
+        let lo = insns.partition_point(|insn| insn.addr < entry);
+        let hi = insns.partition_point(|insn| insn.addr < upper);
+        let body = &insns[lo..hi];
+        if body.is_empty() {
             continue;
         }
 
-        let cfg = Cfg::build(&insns);
+        let cfg = Cfg::build(body);
         out.insert(
             entry,
             CfgWire {
