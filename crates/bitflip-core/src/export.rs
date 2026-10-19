@@ -1857,7 +1857,7 @@ fn write_json_symbols(
     let imports: Vec<&crate::ImportInfo> = parsed
         .imports
         .iter()
-        .filter(|import| import.iat_slot.as_deref().is_none_or(&in_range))
+        .filter(|import| import.iat_slot.as_deref().is_none_or(in_range))
         .collect();
     let exports: Vec<&crate::ExportInfo> = parsed
         .exports
