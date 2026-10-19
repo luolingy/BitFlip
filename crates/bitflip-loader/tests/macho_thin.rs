@@ -204,7 +204,47 @@ fn chained_fixup_imports_reach_the_object_model() {
 
     let notes = object.notes.join("\n");
     assert!(notes.contains("已解析 LC_DYLD_CHAINED_FIXUPS"), "{notes}");
-    assert!(notes.contains("iat_slot 是"), "{notes}");
+    assert!(
+        notes.contains("已走 LC_DYLD_CHAINED_FIXUPS 的指针链"),
+        "这份样本的链描述是空的（三个段都没有链），走链仍然要有结论：{notes}"
+    );
+}
+
+#[test]
+fn chained_chain_imports_carry_their_slot_addresses() {
+    // 沿指针链走出来的地址要从 crate 外面的公开入口可见 —— 那是分析层做交叉引用
+    // 唯一能用的东西，只写在 notes 里不算数据。
+    let image = fixture::demo_chained_chain64();
+    let object = parse_object(ObjectKind::MachO, &image.bytes, 0, ObjectId::Plain)
+        .expect("链样本必须能解析");
+
+    let slots: Vec<Option<u64>> = object
+        .imports
+        .iter()
+        .map(|import| import.iat_slot)
+        .collect();
+    assert_eq!(
+        slots,
+        vec![
+            Some(fixture::DYLD_DATA_VMADDR + 0x100),
+            Some(fixture::DYLD_DATA_VMADDR + 0x108),
+            Some(fixture::DYLD_DATA_VMADDR + 0x118),
+            // `_mainRef` 没被任何 bind 指针引用。
+            None,
+        ],
+        "每条导入的 iat_slot 来自链里对应的 bind 指针"
+    );
+    let notes = object.notes.join("\n");
+    assert!(notes.contains("4 条导入里 3 条拿到槽位地址"), "{notes}");
+}
+
+#[test]
+fn a_chain_that_never_terminates_is_an_error_not_a_hang() {
+    // next 把指针推出页尾：dyld 的链不跨页，这里必须立即报错（不许一直读到文件尾）。
+    let bytes = fixture::malformed_chained_chain_runs_past_page();
+    let error =
+        parse_object(ObjectKind::MachO, &bytes, 0, ObjectId::Plain).expect_err("跨页的链必须报错");
+    assert!(error.to_string().contains("页尾"), "{error}");
 }
 
 #[test]

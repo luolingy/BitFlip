@@ -14,22 +14,23 @@
 //! | `LC_FUNCTION_STARTS` | 同上 `linkedit_data_command` + ULEB128 增量 | 函数起点（绝对虚拟地址，升序） |
 //! | `LC_DYLD_INFO` / `LC_DYLD_INFO_ONLY` | 同上 `dyld_info_command` | 导出 trie（`export_off`）+ bind / lazy_bind 操作码流 |
 //! | `LC_DYLD_EXPORTS_TRIE` | 同上 `linkedit_data_command` | 导出 trie 的另一种来处（iOS 13+ 的命令形式） |
-//! | `LC_DYLD_CHAINED_FIXUPS` | `mach-o/fixup-chains.h`（`dyld_chained_fixups_header` + 三种 `dyld_chained_import*`） | **只解导入表**（名字 / 库 / weak / 加数），见 [`chained`]：**没有走指针链**，所以没有每条导入的槽位地址 |
+//! | `LC_DYLD_CHAINED_FIXUPS` | `mach-o/fixup-chains.h`（`dyld_chained_fixups_header` + 三种 `dyld_chained_import*` + `dyld_chained_starts_in_image` / `_in_segment` + `dyld_chained_ptr_*`） | 导入表（名字 / 库 / weak / 加数）+ **指针链**（每条导入的槽位地址），见 [`chained`]：64 位的链格式全走；32 位格式明确报"暂不支持" |
 //! | fat / universal | `mach-o/fat.h` | 见 [`fat`]：切片枚举 + 选片 + `parse_slice`，已接进容器与会话 |
 //!
 //! # 明确没做的（不要以为有）
 //!
 //! - **`LC_DYSYMTAB`**：动态符号表/间接符号表没有解析。
-//! - **`LC_DYLD_CHAINED_FIXUPS` 的指针链没有走。** 链式修复（iOS 13 之后的新格式）
-//!   把绑定写进 `LC_DYLD_CHAINED_FIXUPS`，`LC_DYLD_INFO` 的 bind 流**整条不存在** ——
-//!   实测 `temp/` 下四份 IPA 里三份是这样（SideStore / LiveContainer / Stapxs）。
-//!   本片解的是它的**导入表**（[`chained`]：`imports_offset` / 符号池），所以
-//!   "导入了哪些符号、来自哪个库、是否 weak、带不带加数"现在是真实的。**没做的**
-//!   是 `starts_offset` 描述的指针链（以及按 `pointer_format` 还原指针）：沿链走
-//!   才知道每条导入写进哪个槽位，所以 [`Object::imports`] 里这些导入的
-//!   `iat_slot` 是 `None`（未知），不是 0。`notes` 会把这两件事分开说。
-//!   老格式（`LC_DYLD_INFO_ONLY`，如 `net.kdt.pojavlauncher…ipa`）仍走 bind 流，
-//!   那条路上 `iat_slot` 是有地址的（1 382 + 165 条）。
+//! - **`LC_DYLD_CHAINED_FIXUPS` 的指针链：64 位格式已走，32 位没走。**
+//!   链式修复（iOS 13 之后的新格式）把绑定写进 `LC_DYLD_CHAINED_FIXUPS`，
+//!   `LC_DYLD_INFO` 的 bind 流**整条不存在** —— 实测 `temp/` 下四份 IPA 里三份是
+//!   这样（SideStore / LiveContainer / Stapxs）。本片解它的**导入表**（[`chained`]：
+//!   `imports_offset` / 符号池），并且沿 `starts_offset` 的指针链走，把每条导入
+//!   写进的槽位地址填进 `iat_slot`（见 [`chained::walk_chains`]）。**没做的**是
+//!   32 位的链格式（`DYLD_CHAINED_PTR_32*`）与 x86_64 / dyld 共享缓存的内核格式：
+//!   遇到就明确报 `NotSupported`，不按 64 位硬读给出错地址。链里的 **rebase** 指针
+//!   只计数、不当作导入（它们指向本镜像内部）。老格式（`LC_DYLD_INFO_ONLY`，如
+//!   `net.kdt.pojavlauncher…ipa`）仍走 bind 流，那条路上 `iat_slot` 同样有地址
+//!   （1 382 + 165 条）。
 //! - **weak bind**（`weak_bind_off` / `weak_bind_size`）：操作码语言与普通 bind 相同，
 //!   但语义是"弱定义解析"，本片没有接（`notes` 会说明存在但没解）。
 //! - **arm64e 的线程化绑定**（`BIND_OPCODE_THREADED` 的 APPLY 分支）：要用线程化指针表
@@ -89,8 +90,10 @@
 //!    [`MachOExport::other`]，并且**逐条**写进 `notes`（对象模型里 `Export` 只有一个
 //!    `address` 字段，放不下两个 —— 宁可用 notes 说清楚，也不丢第二条地址）。
 //!    `LC_DYLD_CHAINED_FIXUPS` 的导入表同样进 [`Object::imports`]（`module` 是解析后
-//!    的库名），但它**没有地址**：对象模型里 `iat_slot` 因此是 `None`，而 weak 与
-//!    addend 在 `Import` 里没有字段，条数与样例写进 `notes`（结构化细节保留在
+//!    的库名），它的**槽位地址来自指针链**：走链时按 bind 指针里的 `ordinal`（导入表
+//!    下标）把地址填到该条导入上，所以 `iat_slot` 现在有真实地址；链里没有绑定到的
+//!    导入（例如没被引用的 weak 导入）保持 `None`（未知），不是 0。weak 与 addend 在
+//!    `Import` 里没有字段，条数与样例写进 `notes`（结构化细节保留在
 //!    [`MachOFile::chained_fixups`]）。
 //!
 //! # 解析纪律（与 PE/ELF 一致）
@@ -116,7 +119,7 @@ pub mod export_trie;
 pub mod fat;
 
 pub use bind::{BindImport, BindKind};
-pub use chained::{ChainedFixups, ChainedImport};
+pub use chained::{ChainWalk, ChainedFixups, ChainedImport};
 pub use export_trie::MachOExport;
 
 // ── 魔数（`mach-o/loader.h`） ───────────────────────────────────────────────
@@ -401,8 +404,9 @@ pub struct MachOFile {
     /// `None` = 没有这条命令；`Some` 而 [`ChainedFixups::imports`] 为空 = 文件里
     /// 明确写着 `imports_count = 0` —— 两种含义不同，别读成同一件事。
     ///
-    /// 这些条目**没有地址**：本片只解导入表，没有走 `starts_offset` 描述的指针链
-    /// （见 [`chained`]），所以它给的是"导入了什么"，不是"写到了哪"。
+    /// 导入的槽位地址来自 [`ChainedFixups::chains`] 那次走链（每条
+    /// [`ChainedImport::iat_slot`]）；`chains` 为 `None` 时地址未知，原因在 `notes`
+    /// 里（没有链描述 / 没有镜像基址换不出地址）。
     pub chained_fixups: Option<ChainedFixups>,
     /// 解析过程中的说明（降级、跳过、没做的部分）。
     pub notes: Vec<String>,
@@ -963,8 +967,8 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
     // （绑定槽位是"段基址 + 段内偏移"），而段表与基址在这一步之前已经定了。
     let (export_trie, exports) = decode_exports(reader, &facts, image_base, &mut notes)?;
     let imports = decode_imports(reader, &facts, &header, &mut notes)?;
-    // 链式修复的**导入表**（不是指针链）：新版 Xcode 产物的导入只在这里。
-    let chained_fixups = decode_chained_fixups(reader, &facts, &mut notes)?;
+    // 链式修复：导入表（`imports_offset`）+ 指针链（`starts_offset`，要镜像基址与段表）。
+    let chained_fixups = decode_chained_fixups(reader, &facts, image_base, &mut notes)?;
 
     // ── 没做的部分：一律写进 notes，不让界面看起来"完整" ────────────────
     match facts.symtab {
@@ -1198,20 +1202,21 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
             }
         }
 
-        if fixups.has_starts() {
-            notes.push(format!(
-                "LC_DYLD_CHAINED_FIXUPS 的 starts_offset = {:#x}：文件里确实有指针链描述，\
-                 但本片**没有走链**（那要按 starts_in_segment 与 pointer_format 逐条还原）——\
-                 因此每条导入写进哪个指针槽未知，Object.imports 里这些导入的 iat_slot 是 \
-                 None（不是 0）；链里的 rebase 指针也不在 Object 里",
-                fixups.starts_offset
-            ));
-        } else {
-            notes.push(
-                "LC_DYLD_CHAINED_FIXUPS 的 starts_offset = 0：这份文件没有链描述（只有导入表\
-                 与符号池），所以\"导入没有地址\"不是本片没走链，而是文件里就没有链"
-                    .to_string(),
-            );
+        // 走链的结论由 `chained::walk_chains` 写进 notes（走过的段/页/链/指针、
+        // 多少个导入拿到地址、重复绑定、以及与 LC_SEGMENT 的差额）。这里只补两种
+        // "没有走到"的情形各自的说明 —— 不让界面看起来"地址是有的"。
+        match (&fixups.chains, fixups.has_starts()) {
+            (Some(_), _) => {}
+            (None, true) => {
+                // walk_chains 已经写明原因（例如没有 __TEXT 段、镜像基址未知）。
+            }
+            (None, false) => {
+                notes.push(
+                    "LC_DYLD_CHAINED_FIXUPS 的 starts_offset = 0：这份文件没有链描述（只有导入表\
+                     与符号池），所以\"导入没有地址\"不是本片没走链，而是文件里就没有链"
+                        .to_string(),
+                );
+            }
         }
     }
     if facts.has_codesig {
@@ -2321,14 +2326,20 @@ fn read_bind_stream(
     bind::parse(payload, segments, dylibs, pointer_size, kind, notes)
 }
 
-/// 切 `LC_DYLD_CHAINED_FIXUPS` 的 payload 并解它的**导入表**。
+/// 切 `LC_DYLD_CHAINED_FIXUPS` 的 payload，解它的**导入表**，再沿指针链走一遍。
 ///
 /// 返回 `None` 表示文件里没有这条命令（不是"有这条命令但 0 条导入"—— 那种情形
 /// 是 `Some` + 空 `imports`，`notes` 里说得不一样）。范围校验在这里做（与
-/// [`read_bind_stream`] 同一套），编码细节在 [`chained::parse`]。
+/// [`read_bind_stream`] 同一套），编码细节在 [`chained::parse`]（导入表）与
+/// [`chained::walk_chains`]（指针链）。
+///
+/// 走链要**整份文件**的字节：指针链本身在各个段的数据里（`__DATA` 等），不在
+/// `LC_DYLD_CHAINED_FIXUPS` 的 payload 里 —— payload 只描述"哪些段、哪些页、
+/// 页里哪个偏移有链"。
 fn decode_chained_fixups(
     reader: &Reader<'_>,
     facts: &CommandFacts,
+    image_base: Option<u64>,
     notes: &mut Vec<String>,
 ) -> Result<Option<ChainedFixups>, ParseError> {
     let Some(range) = facts.chained_fixups else {
@@ -2356,7 +2367,21 @@ fn decode_chained_fixups(
         return Ok(None);
     }
     let payload = reader.slice(range.dataoff, range.datasize, "LC_DYLD_CHAINED_FIXUPS")?;
-    chained::parse(payload, &facts.dylibs).map(Some)
+    let mut fixups = chained::parse(payload, &facts.dylibs)?;
+    // 导入表没有地址：地址在指针链里，走一遍才填得上。
+    if fixups.has_starts() {
+        let walked = chained::walk_chains(
+            payload,
+            reader.as_bytes(),
+            &facts.segments,
+            image_base,
+            fixups.starts_offset,
+            &mut fixups.imports,
+            notes,
+        )?;
+        fixups.chains = walked;
+    }
+    Ok(Some(fixups))
 }
 
 // ── 入口点与对象模型 ────────────────────────────────────────────────────────
@@ -2658,15 +2683,15 @@ fn build_object(file: &MachOFile, id: ObjectId) -> Object {
 
     // 链式修复的**导入表** → `Object.imports`（新版 Xcode 产物的导入只在这里）。
     //
-    // `iat_slot` 是 `None`：本片**没有走指针链**，每条导入写进哪个槽位在文件里不是
-    // 一张表，而是一串指针链 —— 没走就给 None（未知），绝不填 0（CLAUDE.md §7）。
+    // `iat_slot` 来自走链（`chained::walk_chains` 按 bind 指针里的 ordinal 下标填）：
+    // 没被链绑定到的导入保持 None（未知），绝不填 0（CLAUDE.md §7）。
     if let Some(fixups) = &file.chained_fixups {
         for import in &fixups.imports {
             object.imports.push(Import {
                 module: import.dylib.clone(),
                 name: Some(import.name.clone()),
                 ordinal: None,
-                iat_slot: None,
+                iat_slot: import.iat_slot,
                 thunk: None,
             });
         }

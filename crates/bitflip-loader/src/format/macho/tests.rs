@@ -1050,7 +1050,7 @@ fn a_bind_do_bind_without_a_symbol_is_rejected() {
 // ── LC_DYLD_CHAINED_FIXUPS 的导入表（chained.rs） ────────────────────────────
 //
 // 样本按 `mach-o/fixup-chains.h` 拼在 fixture 里（位域布局与偏移那里有出处）。
-// 这一组只验证"导入表解出来的东西对不对"，**不**验证指针链（本片没有走链）。
+// 这一组只验证"导入表解出来的东西对不对"；**指针链**的走法在下面「指针链」那一段。
 
 #[test]
 fn chained_fixup_imports_resolve_libraries_weakness_and_specials() {
@@ -1126,7 +1126,7 @@ fn chained_import_addend_formats_carry_their_addend() {
 }
 
 #[test]
-fn chained_imports_reach_the_object_model_without_addresses() {
+fn chained_imports_without_a_chain_stay_unaddressed() {
     let image = fixture::demo_chained_fixups64();
     let object = parse_bytes(&image.bytes).expect("能解析");
 
@@ -1139,7 +1139,7 @@ fn chained_imports_reach_the_object_model_without_addresses() {
     assert_eq!(msg_send.module, "/usr/lib/libSystem.B.dylib");
     assert_eq!(
         msg_send.iat_slot, None,
-        "没有走指针链就没有地址：None 是\"未知\"，0 会变成一条假地址（§7）"
+        "这份样本的链描述里三个段都没有链：没有地址就是 None（未知），0 会变成一条假地址（§7）"
     );
     assert_eq!(msg_send.ordinal, None, "库序号不是\"导入符号的序号\"");
 
@@ -1153,8 +1153,12 @@ fn chained_imports_reach_the_object_model_without_addresses() {
         "weak 在 Import 里没有字段，必须写进 notes：{joined}"
     );
     assert!(
-        joined.contains("没有走链"),
-        "notes 必须说明指针链没走、地址未知：{joined}"
+        joined.contains("已走 LC_DYLD_CHAINED_FIXUPS 的指针链"),
+        "走链这件事要出现在 notes 里（哪怕走了 0 个段）：{joined}"
+    );
+    assert!(
+        joined.contains("0 条拿到槽位地址"),
+        "没拿到地址要说出来，不许含糊：{joined}"
     );
     assert!(
         joined.contains("没有 LC_DYLD_INFO"),
@@ -1227,4 +1231,252 @@ fn a_chained_ordinal_out_of_range_is_rejected() {
     let message = error.to_string();
     assert!(message.contains("lib_ordinal = 7"), "{message}");
     assert!(message.contains("只有 2 条"), "{message}");
+}
+
+// ── 指针链（chained::walk_chains） ──────────────────────────────────────────
+//
+// 样本按 `mach-o/fixup-chains.h` 拼在 fixture 里（`build_starts_in_image` /
+// `arm64e_bind` / `ptr64_bind` 的注释里写了每个位域的出处）。这一组验证
+// "沿链走、按 pointer_format 还原、把地址填进 iat_slot"这条链路。
+
+/// 样本里 `__DATA` 的 `vmaddr`（链指针的地址基准）。
+const DATA_BASE: u64 = fixture::DYLD_DATA_VMADDR;
+
+#[test]
+fn a_chain_page_fills_iat_slots_across_two_dylibs() {
+    let image = fixture::demo_chained_chain64();
+    let file = read(&image.bytes).expect("链样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    let walk = fixups.chains.as_ref().expect("有链描述就该走出一份结果");
+
+    assert_eq!(walk.segments, 1, "只有 __DATA 段有链描述");
+    assert_eq!(walk.pages, 1);
+    assert_eq!(walk.chains, 1);
+    assert_eq!(walk.pointers, 4, "0x100 / 0x108 / 0x110 / 0x118 四个指针");
+    assert_eq!(walk.binds, 3, "三次 bind（中间那个是 rebase）");
+    assert_eq!(walk.rebases, 1);
+    assert_eq!(walk.imports_with_slot, 3);
+
+    // 地址 = 段 vmaddr + 页偏移 + 页内偏移（页 0 的 vmaddr 就是 __DATA.vmaddr）。
+    assert_eq!(fixups.imports[0].iat_slot, Some(DATA_BASE + 0x100));
+    assert_eq!(
+        fixups.imports[1].iat_slot,
+        Some(DATA_BASE + 0x108),
+        "第二个 bind 落在 0x108（stride 8）"
+    );
+    assert_eq!(
+        fixups.imports[2].iat_slot,
+        Some(DATA_BASE + 0x118),
+        "rebase 不占导入，链继续到 0x118"
+    );
+    assert_eq!(
+        fixups.imports[3].iat_slot, None,
+        "_mainRef 没被任何 bind 指针引用：None 是\"链里没出现\"，不是 0"
+    );
+
+    let joined = file.notes.join("\n");
+    assert!(
+        joined.contains("已走 LC_DYLD_CHAINED_FIXUPS 的指针链"),
+        "走链的计数要写进 notes：{joined}"
+    );
+    assert!(joined.contains("3 个 bind"), "{joined}");
+    assert!(joined.contains("4 条导入里 3 条拿到槽位地址"), "{joined}");
+}
+
+#[test]
+fn a_multi_start_page_walks_every_chain() {
+    let image = fixture::demo_chained_multi_start();
+    let file = read(&image.bytes).expect("多起点页样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    let walk = fixups.chains.as_ref().expect("有链");
+
+    assert_eq!(walk.pages, 1);
+    assert_eq!(walk.chains, 2, "page_start 的 0x8000 位指向两条链");
+    assert_eq!(walk.pointers, 2);
+    assert_eq!(
+        walk.imports_with_slot, 2,
+        "两条链各绑一条导入（ordinal 0 与 2）"
+    );
+    assert_eq!(fixups.imports[0].iat_slot, Some(DATA_BASE + 0x80));
+    assert_eq!(fixups.imports[2].iat_slot, Some(DATA_BASE + 0x100));
+    assert_eq!(
+        fixups.imports[1].iat_slot, None,
+        "多起点的第二条链只绑了 ordinal 2"
+    );
+}
+
+#[test]
+fn a_multi_start_index_may_equal_the_page_count() {
+    // 绝对下标从 page_count 起算：下标 == page_count 是**合法**的池子第一项，
+    // 不能被"越界"判定误伤。
+    let image = fixture::demo_chained_multi_start_after_two_pages();
+    let file = read(&image.bytes).expect("多起点 + 两页的样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    let walk = fixups.chains.as_ref().expect("有链");
+
+    assert_eq!(walk.pages, 1, "第 1 页是 0xFFFF（没有修复）");
+    assert_eq!(walk.chains, 1);
+    assert_eq!(fixups.imports[3].iat_slot, Some(DATA_BASE + 0x180));
+}
+
+#[test]
+fn a_multi_start_index_inside_page_start_is_rejected() {
+    // fixup-chains.h 把多起点下标注释成 "index into chain_starts[]"，字面也能读成
+    // 相对 chain_starts 起算。本文件按 dyld 的绝对读法；下标落进 page_start[] 自己
+    // 的区域时报错并说明歧义，而不是按另一种读法猜一遍。
+    let bytes = fixture::malformed_chained_multi_start_index_into_page_array();
+    let error = read(&bytes).expect_err("下标 0 落在 page_start[] 自己的区域里必须报错");
+    let message = error.to_string();
+    assert!(message.contains("多起点页"), "{message}");
+    assert!(
+        message.contains("落在 page_start[0..1] 自己的区域里"),
+        "{message}"
+    );
+    assert!(
+        message.contains("chain_starts"),
+        "报错要指出这是措辞歧义，下次有人遇到能直接看懂：{message}"
+    );
+}
+
+#[test]
+fn a_page_marked_start_none_is_skipped() {
+    let image = fixture::demo_chained_page_without_fixups();
+    let file = read(&image.bytes).expect("page_start = 0xFFFF 的样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    let walk = fixups.chains.as_ref().expect("有链");
+
+    assert_eq!(walk.pages, 1, "两页里只有一页有链（另一页是 0xFFFF）");
+    assert_eq!(walk.chains, 1);
+    assert_eq!(walk.pointers, 1);
+    assert_eq!(fixups.imports[0].iat_slot, Some(DATA_BASE + 0x100));
+}
+
+#[test]
+fn a_chain_that_ends_mid_page_stops_there() {
+    let image = fixture::demo_chained_ends_mid_page();
+    let file = read(&image.bytes).expect("链结束在页中间的样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    let walk = fixups.chains.as_ref().expect("有链");
+
+    assert_eq!(
+        walk.pointers, 2,
+        "next == 0 之后就停，不许把页剩下的字节当指针链"
+    );
+    assert_eq!(walk.chains, 1);
+    assert_eq!(fixups.imports[0].iat_slot, Some(DATA_BASE + 0x200));
+    assert_eq!(fixups.imports[1].iat_slot, Some(DATA_BASE + 0x208));
+}
+
+#[test]
+fn an_auth_bind_has_no_addend_field() {
+    let image = fixture::demo_chained_auth_bind();
+    let file = read(&image.bytes).expect("认证绑定样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    let walk = fixups.chains.as_ref().expect("有链");
+
+    assert_eq!(walk.binds, 1);
+    assert_eq!(
+        walk.auth_binds, 1,
+        "auth 位（bit 63）置位 —— 那几位是 diversity/key，不是 addend"
+    );
+    assert_eq!(
+        walk.bind_addends, 0,
+        "认证绑定没有 addend 字段，不能报成 0 加数"
+    );
+    assert_eq!(fixups.imports[1].iat_slot, Some(DATA_BASE + 0x300));
+}
+
+#[test]
+fn a_bind_hit_twice_keeps_the_first_slot_and_counts_the_rest() {
+    let image = fixture::demo_chained_duplicate_bind();
+    let file = read(&image.bytes).expect("重复绑定样本必须能解析");
+    let fixups = file.chained_fixups.as_ref().expect("有链式修复");
+    let walk = fixups.chains.as_ref().expect("有链");
+
+    assert_eq!(
+        fixups.imports[0].iat_slot,
+        Some(DATA_BASE + 0x100),
+        "同一导入被绑在两个地址时保留**第一个**"
+    );
+    assert_eq!(walk.extra_bind_sites, 1, "第二处要计数，不许悄悄丢");
+    assert_eq!(
+        walk.duplicate_samples,
+        vec![(0, DATA_BASE + 0x108)],
+        "样例里给出第二处的地址，人能核对"
+    );
+    assert_eq!(walk.imports_with_slot, 1);
+
+    let joined = file.notes.join("\n");
+    assert!(joined.contains("已经绑过"), "{joined}");
+    assert!(joined.contains("0x100002108"), "{joined}");
+}
+
+#[test]
+fn chained_slot_addresses_reach_the_object_model() {
+    let image = fixture::demo_chained_chain64();
+    let object = parse_bytes(&image.bytes).expect("能解析");
+    let with_slots = object
+        .imports
+        .iter()
+        .filter(|item| item.iat_slot.is_some())
+        .count();
+    assert_eq!(with_slots, 3, "三条被 bind 的导入带上地址");
+    let msg_send = object
+        .imports
+        .iter()
+        .find(|item| item.name.as_deref() == Some("_objc_msgSend"))
+        .expect("有 _objc_msgSend");
+    assert_eq!(
+        msg_send.iat_slot,
+        Some(DATA_BASE + 0x100),
+        "iat_slot 是**指针槽**的地址（与 bind 流那条路一致）"
+    );
+}
+
+#[test]
+fn an_unsupported_pointer_format_is_an_explicit_not_supported() {
+    let bytes = fixture::malformed_chained_unsupported_pointer_format();
+    let error = read(&bytes).expect_err("pointer_format = 3（32 位格式）必须明确报不支持");
+    assert!(
+        matches!(error, ParseError::NotSupported { .. }),
+        "这是没实现的能力，不是坏文件（CLAUDE.md §7）：{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("pointer_format = 3"), "{message}");
+    assert!(message.contains("没实现"), "{message}");
+}
+
+#[test]
+fn a_chain_that_runs_past_its_page_is_rejected() {
+    let bytes = fixture::malformed_chained_chain_runs_past_page();
+    let error = read(&bytes).expect_err("next 会把指针推到页外，必须拒绝（不许跨页读）");
+    let message = error.to_string();
+    assert!(message.contains("页尾"), "{message}");
+    assert!(message.contains("跨页"), "{message}");
+}
+
+#[test]
+fn a_multi_start_list_without_last_is_rejected_not_walked_forever() {
+    let bytes = fixture::malformed_chained_multi_start_without_last();
+    let error = read(&bytes).expect_err("多起点列表没有 LAST 位，必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("列表没有终点"), "{message}");
+}
+
+#[test]
+fn a_chain_bind_ordinal_past_the_import_table_is_rejected() {
+    let bytes = fixture::malformed_chained_chain_ordinal_out_of_range();
+    let error = read(&bytes).expect_err("bind 的 ordinal = 9 越界，必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("ordinal = 9"), "{message}");
+    assert!(message.contains("导入表只有"), "{message}");
+}
+
+#[test]
+fn a_segment_offset_pointing_before_its_segment_is_rejected() {
+    let bytes = fixture::malformed_chained_segment_offset_before_segment();
+    let error = read(&bytes).expect_err("segment_offset 落在段 vmaddr 之前，必须拒绝");
+    let message = error.to_string();
+    assert!(message.contains("segment_offset"), "{message}");
+    assert!(message.contains("自相矛盾"), "{message}");
 }

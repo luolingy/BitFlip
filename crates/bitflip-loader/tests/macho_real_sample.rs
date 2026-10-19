@@ -778,6 +778,18 @@ struct ChainedCounts {
     weak: usize,
     /// 其中带 addend 的条数。
     with_addend: usize,
+    /// 走链后拿到 `iat_slot`（槽位地址）的条数。
+    imports_with_slot: usize,
+    /// 走链的计数（没有链描述、或链没法走时是 `None`）。
+    walk: Option<macho::ChainWalk>,
+    /// 槽位地址**不在任何节里**的条数（应当是 0：绑定槽位都在 `__got` / `__data`）。
+    slots_outside_sections: usize,
+    /// 拿到地址的前几条（名字, 库, 地址, 所在的段/节）—— 给人按常识核对。
+    slot_head: Vec<(String, String, u64, Option<String>)>,
+    /// 没拿到地址的前几条（名字, 库）—— 空着才是"全都绑上了"。
+    unbound_head: Vec<(String, String)>,
+    /// 每个段的内存范围 `[vmaddr, vmaddr+vmsize)`：用来核对槽位地址落在段内。
+    segment_extents: Vec<(u64, u64)>,
     /// 去重后的被导入库数（含 `<main-executable>` 这类标签）。
     libraries: usize,
     /// 经典 bind 流的导入条数（老格式样本用）。
@@ -786,8 +798,30 @@ struct ChainedCounts {
     notes_mention_chained: bool,
     /// notes 里说"已解析 dyld 绑定"了吗（老格式样本要用）。
     notes_mention_bind_imports: bool,
-    /// 前几条（名字, 库），给人按 `nm` 风格的常识核对。
-    head: Vec<(String, String)>,
+}
+
+/// 地址落在哪个节里（`段名,节名`）；不在任何节里返回 `None`。
+///
+/// 用 `MachOFile` 的段/节表（`section.addr` / `section.size`）而不是对象模型 ——
+/// 槽位地址是要人核对的原始事实，核对时不该绕经归一化后的结构。
+fn section_at(facts: &macho::MachOFile, address: u64) -> Option<String> {
+    for segment in &facts.segments {
+        for section in &segment.sections {
+            if address >= section.addr && address < section.addr.saturating_add(section.size) {
+                return Some(format!("{},{}", section.segname, section.sectname));
+            }
+        }
+    }
+    None
+}
+
+/// 地址是否落在某个节里（[`section_at`] 的布尔版，给全量统计用）。
+fn in_some_section(facts: &macho::MachOFile, address: u64) -> bool {
+    facts.segments.iter().any(|segment| {
+        segment.sections.iter().any(|section| {
+            address >= section.addr && address < section.addr.saturating_add(section.size)
+        })
+    })
 }
 
 fn measure_chained(path: &std::path::Path) -> ChainedCounts {
@@ -803,7 +837,10 @@ fn measure_chained(path: &std::path::Path) -> ChainedCounts {
     let mut libraries = std::collections::BTreeSet::new();
     let mut weak = 0usize;
     let mut with_addend = 0usize;
-    let mut head = Vec::new();
+    let mut imports_with_slot = 0usize;
+    let mut slots_outside_sections = 0usize;
+    let mut slot_head = Vec::new();
+    let mut unbound_head = Vec::new();
     if let Some(fixups) = fixups {
         for import in &fixups.imports {
             libraries.insert(import.dylib.clone());
@@ -813,11 +850,41 @@ fn measure_chained(path: &std::path::Path) -> ChainedCounts {
             if import.addend.is_some() {
                 with_addend += 1;
             }
-            if head.len() < 5 {
-                head.push((import.name.clone(), import.dylib.clone()));
+            match import.iat_slot {
+                Some(address) => {
+                    imports_with_slot += 1;
+                    if !in_some_section(&facts, address) {
+                        slots_outside_sections += 1;
+                    }
+                    if slot_head.len() < 5 {
+                        slot_head.push((
+                            import.name.clone(),
+                            import.dylib.clone(),
+                            address,
+                            section_at(&facts, address),
+                        ));
+                    }
+                }
+                None => {
+                    if unbound_head.len() < 5 {
+                        unbound_head.push((import.name.clone(), import.dylib.clone()));
+                    }
+                }
             }
         }
     }
+    // 段的内存范围：槽位地址要落在其中（`__PAGEZERO` 的 vmsize 是 4 GB，会覆盖
+    // 0x1_xxx_xxxx 之前的地址，所以 start 用 vmaddr、end 用 vmaddr + vmsize）。
+    let segment_extents: Vec<(u64, u64)> = facts
+        .segments
+        .iter()
+        .map(|segment| {
+            (
+                segment.vmaddr,
+                segment.vmaddr.saturating_add(segment.vmsize),
+            )
+        })
+        .collect();
 
     ChainedCounts {
         name: path
@@ -831,20 +898,28 @@ fn measure_chained(path: &std::path::Path) -> ChainedCounts {
         chained_imports: fixups.map_or(0, |fixups| fixups.imports.len()),
         weak,
         with_addend,
+        imports_with_slot,
+        slots_outside_sections,
+        walk: fixups.and_then(|fixups| fixups.chains.clone()),
+        slot_head,
+        unbound_head,
+        segment_extents,
         libraries: libraries.len(),
         bind_imports: facts.imports.len(),
         notes_mention_chained: joined.contains("LC_DYLD_CHAINED_FIXUPS"),
         notes_mention_bind_imports: joined.contains("已解析 dyld 绑定"),
-        head,
     }
 }
 
-/// 四份真实 IPA：链式修复的**导入表**必须解出真实的导入集。
+/// 四份真实 IPA：链式修复的**导入表**必须解出真实的导入集，**指针链**必须给每条
+/// 导入一个可核对的槽位地址。
 ///
 /// 这条测试回答的问题：
 ///
 /// * 新版产物（`LC_DYLD_CHAINED_FIXUPS` 而没有 `LC_DYLD_INFO`）此前 `Object.imports`
 ///   恒空（"绑定在链式修复里，没解"）。现在它应当给出真实的导入集；
+/// * 走链之后，**大多数**导入应当有一个 `iat_slot`（指着 `__DATA` 里的指针槽）。
+///   一条都没有只能是"链走错了"，所以断言不是"至少一条"，而是"过半"；
 /// * `LiveContainer`（151 KB 的启动器壳子）应当只有少量导入；
 /// * `SideStore`（19.6 MB、79 个 dylib）应当是**上百条**；
 /// * 老格式的 PojavLauncher 仍走 bind 流，链式修复那边为空 —— 两种写法都要能说清。
@@ -855,21 +930,22 @@ fn real_binaries_report_chained_fixup_imports() {
     let counts: Vec<ChainedCounts> = paths.iter().map(|path| measure_chained(path)).collect();
 
     eprintln!(
-        "{:<44} {:>10} {:>6} {:>8} {:>8} {:>8} {:>6} {:>6} {:>6} {:>8}",
+        "{:<44} {:>10} {:>6} {:>8} {:>8} {:>8} {:>10} {:>10} {:>6} {:>6} {:>8}",
         "样本",
         "二进制字节",
         "dylib",
         "chained",
         "format",
         "链式导入",
+        "有地址",
+        "走链指针",
         "weak",
         "addend",
-        "库数",
         "bind导入"
     );
     for row in &counts {
         eprintln!(
-            "{:<44} {:>10} {:>6} {:>8} {:>8} {:>8} {:>6} {:>6} {:>6} {:>8}",
+            "{:<44} {:>10} {:>6} {:>8} {:>8} {:>8} {:>10} {:>10} {:>6} {:>6} {:>8}",
             row.name,
             row.binary_bytes,
             row.dylibs,
@@ -877,13 +953,41 @@ fn real_binaries_report_chained_fixup_imports() {
             row.imports_format
                 .map_or_else(|| "-".to_string(), |format| format.to_string()),
             row.chained_imports,
+            row.imports_with_slot,
+            row.walk
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |walk| walk.pointers.to_string()),
             row.weak,
             row.with_addend,
-            row.libraries,
             row.bind_imports
         );
-        for (name, library) in &row.head {
-            eprintln!("    {name:<40} ← {library}");
+        if let Some(walk) = &row.walk {
+            eprintln!(
+                "    走链：{} 段 / {} 页 / {} 条链 / {} 指针（{} bind{}、{} rebase）；\
+                 重复绑定 {} 处；槽位不在任何节里 {} 条",
+                walk.segments,
+                walk.pages,
+                walk.chains,
+                walk.pointers,
+                walk.binds,
+                if walk.auth_binds > 0 {
+                    format!(" 含 {} 条认证绑定", walk.auth_binds)
+                } else {
+                    String::new()
+                },
+                walk.rebases,
+                walk.extra_bind_sites,
+                row.slots_outside_sections
+            );
+        }
+        for (name, library, address, section) in &row.slot_head {
+            eprintln!(
+                "    槽位 {address:#014x}  {name:<40} ← {library}   [{}]",
+                section.as_deref().unwrap_or("不在任何节里")
+            );
+        }
+        for (name, library) in &row.unbound_head {
+            eprintln!("    无地址              {name:<40} ← {library}");
         }
     }
 
@@ -915,6 +1019,39 @@ fn real_binaries_report_chained_fixup_imports() {
                 row.name,
                 row.imports_format
             );
+            // 走链必须给出地址：真实的 iOS 13+ 二进制把每个用到的导入绑在 __DATA 的
+            // 指针槽里，所以**过半**的导入应当有地址。一条都没有只能是链走错了
+            // （pointer_format 读错、页偏移算错、starts_in_segment 定位错）。
+            // 这条断言刻意不是"至少一条"：那会让"只走通一条"也算绿。
+            assert!(
+                row.imports_with_slot * 2 > row.chained_imports,
+                "{}：{} 条链式修复导入里只有 {} 条拿到槽位地址（不到一半）—— \
+                 指针链没走对，不是\"这些导入没有槽位\"",
+                row.name,
+                row.chained_imports,
+                row.imports_with_slot
+            );
+            let walk = row
+                .walk
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}：有链描述却没有任何走链结果", row.name));
+            assert!(
+                walk.pointers >= row.imports_with_slot,
+                "{}：走到的指针数({}) 比拿到地址的导入数({}) 还少 —— 计数与地址自相矛盾",
+                row.name,
+                walk.pointers,
+                row.imports_with_slot
+            );
+            assert_eq!(
+                walk.imports_with_slot, row.imports_with_slot,
+                "{}：走链结果里的导入计数与导入表里的 iat_slot 计数必须一致",
+                row.name
+            );
+            assert!(
+                walk.pages > 0,
+                "{}：真实的 iOS 二进制一定有带指针链的页（walk.pages = 0 说明链描述没读到）",
+                row.name
+            );
             assert!(
                 row.libraries <= row.dylibs + 3,
                 "{}：被导入的库({}) 比链接的 dylib({}) 多出 3 个以上 —— 库序号解析错位了",
@@ -922,6 +1059,31 @@ fn real_binaries_report_chained_fixup_imports() {
                 row.libraries,
                 row.dylibs
             );
+            // 槽位地址必须落在某个段的内存范围里、而且落在某个节里：落在外面说明
+            // 地址算式（基址 + segment_offset + 页偏移）错了。这一条是**全量**统计，
+            // 不是抽样：真实的绑定槽位都在 `__DATA_CONST,__got` 这样的节里。
+            assert_eq!(
+                row.slots_outside_sections, 0,
+                "{}：{} 条导入的槽位地址不落在任何节里 —— 地址算式（基址 + segment_offset + \
+                 页偏移）错了一位，或者 pointer_format 的 stride 读错",
+                row.name, row.slots_outside_sections
+            );
+            for (name, _library, address, section) in &row.slot_head {
+                assert!(
+                    row.segment_extents
+                        .iter()
+                        .any(|(start, end)| *address >= *start && *address < *end),
+                    "{}：导入 {name} 的槽位地址 {address:#x} 不落在任何段的内存范围里 —— \
+                     地址算式（基址 + segment_offset + 页偏移）错了",
+                    row.name
+                );
+                assert!(
+                    section.is_some(),
+                    "{}：导入 {name} 的槽位地址 {address:#x} 不落在任何节里 —— \
+                     绑定槽位应当在 __DATA / __DATA_CONST 的 __got / __data 之类的节里",
+                    row.name
+                );
+            }
         } else {
             // 老格式：链式修复那边没有，导入只能来自 bind 流。
             assert!(
@@ -933,6 +1095,17 @@ fn real_binaries_report_chained_fixup_imports() {
                 row.notes_mention_bind_imports,
                 "{}：bind 流解出了 {} 条导入，notes 就必须说\"已解析 dyld 绑定\"",
                 row.name, row.bind_imports
+            );
+            // 没有链式修复就不该有链式修复的地址：两种写法不能互相串。
+            assert_eq!(
+                row.imports_with_slot, 0,
+                "{}：没有 LC_DYLD_CHAINED_FIXUPS，链式修复那边不该有任何槽位地址",
+                row.name
+            );
+            assert!(
+                row.walk.is_none(),
+                "{}：没有 LC_DYLD_CHAINED_FIXUPS 就不该有走链结果",
+                row.name
             );
         }
 

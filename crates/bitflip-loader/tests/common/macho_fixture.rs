@@ -284,6 +284,15 @@ pub const R_ONLY: u32 = 1;
 
 // ── 字节写入 ────────────────────────────────────────────────────────────────
 
+fn put_u16(out: &mut [u8], offset: usize, value: u16, little: bool) {
+    let raw = if little {
+        value.to_le_bytes()
+    } else {
+        value.to_be_bytes()
+    };
+    out[offset..offset + 2].copy_from_slice(&raw);
+}
+
 fn put_u32(out: &mut [u8], offset: usize, value: u32, little: bool) {
     let raw = if little {
         value.to_le_bytes()
@@ -2365,41 +2374,12 @@ pub fn chained_image(payload: &[u8]) -> ChainedImage {
 
 /// 完整样本：`imports_format = 1`，4 条导入跨 2 个库 —— 其中 `_UIApplicationMain`
 /// 是 weak，`_mainRef` 的库序号是 `0xFF`（二补码 -1 = 主可执行文件）。
+///
+/// 链描述给的是 [`minimal_starts_in_image`]（三个段都没有链）：这份样本验证的是
+/// **导入表**，指针链走不走得通由下面的 `demo_chained_chain*` 系列验证。
 #[must_use]
 pub fn demo_chained_fixups64() -> ChainedImage {
-    let (symbols, offsets) = symbol_pool(&[
-        "_objc_msgSend",
-        "_UIApplicationMain",
-        "_dispatch_async",
-        "_mainRef",
-    ]);
-    let spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT)
-        .pool(symbols, minimal_starts_in_image(3))
-        .import(ChainedImportSpec {
-            lib_ordinal: 1, // libSystem
-            weak_import: false,
-            name_offset: offsets[0],
-            addend: 0,
-        })
-        .import(ChainedImportSpec {
-            lib_ordinal: 2, // UIKit
-            weak_import: true,
-            name_offset: offsets[1],
-            addend: 0,
-        })
-        .import(ChainedImportSpec {
-            lib_ordinal: 1, // libSystem
-            weak_import: false,
-            name_offset: offsets[2],
-            addend: 0,
-        })
-        .import(ChainedImportSpec {
-            lib_ordinal: 0xFF, // -1 = main executable
-            weak_import: false,
-            name_offset: offsets[3],
-            addend: 0,
-        });
-    chained_image(&build_chained_fixups(&spec))
+    chained_image(&chained_four_imports(minimal_starts_in_image(3)))
 }
 
 /// `imports_format = 2`（`DYLD_CHAINED_IMPORT_ADDEND`）：带 `i32` 加数。
@@ -2520,4 +2500,546 @@ pub fn malformed_chained_ordinal_out_of_range() -> Vec<u8> {
             addend: 0,
         });
     chained_image(&build_chained_fixups(&spec)).bytes
+}
+
+// ── LC_DYLD_CHAINED_FIXUPS 的**指针链**（starts_in_image / starts_in_segment） ──
+//
+// 规范出处同上：Apple XNU 的 `EXTERNAL_HEADERS/mach-o/fixup-chains.h`。结构声明与
+// 位域按规范手拼（CLAUDE.md §6.11：不许照解析器的实现拼）：
+//
+// ```text
+// struct dyld_chained_starts_in_image {       // 4 + 4×seg_count 字节
+//     uint32_t seg_count;                     // +0x00
+//     uint32_t seg_info_offset[1];            // +0x04 每项相对本结构起点；0 = 该段没有链
+// };
+//
+// struct dyld_chained_starts_in_segment {      // 22 字节固定头 + 数组
+//     uint32_t size;                           // +0x00 整个结构（含后面的数组）的字节数
+//     uint16_t page_size;                      // +0x04 0x1000 / 0x4000
+//     uint16_t pointer_format;                 // +0x06 DYLD_CHAINED_PTR_*
+//     uint64_t segment_offset;                 // +0x08 段相对镜像基址的**内存**偏移
+//     uint32_t max_valid_pointer;              // +0x10 只有 32 位格式用
+//     uint16_t page_count;                     // +0x14
+//     uint16_t page_start[1];                  // +0x16
+//     // uint16_t chain_starts[];              多起点列表，最后一项带 0x8000
+// };
+//
+// enum {
+//     DYLD_CHAINED_PTR_START_NONE  = 0xFFFF,   // page_start[]：这一页没有修复
+//     DYLD_CHAINED_PTR_START_MULTI = 0x8000,   // page_start[]：多起点页，低 15 位是下标
+//     DYLD_CHAINED_PTR_START_LAST  = 0x8000,   // chain_starts[]：列表最后一项
+// };
+//
+// 指针字（8 字节，小端；LSB-first 的位域）：
+//   DYLD_CHAINED_PTR_ARM64E = 1（stride 8）：ordinal 0..16、addend 32..51（19 位二补码）、
+//       next 51..62（11 位）、bind 62、auth 63
+//   DYLD_CHAINED_PTR_64     = 2（stride 4）：ordinal 0..24、addend 24..32（8 位无符号）、
+//       next 51..63（12 位）、bind 63
+//   next 的单位是 stride（dyld: `offset += next * stride`），next == 0 结束链。
+// ```
+//
+// 段偏移的来历：样本骨架（[`dyld_base64`]）里 `__DATA` 的 `fileoff` 是 0x2000、
+// `vmaddr` 是 0x1_0000_2000，`__TEXT.vmaddr` 是 0x1_0000_0000 —— 所以
+// `segment_offset`（相对镜像基址）= 0x2000，链指针在文件偏移 0x2000 + 页偏移处。
+
+/// 样本里链指针所在段（`__DATA`）的 `fileoff`（见 [`dyld_base64`] 的 `SegmentSpec`）。
+pub const CHAIN_SEGMENT_FILEOFF: u64 = 0x2000;
+
+/// 样本里 `__DATA` 相对镜像基址的内存偏移（`0x1_0000_2000 - 0x1_0000_0000`）。
+pub const CHAIN_SEGMENT_OFFSET: u64 = 0x2000;
+
+/// 样本里一页的字节数（4 KB 页；真机 arm64 常用 0x4000，两种都在解析器支持范围内）。
+pub const CHAIN_PAGE_SIZE: u64 = 0x1000;
+
+/// 一段的链描述规格（`dyld_chained_starts_in_segment`）。
+#[derive(Debug, Clone)]
+pub struct ChainSegmentSpec {
+    /// `page_size`。
+    pub page_size: u16,
+    /// `pointer_format`（`DYLD_CHAINED_PTR_*`）。
+    pub pointer_format: u16,
+    /// `segment_offset`（段相对镜像基址的内存偏移）。
+    pub segment_offset: u64,
+    /// `max_valid_pointer`。
+    pub max_valid_pointer: u32,
+    /// `page_start[]` 的原样值（`0xFFFF` / `0x8000|idx` / 页内偏移）。
+    pub page_start: Vec<u16>,
+    /// 多起点页的 `chain_starts[]`：拼在 `page_start[]` 之后，最后一项自带 `0x8000`。
+    pub chain_starts: Vec<u16>,
+    /// 覆盖 `size` 字段（畸形样本可以写小）。
+    pub size_override: Option<u32>,
+}
+
+impl ChainSegmentSpec {
+    /// 一段的链描述（`page_start[]` 由调用方给；`segment_offset` 默认指向样本的 `__DATA`）。
+    #[must_use]
+    pub fn new(page_size: u16, pointer_format: u16, page_start: Vec<u16>) -> Self {
+        Self {
+            page_size,
+            pointer_format,
+            segment_offset: CHAIN_SEGMENT_OFFSET,
+            max_valid_pointer: 0xFFFF_FFFF,
+            page_start,
+            chain_starts: Vec::new(),
+            size_override: None,
+        }
+    }
+
+    /// 多起点页的 `chain_starts[]`。
+    #[must_use]
+    pub fn chain_starts(mut self, entries: Vec<u16>) -> Self {
+        self.chain_starts = entries;
+        self
+    }
+}
+
+/// 按规格拼 `dyld_chained_starts_in_image`：`entries[i]` 是第 i 个段的链描述，
+/// `None` = 这个段的 `seg_info_offset` 写 0（没有链）。
+///
+/// 每个段的 `starts_in_segment` 按 8 字节对齐依次摆放，偏移**由布局算出来**。
+#[must_use]
+pub fn build_starts_in_image(entries: &[Option<ChainSegmentSpec>]) -> Vec<u8> {
+    let mut offsets = vec![0u32; entries.len()];
+    let mut cursor = align_up(4 + 4 * entries.len() as u64, 8);
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(spec) = entry {
+            offsets[index] = cursor as u32;
+            let entries_bytes = 2 * (spec.page_start.len() + spec.chain_starts.len()) as u64;
+            cursor = align_up(cursor + 22 + entries_bytes, 8);
+        }
+    }
+    let total = cursor.max(4 + 4 * entries.len() as u64) as usize;
+    let mut out = vec![0u8; total];
+    put_u32(&mut out, 0, entries.len() as u32, true);
+    for (index, offset) in offsets.iter().enumerate() {
+        put_u32(&mut out, 4 + 4 * index, *offset, true);
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(spec) = entry else { continue };
+        let at = offsets[index] as usize;
+        let entries_bytes = 2 * (spec.page_start.len() + spec.chain_starts.len());
+        put_u32(
+            &mut out,
+            at,
+            spec.size_override.unwrap_or((22 + entries_bytes) as u32),
+            true,
+        );
+        put_u16(&mut out, at + 0x04, spec.page_size, true);
+        put_u16(&mut out, at + 0x06, spec.pointer_format, true);
+        put_u64(&mut out, at + 0x08, spec.segment_offset, true);
+        put_u32(&mut out, at + 0x10, spec.max_valid_pointer, true);
+        put_u16(&mut out, at + 0x14, spec.page_start.len() as u16, true);
+        for (slot, value) in spec.page_start.iter().enumerate() {
+            put_u16(&mut out, at + 0x16 + 2 * slot, *value, true);
+        }
+        for (slot, value) in spec.chain_starts.iter().enumerate() {
+            put_u16(
+                &mut out,
+                at + 0x16 + 2 * (spec.page_start.len() + slot),
+                *value,
+                true,
+            );
+        }
+    }
+    out
+}
+
+/// 页里的一个指针字。
+#[derive(Debug, Clone, Copy)]
+pub struct ChainPointer {
+    /// 页号。
+    pub page: usize,
+    /// 页内偏移（字节）。
+    pub offset: u16,
+    /// 指针字（用下面的 `arm64e_*` / `ptr64_*` 按规范位域拼）。
+    pub word: u64,
+}
+
+/// `dyld_chained_ptr_arm64e_bind`（格式 1 / 7 / 9 / 10）：`ordinal` 在 bits 0..16、
+/// `addend` 在 bits 32..51（19 位二补码）、`next` 在 bits 51..62、`bind` 在 bit 62、
+/// `auth` 在 bit 63（这里固定 0）。
+#[must_use]
+pub fn arm64e_bind(ordinal: u16, addend: i64, next: u16) -> u64 {
+    (u64::from(ordinal) & 0xFFFF)
+        | ((addend as u64 & 0x7_FFFF) << 32)
+        | ((u64::from(next) & 0x7FF) << 51)
+        | (1 << 62)
+}
+
+/// `dyld_chained_ptr_arm64e_auth_bind`：`ordinal` 在 bits 0..16、`zero` 在 bits 16..32、
+/// `diversity` 在 bits 32..48、`addrDiv` 在 bit 48、`key` 在 bits 49..51、`next` 在
+/// bits 51..62、`bind` 在 bit 62、`auth` 在 bit 63 —— **没有 addend 字段**。
+#[must_use]
+pub fn arm64e_auth_bind(ordinal: u16, diversity: u16, next: u16) -> u64 {
+    (u64::from(ordinal) & 0xFFFF)
+        | (u64::from(diversity) << 32)
+        | ((u64::from(next) & 0x7FF) << 51)
+        | (1 << 62)
+        | (1 << 63)
+}
+
+/// `dyld_chained_ptr_arm64e_rebase`：`target` 在 bits 0..43、`high8` 在 bits 43..51、
+/// `next` 在 bits 51..62（`bind` / `auth` 都是 0）。
+#[must_use]
+pub fn arm64e_rebase(target: u64, next: u16) -> u64 {
+    (target & 0x7FF_FFFF_FFFF) | ((u64::from(next) & 0x7FF) << 51)
+}
+
+/// `dyld_chained_ptr_64_bind`（格式 2 / 6）：`ordinal` 在 bits 0..24、`addend` 在
+/// bits 24..32（8 位无符号）、`next` 在 bits 51..63、`bind` 在 bit 63。
+#[must_use]
+pub fn ptr64_bind(ordinal: u32, addend: u8, next: u16) -> u64 {
+    (u64::from(ordinal) & 0xFF_FFFF)
+        | ((u64::from(addend) & 0xFF) << 24)
+        | ((u64::from(next) & 0xFFF) << 51)
+        | (1 << 63)
+}
+
+/// `dyld_chained_ptr_64_rebase`：`target` 在 bits 0..36、`high8` 在 bits 36..44、
+/// `next` 在 bits 51..63（`bind` 是 0）。
+#[must_use]
+pub fn ptr64_rebase(target: u64, next: u16) -> u64 {
+    (target & 0xF_FFFF_FFFF) | ((u64::from(next) & 0xFFF) << 51)
+}
+
+/// 链样本用的 4 条导入（与 [`demo_chained_fixups64`] 同一张表：libSystem / UIKit /
+/// libSystem / 主可执行文件，第 2 条是 weak），链描述由调用方给。
+fn chained_four_imports(starts: Vec<u8>) -> Vec<u8> {
+    let (symbols, offsets) = symbol_pool(&[
+        "_objc_msgSend",
+        "_UIApplicationMain",
+        "_dispatch_async",
+        "_mainRef",
+    ]);
+    let mut spec = ChainedFixupsSpec::new(DYLD_CHAINED_IMPORT);
+    spec.starts = starts;
+    spec.symbols = symbols;
+    spec.imports = vec![
+        ChainedImportSpec {
+            lib_ordinal: 1, // libSystem
+            weak_import: false,
+            name_offset: offsets[0],
+            addend: 0,
+        },
+        ChainedImportSpec {
+            lib_ordinal: 2, // UIKit
+            weak_import: true,
+            name_offset: offsets[1],
+            addend: 0,
+        },
+        ChainedImportSpec {
+            lib_ordinal: 1, // libSystem
+            weak_import: false,
+            name_offset: offsets[2],
+            addend: 0,
+        },
+        ChainedImportSpec {
+            lib_ordinal: 0xFF, // -1 = 主可执行文件
+            weak_import: false,
+            name_offset: offsets[3],
+            addend: 0,
+        },
+    ];
+    build_chained_fixups(&spec)
+}
+
+/// 把指针字写进 `__DATA` 段里对应的文件位置（`fileoff + page×page_size + 页内偏移`）。
+fn chained_chain_image(starts: Vec<u8>, pointers: &[ChainPointer]) -> ChainedImage {
+    let payload = chained_four_imports(starts);
+    let mut image = chained_image(&payload);
+    for pointer in pointers {
+        let at = CHAIN_SEGMENT_FILEOFF
+            + pointer.page as u64 * CHAIN_PAGE_SIZE
+            + u64::from(pointer.offset);
+        let end = at as usize + 8;
+        if image.bytes.len() < end {
+            image.bytes.resize(end, 0);
+        }
+        put_u64(&mut image.bytes, at as usize, pointer.word, true);
+    }
+    image
+}
+
+/// 一页、一条链、两个 bind 跨两个库（`ordinal` 0 = libSystem、1 = UIKit），中间夹一个
+/// rebase；链在 0x118 结束（页是 0x1000，所以这是"链结束在页中间"）。
+///
+/// 期望的槽位地址：`0x1_0000_2100` / `0x1_0000_2108` / `0x1_0000_2118`（跳过 rebase）。
+/// 第 4 条导入（`_mainRef`）没有出现在链里 → 地址是 `None`（不是 0）。
+#[must_use]
+pub fn demo_chained_chain64() -> ChainedImage {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        // 格式 1 = DYLD_CHAINED_PTR_ARM64E（stride 8），页 0 的链从 0x100 开始。
+        Some(ChainSegmentSpec::new(0x1000, 1, vec![0x100])),
+    ]);
+    chained_chain_image(
+        starts,
+        &[
+            ChainPointer {
+                page: 0,
+                offset: 0x100,
+                word: arm64e_bind(0, 0, 1),
+            },
+            ChainPointer {
+                page: 0,
+                offset: 0x108,
+                word: arm64e_bind(1, 8, 1),
+            },
+            ChainPointer {
+                page: 0,
+                offset: 0x110,
+                word: arm64e_rebase(0x1_0000_2200, 1),
+            },
+            ChainPointer {
+                page: 0,
+                offset: 0x118,
+                word: arm64e_bind(2, 0, 0),
+            },
+        ],
+    )
+}
+
+/// **多起点页**：格式 2（`DYLD_CHAINED_PTR_64`，stride 4），页 0 有两条链。
+///
+/// `page_start[0] = 0x8001` → 低 15 位 1 是下标；数组从下标 1 开始是 `chain_starts[]`：
+/// `0x0080`（不是最后一项）→ `0x8100`（`0x8000` = LAST，偏移 0x100）。
+/// 期望地址：导入 0 → `0x1_0000_2080`，导入 2 → `0x1_0000_2100`。
+#[must_use]
+pub fn demo_chained_multi_start() -> ChainedImage {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(
+            ChainSegmentSpec::new(0x1000, 2, vec![0x8000 | 1])
+                .chain_starts(vec![0x0080, 0x8000 | 0x0100]),
+        ),
+    ]);
+    chained_chain_image(
+        starts,
+        &[
+            ChainPointer {
+                page: 0,
+                offset: 0x80,
+                word: ptr64_bind(0, 0, 0),
+            },
+            ChainPointer {
+                page: 0,
+                offset: 0x100,
+                word: ptr64_bind(2, 0, 0),
+            },
+        ],
+    )
+}
+
+/// 两页：第 0 页有一条链（一个 bind），第 1 页 `page_start = 0xFFFF`（没有修复）。
+#[must_use]
+pub fn demo_chained_page_without_fixups() -> ChainedImage {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 1, vec![0x100, 0xFFFF])),
+    ]);
+    chained_chain_image(
+        starts,
+        &[ChainPointer {
+            page: 0,
+            offset: 0x100,
+            word: arm64e_bind(0, 0, 0),
+        }],
+    )
+}
+
+/// 一条链在页中间结束：两个 bind（0x200 → 0x208），`next == 0` 落在 0x208，而一页有 0x1000。
+#[must_use]
+pub fn demo_chained_ends_mid_page() -> ChainedImage {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 1, vec![0x200])),
+    ]);
+    chained_chain_image(
+        starts,
+        &[
+            ChainPointer {
+                page: 0,
+                offset: 0x200,
+                word: arm64e_bind(0, 0, 1),
+            },
+            ChainPointer {
+                page: 0,
+                offset: 0x208,
+                word: arm64e_bind(1, 0, 0),
+            },
+        ],
+    )
+}
+
+/// 认证绑定的样本：`auth == 1` 的 bind 没有 addend 字段（那 19 位是 diversity/key）。
+#[must_use]
+pub fn demo_chained_auth_bind() -> ChainedImage {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 1, vec![0x300])),
+    ]);
+    chained_chain_image(
+        starts,
+        &[ChainPointer {
+            page: 0,
+            offset: 0x300,
+            word: arm64e_auth_bind(1, 0x1234, 0),
+        }],
+    )
+}
+
+/// 同一条导入（`ordinal = 0`）被绑在**两个**地址：0x100 与 0x108 —— 用来验证
+/// "保留第一个、其余计数"这条规则（不许悄悄丢，也不许挑一个"代表"）。
+#[must_use]
+pub fn demo_chained_duplicate_bind() -> ChainedImage {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 1, vec![0x100])),
+    ]);
+    chained_chain_image(
+        starts,
+        &[
+            ChainPointer {
+                page: 0,
+                offset: 0x100,
+                word: arm64e_bind(0, 0, 1),
+            },
+            ChainPointer {
+                page: 0,
+                offset: 0x108,
+                word: arm64e_bind(0, 0, 0),
+            },
+        ],
+    )
+}
+
+/// 多起点 + 两页：`page_count = 2`，多起点下标正好等于 `page_count`（池子第一项）——
+/// 合法的绝对下标从 `page_count` 起算，这条样本确认判定不会把它误当越界。
+#[must_use]
+pub fn demo_chained_multi_start_after_two_pages() -> ChainedImage {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(
+            ChainSegmentSpec::new(0x1000, 2, vec![0x8000 | 2, 0xFFFF])
+                .chain_starts(vec![0x8000 | 0x0180]),
+        ),
+    ]);
+    chained_chain_image(
+        starts,
+        &[ChainPointer {
+            page: 0,
+            offset: 0x180,
+            word: ptr64_bind(3, 0, 0),
+        }],
+    )
+}
+
+/// 畸形：多起点的下标 0 落在 `page_start[]` 自己的区域里（`page_count = 1`）——
+/// 这正是 `fixup-chains.h` 措辞歧义（"index into chain_starts[]"）会踩到的位置：
+/// 必须报错并说明歧义，不许按另一种读法再猜一遍。
+#[must_use]
+pub fn malformed_chained_multi_start_index_into_page_array() -> Vec<u8> {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 2, vec![0x8000]).chain_starts(vec![0x8000 | 0x0100])),
+    ]);
+    chained_chain_image(starts, &[]).bytes
+}
+
+/// 畸形：`pointer_format = 3`（`DYLD_CHAINED_PTR_32`）—— 32 位格式本片不解，必须报
+/// "暂不支持"而不是按 64 位硬读。
+#[must_use]
+pub fn malformed_chained_unsupported_pointer_format() -> Vec<u8> {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 3, vec![0x100])),
+    ]);
+    chained_chain_image(
+        starts,
+        &[ChainPointer {
+            page: 0,
+            offset: 0x100,
+            word: 0,
+        }],
+    )
+    .bytes
+}
+
+/// 畸形：`next` 把下一个指针推到页尾之外（0x100 + 0xFFF×4 = 0x40FC > 0x1000）——
+/// 必须报错，不许硬走到相邻页（跨页读会给出编造的地址）。
+#[must_use]
+pub fn malformed_chained_chain_runs_past_page() -> Vec<u8> {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 2, vec![0x100])),
+    ]);
+    chained_chain_image(
+        starts,
+        &[ChainPointer {
+            page: 0,
+            offset: 0x100,
+            word: ptr64_bind(0, 0, 0xFFF),
+        }],
+    )
+    .bytes
+}
+
+/// 畸形：多起点列表一直没有 `0x8000`（LAST）位，读到数组末尾也没结束 —— 必须报错，
+/// 不许越界继续读。
+#[must_use]
+pub fn malformed_chained_multi_start_without_last() -> Vec<u8> {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 2, vec![0x8000 | 1]).chain_starts(vec![0x0080, 0x0100])),
+    ]);
+    chained_chain_image(starts, &[]).bytes
+}
+
+/// 畸形：bind 指针里 `ordinal = 9`，但导入表只有 4 条 —— 必须报错（不许索引到随机
+/// 一条导入上，也不许跳过这条地址）。
+#[must_use]
+pub fn malformed_chained_chain_ordinal_out_of_range() -> Vec<u8> {
+    let starts = build_starts_in_image(&[
+        None,
+        None,
+        Some(ChainSegmentSpec::new(0x1000, 1, vec![0x100])),
+    ]);
+    chained_chain_image(
+        starts,
+        &[ChainPointer {
+            page: 0,
+            offset: 0x100,
+            word: arm64e_bind(9, 0, 0),
+        }],
+    )
+    .bytes
+}
+
+/// 畸形：`segment_offset` 指向段起点之前（0x1000，而 `__DATA.vmaddr - 镜像基址` 是
+/// 0x2000）—— 地址换不出来，必须报错而不是算到上一页去。
+#[must_use]
+pub fn malformed_chained_segment_offset_before_segment() -> Vec<u8> {
+    let mut segment = ChainSegmentSpec::new(0x1000, 1, vec![0x100]);
+    segment.segment_offset = 0x1000;
+    let starts = build_starts_in_image(&[None, None, Some(segment)]);
+    chained_chain_image(
+        starts,
+        &[ChainPointer {
+            page: 0,
+            offset: 0x100,
+            word: arm64e_bind(0, 0, 0),
+        }],
+    )
+    .bytes
 }
