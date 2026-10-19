@@ -356,14 +356,17 @@ impl Snapshot {
             let section = &data[offset..end];
             match kind {
                 TableKind::Functions => {
-                    for chunk in section.chunks_exact(24) {
+                    // CI 上的 clippy 比本机新，会要求用 `as_chunks`（`chunks_exact`
+                    // 配常量块长时它会提示）。`as_chunks` 在定长编码表这里是等价的，
+                    // 且把"块长固定"写进类型，不需要再拆 `(&[T; N], 余数)`。
+                    for chunk in section.as_chunks::<24>().0 {
                         snapshot
                             .functions
                             .push(FunctionEntry::decode(chunk).expect("固定长度"));
                     }
                 }
                 TableKind::Xrefs => {
-                    for chunk in section.chunks_exact(XrefEntry::ENCODED_LEN) {
+                    for chunk in section.as_chunks::<{ XrefEntry::ENCODED_LEN }>().0 {
                         snapshot
                             .xrefs
                             .push(XrefEntry::decode(chunk).expect("固定长度"));
