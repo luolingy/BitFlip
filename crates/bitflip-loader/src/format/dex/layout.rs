@@ -624,8 +624,7 @@ mod tests {
         out.extend_from_slice(&element_width.to_le_bytes());
         out.extend_from_slice(&count.to_le_bytes());
         // CI 的 clippy（比本机新）指出 `map_or(0, |c| c)` 就是 `unwrap_or(0)`。
-        let mut data =
-            vec![0u8; usize::try_from(count).unwrap_or(0) * usize::from(element_width)];
+        let mut data = vec![0u8; usize::try_from(count).unwrap_or(0) * usize::from(element_width)];
         if data.len() % 2 != 0 {
             data.push(0);
         }
