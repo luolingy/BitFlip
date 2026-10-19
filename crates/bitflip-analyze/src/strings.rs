@@ -125,7 +125,9 @@ fn scan_utf16le(data: &[u8], base: u64, opts: &StringOptions, out: &mut Vec<Stri
             if char_len >= opts.min_length && j + 1 < n && data[j] == 0 && data[j + 1] == 0 {
                 let bytes = &data[s..j];
                 let mut chars = Vec::with_capacity(char_len);
-                for pair in bytes.chunks_exact(2) {
+                // CI 的 clippy（比本机新）要求常量块长用 `as_chunks`；语义相同：
+                // 只取每对里的第一个字节（UTF-16LE 的低字节）。
+                for pair in bytes.as_chunks::<2>().0 {
                     chars.push(pair[0]);
                 }
                 out.push(StringEntry {
