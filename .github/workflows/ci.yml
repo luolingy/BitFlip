@@ -39,6 +39,16 @@ jobs:
       - name: Clippy（warnings 视为错误）
         run: cargo clippy --all-targets -- -D warnings
 
+      # 部分测试要求 tests/fixtures/generated/ 下的样本，而样本按 §0.2 不入库。
+      # 原先这些测试在 CI 上直接 panic（"缺少 fixture"），于是"测试闸门"永远是红的。
+      # 这里现场生成一次：ubuntu 自带 pwsh 与 clang，补齐 gcc-mingw-w64 后脚本即可产出
+      # m3-mingw-static.exe 等 PE 样本。
+      - name: 生成测试样本
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          pwsh -File scripts/gen-fixtures.ps1
+
       - name: 单元与集成测试
         run: cargo test --workspace
 
