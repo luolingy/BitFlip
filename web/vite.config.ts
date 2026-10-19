@@ -10,6 +10,20 @@ export default defineConfig({
     emptyOutDir: true,
     sourcemap: false,
     target: "es2022",
+    // 产物名字钉死成 `assets/app.js` / `assets/app.css`：Rust 侧 rust-embed 与服务端
+    // 静态路由按这两个固定名取文件，Vite 默认的哈希名会让内嵌的那份对不上。
+    // 界面是本地单页应用、只有一个入口，固定名不带来缓存问题。
+    rollupOptions: {
+      output: {
+        entryFileNames: "assets/app.js",
+        chunkFileNames: "assets/[name].js",
+        assetFileNames: (asset) =>
+          typeof asset.names !== "undefined" &&
+          asset.names.some((name) => name.endsWith(".css"))
+            ? "assets/app.css"
+            : "assets/[name][extname]",
+      },
+    },
   },
   server: {
     host: "127.0.0.1",
