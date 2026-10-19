@@ -1,0 +1,16 @@
+fixture libsample.so
+nodes 5
+edges 5
+unresolved_indirect 0
+outside_targets 0
+roots 5
+components 5
+largest_component 1
+wire_edges 5
+unresolved 0
+external_edges 0
+edge 00000000000014f0 0000000000001570 tail=false external=false
+edge 00000000000014f0 0000000000001580 tail=false external=false
+edge 00000000000014f0 0000000000001530 tail=false external=false
+edge 0000000000001570 0000000000001560 tail=true external=false
+edge 0000000000001580 0000000000001560 tail=true external=false

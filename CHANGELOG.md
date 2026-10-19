@@ -11,6 +11,83 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — 调用图里指向导入符号的边（M12 第五片）
+
+上一片让 Mach-O 真的有了 `Object.imports`（名字 + 所在库 + 槽位地址 `iat_slot`），
+但**调用图没用它**：`bl` 到 `__stubs` 里的跳板桩、或直接跳到 GOT 槽的调用，终点不是
+任何函数 —— 落进"已知函数之外"就被丢掉。用户看到的是一张**看起来完整**的图，其实
+缺了全部调外部函数的部分。这一片把这类目标翻译成"这是 `<dylib>` 的 `<符号>`"。
+
+- **两条解析规则，都只认地址相同**（`crates/bitflip-core/src/import_edges.rs`）：
+  1. 边目标**等于**某个导入的 `iat_slot`；2. 边目标落在 `__stubs` 节里、那几条字节是
+  一条跳板桩（`bitflip_arch::import_stub_slot`），桩读的槽位**等于**某个导入的槽位。
+  没有学习、没有启发式、没有"看着像"：对不上就保持原样。
+- **AArch64 的桩形状是新解出来的**：`adrp x16, #page` / `ldr x16, [x16, #off]` /
+  `br x16`（`adrp` 立即数按有符号 21 位 → 页，`ldr` 无符号偏移按 8 缩放）。x86_64 / i386
+  仍是既有的 `jmp *[rip+disp]`。**没有**扩宽 `plt_stub`/`supports_plt_stub`（ELF 的
+  `.plt` 命名路径靠它们，扩宽会连带改掉 ELF/AArch64 的行为），而是新增一对
+  `import_stub_slot`/`supports_import_stub`，让"哪些架构支持什么"可分辨。
+  真实字节与真实槽位来自 `temp/LiveContainer.ipa`：`__TEXT,__stubs` 78 条桩算出的槽位
+  与链式修复 bind 链给出的 `iat_slot` **逐一相同**（78/78），单测用这三条指令的原字节钉住。
+- **边照样进 `edges`，但明确标成外部**（`CallEdgeWire` 新增三个字段）：
+  `external: bool` / `import_name: Option<String>` / `import_module: Option<String>`。
+  `callee` 保持调用指令编码里的那个地址 —— 外部边里它**不是**函数入口，没有反汇编、
+  没有大小、没有 CFG，字段文档里写死了这件事。**不**伪造一个本镜像里的函数、**不**借用
+  内部命名（§7）；按序号导入时 `import_name` 是 `null`，序号不伪装成名字。
+- **只对 Mach-O 建表**（`formats_with_import_edges`）。这里与需求的前提有一处**不一致，
+  必须说明**：PE 的解析器**同样**在填 `iat_slot`（实测 `m3-mingw-static.exe` 46 条导入
+  全部带槽位），所以"别的格式没有导入表"不成立；真正的原因是 PE 的 `__imp_xxx` 跳板就在
+  `.text` 里、形状与 `jmp *[rip+disp]` 相同，一旦按桩解析就会给 PE 多出一批外部边，而
+  ELF 的 `.plt` 桩早已由另一条路径命名成 `名字@plt` 的**函数**。本片的验收要求是 PE/ELF
+  行为不变，于是按格式收窄，并由黄金文件逐行钉住（见下）。
+- **`outside_targets` 不再重复计数**：被解析成导入的目标原本计入"落在已知函数之外"，
+  现在从该计数里扣除，扣除量写进 notes（同一件事不数两遍）。
+- **notes 里必须有账**：`调用图里有 N 条边指向导入符号（M 个不同导入）…callee 是桩/槽
+  地址、被调用方在本镜像之外`；此外 `iat_slot = None` 的导入条数、桩节里没解析出来的
+  目标数、架构不支持桩识别、没有 `__stubs` 节，各有一条。桩识别失效是**静默**的，
+  所以这些计数进的是调用图自己的 notes（`/api/call-graph` 的 `notes` 里看得到）。
+- **API 版本**：`CORE_API_VERSION` 3 → 4、`SERVER_API_VERSION` 3 → 4（同步）、
+  `ANALYSIS_FORMAT_VERSION` 1 → 2 —— `CallEdgeWire` 是公开类型、JSON 形状变了（每条边
+  多三个字段），消费者必须能分辨"这版边里有没有外部边这一说"。`INFO_FORMAT_VERSION`
+  **不动**（`ObjectInfo` 一个字段没加）、`EXPORT_FORMAT_VERSION` 不动、
+  `ARCH_API_VERSION` **不动**（只新增两个函数，既有类型与行为都没变）。
+- **界面**：`web/src/api.ts` 的 `CallEdge` 跟上三个字段；邻域面板把外部边的另一端渲染成
+  **导入名 + 所在库 + "外部"标记**，不再做成可点开的地址（那边没有可分析的目标）。
+  `web` 的类型检查本机跑不了（`npm` 在沙箱下不可用），只做了人工核对。
+- **明确没做**：经寄存器/GOT 的间接调用（`blr x16` 之前内联 `adrp`+`ldr` 的那种，
+  LiveContainer 上 15 条间接调用里有 3 条形态接近，仍记为未解析）、Objective-C 的
+  `__objc_stubs`（先取 selector 再跳 `_objc_msgSend`，解析成"调用了 objc_msgSend"会丢掉
+  selector，而那正是那条边的全部意义 —— 537 条边保持未解析）、arm64e 的 `braa`、
+  `ldur`/`ldr w` 形态、PE 跳板、ELF `.plt` 桩 → 槽位的边。raw `bitflip_analyze::CallGraph`
+  一行没改，可达性语义不变。
+
+**真实样本**（`temp/LiveContainer.ipa` 主二进制，151 648 B，aarch64，`temp/` 永不入库）：
+
+| 项 | 值 |
+| --- | --- |
+| 导入 | 118 条，**全部**有槽位与名字 |
+| `__TEXT,__stubs` | `0x10000b588..0x10000b930`（936 B，78 条桩） |
+| 调用图边数 | 1 760（与这一片之前相同） |
+| **其中指向导入符号** | **1 105 条 / 78 个不同导入** |
+| 最热导入 | `_objc_release` 410、`_objc_retainAutoreleasedReturnValue` 352、`_objc_retain` 69、`_NSLog` 21 |
+| 桩识别覆盖 | 78/78（桩算出的槽位与导入表逐一相同） |
+
+1 105 条边此前全都以"桩地址"的形式混在 1 760 条已解析边里（`find_function` 的
+无边界吸收规则把它们收进了旁边函数的范围）——所以**边数没变，变的是这些边终于说清了
+被调用方是谁**。
+
+**PE / ELF 回归**（`crates/bitflip-core/tests/import_edges_regression.rs`，黄金文件
+`tests/golden/callgraph_*.txt` 是**这一片代码之前**的输出，边与计数逐行比过）：
+
+| 样本 | 边 | 未解析 | 外部边 |
+| --- | --- | --- | --- |
+| `m3-mingw-static.exe`（PE，46 条导入全有槽位） | 336 | 39 | **0** |
+| `libsample.so`（ELF，含两条 `.plt` 桩边） | 5 | 0 | **0** |
+| `elf-ehframe.exe`（ELF） | 9 | 0 | **0** |
+
+PE 那条另有一个用例证明"闸门是有数据可用的"：46 个槽位一个都没被调用 —— 有数据、没触发，
+不是"没数据所以碰巧没变"。
+
 ### 新增 — 分析层用上 Mach-O 的函数起点表（M12 第四片）
 
 上一片把 `LC_FUNCTION_STARTS` 解成了 `Object.function_starts`，但**分析层一眼没看**：

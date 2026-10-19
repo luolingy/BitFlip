@@ -17,6 +17,7 @@ mod diff;
 mod disasm;
 mod error;
 mod export;
+mod import_edges;
 mod session;
 mod timing;
 
@@ -97,7 +98,13 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// 开始**真的填** `symbols`（字段本身早就有，形状没变，但"空表"的含义变了：
 /// 以前恒为空是因为没解析，现在空是"文件里没有可引用的符号"）。
 /// 同样是增量字段，但形状变了 ⇒ 版本号 +1。
-pub const CORE_API_VERSION: u32 = 3;
+///
+/// v4（M12 第五片）：[`CallEdgeWire`] 新增 `external` / `import_name` /
+/// `import_module`（调用图开始有条边指向**本镜像之外**的导入符号）。
+/// 又是增量字段，但公开结构体的形状变了（字面量构造会编译失败），
+/// 而且 `callee` 的含义多了一种：`external = true` 时它是桩/槽地址，
+/// **不是**函数入口 —— 消费方必须能分辨 ⇒ 版本号 +1。
+pub const CORE_API_VERSION: u32 = 4;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

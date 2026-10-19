@@ -27,10 +27,16 @@ use bitflip_symbols::{SymbolCandidate, SymbolSource};
 use serde::{Deserialize, Serialize};
 
 use crate::disasm::{hex16, parse_address, Disasm};
+use crate::import_edges::ImportEdges;
 use crate::timing::Stages;
 
 /// wire 格式版本。
-pub const ANALYSIS_FORMAT_VERSION: u32 = 1;
+///
+/// 2（M12 第五片）：[`CallEdgeWire`] 新增 `external` / `import_name` /
+/// `import_module`。调用图的 JSON 形状变了（每条边多三个字段），
+/// 所以这个号必须动 —— 消费方要能分辨"这版边里有没有外部边这一说"。
+/// `INFO_FORMAT_VERSION` 不动：`ObjectInfo` 一个字段都没变。
+pub const ANALYSIS_FORMAT_VERSION: u32 = 2;
 
 /// 签名库这一遍的账目（M8）。
 ///
@@ -527,14 +533,52 @@ pub struct CallGraphSummaryWire {
 }
 
 /// 一条已解析的调用边（wire）。
+///
+/// # 两种边：本镜像里的，和本镜像之外的
+///
+/// `external == false` 时 `callee` 是**本镜像里的函数入口**，两边都有
+/// 反汇编、大小、CFG。
+///
+/// `external == true` 时被调用方在**本二进制之外**：`callee` 只是调用指令
+/// 编码里那个地址（`bl` 到的导入跳板桩，或直接指向 GOT 槽的目标），
+/// 它**不是**函数入口，也没有反汇编、没有大小、没有 CFG。这条边为什么
+/// 能成立写在 `import_name` / `import_module` 里：那是加载器从导入表
+/// （Mach-O 的 bind / 链式修复）读出来的事实，不是按名字猜的。
+///
+/// 为什么不把它塞进一个"看起来很正常的函数"：那会让调用图凭空多出一个
+/// 节点，而那个节点的内容是别的东西（CLAUDE.md §7：不用假名冒充识别结果）。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CallEdgeWire {
     /// 调用方函数入口（定长 16 位十六进制）。
     pub caller: String,
-    /// 被调用方函数入口。
+    /// 被调用方：内部边是函数入口；外部边是调用指令编码里的桩/槽地址。
     pub callee: String,
     /// 是否为尾调用（不返回）。
     pub tail: bool,
+    /// 这条边的被调用方是否在**本镜像之外**（导入符号）。
+    ///
+    /// `true` 时 `callee` **不是**函数入口（见类型文档）。
+    pub external: bool,
+    /// 导入符号名；只有 `external == true` 且加载器解出了名字时才有值。
+    ///
+    /// 按序号导入、或名字读不到时是 `null` —— 序号不会伪装成名字。
+    pub import_name: Option<String>,
+    /// 导入所在模块（Mach-O 的 dylib 路径）；`external == false` 时为 `null`。
+    pub import_module: Option<String>,
+}
+
+impl CallEdgeWire {
+    /// 一条本镜像内部的调用边。
+    fn internal(caller: String, callee: String, tail: bool) -> Self {
+        Self {
+            caller,
+            callee,
+            tail,
+            external: false,
+            import_name: None,
+            import_module: None,
+        }
+    }
 }
 
 /// 一个未解析的调用点（wire）。
@@ -1582,8 +1626,18 @@ impl TargetAnalysis {
         timing.mark("数据/代码判定");
 
         // 调用图（M6）：CFG 之外的另一张图 —— 函数之间谁调用谁。
-        let (call_graph, call_graph_raw) =
-            build_call_graph_wire(decoded.as_slice(), &functions, &mut notes);
+        //
+        // 导入边（M12 第五片）：调用目标落在导入槽位 / 导入跳板桩上时，那条
+        // 边是"调用到本镜像之外"。对照表只对 Mach-O 建（理由见
+        // `crate::import_edges` 的模块文档：PE/ELF 今天的行为被验收冻结）。
+        let read_bytes = |addr: u64, len: usize| disasm.space.read(addr, len);
+        let import_edges = ImportEdges::build(object, &read_bytes);
+        let (call_graph, call_graph_raw) = build_call_graph_wire(
+            decoded.as_slice(),
+            &functions,
+            import_edges.as_ref(),
+            &mut notes,
+        );
 
         timing.mark("调用图");
 
@@ -2160,9 +2214,17 @@ fn decode_indexed_insns(disasm: &Disasm) -> Vec<bitflip_arch::DecodedInsn> {
 /// 未解析的间接调用没有目标，混进 `edges` 会让前端拿到 `null`
 /// 然后画出悬空节点。它们走 `unresolved` 字段，并计入
 /// `summary.unresolved_indirect` —— 图不完整这件事必须能被量化。
+///
+/// # 解析到导入的边（M12 第五片）
+///
+/// 目标落在 `__stubs` 的跳板桩上、或直接等于某个导入的槽位地址时，这条边
+/// 是**调用到本镜像之外**：照样进 `edges`（否则调用图会静默少掉所有调外部
+/// 函数的部分），但标 `external = true` 并带上导入名与所在库。`callee`
+/// 保持调用指令编码里的那个地址，**不**伪造一个函数入口（CLAUDE.md §7）。
 fn build_call_graph_wire(
     insns: &[bitflip_arch::DecodedInsn],
     functions: &[FunctionWire],
+    imports: Option<&ImportEdges<'_>>,
     notes: &mut Vec<String>,
 ) -> (CallGraphWire, bitflip_analyze::CallGraph) {
     const HUB_LIMIT: usize = 20;
@@ -2179,19 +2241,57 @@ fn build_call_graph_wire(
     // 用调用方解好的那一遍（不再为建图重解整个索引）。
     let graph = bitflip_analyze::build_call_graph(insns, &ranges);
 
-    // 输出**已解析**的边。未解析的边单独放 `unresolved`：它们没有目标，
-    // 混进 `edges` 会让前端拿到空字符串然后画出悬空节点。
+    // 边：内部已解析的 + 解析到导入的外部边。
+    //
+    // 未解析的边单独放 `unresolved`：它们没有目标，混进 `edges` 会让前端
+    // 拿到空字符串然后画出悬空节点。
+    let mut external_edges = 0usize;
+    let mut external_imports: BTreeSet<usize> = BTreeSet::new();
+    // 被解析成导入、且原本计入 `outside_targets` 的目标（下面要扣掉）。
+    let mut external_outside_targets: BTreeSet<u64> = BTreeSet::new();
+    // 落在桩节里却没能解析成导入的目标 —— 这件事必须进 notes：桩识别失效
+    // 是**静默**的，不说就是一整张图凭空少了边。
+    let mut stub_unresolved: BTreeSet<u64> = BTreeSet::new();
+
     let edges: Vec<CallEdgeWire> = graph
         .edges
         .iter()
-        .filter(|e| e.resolution == bitflip_analyze::CalleeResolution::Resolved)
         .filter_map(|e| {
             let callee = e.callee?;
-            Some(CallEdgeWire {
-                caller: hex16(e.caller),
-                callee: hex16(callee),
-                tail: e.tail,
-            })
+            let caller = hex16(e.caller);
+
+            // ① 先问导入表：这个目标是不是某个导入的槽位 / 跳板桩。
+            //
+            // 放在"只留 Resolved"之前：桩地址常常被 `find_function` 的
+            // "边界未知的函数往后吸收"规则吞进某个函数范围，于是它今天
+            // 显示成 Resolved —— 但它的内容仍是桩，被调用方仍在本镜像之外。
+            if let Some(table) = imports {
+                if let Some(index) = table.lookup_index(callee) {
+                    external_edges += 1;
+                    external_imports.insert(index);
+                    if e.resolution == bitflip_analyze::CalleeResolution::OutsideKnownFunctions {
+                        external_outside_targets.insert(callee);
+                    }
+                    let import = table.import_at(index);
+                    return Some(CallEdgeWire {
+                        caller,
+                        callee: hex16(callee),
+                        tail: e.tail,
+                        external: true,
+                        import_name: import.and_then(|import| import.name.clone()),
+                        import_module: import.map(|import| import.module.clone()),
+                    });
+                }
+                if table.in_stub_section(callee) {
+                    stub_unresolved.insert(callee);
+                }
+            }
+
+            // ② 本镜像内部的边：只要已解析的。
+            if e.resolution != bitflip_analyze::CalleeResolution::Resolved {
+                return None;
+            }
+            Some(CallEdgeWire::internal(caller, hex16(callee), e.tail))
         })
         .collect();
 
@@ -2207,6 +2307,13 @@ fn build_call_graph_wire(
     // `unresolved_indirect`。这样两个数字都能对上。
     summary.edges = edges.len();
 
+    // 解析成导入的那些目标不再算"解释不了的目标"：`outside_targets` 的含义
+    // 是"落在已知函数之外、且我们还说不出它是什么"。同一件事不数两遍，
+    // 否则用户会看到"40 个外部目标"却又在边上看到它们的名字。
+    summary.outside_targets = summary
+        .outside_targets
+        .saturating_sub(external_outside_targets.len());
+
     for n in &graph.notes {
         notes.push(n.clone());
     }
@@ -2216,6 +2323,47 @@ fn build_call_graph_wire(
             summary.largest_component
         ));
     }
+
+    // 调用图自己的 notes（会随 `/api/call-graph` 一起返回）也要带上导入边的账目：
+    // 只写进 `TargetAnalysis.notes` 的话，调用图那个响应里就看不到这些边是怎么来的。
+    let mut wire_notes: Vec<String> = graph.notes.clone();
+    if let Some(table) = imports {
+        wire_notes.push(format!(
+            "调用图里有 {external_edges} 条边指向导入符号（{} 个不同导入）：这些边 external=true，\
+             callee 是调用指令里的桩/槽地址 —— 被调用方在本镜像之外，\
+             没有反汇编、没有大小、没有 CFG",
+            external_imports.len()
+        ));
+        if !external_outside_targets.is_empty() {
+            wire_notes.push(format!(
+                "其中 {} 个目标原本计入 outside_targets，已从中扣除（同一件事不数两遍）",
+                external_outside_targets.len()
+            ));
+        }
+        if table.unslotted() > 0 {
+            wire_notes.push(format!(
+                "另外 {} 条导入没有槽位地址（classic bind 或链里没被绑定），不产生边 —— 未知保持未知",
+                table.unslotted()
+            ));
+        }
+        if !table.stub_arch_supported() && table.slotted() > 0 {
+            wire_notes.push(format!(
+                "本架构（{}）尚未实现导入跳板桩的形状识别：只有目标地址**直接等于**导入槽位的调用能解析",
+                table.spec().arch.as_str()
+            ));
+        } else if !table.has_stub_sections() && table.slotted() > 0 {
+            wire_notes.push(
+                "这份二进制没有 `__stubs` 节：只有目标地址直接等于导入槽位的调用能解析".to_string(),
+            );
+        }
+        if !stub_unresolved.is_empty() {
+            wire_notes.push(format!(
+                "有 {} 个调用目标落在桩节里却没能解析成导入（桩形态没认出来，或桩读的槽位不在导入表里）",
+                stub_unresolved.len()
+            ));
+        }
+    }
+    notes.extend(wire_notes.iter().cloned());
 
     let wire = CallGraphWire {
         summary: CallGraphSummaryWire {
@@ -2237,7 +2385,7 @@ fn build_call_graph_wire(
                 insn: hex16(e.from_insn),
             })
             .collect(),
-        notes: graph.notes.clone(),
+        notes: wire_notes,
     };
     // 原图一并返回：可达性查询要按邻接表做 BFS，而 wire 形态的边
     // 每次查询都要重建邻接表。构建期留一份，查询期就只是遍历。
@@ -3452,6 +3600,188 @@ mod tests {
             rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             vec!["my_name", "bcrypt_hash", "heuristic_name"]
         );
+    }
+
+    // ── 调用图里的导入边（M12 第五片）──
+
+    /// 一条测试用的 `call`（形状与 `bitflip_analyze::callgraph` 的测试一致）。
+    fn call_insn(addr: u64, target: Option<u64>) -> bitflip_arch::DecodedInsn {
+        bitflip_arch::DecodedInsn {
+            addr,
+            len: 5,
+            arch: bitflip_arch::Arch::X86_64,
+            mnemonic: bitflip_arch::MnemonicId(1),
+            flow: Flow::Call,
+            target,
+            condition: None,
+            operands: Vec::new(),
+            reads: bitflip_arch::RegSet::default(),
+            writes: bitflip_arch::RegSet::default(),
+            privileged: false,
+        }
+    }
+
+    /// 一个只有起止地址的函数（其余字段与调用图无关）。
+    fn function_wire(start: u64, end: Option<u64>) -> FunctionWire {
+        FunctionWire {
+            start: hex16(start),
+            end: end.map(hex16),
+            name: String::new(),
+            named: false,
+            source: "discovery".to_string(),
+            source_label: String::new(),
+            confidence: 40,
+            size: end.map(|end| end.saturating_sub(start)),
+            aliases: Vec::new(),
+            file: None,
+            line: None,
+        }
+    }
+
+    fn import_entry(
+        module: &str,
+        name: Option<&str>,
+        slot: Option<u64>,
+    ) -> bitflip_loader::object::Import {
+        bitflip_loader::object::Import {
+            module: module.to_string(),
+            name: name.map(str::to_string),
+            ordinal: None,
+            iat_slot: slot,
+            thunk: None,
+        }
+    }
+
+    /// 合成一条外部边应有的样子 —— 一条调用边，被调用方是槽位地址。
+    #[test]
+    fn a_call_into_an_import_slot_is_one_labelled_external_edge() {
+        // 两条导入：一条有槽位（0x3000），一条没有（classic bind 那种）。
+        let imports = vec![
+            import_entry("/usr/lib/libz.dylib", Some("_inflate"), Some(0x3000)),
+            import_entry("/usr/lib/libz.dylib", Some("_never_bound"), None),
+        ];
+        let read = |_: u64, _: usize| None;
+        let table = ImportEdges::from_parts(
+            &imports,
+            bitflip_arch::ArchSpec::aarch64(),
+            Vec::new(),
+            &read,
+        );
+
+        let functions = [
+            function_wire(0x1000, Some(0x1100)),
+            function_wire(0x2000, Some(0x2100)),
+        ];
+        let insns = vec![
+            call_insn(0x1010, Some(0x2000)), // 内部调用：一个字都不该变
+            call_insn(0x1020, Some(0x3000)), // 导入槽位
+            call_insn(0x1030, Some(0x9000)), // 已知函数之外、也不是导入
+        ];
+        let mut notes = Vec::new();
+        let (wire, raw) = build_call_graph_wire(&insns, &functions, Some(&table), &mut notes);
+
+        // 内部边原样 + 一条外部边。0x9000 那条保持原来的处理（丢掉）。
+        assert_eq!(wire.edges.len(), 2, "边：{:#?}", wire.edges);
+        let internal = wire
+            .edges
+            .iter()
+            .find(|e| e.callee == hex16(0x2000))
+            .expect("内部边必须还在");
+        assert!(!internal.external);
+        assert_eq!(internal.import_name, None);
+        assert_eq!(internal.import_module, None);
+
+        let external: Vec<&CallEdgeWire> = wire.edges.iter().filter(|e| e.external).collect();
+        assert_eq!(external.len(), 1, "只应有一条外部边：{external:#?}");
+        let edge = external[0];
+        assert_eq!(edge.caller, hex16(0x1000));
+        assert_eq!(edge.callee, hex16(0x3000), "callee 是调用指令里的那个地址");
+        assert_eq!(edge.import_name.as_deref(), Some("_inflate"));
+        assert_eq!(edge.import_module.as_deref(), Some("/usr/lib/libz.dylib"));
+
+        // 没有槽位的那条导入不产生任何边（它的名字/库名一次都不该出现）。
+        assert!(
+            wire.edges
+                .iter()
+                .all(|e| e.import_name.as_deref() != Some("_never_bound")),
+            "iat_slot = None 的导入不许产生边"
+        );
+
+        // 外部目标不再计入"解释不了的目标"：0x3000 被扣掉了，0x9000 仍在。
+        assert_eq!(
+            wire.summary.outside_targets, 1,
+            "outside_targets 应只剩 0x9000（外部边已解释，不数两遍）"
+        );
+        assert_eq!(wire.summary.edges, wire.edges.len());
+
+        // 账目必须写进 notes（调用图自己的 notes 与分析的 notes 都要有）。
+        let line = wire
+            .notes
+            .iter()
+            .find(|n| n.contains("条边指向导入符号"))
+            .expect("缺少导入边计数：{wire:#?}");
+        assert!(line.contains("1 条边指向导入符号"), "{line}");
+        assert!(line.contains("1 个不同导入"), "{line}");
+        assert!(
+            notes.iter().any(|n| n == line),
+            "分析的 notes 里也要有这一条"
+        );
+
+        // 原图**不动**：可达性查询仍按原来的边走，外部目标不会被当成新节点。
+        assert_eq!(raw.edge_count(), 3, "原图仍保留全部原始边");
+        assert!(
+            raw.edges.iter().any(|e| e.callee == Some(0x3000)
+                && e.resolution == bitflip_analyze::CalleeResolution::OutsideKnownFunctions),
+            "原图仍是'落在已知函数之外'，只是 wire 把这条边标成了导入"
+        );
+    }
+
+    /// 规则 2：目标是一条跳板桩时，按桩读的槽位解析。
+    #[test]
+    fn a_call_to_an_import_stub_is_labelled_through_its_slot() {
+        // 真实地址：LiveContainer 主二进制的 `__TEXT,__stubs` 起点
+        // （0x10000b588，见 `bitflip_arch::plt` 的测试常量与出处）。
+        // 桩里的 adrp 立即数是相对**它自己所在地址**的，换个地址就对不上槽 ——
+        // 所以这里必须用真实地址，否则测的是"我造的数据"而不是真实形态。
+        let imports = vec![import_entry(
+            "/System/Library/Frameworks/Foundation.framework/Foundation",
+            Some("_NSLog"),
+            Some(0x1_0001_0038),
+        )];
+        let stub_addr = 0x1_0000_b588;
+        let stub = move |addr: u64, len: usize| {
+            if addr != stub_addr || len < 12 {
+                return None;
+            }
+            let mut out = Vec::new();
+            for word in [0xB000_0030u32, 0xF940_1E10, 0xD61F_0200] {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+            Some(out)
+        };
+        let table = ImportEdges::from_parts(
+            &imports,
+            bitflip_arch::ArchSpec::aarch64(),
+            vec![(stub_addr, stub_addr + 0x3a8)],
+            &stub,
+        );
+
+        let functions = [function_wire(0x1_0000_b000, Some(0x1_0000_b580))];
+        let insns = vec![call_insn(0x1_0000_b400, Some(stub_addr))];
+        let mut notes = Vec::new();
+        let (wire, _raw) = build_call_graph_wire(&insns, &functions, Some(&table), &mut notes);
+
+        assert_eq!(
+            wire.edges.len(),
+            1,
+            "桩目标应当成为一条外部边：{:#?}",
+            wire.edges
+        );
+        let edge = &wire.edges[0];
+        assert!(edge.external);
+        assert_eq!(edge.callee, hex16(stub_addr));
+        assert_eq!(edge.import_name.as_deref(), Some("_NSLog"));
+        assert!(notes.iter().any(|n| n.contains("1 条边指向导入符号")));
     }
 }
 

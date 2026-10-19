@@ -43,7 +43,7 @@ pub const TOKEN_QUERY: &str = "token";
 ///
 /// 与 `bitflip_core::CORE_API_VERSION` **同步**：服务转发的是 core 的类型，
 /// 两者形状一变就得一起变（`bitflip-cli` 的 `version` 测试钉住这条一致性）。
-pub const SERVER_API_VERSION: u32 = 3;
+pub const SERVER_API_VERSION: u32 = 4;
 
 /// 程序名。
 pub const APP_NAME: &str = "bitflip";
@@ -961,6 +961,12 @@ async fn call_graph(
                         } else {
                             e.caller.clone()
                         };
+                        // 外部边的另一端是**本镜像之外**的桩/槽地址，不是函数：
+                        // 把它塞进 nodes 会让界面以为那里有一个可打开的函数。
+                        // 邻域到这里就停住，不要再往外扩。
+                        if e.external && e.caller == n_hex {
+                            continue;
+                        }
                         nodes.insert(other.clone());
                         if let Some(a) = bitflip_core::parse_address(&other) {
                             if visited.insert(a) {
@@ -1023,7 +1029,10 @@ async fn call_graph(
     let mut nodes: BTreeSet<String> = BTreeSet::new();
     for e in g.edges.iter().take(limit) {
         nodes.insert(e.caller.clone());
-        nodes.insert(e.callee.clone());
+        // 外部边的 callee 是桩/槽地址，不是函数：不进节点集（见邻域模式里同一条理由）。
+        if !e.external {
+            nodes.insert(e.callee.clone());
+        }
     }
 
     let returned = g.edges.iter().take(limit).cloned().collect::<Vec<_>>();

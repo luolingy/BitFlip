@@ -126,8 +126,8 @@ mod tests {
         // 这两个号必须**同步**：服务转发的是 core 的公开类型，形状一变就得一起变。
         // 断言写在 CLI 里是因为它同时依赖两个 crate —— 让分叉在编译期之后第一次
         // 跑测试时就被抓住，而不是等某个消费者按旧版本解析出一堆 null。
-        assert_eq!(bitflip_core::CORE_API_VERSION, 3);
-        assert_eq!(bitflip_server::SERVER_API_VERSION, 3);
+        assert_eq!(bitflip_core::CORE_API_VERSION, 4);
+        assert_eq!(bitflip_server::SERVER_API_VERSION, 4);
         assert_eq!(
             bitflip_core::CORE_API_VERSION,
             bitflip_server::SERVER_API_VERSION

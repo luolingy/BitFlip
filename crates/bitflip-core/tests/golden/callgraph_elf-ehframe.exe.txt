@@ -1,0 +1,20 @@
+fixture elf-ehframe.exe
+nodes 9
+edges 9
+unresolved_indirect 0
+outside_targets 0
+roots 1
+components 9
+largest_component 1
+wire_edges 9
+unresolved 0
+external_edges 0
+edge 0000000000201520 00000000002013c0 tail=false external=false
+edge 00000000002015d0 00000000002013c0 tail=false external=false
+edge 00000000002015d0 00000000002013f0 tail=false external=false
+edge 00000000002015d0 00000000002014a0 tail=false external=false
+edge 00000000002015d0 00000000002014b0 tail=false external=false
+edge 00000000002015d0 00000000002014d0 tail=false external=false
+edge 00000000002015d0 0000000000201520 tail=false external=false
+edge 00000000002015d0 0000000000201570 tail=false external=false
+edge 00000000002015d0 00000000002015c0 tail=false external=false

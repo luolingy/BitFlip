@@ -693,9 +693,21 @@ export interface CallGraphSummary {
 /** 一条调用边。 */
 export interface CallEdge {
   caller: string;
+  /**
+   * 被调用方。
+   *
+   * `external = false` 时是函数入口；`external = true` 时是调用指令编码里的
+   * 桩/槽地址 —— 被调用方在**本镜像之外**，没有反汇编、没有大小、没有 CFG。
+   */
   callee: string;
   /** 尾调用：跳过去就不回来了。 */
   tail: boolean;
+  /** 被调用方是否在本镜像之外（导入符号）。 */
+  external: boolean;
+  /** 导入符号名；按序号导入、或名字读不到时为 null。 */
+  import_name: string | null;
+  /** 导入所在的库（Mach-O 的 dylib 路径）；内部边为 null。 */
+  import_module: string | null;
 }
 
 /** 一个未解析的调用点。 */

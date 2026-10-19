@@ -1,4 +1,10 @@
-//! 真实 Mach-O 上"分析层真的用上了 `LC_FUNCTION_STARTS`"的验收测试（M12 第四片）。
+//! 真实 Mach-O 上"分析层真的用上了加载器解出来的事实"的验收测试。
+//!
+//! 覆盖两片：
+//!
+//! * **M12 第四片**：`LC_FUNCTION_STARTS` 解出来的起点是否真的变成了函数边界；
+//! * **M12 第五片**：调用图里是否真的出现**指向导入符号**的外部边
+//!   （`real_macho_call_graph_edges_reach_imported_symbols`）。
 //!
 //! 默认 `#[ignore]`：它要一份真实 IPA（`temp/*.ipa` 或 `BITFLIP_TEST_MACHO_IPA`）。
 //! **样本缺失时它 panic，不跳过** —— 跳过会让绿灯说谎（CLAUDE.md §7）。
@@ -297,6 +303,155 @@ fn real_macho_uses_function_starts_as_function_boundaries() {
         .iter()
         .filter(|note| note.contains("LC_FUNCTION_STARTS") || note.contains("函数起点"))
     {
+        eprintln!("  - {note}");
+    }
+}
+
+/// 真实样本：调用图里必须出现**指向导入符号**的边（M12 第五片）。
+///
+/// # 这条测试在证明什么
+///
+/// 1. **解析真的在跑**：外部边数、涉及的不同导入数都打到屏幕上，并设了下限。
+///    "0 条"不是可以接受的结论 —— 那意味着解析没触发，得回去查，而不是把门槛调低。
+/// 2. **不许自证其说**：每条外部边的目标必须**要么**等于某个导入的槽位、
+///    **要么**落在 `__stubs` 节里。任何第三种来源都说明边上的名字是编的。
+/// 3. **不许伪造函数**：导入名不许出现在函数列表里（CLAUDE.md §7：
+///    被调用方在本镜像之外，就不该在本镜像里长出一个同名函数）。
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_macho_call_graph_edges_reach_imported_symbols() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let path = sample_path();
+    let (how, object, bytes) = real_object(&path);
+    let slotted: Vec<u64> = object
+        .imports
+        .iter()
+        .filter_map(|import| import.iat_slot)
+        .collect();
+    eprintln!(
+        "样本 {} → {how}，主二进制 {} 字节；导入 {} 条（有槽位 {} 条）",
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned()
+        ),
+        bytes.len(),
+        object.imports.len(),
+        slotted.len()
+    );
+    assert!(
+        !slotted.is_empty(),
+        "{}：这份二进制一条带槽位的导入都没有 —— 那本片就没有可比对的地址，\
+         测试的结论不成立（换一份样本，别把下限调低）",
+        path.display()
+    );
+    let stub_ranges: Vec<(u64, u64)> = object
+        .sections
+        .iter()
+        .filter(|section| section.file.size > 0)
+        .filter(|section| {
+            section
+                .name
+                .rsplit(',')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("__stubs"))
+        })
+        .map(|section| {
+            (
+                section.vaddr,
+                section.vaddr.saturating_add(section.file.size),
+            )
+        })
+        .collect();
+    for &(start, end) in &stub_ranges {
+        eprintln!("  桩节 {start:#012x}..{end:#012x}（{} 字节）", end - start);
+    }
+
+    let (_disasm, analysis) = analyze(&object, Arc::clone(&bytes));
+    let graph = analysis.call_graph();
+    let external: Vec<&bitflip_core::CallEdgeWire> =
+        graph.edges.iter().filter(|edge| edge.external).collect();
+
+    // 每个导入被调用了多少次 —— 打印最热的几个，让人一眼看出这份二进制的形状。
+    let mut per_import: BTreeMap<String, usize> = BTreeMap::new();
+    for edge in &external {
+        let label = match (&edge.import_name, &edge.import_module) {
+            (Some(name), _) => name.clone(),
+            (None, Some(module)) => format!("(按序号，{module})"),
+            (None, None) => "(无名字)".to_string(),
+        };
+        *per_import.entry(label).or_insert(0) += 1;
+    }
+    let mut hottest: Vec<(String, usize)> = per_import.into_iter().collect();
+    hottest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    eprintln!(
+        "外部边 {} 条，来自 {} 个不同导入（调用图共 {} 条边）；最热的 10 个：",
+        external.len(),
+        hottest.len(),
+        graph.edges.len()
+    );
+    for (name, count) in hottest.iter().take(10) {
+        eprintln!("  {count:>5}  {name}");
+    }
+
+    // ① 解析必须真的触发。参考实测（LiveContainer）：1105 条边 / 78 个导入。
+    assert!(
+        external.len() >= 1000,
+        "外部边只有 {} 条 —— 解析没有真正生效。别调低门槛：先去查桩识别/槽位对照\
+         （参考实测 1105 条 / 78 个导入）",
+        external.len()
+    );
+    assert!(
+        hottest.len() >= 70,
+        "只解析出 {} 个不同导入（参考实测 78 个）",
+        hottest.len()
+    );
+
+    // ② 每条外部边都必须站得住：目标要么是导入槽位，要么在桩节里。
+    let slot_set: BTreeSet<u64> = slotted.iter().copied().collect();
+    for edge in &external {
+        let addr = bitflip_core::parse_address(&edge.callee)
+            .unwrap_or_else(|| panic!("外部边的 callee 不是地址：{edge:?}"));
+        let is_slot = slot_set.contains(&addr);
+        let in_stub = stub_ranges
+            .iter()
+            .any(|&(start, end)| addr >= start && addr < end);
+        assert!(
+            is_slot || in_stub,
+            "外部边的目标 {:#x} 既不是导入槽位、也不在桩节里 —— 这条边的名字是编的：{edge:?}",
+            addr
+        );
+        assert!(
+            edge.import_module.is_some(),
+            "外部边必须带导入所在库（拿不到就别写这条边）：{edge:?}"
+        );
+    }
+
+    // ③ 不许伪造函数：导入名不许出现在函数列表里。
+    let import_names: BTreeSet<&str> = object
+        .imports
+        .iter()
+        .filter_map(|import| import.name.as_deref())
+        .collect();
+    let leaked: Vec<&str> = analysis
+        .functions()
+        .iter()
+        .filter(|function| function.named && import_names.contains(function.name.as_str()))
+        .map(|function| function.name.as_str())
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "导入名被当成了函数名（就是那个凭空长出来的函数）：{leaked:?}"
+    );
+
+    // ④ notes 必须写明账目（边数与不同导入数）。
+    let notes = graph.notes.join("\n");
+    assert!(
+        notes.contains("条边指向导入符号"),
+        "调用图的 notes 里没有导入边的账目：{notes}"
+    );
+    eprintln!("notes（导入边相关）：");
+    for note in graph.notes.iter().filter(|note| note.contains("导入")) {
         eprintln!("  - {note}");
     }
 }

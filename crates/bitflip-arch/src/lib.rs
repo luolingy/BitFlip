@@ -27,7 +27,7 @@ pub use insn::{
     PstateField, RegId, RegSet, ShiftKind, SvcrMode, SysOpRef, SysRegRef,
 };
 pub use padding::{padding_len, supports_padding};
-pub use plt::{plt_stub, supports_plt_stub, PltStub};
+pub use plt::{import_stub_slot, plt_stub, supports_import_stub, supports_plt_stub, PltStub};
 pub use render::{flow_label, format_insn, format_insn_with, text_style, TextStyle};
 pub use types::{Arch, ArchSpec, Endian, Mode};
 

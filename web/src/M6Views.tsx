@@ -358,9 +358,23 @@ function NeighbourhoodPanel({
             <ul className="ref-list">
               {callees.map((e) => (
                 <li key={`out-${e.caller}-${e.callee}`}>
-                  <button className="link-button mono" onClick={() => onNavigate(e.callee)}>
-                    {formatAddress(e.callee)}
-                  </button>
+                  {e.external ? (
+                    // 导入符号：callee 是桩/槽地址，不是函数 —— 不做成可点开的链接，
+                    // 否则界面会假装那里有一个可分析的目标（那边没有反汇编）。
+                    <>
+                      <span className="mono">
+                        {e.import_name ?? "（导入符号，名字未知）"}
+                      </span>
+                      {e.import_module && (
+                        <span className="hint"> {e.import_module}</span>
+                      )}
+                      <span className="chip chip-small">外部</span>
+                    </>
+                  ) : (
+                    <button className="link-button mono" onClick={() => onNavigate(e.callee)}>
+                      {formatAddress(e.callee)}
+                    </button>
+                  )}
                   {e.tail && <span className="chip chip-small">尾调用</span>}
                 </li>
               ))}

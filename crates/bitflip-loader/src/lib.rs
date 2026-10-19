@@ -183,13 +183,15 @@ pub enum ObjectKind {
     /// 产出一堆"看起来正常、实际无意义"的结论。它的结构模型在
     /// [`crate::format::dex`]，入口是 [`crate::parse_dex_structure`]。
     Dex,
-    /// Mach-O（可执行 / `.dylib`；结构层解析见 [`format::macho`]，M12 第一～三片）。
+    /// Mach-O（可执行 / `.dylib`；结构层解析见 [`format::macho`]，M12 第一～五片）。
     ///
     /// "有解析器"覆盖的范围要说清楚：**头/段/节/入口/`LC_UUID`/dylib 名/符号表/
-    /// 函数起点**都在，而 dyld 绑定信息、objc/swift 元数据、代码签名**都不在** ——
-    /// 所以 Mach-O 对象的 `imports` 一定是空的，原因写在 `notes` 里。
-    /// `symbols` / `function_starts` 为空**可能是**"文件里没有"，也可能是解析没做到，
-    /// 两种情形的 `notes` 不同：以那里的说明为准，不要用空表反推结论。
+    /// 函数起点/导入**都在（导入来自 `LC_DYLD_INFO` 的 bind 与
+    /// `LC_DYLD_CHAINED_FIXUPS`，带槽位地址 `iat_slot`），而 objc/swift 元数据、
+    /// 代码签名**不在** —— 缺的那些写在 `notes` 里。
+    /// `symbols` / `function_starts` / `imports` 为空**可能是**"文件里没有"，
+    /// 也可能是解析没做到，两种情形的 `notes` 不同：以那里的说明为准，
+    /// 不要用空表反推结论。
     MachO,
     /// 未识别：按原始二进制处理。
     Raw,
