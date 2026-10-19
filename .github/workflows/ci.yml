@@ -84,7 +84,9 @@ jobs:
           printf 'const char *bf = "ci";\nint bf_add(int a,int b){return a+b;}\n' > /tmp/sample.c
           clang -c /tmp/sample.c -o tests/fixtures/generated/elf-x86_64.o
           clang -c --target=aarch64-unknown-linux-gnu /tmp/sample.c -o tests/fixtures/generated/elf-aarch64.o
-          llvm-ar rcs tests/fixtures/generated/libelf.a tests/fixtures/generated/elf-x86_64.o
+          # 用 binutils 的 `ar`，不要 `llvm-ar`：ubuntu 运行器上 clang 有，但 llvm 工具组
+          # 没装，`llvm-ar` 会 exit 127（这条闸门因此一直红）。这里只是造一个 .a 给 info 用。
+          ar rcs tests/fixtures/generated/libelf.a tests/fixtures/generated/elf-x86_64.o
           ./target/release/bitflip-cli info tests/fixtures/generated/libelf.a
 
       - name: 服务冒烟测试（令牌 + Origin）
