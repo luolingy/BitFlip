@@ -83,7 +83,30 @@ function Get-ProductionLines {
     # this repo is a single trailing test module, so this is exact. If a file
     # ever gains a cfg(test) block in the middle, the gate would under-report,
     # so the script reports when the marker appears more than once.
-    $lines = Get-Content -LiteralPath $Path
+    # Read as UTF-8 EXPLICITLY, then verify the line count against the raw bytes.
+    #
+    # Windows PowerShell 5.1 defaults to the ANSI code page. This repo's sources
+    # are UTF-8, and decoding them as ANSI yields a DIFFERENT number of lines --
+    # measured on crates/bitflip-analyze/src/jumptable.rs: 956 locally vs the
+    # true 1169. The #[cfg(test)] cut point then lands in the wrong place, real
+    # production code is treated as test code, and this gate reports OK here
+    # while CI (whose PowerShell is UTF-8 by default) fails on the same commit.
+    # A gate whose local answer disagrees with CI's is worse than no gate.
+    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8)
+
+    # Belt and braces: if the decoded line count does not match the number of LF
+    # bytes, the split below is not where we think it is. Refuse to guess rather
+    # than silently cutting the file at the wrong line.
+    $rawBytes = [System.IO.File]::ReadAllBytes($Path)
+    $lf = 0
+    foreach ($b in $rawBytes) { if ($b -eq 10) { $lf++ } }
+    $expected = $lf
+    if ($rawBytes.Count -gt 0 -and $rawBytes[$rawBytes.Count - 1] -ne 10) { $expected = $lf + 1 }
+    if ($lines.Count -ne $expected) {
+        Write-Host ("  ERROR " + $Path + ": " + $lf + " LF byte(s) but " + $lines.Count + " decoded line(s)")
+        Write-Host "  The #[cfg(test)] cut point would be wrong, so this gate refuses to report."
+        exit 1
+    }
     $stop = $lines.Count
     $markers = 0
     for ($i = 0; $i -lt $lines.Count; $i++) {

@@ -730,25 +730,19 @@ fn read_entry(space: &AddrSpace, addr: u64, width: EntryWidth) -> Option<u64> {
     })
 }
 
-/// 按架构给一个"合理的表项宽度"提示，用于说明文字。
+/// 给一个"合理的表项宽度"提示，用于说明文字。
 ///
 /// **不做默认值使用** —— 宽度由验证决定。这个函数只用于在 notes 里
 /// 解释"为什么优先试 4 字节"。
+///
+/// 每个架构目前都是 4 字节，所以这里**不按架构分支**：x86_64 的 PIC switch
+/// 几乎总是 4 字节相对偏移表，AArch64 两种都常见但 4 字节更省空间，RISC-V /
+/// MIPS / Wasm32 同理。写成一排"每个 arm 返回同一个值"的 match 只会制造
+/// "这里按架构区分"的假象（架构分层闸门也会正确地把它报成违规）。
+/// 参数保留是为了将来某个架构真的需要不同提示时不必改签名。
 #[must_use]
-pub const fn preferred_width(arch: Arch) -> EntryWidth {
-    match arch {
-        // x86_64 PIC 的 switch 几乎总是 4 字节相对偏移表。
-        Arch::X86_64 | Arch::X86 => EntryWidth::U32,
-        // AArch64 两种都常见，4 字节更省空间因此略多。
-        Arch::Aarch64 | Arch::Arm => EntryWidth::U32,
-        Arch::Riscv32 | Arch::Riscv64 => EntryWidth::U32,
-        Arch::Mips | Arch::Mips64 => EntryWidth::U32,
-        Arch::Wasm32 => EntryWidth::U32,
-        // `Arch` 是 `#[non_exhaustive]`：未来新增架构时这里仍然要能编译。
-        // 4 字节是现代目标上最常见的表项宽度，但这个值只是"先试哪个"
-        // 的提示，最终由验证决定，所以兜底不会引入错误结论。
-        _ => EntryWidth::U32,
-    }
+pub const fn preferred_width(_arch: Arch) -> EntryWidth {
+    EntryWidth::U32
 }
 
 #[cfg(test)]
