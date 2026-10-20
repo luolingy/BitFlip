@@ -41,8 +41,11 @@ jobs:
 
       # 部分测试要求 tests/fixtures/generated/ 下的样本，而样本按 §0.2 不入库。
       # 原先这些测试在 CI 上直接 panic（"缺少 fixture"），于是"测试闸门"永远是红的。
-      # 这里现场生成一次：ubuntu 自带 pwsh 与 clang，补齐 gcc-mingw-w64 后脚本即可产出
-      # m3-mingw-static.exe 等 PE 样本。
+      # 这里现场生成一次：ubuntu 自带 pwsh 与 clang，补齐 gcc-mingw-w64 后脚本可以产出
+      # elf-*、pe-x86_64.{obj,exe,dll} 与 libpe-x86_64.a。
+      # 它**不产出** m3-mingw-static.*（那是 Windows 开发机上的旧产物，生成脚本见
+      # scripts/gen-m3-coverage-sample.ps1，里面写死了 E:\mingw64\...），所以下面那步
+      # 仍保留"缺 fixture 可数降级"的通道 —— 那是跳过，不是通过（§7）。
       - name: 生成测试样本
         run: |
           sudo apt-get update
