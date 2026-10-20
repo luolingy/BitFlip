@@ -51,25 +51,44 @@ jobs:
 
       - name: 单元与集成测试
         run: |
-          set -uo pipefail
+          # GitHub Actions 用 `bash -e` 跑每一步，`set -uo pipefail` 并不会关掉 -e。
+          # 上一版正是栽在这里：`cargo test` 一失败，整个步骤带着 101 直接退出，
+          # 下面那段"缺 fixture 可数降级"一行都没跑到 —— 日志里连两个计数都没出现。
+          # 所以必须用 `|| code=$?` 显式接住失败，计数逻辑才真的执行。
           log=/tmp/cargo-test.log
-          cargo test --workspace > "$log" 2>&1
-          code=$?
-          cat "$log"
-          if [ $code -eq 0 ]; then exit 0; fi
+          code=0
+          cargo test --workspace > "$log" 2>&1 || code=$?
+          cat "$log" || true
+          if [ "$code" -eq 0 ]; then
+            echo "cargo test 全绿"
+            exit 0
+          fi
 
           # 少数测试依赖 Windows 开发机上生成的 golden 样本（m3-mingw-static.exe 等），
           # 这些样本按 §0.2 不入库，gen-fixtures.ps1 也不产出。把它们当作"跳过"必须
-          # **可数、可区分**（§7）：只有"失败的测试条数 == 缺少 fixture 的条数"时才降级，
-          # 并把每条跳过的测试名打出来 + 发一条 warning。有任何一个别的失败，照样红。
+          # **可数、可区分**（§7）：只有"每一个失败测试都是因为缺 fixture"时才降级。
+          #
+          # failed  = libtest 打出的 `test <名字> ... FAILED` 行数；
+          # missing = 失败测试自己的 stdout 块里出现 fixture 缺失标记的块数
+          #           （一块最多记一次，所以 missing 恒 <= failed）。
+          # 两者相等就说明没有别的失败；只要有一条别的失败，等式就破，照样红。
           failed=$(grep -cE '^test .*\.\.\. FAILED$' "$log" || true)
-          missing=$(grep -cE '缺少 fixture|跳过：fixture' "$log" || true)
+          missing=$(awk '
+            /^---- .* stdout ----$/ { inblock = 1; next }
+            /^---- .* stderr ----$/ { inblock = 0; next }
+            /^note: run with / { inblock = 0; next }
+            inblock && /缺少 fixture|跳过：fixture/ { count++; inblock = 0 }
+            END { print count + 0 }
+          ' "$log")
+          echo "cargo test 退出码=$code"
+          echo "failed=$failed missing=$missing"
           if [ "$failed" -gt 0 ] && [ "$failed" -eq "$missing" ]; then
-            echo "::warning::$failed 个测试因缺少本地 golden 样本被跳过（不是通过）"
+            echo "::warning::$failed 个测试因缺少本地 golden 样本被跳过（这不是通过）"
             grep -E '^test .*\.\.\. FAILED$' "$log" | sed 's/^/  skipped: /'
             exit 0
           fi
-          echo "::error::$failed 个测试失败，其中只有 $missing 条是缺少 fixture"
+          echo "::error::cargo test 退出码 $code：$failed 个测试 FAILED，其中只有 $missing 条是缺 fixture"
+          grep -E '^test .*\.\.\. FAILED$' "$log" | sed 's/^/  失败: /' || true
           exit 1
 
       # 这两道闸门原先只在本机手工跑。它们要扫全仓，挪到 CI 才是该待的地方 ——
@@ -84,6 +103,13 @@ jobs:
   bundle:
     name: 端到端（构建 SPA + 内嵌 + 服务冒烟）
     runs-on: ubuntu-latest
+    env:
+      # 仓库的 .cargo/config.toml 把 target-dir 钉在 ".cargo-target"（CLAUDE.md §3：
+      # 构建产物必须留在仓库内，本机 C: 只剩约 2.8GB）。所以 cargo 的产物不在默认的
+      # ./target 下。下面这些步骤原先一律按 ./target/release/... 调用，实际拿到的是
+      # ".../target/release/bitflip-cli: No such file or directory"（exit 127）——
+      # 看着像缺工具，其实是路径。统一从这里取，别再散落到各步里。
+      BIN: .cargo-target/release
     steps:
       - uses: actions/checkout@v4
 
@@ -106,7 +132,11 @@ jobs:
           npm run build
 
       - name: 构建二进制（此时 dist 已存在，会被内嵌）
-        run: cargo build --release -p bitflip-app -p bitflip-cli
+        run: |
+          cargo build --release -p bitflip-app -p bitflip-cli
+          # 路径一旦漂到 ./target，下面每一步都会以 127 收场且没人看得懂原因。
+          # 在这里断言一次，让漂移在它真正发生的那一步就红。
+          ls -l "$BIN/bitflip-cli" "$BIN/bitflip"
 
       - name: 生成的样本可被识别
         run: |
@@ -117,12 +147,12 @@ jobs:
           # 用 binutils 的 `ar`，不要 `llvm-ar`：ubuntu 运行器上 clang 有，但 llvm 工具组
           # 没装，`llvm-ar` 会 exit 127（这条闸门因此一直红）。这里只是造一个 .a 给 info 用。
           ar rcs tests/fixtures/generated/libelf.a tests/fixtures/generated/elf-x86_64.o
-          ./target/release/bitflip-cli info tests/fixtures/generated/libelf.a
+          ${BIN}/bitflip-cli info tests/fixtures/generated/libelf.a
 
       - name: 服务冒烟测试（令牌 + Origin）
         run: |
           set -euo pipefail
-          ./target/release/bitflip-cli serve tests/fixtures/generated/elf-x86_64.o \
+          ${BIN}/bitflip-cli serve tests/fixtures/generated/elf-x86_64.o \
             --no-open --port 8790 --token ci-token &
           server_pid=$!
           trap 'kill $server_pid 2>/dev/null || true' EXIT
@@ -156,7 +186,7 @@ jobs:
           fi
           # 用 8795：与上面那两个步骤的端口（8790 及其回退位 8791）隔开，
           # 避免步骤之间抢端口导致偶发失败。
-          ./target/release/bitflip-cli serve tests/fixtures/generated/elf-x86_64.o \
+          ${BIN}/bitflip-cli serve tests/fixtures/generated/elf-x86_64.o \
             --no-open --port 8795 --token bind-token &
           server_pid=$!
           trap 'kill $server_pid 2>/dev/null || true' EXIT
@@ -180,7 +210,7 @@ jobs:
           set -euo pipefail
           # 这是 README 里告诉用户的第一条命令，必须真的能起服务。
           # 用 --no-open：CI 无浏览器，否则 open_url 会失败（虽然它会降级，但没必要）。
-          ./target/release/bitflip tests/fixtures/generated/elf-x86_64.o \
+          ${BIN}/bitflip tests/fixtures/generated/elf-x86_64.o \
             --no-open --port 8796 --token entry-token > /tmp/entry.log 2>&1 &
           server_pid=$!
           trap 'kill $server_pid 2>/dev/null || true' EXIT
@@ -196,4 +226,4 @@ jobs:
           grep -q '#token=entry-token' /tmp/entry.log
 
       - name: 前端确实被内嵌
-        run: ./target/release/bitflip-cli version | grep -q '已内嵌'
+        run: ${BIN}/bitflip-cli version | grep -q '已内嵌'
