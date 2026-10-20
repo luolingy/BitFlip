@@ -206,15 +206,19 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
             "测试里的选法与产品实现分叉了：{found:?}"
         );
         eprintln!("依据 = {}", found.source.label_zh());
+        for note in &found.notes {
+            eprintln!("降级说明 = {note}");
+        }
+        if name.contains("LiveContainer") {
+            // 这份 IPA 的 `Info.plist` 是 XML，里面写着 CFBundleExecutable（长名）。
+            // 既然文件里写着，结论就必须是事实，而不是"同名匹配落空 → 推断"。
+            assert!(
+                !found.source.is_guess(),
+                "LiveContainer 的 Info.plist 里写着可执行名，必须按事实报出来：{found:?}"
+            );
+        }
         if found.source.is_guess() {
-            // LiveContainer 的可执行名与 `.app` 不同名，走的必然是指望第二层。
-            eprintln!("注意：这是**推断**（同名匹配落空），界面必须标明");
-            if name.contains("LiveContainer") {
-                assert!(
-                    found.source.is_guess(),
-                    "LiveContainer 的可执行名与 .app 不同名，必须走推断那一层：{found:?}"
-                );
-            }
+            eprintln!("注意：这是**推断**（前两条依据都落空），界面必须标明");
         }
         assert!(
             !found.note_zh().is_empty(),

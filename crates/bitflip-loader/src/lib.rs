@@ -32,6 +32,7 @@ pub mod bundle;
 pub mod ehframe;
 pub mod format;
 pub mod object;
+pub mod plist;
 pub mod reader;
 
 #[cfg(test)]

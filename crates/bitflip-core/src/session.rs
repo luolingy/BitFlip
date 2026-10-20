@@ -958,6 +958,10 @@ impl Session {
                     bitflip_loader::format::zip::read_member(bytes, index).ok()
                 }) {
                     guess.notes.push(found.note_zh());
+                    // Info.plist 读不出来 / 声明与归档不符这类降级，必须跟着结论一起
+                    // 出现在界面上（§7）—— 否则用户只看到"按约定匹配"，不知道事实来源
+                    // 本来就在归档里、只是没读通。
+                    guess.notes.extend(found.notes.iter().cloned());
                 } else if bitflip_loader::bundle::looks_like_app_bundle(&guess.members) {
                     // 是 .app，但主二进制认不出来。要说清"认不出"，别让它看起来像"没有"。
                     guess.notes.push(

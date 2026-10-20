@@ -11,6 +11,42 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — 主二进制来自 Info.plist 的事实，而不是同名约定（M12 第六片）
+
+上一片把"凭什么认出主二进制"带进了 `notes`，但依据仍然只有 `.app` 同名约定与"第一个
+Mach-O 头"两条。四份真实 IPA 里有两份的可执行名与 `.app` 不同名，于是它们的"主二进制"
+只能标成**推断** —— 而 `Info.plist` 里其实写着答案。这一片去读 `CFBundleExecutable`。
+
+- **两种 plist 都读**（`crates/bitflip-loader/src/plist.rs`，新模块）：
+  `bplist00` 按 `CFBinaryPList` 的对象区 / 偏移表 / trailer 布局解；XML 只做一次有界
+  扫描（找 `<key>CFBundleExecutable</key>` 之后第一个 `<string>`，含五个预定义实体与
+  数字字符引用）。实测四份样本正好一半一半（`SideStore`、`Stapxs.QQ.Lite` 是二进制，
+  `LiveContainer`、`PojavLauncher` 是 XML）—— 只认一种，另一半样本就永远只能靠猜。
+- **不引 plist crate**：只需要一个字符串键；通用库要付供应链与许可的成本，也会诱使
+  上层把整份 `Info.plist` 当结构化数据用，而我们对它的其余字段没有结论可下。
+- **事实优先，降级要说出来**：`MainBinarySource::FromPlist` 排在同名约定与魔数推断
+  之前；`MainBinary::notes` 记录"plist 读不出来 / 里没有这个键 / 声明的名字不在归档
+  里"，由 `bitflip-core` 的会话并进 `notes`（§7：降级要写在界面上）。
+- **边界**：偏移、长度、对象引用全部做上界检查；对象数据必须落在"魔数之后、偏移表
+  之前"；字符串上限 64 KiB；不认识的 XML 实体**原样保留**而不是悄悄吞掉；不可 panic
+  （有"每一段前缀"与"逐字节篡改"两条测试兜底）。
+- **真实样本验收**（`temp/` 里四份 IPA，`#[ignore]` 的测试用 `--ignored --nocapture` 跑）：
+
+| 样本 | `Info.plist` 格式 | 依据 |
+| --- | --- | --- |
+| `LiveContainer.ipa` | XML | 事实（`CFBundleExecutable`） |
+| `SideStore.ipa` | 二进制 | 事实 |
+| `Stapxs.QQ.Lite-3.3.3.ipa` | 二进制 | 事实 |
+| `net.kdt.pojavlauncher-2.2-ios.ipa` | XML | 事实 |
+
+  四份都没有降级说明（`MainBinary::notes` 为空）。
+
+- **没有做**：`.app` **目录**作为容器（`LoaderError::IsDirectory` 仍是拒绝）。这一片
+  只解决 `docs/PLAN.md` M12 第 3 条里 `Info.plist` 的那一半，目录那一半还没落地。
+- **API**：`bitflip-loader` 新增 `plist` 模块、`MainBinary::notes`、
+  `MainBinarySource::FromPlist`。`CORE_API_VERSION` / `SERVER_API_VERSION` **不动**：
+  结论的地址与计数没变，变的只是 `notes` 说得更准。
+
 ### 新增 — 调用图里指向导入符号的边（M12 第五片）
 
 上一片让 Mach-O 真的有了 `Object.imports`（名字 + 所在库 + 槽位地址 `iat_slot`），
