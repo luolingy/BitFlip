@@ -455,10 +455,13 @@ fn decode_utf16be(bytes: &[u8]) -> Option<String> {
     if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-        .collect();
+    // 用 `as_chunks` 而不是 `chunks_exact(2)`：后者在 clippy 1.99 起会被
+    // `chunks_exact_to_as_chunks` 拒掉（本机 1.96 不报，CI 报 —— 本机绿不是证明）。
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    let units: Vec<u16> = pairs.iter().map(|pair| u16::from_be_bytes(*pair)).collect();
     String::from_utf16(&units).ok()
 }
 
