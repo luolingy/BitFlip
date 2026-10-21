@@ -531,11 +531,14 @@ impl TargetInfo {
     ///
     /// 与 [`Self::is_archive`] **刻意分开**：fat / universal 不是"归档"（它的整份
     /// 文件确实能打开 —— 会话按写明的规则挑一片），但它的切片仍然是可单独选的
-    /// 成员。把两者合成一个判断会让 `info` 要么说"这是归档"（错），
+    /// 成员。`.app` 目录容器同理：主二进制直接可分析，成员（框架、动态库、资源）
+    /// 也能单独选。把两者合成一个判断会让 `info` 要么说"这是归档"（错），
     /// 要么让 `--member` 用不了（也错）。
     #[must_use]
     pub fn has_selectable_members(&self) -> bool {
-        self.is_archive() || self.container == ContainerKind::Fat.as_str()
+        self.is_archive()
+            || self.container == ContainerKind::Fat.as_str()
+            || self.container == ContainerKind::AppBundle.as_str()
     }
 }
 
@@ -629,6 +632,12 @@ pub struct Session {
     /// "这份文件没有调试信息"与"有但被裁掉了"对用户是两个不同的结论。
     /// 它不需要用户给路径（不像签名库），所以打开时直接读，读不到也不让打开失败。
     debug: Arc<bitflip_debug::DebugInfo>,
+    /// 目录容器的根路径（`ContainerKind::AppBundle` 时是 `.app` 目录本身）。
+    ///
+    /// 目录成员的取法（[`MemberStorage::File`]）要按相对路径从**这个根**读盘，
+    /// 而 [`Self::path`] 会被成员会话改写成 `容器#成员` 的合成路径 —— 所以根要
+    /// 单独留一份。文件容器这里是 `None`。
+    container_root: Option<PathBuf>,
     /// 整个文件的字节。
     ///
     /// 分析层需要按虚拟地址随机访问原始字节（反汇编、字符串搜索、交叉引用）。
@@ -893,7 +902,71 @@ impl Session {
             guess.image_base = Some(base);
         }
 
-        let file_size = std::fs::metadata(&path).map_or(guess.sniffed_bytes as u64, |m| m.len());
+        // ── `.app` 目录容器：先认主二进制，它的字节就是"目标字节" ──────────
+        //
+        // 目录容器不能像文件那样"整份读入"（目录不是文件）。可分析的对象是
+        // 主二进制（`Info.plist` 的 `CFBundleExecutable`），其余成员按名从磁盘读。
+        // 所以打开的第一步是从成员表里认出主二进制、读出它的字节。
+        let mut app_bundle_bytes: Option<Vec<u8>> = None;
+        if guess.container == ContainerKind::AppBundle {
+            let names: Vec<&str> = guess.members.iter().map(|m| m.name.as_str()).collect();
+            // 同名约定要用"目录名去掉 .app"：iOS 根层 / Contents/MacOS 里的
+            // 可执行名通常就是它。
+            let bundle_short = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.strip_suffix(".app").unwrap_or(name));
+            if let Some(found) = bitflip_loader::bundle::find_main_binary(
+                bitflip_loader::bundle::BundleLayout::Directory,
+                bundle_short,
+                &names,
+                |index| bitflip_loader::bundle::read_app_member(&path, names[index]),
+            ) {
+                guess.notes.push(found.note_zh());
+                // Info.plist 读不出来 / 声明与归档不符这类降级，必须跟着结论一起
+                // 出现在界面上（§7）—— 否则用户只看到"按约定匹配"，不知道事实来源
+                // 本来就在归档里、只是没读通。
+                guess.notes.extend(found.notes.iter().cloned());
+                if let Some(bytes) = bitflip_loader::bundle::read_app_member(&path, &found.name) {
+                    let len = bytes.len() as u64;
+                    if len > MAX_FULL_PARSE_BYTES {
+                        guess.notes.push(format!(
+                            "主二进制 {}（{len} 字节）超过完整解析上限 {MAX_FULL_PARSE_BYTES} 字节：\
+                             本次只做识别，不做解析与反汇编",
+                            found.name
+                        ));
+                    } else {
+                        guess.notes.push(format!(
+                            "目录容器按主二进制 {} 解析（{len} 字节），成员内容按需从磁盘读取",
+                            found.name
+                        ));
+                        app_bundle_bytes = Some(bytes);
+                    }
+                } else {
+                    guess.notes.push(format!(
+                        "主二进制 {} 从磁盘读不出来（超过读取上限或 IO 失败）：\
+                         只做识别，不做解析",
+                        found.name
+                    ));
+                }
+            } else {
+                guess.notes.push(
+                    "这份 .app 目录里认不出主二进制：根层 / Contents 里没有 Info.plist \
+                     声明的文件，也没有同名可执行或头 4 字节是 Mach-O 魔数的成员\
+                     （可能被加固或重排过）"
+                        .to_string(),
+                );
+            }
+        }
+
+        // 目标"大小"：目录容器没有文件大小可谈，用主二进制的大小（实际分析的对象）。
+        let file_size = if guess.container == ContainerKind::AppBundle {
+            app_bundle_bytes
+                .as_ref()
+                .map_or(0, |bytes| bytes.len() as u64)
+        } else {
+            std::fs::metadata(&path).map_or(guess.sniffed_bytes as u64, |m| m.len())
+        };
 
         // 文件字节**只读一次**，解析与后续字节级查询共用。
         //
@@ -924,7 +997,12 @@ impl Session {
         //
         // 提前读盘不改变 I/O 行为：这段读**本来就是无条件执行的**（只受上限
         // 约束），原来只是晚了几十行。
-        let full_bytes: Option<Vec<u8>> = if file_size > MAX_FULL_PARSE_BYTES {
+        //
+        // 目录容器的"字节"已经在上面读好了（主二进制），这里直接搬过去；
+        // 只有文件目标才走 `fs::read`。
+        let full_bytes: Option<Vec<u8>> = if guess.container == ContainerKind::AppBundle {
+            app_bundle_bytes
+        } else if file_size > MAX_FULL_PARSE_BYTES {
             None
         } else {
             match std::fs::read(&path) {
@@ -937,6 +1015,23 @@ impl Session {
                 }
             }
         };
+
+        // 目录容器：主二进制的识别结论（对象格式/架构/入口等）并进 `guess` ——
+        // 目录本身没有单一对象格式，界面上的格式/架构/入口应该来自主二进制。
+        if guess.container == ContainerKind::AppBundle {
+            if let Some(bytes) = full_bytes.as_deref() {
+                let inner = bitflip_loader::sniff_bytes(bytes);
+                guess.object = inner.object;
+                guess.arch = inner.arch;
+                guess.bits = inner.bits;
+                guess.endian = inner.endian;
+                guess.entry = inner.entry;
+                guess.image_base = inner.image_base;
+                guess.sections = inner.sections;
+                // 主二进制的嗅探说明（比如 fat 有多个切片）也要让用户看到。
+                guess.notes.extend(inner.notes);
+            }
+        }
 
         // ZIP/APK：现在才够条件枚举成员（中央目录在文件末尾）。
         if guess.container == ContainerKind::Zip {
@@ -954,9 +1049,12 @@ impl Session {
         if guess.container == ContainerKind::Zip {
             if let Some(bytes) = full_bytes.as_deref() {
                 let names: Vec<&str> = guess.members.iter().map(|m| m.name.as_str()).collect();
-                if let Some(found) = bitflip_loader::bundle::find_main_binary(&names, |index| {
-                    bitflip_loader::format::zip::read_member(bytes, index).ok()
-                }) {
+                if let Some(found) = bitflip_loader::bundle::find_main_binary(
+                    bitflip_loader::bundle::BundleLayout::Ipa,
+                    None,
+                    &names,
+                    |index| bitflip_loader::format::zip::read_member(bytes, index).ok(),
+                ) {
                     guess.notes.push(found.note_zh());
                     // Info.plist 读不出来 / 声明与归档不符这类降级，必须跟着结论一起
                     // 出现在界面上（§7）—— 否则用户只看到"按约定匹配"，不知道事实来源
@@ -1049,7 +1147,8 @@ impl Session {
         // 去解压；不留字节，`--member lib/arm64-v8a/*.so` 就直接无从下手。
         let is_archive = guess.container == ContainerKind::Ar
             || guess.container == ContainerKind::MsvcLib
-            || guess.container == ContainerKind::Zip;
+            || guess.container == ContainerKind::Zip
+            || guess.container == ContainerKind::AppBundle;
         let bytes: Arc<[u8]> = if object_raw.is_some() || is_archive {
             full_bytes.map_or_else(|| Arc::from(Vec::new()), Arc::from)
         } else {
@@ -1111,6 +1210,7 @@ impl Session {
             info.notes.push(format!("调试信息：{note}"));
         }
 
+        let container_root = (guess.container == ContainerKind::AppBundle).then(|| path.clone());
         Ok(Self {
             path,
             guess,
@@ -1119,6 +1219,7 @@ impl Session {
             object_raw,
             signatures,
             debug,
+            container_root,
             bytes,
             hash: std::sync::OnceLock::new(),
             analysis: std::sync::OnceLock::new(),
@@ -1133,8 +1234,14 @@ impl Session {
         if let Some(h) = self.hash.get() {
             return Ok(h.as_str());
         }
-        let computed = bitflip_project::target_hash(&self.path)
-            .map_err(|e| BitflipError::Project(e.to_string()))?;
+        let computed = if self.guess.container == ContainerKind::AppBundle {
+            // 目录本身不能当文件读。哈希以主二进制（`self.bytes`）为准 ——
+            // 那正是我们实际分析并展示的东西。
+            bitflip_project::target_hash_bytes(&self.bytes)
+        } else {
+            bitflip_project::target_hash(&self.path)
+                .map_err(|e| BitflipError::Project(e.to_string()))?
+        };
         // get_or_init 是幂等的：并发调用只会有一个值胜出，都拿到同一个引用
         Ok(self.hash.get_or_init(|| computed).as_str())
     }
@@ -1227,36 +1334,22 @@ impl Session {
         }
 
         if guess.container == ContainerKind::Fat {
-            // fat/universal 容器里没有"这个文件"的单一架构，但**有**一个写明的
-            // 选择规则（`fat::SELECTION_RULE_ZH`）：不指定架构时按规则挑一片，
-            // 指定了就按架构挑。两种情形都把"挑的是哪片、凭什么"写进
-            // `notes` —— 默认挑一片是**猜测**，猜测必须自报家门（§7）。
-            //
-            // 注意这里绝不"找不到就退回默认那片"：用户说要 arm64 而文件里没有
-            // arm64 时，报错要列出实际有哪些切片（`fat::FatError::ArchAbsent`）。
-            let container = bitflip_loader::format::macho::fat::read(bytes)
-                .map_err(|error| format!("fat 容器解析失败：{}", error.summary_zh()))?;
-            let requested = guess.arch.map(|spec| spec.arch);
-            let selection = container
-                .select(requested)
-                .map_err(|error| format!("fat 选片失败：{error}"))?;
-            let mut object = bitflip_loader::format::macho::fat::parse_slice(
-                bytes,
-                selection.index,
-                ObjectId::Plain,
-            )
-            .map_err(|error| {
-                format!(
-                    "fat 第 {} 片解析失败：{}",
-                    selection.index,
-                    error.summary_zh()
-                )
-            })?;
-            // 这条 note 落在**对象自己**的 notes 里：`info` 把它印在"结构说明"下，
-            // 与段/节并列。只放在目标级说明里的话，`--member` 选出来的切片
-            // 就不知道自己是第几片了。
-            object.note(container.selection_note(selection));
-            return Ok(object);
+            return Self::parse_fat(bytes, guess);
+        }
+
+        // `.app` 目录容器：可分析对象是主二进制。它可能是 fat/universal
+        // （arm64 + arm64e 的通用包）—— 那种情况与直接打开 fat 文件是同一套
+        // 选片逻辑。`open` 已把主二进制的识别结论并进了 `guess`，但"主二进制
+        // 是不是 fat"不在 `guess` 上（`guess.container` 仍是 AppBundle），这里按
+        // 字节再嗅探一次决定走哪条路 —— 便宜（只读嗅探窗口），而且保证 fat
+        // 主二进制的行为与直接打开 fat 文件一致。
+        //
+        // 薄主二进制则直接按对象格式派发（走下面的 `match guess.object`）。
+        if guess.container == ContainerKind::AppBundle {
+            let inner = bitflip_loader::sniff_bytes(bytes);
+            if inner.container == ContainerKind::Fat {
+                return Self::parse_fat(bytes, guess);
+            }
         }
 
         // 派发走 `bitflip_loader::parse_object` 这一个入口：新增格式时这里**不必改**
@@ -1267,6 +1360,43 @@ impl Session {
             kind => bitflip_loader::parse_object(kind, bytes, 0, ObjectId::Plain)
                 .map_err(|error| format!("{} 解析失败：{}", kind.label_zh(), error.summary_zh())),
         }
+    }
+
+    /// 从 fat/universal 容器里挑一片并解析。
+    ///
+    /// `ContainerKind::Fat` 与 `.app` 目录里的 fat 主二进制共用这一条路。
+    ///
+    /// fat 容器里没有"这个文件"的单一架构，但**有**一个写明的选择规则
+    /// （`fat::SELECTION_RULE_ZH`）：不指定架构时按规则挑一片，指定了就按架构挑。
+    /// 两种情形都把"挑的是哪片、凭什么"写进 `notes` —— 默认挑一片是**猜测**，
+    /// 猜测必须自报家门（§7）。
+    ///
+    /// 注意这里绝不"找不到就退回默认那片"：用户说要 arm64 而文件里没有 arm64 时，
+    /// 报错要列出实际有哪些切片（`fat::FatError::ArchAbsent`）。
+    fn parse_fat(bytes: &[u8], guess: &Guess) -> Result<Object, String> {
+        let container = bitflip_loader::format::macho::fat::read(bytes)
+            .map_err(|error| format!("fat 容器解析失败：{}", error.summary_zh()))?;
+        let requested = guess.arch.map(|spec| spec.arch);
+        let selection = container
+            .select(requested)
+            .map_err(|error| format!("fat 选片失败：{error}"))?;
+        let mut object = bitflip_loader::format::macho::fat::parse_slice(
+            bytes,
+            selection.index,
+            ObjectId::Plain,
+        )
+        .map_err(|error| {
+            format!(
+                "fat 第 {} 片解析失败：{}",
+                selection.index,
+                error.summary_zh()
+            )
+        })?;
+        // 这条 note 落在**对象自己**的 notes 里：`info` 把它印在"结构说明"下，
+        // 与段/节并列。只放在目标级说明里的话，`--member` 选出来的切片
+        // 就不知道自己是第几片了。
+        object.note(container.selection_note(selection));
+        Ok(object)
     }
 
     /// 把原始二进制包装成一个只有一个可执行段的合成对象。
@@ -1487,9 +1617,10 @@ impl Session {
     ) -> Result<Arc<[u8]>, BitflipError> {
         // ── 取得成员内容 ────────────────────────────────────────────────
         //
-        // 两条路，由 `MemberStorage` 决定（见 `bitflip_loader::MemberStorage`）：
+        // 三条路，由 `MemberStorage` 决定（见 `bitflip_loader::MemberStorage`）：
         //   * `Inline`    —— ar / MSVC `.lib`：`offset..offset+size` 就是内容；
-        //   * `Container` —— ZIP/APK：内容在容器里，可能压缩过，按 `index` 去要。
+        //   * `Container` —— ZIP/APK：内容在容器里，可能压缩过，按 `index` 去要；
+        //   * `File`      —— `.app` 目录容器：按成员名相对路径从磁盘读。
         //
         // 早先这里只有切片一条路，于是 APK 的成员会被当成"裸字节"去解析
         // —— 拿到的其实是 deflate 流，嗅探只会说"未识别"。
@@ -1539,6 +1670,27 @@ impl Session {
                             "成员 {:?} 取出失败：{}",
                             member.name,
                             error.summary_zh()
+                        ))
+                    },
+                )?;
+                Ok(Arc::from(data))
+            }
+            MemberStorage::File => {
+                // `.app` 目录容器的成员：按相对路径从容器根读盘。根缺失说明
+                // 容器解析自相矛盾（`File` 存储只能属于目录容器）。
+                let Some(root) = self.container_root.as_deref() else {
+                    return Err(BitflipError::InvalidInput(format!(
+                        "成员 {:?} 标记为目录文件，但会话没有目录容器根 —— 容器解析结果自相矛盾",
+                        member.name
+                    )));
+                };
+                let data = bitflip_loader::bundle::read_app_member(root, &member.name).ok_or_else(
+                    || {
+                        BitflipError::unavailable(format!(
+                            "成员 {:?} 从目录 {} 读取失败（文件不存在、不是普通文件、\
+                             或超过读取上限）",
+                            member.name,
+                            root.display()
                         ))
                     },
                 )?;
@@ -1642,6 +1794,9 @@ impl Session {
                 // （成员就是编译单元，函数没有大小、剥离后一无所有）。
                 signatures: self.signatures.clone(),
                 debug,
+                // 目录容器根跟着成员会话一起走：成员自己的成员（不太会有）取内容
+                // 仍然按相对路径从同一个根读盘。
+                container_root: self.container_root.clone(),
                 bytes: content,
                 hash: std::sync::OnceLock::new(),
                 analysis: std::sync::OnceLock::new(),

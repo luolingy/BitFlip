@@ -38,9 +38,10 @@
 //! - **objc / swift 元数据**（`__objc_classname`、`__swift5_*` 等）：按普通节列出，
 //!   不解析内容。
 //! - **代码签名**（`LC_CODE_SIGNATURE`）：只记录存在性，**不做校验**。
-//! - **`.app` bundle / IPA 容器语义**：`LoaderError::IsDirectory` 仍然是拒绝。
-//!   （IPA 里的主二进制定位已由 [`crate::bundle::find_main_binary`] 覆盖，那是
-//!   打包约定层面的判断，不是 Mach-O 格式的一部分。）
+//! - **`.app` bundle / IPA 容器语义**：目录容器由 [`crate::sniff_file`] 识别
+//!   （`looks_like_app_directory`），主二进制由 [`crate::bundle::find_main_binary`]
+//!   定位 —— 那是打包约定层面的判断，不是 Mach-O 格式的一部分；`LoaderError::IsDirectory`
+//!   现在只拒绝"不是 `.app` 形状"的目录。
 //!
 //! # 几处判断，写在这里免得被当成 bug
 //!

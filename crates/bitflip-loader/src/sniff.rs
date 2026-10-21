@@ -86,7 +86,7 @@ pub fn sniff_file(path: impl AsRef<Path>) -> Result<Guess, LoaderError> {
     })?;
 
     if meta.is_dir() {
-        return Err(LoaderError::IsDirectory(path.display().to_string()));
+        return sniff_directory(path);
     }
     if !meta.is_file() {
         return Err(LoaderError::NotRegularFile(path.display().to_string()));
@@ -113,6 +113,33 @@ pub fn sniff_file(path: impl AsRef<Path>) -> Result<Guess, LoaderError> {
             .notes
             .push(format!("文件 {total} 字节，仅嗅探了前 {} 字节", buf.len()));
     }
+    Ok(guess)
+}
+
+/// 嗅探一个**目录**：只有 `.app` bundle 形状的目录才是目标（M12 第 3 条）。
+///
+/// 目录容器与文件容器有一个结构性差别：成员可以**用元数据枚举、按名读盘**，
+/// 不依赖"整份字节"。所以嗅探阶段就能把成员表填齐（不像 ZIP 要等完整字节）。
+/// 主二进制是谁、它是什么格式，由打开方按 `Info.plist` 与命名约定识别 ——
+/// 这里只枚举、不解析（嗅探的边界：只有识别，没有解析）。
+fn sniff_directory(path: &Path) -> Result<Guess, LoaderError> {
+    if !crate::bundle::looks_like_app_directory(path) {
+        return Err(LoaderError::IsDirectory(path.display().to_string()));
+    }
+
+    let (members, mut notes) = crate::bundle::enumerate_app_directory(path)?;
+    notes.push(format!(
+        "这是 .app bundle 目录容器（{} 个成员）：目录本身没有单一对象格式，\
+         主二进制在打开目标时按 Info.plist 与命名约定识别",
+        members.len()
+    ));
+    notes.push("目录容器按元数据枚举成员、按成员名读盘，嗅探不读取任何文件内容".to_string());
+
+    let mut guess = Guess::new(0);
+    guess.container = ContainerKind::AppBundle;
+    guess.object = ObjectKind::Raw;
+    guess.notes = notes;
+    guess.members = members;
     Ok(guess)
 }
 
@@ -1084,6 +1111,59 @@ mod tests {
         let missing = dir.path().join("nope.bin");
         let err = sniff_file(&missing).expect_err("不存在的文件必须报错");
         assert!(matches!(err, LoaderError::Io { .. }));
+    }
+
+    #[test]
+    fn an_app_bundle_directory_is_recognized_and_enumerated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // iOS 形状：根层 Info.plist + 可执行 + 资源。
+        std::fs::write(
+            dir.path().join("Info.plist"),
+            br#"<?xml version="1.0"?><plist><dict/></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("SideStore"),
+            b"\xcf\xfa\xed\xfe\x00\x00\x00\x00",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("Frameworks")).unwrap();
+        std::fs::write(dir.path().join("Frameworks").join("X.dylib"), b"dylib").unwrap();
+
+        let guess = sniff_file(dir.path()).expect(".app 目录应当被识别");
+        assert_eq!(guess.container, ContainerKind::AppBundle);
+        // 嗅探不解析主二进制：格式留待打开时按 Info.plist 与魔数判定。
+        assert_eq!(guess.object, ObjectKind::Raw);
+        let names: Vec<&str> = guess.members.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"Info.plist"), "{names:?}");
+        assert!(names.contains(&"SideStore"), "{names:?}");
+        assert!(names.contains(&"Frameworks/X.dylib"), "{names:?}");
+        assert!(
+            guess
+                .members
+                .iter()
+                .all(|m| m.storage == MemberStorage::File),
+            "目录成员必须是 File 存储"
+        );
+        assert!(guess.has_notes(), "容器识别要带说明");
+    }
+
+    #[test]
+    fn a_macos_app_directory_is_recognized_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("Contents").join("MacOS")).unwrap();
+        std::fs::write(
+            dir.path().join("Contents").join("Info.plist"),
+            br#"<?xml version="1.0"?><plist><dict/></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Contents").join("MacOS").join("Foo"),
+            b"macho",
+        )
+        .unwrap();
+        let guess = sniff_file(dir.path()).expect("Contents/Info.plist 也是 .app");
+        assert_eq!(guess.container, ContainerKind::AppBundle);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! `init`），所以答案必须带上成员名，否则用户拿着地址也不知道去哪看。
 
 use anyhow::Context;
-use bitflip_core::{ApkRole, ArchiveMember, OpenOptions, Session};
+use bitflip_core::{ApkRole, ArchiveMember, MemberStorage, OpenOptions, Session};
 use serde_json::json;
 
 use crate::cli::{FunctionsArgs, MembersArgs, SymbolArgs};
@@ -73,7 +73,9 @@ pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
             "format_version": session.info().format_version,
             "target": session.info().path,
             "container": session.info().container,
-            "is_archive": session.info().is_archive(),
+            // 含义与 server 的 `/api/members` 一致：这个布尔说的是
+            // "有可选的成员"，不是严格的"是归档"（`.app` 目录与 fat 也是 true）。
+            "is_archive": session.info().has_selectable_members(),
             "member_count": members.len(),
             "members_truncated": session.info().members_truncated,
             "members": list,
@@ -85,11 +87,11 @@ pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if !session.info().is_archive() {
-        // 不是归档时明确说清，而不是打印空列表 ——
-        // "没有成员"和"这不是归档"对用户是两件事。
+    if !session.info().has_selectable_members() {
+        // 不是"可列成员"的容器时明确说清，而不是打印空列表 ——
+        // "没有成员"和"这不是容器"对用户是两件事。
         println!(
-            "{} 不是归档（容器 {}）：没有成员可列。",
+            "{} 不是容器（容器 {}）：没有成员可列。",
             session.info().path,
             session.info().container_label
         );
@@ -109,12 +111,15 @@ pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
     println!();
     println!("{:>10}  {:>14}  {:>8}  名字", "大小", "偏移", "存储");
     // 角色标注只在**容器成员**上给：`ApkRole` 是 APK 的命名约定知识，
-    // 对 ar / MSVC `.lib` 的内联成员名没有依据。
+    // 对 ar / MSVC `.lib` 的内联成员名、以及 `.app` 目录里的 iOS 成员名
+    // 都没有依据（给 iOS bundle 打 APK 角色标记是纯粹的误导）。
     //
-    // 判据用 `storage` 而不是比对"容器短名是不是 zip"：ZIP 成员恒为 `Container`、
-    // ar / `.lib` 成员恒为 `Inline`（见 `MemberStorage` 的说明），两者一一对应。
+    // 判据用 `storage` 而不是比对"容器短名"：ZIP 成员恒为 `Container`、
+    // ar / `.lib` 成员恒为 `Inline`、目录成员恒为 `File`，三者一一对应。
     // 用结构判据就不必依赖一个字符串巧合，也就不会因为改个短名而悄悄失准。
-    let show_role = members.iter().any(|m| !m.storage.is_inline());
+    let show_role = members
+        .iter()
+        .any(|m| matches!(m.storage, MemberStorage::Container { .. }));
     for member in members {
         // 偏移可能是"未知"：ZIP 成员的数据起点在**本地头**里（中央目录只记
         // 本地头的位置），本地头对不上就算不出来。显示"未知"而不是 `0x0`
@@ -123,11 +128,13 @@ pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
             .offset
             .map_or_else(|| "未知".to_string(), |o| format!("{o:#x}"));
         // "存储"列：内联成员直接可切片；容器成员给**原始方法号**
-        // （号码是能拿去查 APPNOTE 的线索，比"其他"有用）。
-        let storage = member
-            .storage
-            .method()
-            .map_or_else(|| "内联".to_string(), |m| format!("方法 {m}"));
+        // （号码是能拿去查 APPNOTE 的线索，比"其他"有用）；目录成员按名读盘。
+        // 判据用 `storage` 而不是容器短名，理由同 `show_role`。
+        let storage = match member.storage {
+            MemberStorage::Inline => "内联".to_string(),
+            MemberStorage::File => "目录文件".to_string(),
+            MemberStorage::Container { method, .. } => format!("方法 {method}"),
+        };
         println!(
             "{:>10}  {:>14}  {:>8}  {}{}{}",
             member.size,
@@ -146,6 +153,7 @@ pub fn run_members(args: &MembersArgs) -> anyhow::Result<()> {
     println!();
     println!("存储列  内联：文件里就是成员裸字节，可直接解析（ar / MSVC .lib）");
     println!("        方法 N：成员存于容器内，取内容要经容器（ZIP：0=stored 不压缩，8=deflate）");
+    println!("        目录文件：`.app` bundle 目录里的文件，按相对路径读盘");
     println!("偏移列  未知：容器目录指向的本地头对不上，数据起点算不出来 —— 不是偏移 0");
     if show_role {
         println!("角色标注  **按成员名**判定的 APK 固定位置（不解压、不解析）：只标出");

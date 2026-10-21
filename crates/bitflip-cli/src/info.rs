@@ -125,7 +125,9 @@ fn print_human(info: &TargetInfo, session: &Session) {
     let members = session.guess().members.as_slice();
     if !members.is_empty() {
         println!();
-        println!("归档成员（最多显示 20 个）");
+        // 叫"容器成员"而不是"归档成员"：`.app` 目录容器与 fat 不是归档，
+        // 但它们同样有成员表，这里印的就是那张表。
+        println!("容器成员（最多显示 20 个）");
         for member in members.iter().take(20) {
             // 偏移可能是未知（ZIP 成员的数据起点在本地头里，本地头对不上就没有）。
             // 显示"偏移未知"而不是 `0x00000000` —— 后者是个**合法**偏移，

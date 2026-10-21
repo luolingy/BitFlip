@@ -1662,6 +1662,11 @@ IPA（ZIP 容器）  →  .app（目录容器）  →  Mach-O 可执行文件  �
    —— `LoaderError::IsDirectory` 目前是一句"排期在 M10"的拒绝。要改成"进入目录、
    枚举 `Contents/`、把 `Contents/MacOS/<name>`、`Frameworks/*.dylib`、
    `PlugIns/*.appex` 列为成员"，同时保留 `Info.plist` 的识别（二进制 plist 要解码）。
+   （2026-10-19 更正：**已落地**。`ContainerKind::AppBundle` + `MemberStorage::File`，
+   成员枚举按元数据、内容按相对路径读盘；`IsDirectory` 现在只拒绝"不是 `.app` 形状"
+   的目录。列举口径与这里写的略有出入：成员是**整棵目录树**（深度 ≤ 6、≤ 4096 个），
+   不按 `MacOS` / `Frameworks` / `PlugIns` 分类白名单 —— 白名单会漏掉真实的 bundle 结构。
+   详见 CHANGELOG 的"M12 第七片"。）
 4. **IPA**：ZIP → `Payload/*.app/` → 递归走 `.app` 逻辑。 
 5. **分析能力对齐**：函数识别（`LC_FUNCTION_STARTS` + 符号表）、反汇编、调用图、
    字符串、交叉引用、导出/差分 —— 全部走既有的通用流水线，**这意味着如果 M1–M9

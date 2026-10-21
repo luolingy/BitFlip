@@ -197,9 +197,13 @@ fn a_real_ios_binary_yields_segments_sections_and_entry() {
     // 出现一个测试根本没覆盖过的答案。这正是"同一段判断只该有一份"的可执行版本。
     {
         let names: Vec<&str> = listing.members.iter().map(|m| m.name.as_str()).collect();
-        let found =
-            bitflip_loader::bundle::find_main_binary(&names, |i| zip::read_member(&ipa, i).ok())
-                .expect("产品实现也应当认得出主二进制");
+        let found = bitflip_loader::bundle::find_main_binary(
+            bitflip_loader::bundle::BundleLayout::Ipa,
+            None,
+            &names,
+            |i| zip::read_member(&ipa, i).ok(),
+        )
+        .expect("产品实现也应当认得出主二进制");
         assert_eq!(
             (found.index, found.name.as_str()),
             (index, name.as_str()),

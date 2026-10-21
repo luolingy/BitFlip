@@ -2,10 +2,12 @@
 //!
 //! 三层抽象（见 `docs/ARCHITECTURE.md` §3）：
 //!
-//! - **容器（[`ContainerKind`]）**：一个文件里可能装着多个对象 —— 归档（ar / MSVC `.lib`）、
-//!   fat/universal、ZIP。ar 与 `.lib` 从 M0 起可枚举；fat/universal 的切片枚举、
-//!   选片与成员化在 M12 落地（[`format::macho::fat`]）；
-//!   ZIP 只做容器层（[`list_zip_members`] / [`read_zip_member`]）。
+//! - **容器（[`ContainerKind`]）**：一个文件（或目录）里可能装着多个对象 —— 归档
+//!   （ar / MSVC `.lib`）、fat/universal、ZIP、`.app` bundle 目录。ar 与 `.lib` 从
+//!   M0 起可枚举；fat/universal 的切片枚举、选片与成员化在 M12 落地
+//!   （[`format::macho::fat`]）；ZIP 只做容器层（[`list_zip_members`] /
+//!   [`read_zip_member`]）；`.app` 目录的枚举与按名读盘在
+//!   [`crate::bundle`]（`enumerate_app_directory` / `read_app_member`）。
 //! - **对象（[`ObjectKind`]）**：可分析的基本单位 —— PE、COFF、ELF、Mach-O、raw。
 //! - **架构（[`bitflip_arch::ArchSpec`]）**：由格式的 machine 字段映射得到。
 //!
@@ -94,9 +96,10 @@ pub enum LoaderError {
         #[source]
         source: std::io::Error,
     },
-    /// 目标是目录（例如 macOS `.app` bundle）。
+    /// 目标是目录，但看起来不是 `.app` bundle（M12 第 3 条的目录容器只认这种形状）。
     #[error(
-        "目标是目录而不是文件: {0} —— .app bundle 之类的目录容器排期在 M12（见 docs/PLAN.md）"
+        "目标是目录 {0}，但它不是 .app bundle（目录里应有 Info.plist 或 Contents/Info.plist，\
+         见 docs/PLAN.md 的 M12）"
     )]
     IsDirectory(String),
     /// 目标既不是文件也不是目录（设备、管道等）。
@@ -140,6 +143,23 @@ pub enum ContainerKind {
     /// 也能按 `--arch` 挑一片（`format::macho::fat::parse_slice`）。
     /// 但**整份** fat 文件本身仍然不是一个对象：直接 `parse` 它依旧明确报错。
     Fat,
+    /// `.app` bundle 目录容器（macOS `Foo.app/Contents/…` 或 iOS 解包后的根层）。
+    ///
+    /// 这是"一个目录装着多个命名成员"，但与 `Ar`/`Zip` 有两处**结构性**不同：
+    ///
+    /// 1. **成员可以枚举，也可以直接读，都不需要整份字节**：目录在磁盘上就是
+    ///    一棵树，`enumerate_app_directory` 按元数据列出成员；内容按成员名
+    ///    单独读盘（[`crate::bundle::read_app_member`]）。所以嗅探阶段就能
+    ///    枚举完，不需要像 ZIP 那样等完整字节。
+    /// 2. **容器本身有"那个对象"**：`.app` 的语义里有一个主二进制
+    ///    （`Info.plist` 的 `CFBundleExecutable`，见 [`crate::bundle`]），
+    ///    它**不是**像 ar/ZIP 那样"容器无代码、只能分析成员" ——
+    ///    主二进制本身就是可分析对象。因此 `bitflip-core` 打开 `.app` 目录时
+    ///    把主二进制的字节当目标字节解析，成员表照旧列出。
+    ///
+    /// 成员存储是 [`MemberStorage::File`]：取内容按相对路径读盘，
+    /// 不是切片、也不是解压。
+    AppBundle,
 }
 
 impl ContainerKind {
@@ -152,6 +172,7 @@ impl ContainerKind {
             Self::MsvcLib => "msvc-lib",
             Self::Zip => "zip",
             Self::Fat => "fat",
+            Self::AppBundle => "app-bundle",
         }
     }
 
@@ -164,6 +185,7 @@ impl ContainerKind {
             Self::MsvcLib => "MSVC 静态库",
             Self::Zip => "ZIP 容器",
             Self::Fat => "fat 通用容器",
+            Self::AppBundle => "`.app` bundle 目录",
         }
     }
 }
@@ -345,6 +367,12 @@ pub enum MemberStorage {
         /// 其长度在**本地头**里是空的。此时按"长度未知"处理，不要当 0 用。
         uncompressed_size: u64,
     },
+    /// 目录容器的成员：内容按 [`ArchiveMember::name`] 的相对路径从磁盘读。
+    ///
+    /// `.app` bundle 目录（[`ContainerKind::AppBundle`]）。`offset` / `size`
+    /// 只是诊断信息（文件长度），取内容一律走
+    /// [`crate::bundle::read_app_member`]。
+    File,
 }
 
 impl MemberStorage {
@@ -360,6 +388,7 @@ impl MemberStorage {
         match self {
             Self::Inline => "inline",
             Self::Container { .. } => "container",
+            Self::File => "file",
         }
     }
 
@@ -377,6 +406,7 @@ impl MemberStorage {
                 8 => "容器内，方法 8（deflate）".to_string(),
                 other => format!("容器内，方法 {other}（未知方法，保留原始号码）"),
             },
+            Self::File => "目录里的文件（按相对路径读）".to_string(),
         }
     }
 
@@ -386,6 +416,7 @@ impl MemberStorage {
         match self {
             Self::Inline => None,
             Self::Container { method, .. } => Some(method),
+            Self::File => None,
         }
     }
 
@@ -401,6 +432,7 @@ impl MemberStorage {
             Self::Container {
                 uncompressed_size, ..
             } => Some(uncompressed_size),
+            Self::File => None,
         }
     }
 }
@@ -559,6 +591,26 @@ impl Guess {
             };
             return format!(
                 "{}，{members}（成员格式各不相同，按成员逐个判定）",
+                self.container.label_zh()
+            );
+        }
+
+        if self.container == ContainerKind::AppBundle {
+            // `.app` 目录与归档不同：它有主二进制，容器级对象格式来自主二进制。
+            // 主二进制没认出来（`Raw`）就是"没认出来"，不能假装没有。
+            let members = if self.members.is_empty() {
+                "成员清单未枚举".to_string()
+            } else {
+                let extra = if self.members_truncated { "+" } else { "" };
+                format!("成员 {}{}", self.members.len(), extra)
+            };
+            let object = if self.object == ObjectKind::Raw {
+                "主二进制格式未识别".to_string()
+            } else {
+                format!("主二进制 {}", self.object.label_zh())
+            };
+            return format!(
+                "{} / {object} / {arch}，{members}",
                 self.container.label_zh()
             );
         }

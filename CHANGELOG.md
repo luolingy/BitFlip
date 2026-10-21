@@ -41,11 +41,59 @@ Mach-O 头"两条。四份真实 IPA 里有两份的可执行名与 `.app` 不�
 
   四份都没有降级说明（`MainBinary::notes` 为空）。
 
-- **没有做**：`.app` **目录**作为容器（`LoaderError::IsDirectory` 仍是拒绝）。这一片
-  只解决 `docs/PLAN.md` M12 第 3 条里 `Info.plist` 的那一半，目录那一半还没落地。
+- **目录那一半当时没做**：`.app` **目录**作为容器是下一片的事（见下面第七片）。这一片
+  只解决 `docs/PLAN.md` M12 第 3 条里 `Info.plist` 的那一半。
 - **API**：`bitflip-loader` 新增 `plist` 模块、`MainBinary::notes`、
   `MainBinarySource::FromPlist`。`CORE_API_VERSION` / `SERVER_API_VERSION` **不动**：
   结论的地址与计数没变，变的只是 `notes` 说得更准。
+
+### 新增 — `.app` 目录本身能作为容器打开（M12 第七片）
+
+上一片让 IPA 里的主二进制变成事实，但**目录**仍然一律被拒（`LoaderError::IsDirectory`）。
+可 macOS 的 `.app` 本来就是一个目录，iOS 应用解包后也是一棵目录树 —— 手里只有解包目录、
+没有 IPA 的人因此什么也做不了，而那恰好是改包、看内嵌框架、比对签名时最常见的东西。
+
+- **目录容器**（`ContainerKind::AppBundle`，`as_str` = `app-bundle`）：只认**像 `.app`** 的目录
+  —— 根层有 `Info.plist`（iOS 解包）或 `Contents/Info.plist`（macOS）。两者都没有就是普通目录，
+  照旧按"不是目标"报错，但文案改成说清缺的是哪份 plist（不再指向排期，那已经落地了）。
+- **成员枚举只靠元数据**（`bundle::enumerate_app_directory`）：深度 ≤ 6 层、成员 ≤ 4096 个，
+  名字是 `/` 分隔的相对路径，存储是新变体 `MemberStorage::File`。符号链接**不跟随** ——
+  成员名只代表 bundle 内部的文件，链接可能指到 bundle 外面。超深/超量写进 `notes`，不静默截断。
+- **成员内容按名读盘**（`bundle::read_app_member`）：绝对路径、`..`、空段一律拒绝；
+  单成员上限 512 MiB（与 `MAX_FULL_PARSE_BYTES` 对齐 —— 解析器要的字节不会更多）。
+- **主二进制仍然事实优先**：`find_main_binary` 现在收 `BundleLayout`（`Ipa` / `Directory`）
+  与目录名。目录布局里 `CFBundleExecutable` 给出的名字要落在根层或 `Contents/MacOS/` 下。
+  同名约定、魔数推断、以及每一条降级说明与 IPA **完全一致**（同一个函数、同一套 `notes`）。
+- **可分析对象就是主二进制**：打开目录时把主二进制的字节当 `Session::bytes`，把它的嗅探结论
+  （对象格式/架构/入口/节）并进目标级结论，`parse_target` 照常派发。主二进制若是
+  fat/universal（arm64 + arm64e 的通用包），走与直接打开 fat 文件相同的选片逻辑
+  （`parse_fat` 抽出来给两条路共用）。目标"大小"= 主二进制字节数 —— 目录没有文件大小可谈，
+  这一点在说明里写明。
+- **哈希**：目录容器的 `target_hash` 改用 `target_hash_bytes(self.bytes)` —— 目录本身不能
+  当文件读，而我们实际分析、展示的就是主二进制。
+- **`--member` 可用**：目录成员的会话继承 `container_root`，内容按相对路径读。`members` /
+  `info` 的存储列新增"目录文件"；`/api/members` 与 CLI 的 `is_archive` 值放宽为
+  `has_selectable_members()`（`.app` 与 fat 不是归档，但成员可选）—— 字段名保留，
+  是为了不破坏既有消费方。web 的成员视图据此自动显示 `.app` 成员表，`api.ts` 未改。
+
+**真实样本**（`temp/LiveContainer.ipa` 解包成目录；`temp/` 永不入库）：
+
+| 项 | 值 |
+| --- | --- |
+| 容器 | `.app` bundle 目录（`app-bundle`），78 个成员 |
+| 主二进制 | `LiveContainer_PleaseDoNotShorten…`（**事实**，按 `CFBundleExecutable`） |
+| 对象 / 架构 | Mach-O / aarch64，入口 `0x10000860c`，26 节 |
+| 函数 | 311 个（直接分析主二进制） |
+| `--member CydiaSubstrate.framework/CydiaSubstrate` | 1030 个函数（按名读盘） |
+
+另造了一个 macOS 形状的目录（`Contents/Info.plist` + `Contents/MacOS/DemoApp` + 资源）：
+容器、事实来源、成员表都对；没有 plist 的普通目录仍然报错并说明缺什么。
+
+- **API**：`bitflip-loader` 新增 `ContainerKind::AppBundle`、`MemberStorage::File`、
+  `BundleLayout`、`enumerate_app_directory`、`read_app_member`、`looks_like_app_directory`、
+  `MAX_APP_MEMBER_BYTES`、`MAX_BUNDLE_MEMBERS`；`find_main_binary` 签名变了（多了
+  `BundleLayout` 与 `bundle_name`）。`CORE_API_VERSION` / `SERVER_API_VERSION` /
+  `INFO_FORMAT_VERSION` **不动**：新容器只是 `container` 多一个取值，字段名与形状没变。
 
 ### 新增 — 调用图里指向导入符号的边（M12 第五片）
 

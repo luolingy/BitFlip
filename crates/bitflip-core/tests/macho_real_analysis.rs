@@ -76,9 +76,12 @@ fn real_object(path: &std::path::Path) -> (String, bitflip_loader::object::Objec
     let listing = zip::list_members(&ipa)
         .unwrap_or_else(|error| panic!("IPA 应当是能列成员的 ZIP：{}", error.summary_zh()));
     let names: Vec<&str> = listing.members.iter().map(|m| m.name.as_str()).collect();
-    let found = bitflip_loader::bundle::find_main_binary(&names, |index| {
-        zip::read_member(&ipa, index).ok()
-    })
+    let found = bitflip_loader::bundle::find_main_binary(
+        bitflip_loader::bundle::BundleLayout::Ipa,
+        None,
+        &names,
+        |index| zip::read_member(&ipa, index).ok(),
+    )
     .unwrap_or_else(|| panic!("这份 IPA 里找不到 Mach-O 主二进制：{}", path.display()));
     let member = zip::read_member(&ipa, found.index)
         .unwrap_or_else(|error| panic!("取成员 {} 失败：{}", found.name, error.summary_zh()));

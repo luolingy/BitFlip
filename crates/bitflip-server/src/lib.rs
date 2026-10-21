@@ -733,7 +733,11 @@ async fn members(State(state): State<AppState>) -> Response {
 
     Json(MembersResponse {
         format_version: info.format_version,
-        is_archive: info.is_archive(),
+        // 这个字段驱动"要不要展示成员表"。用 `has_selectable_members` 而不是
+        // `is_archive`：`.app` 目录与 fat/universal 不是归档（主二进制/切片直接
+        // 可分析），但成员照旧可选可列 —— 字段名保留 `is_archive` 是兼容旧
+        // 消费方，含义从"是归档"放宽为"有可选的成员"。
+        is_archive: info.has_selectable_members(),
         container: info.container.clone(),
         truncated: info.members_truncated,
         members,
