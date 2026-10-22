@@ -752,12 +752,28 @@ export interface CallEdge {
   import_name: string | null;
   /** 导入所在的库（Mach-O 的 dylib 路径）；内部边为 null。 */
   import_module: string | null;
+  /** 是 ObjC 消息边时的选择器名（`__objc_stubs` 里的消息桩）；否则为 null。 */
+  objc_selector: string | null;
+  /**
+   * 目标**不在指令编码里**，由同一段直线上的前驱指令算出
+   * （`adrp` + `ldr` 取槽 / `adrp` + `add` 算地址）。
+   *
+   * 与直接调用的区别：那是二进制自己说的，这是我们的推理 ——
+   * 界面上要能分辨，用户才知道该不该当事实用。
+   */
+  recovered_indirect: boolean;
 }
 
 /** 一个未解析的调用点。 */
 export interface UnresolvedCall {
   caller: string;
   insn: string;
+  /**
+   * 目标从哪个内存槽读（前驱恢复出的槽地址）；`null` 表示连这步都没恢复。
+   *
+   * 有值时用户至少知道该去看哪个槽，而不是只看到"未解析"。
+   */
+  via_slot: string | null;
 }
 
 /** `/api/call-graph` 响应。 */

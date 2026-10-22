@@ -45,6 +45,14 @@ pub enum CalleeResolution {
     /// 这是 M6 明确不做数据流分析的后果，如实标记而不是留空 ——
     /// 留空会让用户以为"这里没有调用"。
     IndirectUnresolved,
+    /// 间接调用，目标**由同一条直线上的前驱指令算出来**（`adrp` + `ldr` 取
+    /// 一个槽、或 `adrp` + `add` 算一个地址，见 `bitflip_arch::recover_indirect_call_target`）。
+    ///
+    /// 为什么必须与 [`Self::Resolved`] 分开：`Resolved` 的目标是**指令编码里
+    /// 写着的**（`bl 0x...`），而这里的标的是**算出来的** —— 依据是"中间没有
+    /// 别的写、也没有调用"这条直线性质。两者对用户的含义不同：前者是二进制
+    /// 自己说的，后者是我们的推理。混成一个会让推理冒充事实（CLAUDE.md §7）。
+    IndirectRecovered,
 }
 
 impl CalleeResolution {
@@ -55,6 +63,7 @@ impl CalleeResolution {
             Self::Resolved => "resolved",
             Self::OutsideKnownFunctions => "outside",
             Self::IndirectUnresolved => "indirect",
+            Self::IndirectRecovered => "indirect-recovered",
         }
     }
 
@@ -65,6 +74,7 @@ impl CalleeResolution {
             Self::Resolved => "已解析",
             Self::OutsideKnownFunctions => "落在已知函数之外",
             Self::IndirectUnresolved => "间接调用，未解析",
+            Self::IndirectRecovered => "间接调用，经前驱恢复",
         }
     }
 }
@@ -485,9 +495,10 @@ pub fn build_call_graph(
 
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut unresolved_indirect = 0usize;
+    let mut recovered_indirect = 0usize;
     let mut orphan_calls = 0usize;
 
-    for insn in insns {
+    for (index, insn) in insns.iter().enumerate() {
         let is_call = insn.flow == bitflip_arch::Flow::Call;
         // 尾调用：`jmp` 到一个**属于别的函数**的目标。
         //
@@ -514,14 +525,35 @@ pub fn build_call_graph(
         // 间接调用：有 target 的就是直接调用，没有的就是间接。
         let Some(target) = insn.target else {
             if is_call {
-                unresolved_indirect += 1;
-                edges.push(CallEdge {
-                    caller: caller.start,
-                    from_insn: insn.addr,
-                    callee: None,
-                    resolution: CalleeResolution::IndirectUnresolved,
-                    tail: false,
-                });
+                // 先试着从前驱指令恢复（`adrp` + `ldr` / `add`）。恢复出来的是
+                // **算出来的**目标，所以标记成 `IndirectRecovered` 而不是
+                // `Resolved` —— 两者在界面上必须分得开。
+                match bitflip_arch::recover_indirect_call_target(insns, index) {
+                    Some(recovered) => {
+                        let callee = match recovered {
+                            bitflip_arch::RecoveredTarget::Slot { slot } => slot,
+                            bitflip_arch::RecoveredTarget::Address { addr } => addr,
+                        };
+                        recovered_indirect += 1;
+                        edges.push(CallEdge {
+                            caller: caller.start,
+                            from_insn: insn.addr,
+                            callee: Some(callee),
+                            resolution: CalleeResolution::IndirectRecovered,
+                            tail: false,
+                        });
+                    }
+                    None => {
+                        unresolved_indirect += 1;
+                        edges.push(CallEdge {
+                            caller: caller.start,
+                            from_insn: insn.addr,
+                            callee: None,
+                            resolution: CalleeResolution::IndirectUnresolved,
+                            tail: false,
+                        });
+                    }
+                }
             }
             continue;
         };
@@ -566,10 +598,18 @@ pub fn build_call_graph(
     }
 
     let mut notes: Vec<String> = Vec::new();
+    if recovered_indirect > 0 {
+        notes.push(format!(
+            "{recovered_indirect} 处间接调用的目标由前驱指令恢复（`adrp` + `ldr` 取槽、\
+             或 `adrp` + `add` 算地址）—— 这些目标**不在指令编码里**，是同一段直线上\
+             可证明的推理；槽里装什么要上层拿导入表去比"
+        ));
+    }
     if unresolved_indirect > 0 {
         notes.push(format!(
             "{unresolved_indirect} 处间接调用（寄存器/内存）未解析 —— \
-             解析它们需要数据流分析，M6 未实现；这些调用点在图上是断开的"
+             它们的前驱不是 `adrp` + `ldr`/`add` 这种可证明形态（真动态派发、\
+             跨基本块或经栈槽传递）；这些调用点在图上是断开的"
         ));
     }
     if orphan_calls > 0 {
@@ -660,6 +700,41 @@ mod tests {
         assert!(
             g.notes.iter().any(|n| n.contains("间接调用")),
             "未解析的间接调用必须如实说明，不能静默"
+        );
+    }
+
+    /// 前驱恢复：`adrp` + `ldr` + `blr` 的**真实字节**（LiveContainer 主二进制
+    /// 0x100006560，抄自 `llvm-objdump -d`）让 `blr x8` 拿到槽地址。
+    ///
+    /// 关键断言是 `IndirectRecovered` 而不是 `Resolved`：目标不是编码里写的，
+    /// 是我们算出来的，界面上必须分得开（CLAUDE.md §7）。
+    #[test]
+    fn a_got_load_call_is_recovered_from_its_predecessors() {
+        let words: [u32; 3] = [0xd000_0068, 0xf943_e108, 0xd63f_0100];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let insns = bitflip_arch::decoder_for(bitflip_arch::ArchSpec::aarch64()).decode_many(
+            &bytes,
+            0x1_0000_6560,
+            64,
+        );
+        assert_eq!(insns.len(), 3, "{insns:#?}");
+
+        let f = funcs(&[(0x1_0000_6558, Some(0x1_0000_6580))]);
+        let g = build_call_graph(&insns, &f);
+
+        assert_eq!(g.edge_count(), 1, "{:#?}", g.edges);
+        let e = &g.edges[0];
+        assert_eq!(
+            e.callee,
+            Some(0x1_0001_47c0),
+            "槽地址必须是 `0x100014000 + 0x7c0`（objdump 注解里的算法）"
+        );
+        assert_eq!(e.resolution, CalleeResolution::IndirectRecovered);
+        assert_eq!(g.unresolved_indirect, 0, "恢复出来的不再算未解析");
+        assert!(
+            g.notes.iter().any(|n| n.contains("前驱指令恢复")),
+            "恢复了几条必须写进 notes：{:?}",
+            g.notes
         );
     }
 

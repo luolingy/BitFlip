@@ -109,7 +109,11 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// 选择器名）；[`ObjectInfo`] 新增 `objc` 字段（计数 + 样例 + 说明）；
 /// [(`bitflip_loader`)`Object`] 新增 `objc: ObjcMetadata`（选择器/方法/桩）。
 /// 三个都是增量字段，但公开结构体的形状都变了（字面量构造会编译失败）⇒ +1。
-pub const CORE_API_VERSION: u32 = 5;
+///
+/// v6（间接调用前驱恢复这一片）：[`CallEdgeWire`] 新增 `recovered_indirect`
+/// （目标是推理出来的而不是编码里写的）；[`bitflip_analyze::CalleeResolution`]
+/// 新增 `IndirectRecovered` 变体。同样是增量 + 形状变化 ⇒ +1。
+pub const CORE_API_VERSION: u32 = 6;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

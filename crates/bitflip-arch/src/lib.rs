@@ -13,6 +13,7 @@
 mod abi;
 mod backend;
 mod decode;
+mod indirect;
 mod insn;
 mod padding;
 mod plt;
@@ -22,6 +23,7 @@ mod types;
 pub use abi::{abi_for_spec, AbiSpec, ReturnAddress};
 pub use backend::{BackendError, CapstoneDecoder, DecoderBackend};
 pub use decode::{decoder_for, Abi, DecodeError, Decoder, UnsupportedDecoder};
+pub use indirect::{recover_indirect_call_target, RecoveredTarget};
 pub use insn::{
     BarrierOption, ConditionCode, DecodedInsn, Flow, MemRef, MnemonicId, Operand, PrefetchOp,
     PstateField, RegId, RegSet, ShiftKind, SvcrMode, SysOpRef, SysRegRef,
@@ -41,4 +43,7 @@ pub use types::{Arch, ArchSpec, Endian, Mode};
 ///    下游要能分辨是哪个版本给的结论：capstone 的 ppc 后端真实可用了、
 ///    `preferred_endian` 第一次对某些架构返回 `Endian::Big`（此前恒为小端）、
 ///    `abi_for_spec` 对 ppc 返回一套调用约定（此前是 `None`）。
-pub const ARCH_API_VERSION: u32 = 3;
+/// 4：新增 `indirect` 模块（`recover_indirect_call_target` / `RecoveredTarget`）
+///    —— AArch64 的 `blr` 目标前驱恢复。纯增量：既有函数签名与结论一个字没改，
+///    上游不调用它就不会有任何行为变化。
+pub const ARCH_API_VERSION: u32 = 4;

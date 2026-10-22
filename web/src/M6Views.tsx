@@ -375,7 +375,13 @@ function NeighbourhoodPanel({
                       {formatAddress(e.callee)}
                     </button>
                   )}
+                  {e.objc_selector && (
+                    <span className="mono"> {e.objc_selector}</span>
+                  )}
                   {e.tail && <span className="chip chip-small">尾调用</span>}
+                  {e.recovered_indirect && (
+                    <span className="chip chip-small">前驱恢复</span>
+                  )}
                 </li>
               ))}
             </ul>
@@ -387,9 +393,16 @@ function NeighbourhoodPanel({
         <div className="banner banner-warn">
           该函数有 <strong>{unresolved.length}</strong> 处间接调用没有目标，
           未计入上面的列表。调用点：
-          <span className="mono">
-            {unresolved.map((u) => formatAddress(u.insn)).join("、")}
-          </span>
+          <ul className="notes">
+            {unresolved.map((u) => (
+              <li key={`${u.caller}-${u.insn}`} className="mono">
+                {formatAddress(u.insn)}
+                {u.via_slot
+                  ? ` · 目标取自槽 ${formatAddress(u.via_slot)}（槽里装什么静态读不到）`
+                  : ""}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>

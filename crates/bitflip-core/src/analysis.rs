@@ -39,7 +39,11 @@ use crate::timing::Stages;
 ///
 /// 3（objc 名字这一片）：[`CallEdgeWire`] 新增 `objc_selector`。调用图的
 /// JSON 形状又变了（每条边多一个字段），所以再动一次。
-pub const ANALYSIS_FORMAT_VERSION: u32 = 3;
+///
+/// 4（间接调用前驱恢复这一片）：[`CallEdgeWire`] 新增 `recovered_indirect`。
+/// 同样是"每条边多一个字段"，而且这次多出来的是一位**可信度信息**——
+/// 消费方必须能分辨"目标是编码里写的"还是"我们推理出来的"。
+pub const ANALYSIS_FORMAT_VERSION: u32 = 4;
 
 /// 签名库这一遍的账目（M8）。
 ///
@@ -575,6 +579,13 @@ pub struct CallEdgeWire {
     /// 消息"—— 选择器就是消息的全部意义，所以名字挂在这里而不是 `import_name`。
     /// 非消息边为 `null`。
     pub objc_selector: Option<String>,
+    /// 这条边的目标**不在指令编码里**，是同一段直线上从前驱指令算出来的
+    /// （`adrp` + `ldr` 取一个槽、`adrp` + `add` 算一个地址）。
+    ///
+    /// 与"编码里写着 `bl 0x...`"的直接调用必须分得开：后者是二进制自己说的，
+    /// 前者是我们的推理（依据是中间没有别的写、也没有调用）。用户据此判断
+    /// 这条边能不能当事实用（CLAUDE.md §7：事实与推断要能分开）。
+    pub recovered_indirect: bool,
 }
 
 impl CallEdgeWire {
@@ -588,6 +599,7 @@ impl CallEdgeWire {
             import_name: None,
             import_module: None,
             objc_selector: None,
+            recovered_indirect: false,
         }
     }
 }
@@ -599,6 +611,12 @@ pub struct UnresolvedCallWire {
     pub caller: String,
     /// 发起调用的指令地址。
     pub insn: String,
+    /// 目标**从哪个内存槽读**（`adrp` + `ldr` 前驱恢复出来的槽地址）。
+    ///
+    /// `null` 表示连这一步都没恢复出来（真动态派发）。有值时说明"目标是
+    /// 运行时从那个槽里读的"—— 槽里装什么静态读不到（可能只在运行时才填），
+    /// 但至少用户知道该去看哪儿，而不是只看到"未解析"三个字。
+    pub via_slot: Option<String>,
 }
 
 /// 数据/代码判定的 wire 结果（M6）。
@@ -2389,6 +2407,15 @@ fn build_call_graph_wire(
     let mut objc_message_edges = 0usize;
     // 落在 `__objc_stubs` 里、却没被认成任何消息桩的调用目标（桩形态没认出来）。
     let mut objc_stub_unresolved: BTreeSet<u64> = BTreeSet::new();
+    // 目标由前驱指令恢复、却既不是导入槽也不是已知函数入口的边数 ——
+    // 恢复出地址不等于恢复出"它是什么"，这类必须记账（不能静默丢）。
+    let mut recovered_unmapped = 0usize;
+    // 这些调用点连同"目标取自哪个槽"一起报到 `unresolved` 里：用户在那里
+    // 本来只看到"未解析"，现在至少知道该去看哪个槽。
+    let mut recovered_slots: Vec<(u64, u64, u64)> = Vec::new();
+
+    // 已知函数入口集合：恢复出的地址要落在这里才算"内部边"。
+    let known_starts: BTreeSet<u64> = ranges.iter().map(|r| r.start).collect();
 
     let edges: Vec<CallEdgeWire> = graph
         .edges
@@ -2396,17 +2423,25 @@ fn build_call_graph_wire(
         .filter_map(|e| {
             let callee = e.callee?;
             let caller = hex16(e.caller);
+            let recovered = e.resolution == bitflip_analyze::CalleeResolution::IndirectRecovered;
 
             // ① 先问导入表：这个目标是不是某个导入的槽位 / 跳板桩。
             //
             // 放在"只留 Resolved"之前：桩地址常常被 `find_function` 的
             // "边界未知的函数往后吸收"规则吞进某个函数范围，于是它今天
             // 显示成 Resolved —— 但它的内容仍是桩，被调用方仍在本镜像之外。
+            //
+            // 前驱恢复出来的**槽地址**正是走这条路被命名的：`adrp`+`ldr` 取
+            // 的那个槽如果就是某个导入的 `iat_slot`，这条边的名字就出来了。
             if let Some(table) = imports {
                 if let Some(index) = table.lookup_index(callee) {
                     external_edges += 1;
                     external_imports.insert(index);
-                    if e.resolution == bitflip_analyze::CalleeResolution::OutsideKnownFunctions {
+                    if matches!(
+                        e.resolution,
+                        bitflip_analyze::CalleeResolution::OutsideKnownFunctions
+                            | bitflip_analyze::CalleeResolution::IndirectRecovered
+                    ) {
                         external_outside_targets.insert(callee);
                     }
                     let import = table.import_at(index);
@@ -2418,6 +2453,7 @@ fn build_call_graph_wire(
                         import_name: import.and_then(|import| import.name.clone()),
                         import_module: import.map(|import| import.module.clone()),
                         objc_selector: None,
+                        recovered_indirect: recovered,
                     });
                 }
                 if table.in_stub_section(callee) {
@@ -2441,11 +2477,26 @@ fn build_call_graph_wire(
                         import_name: None,
                         import_module: None,
                         objc_selector: Some(selector.to_string()),
+                        recovered_indirect: recovered,
                     });
                 }
             }
 
-            // ② 本镜像内部的边：只要已解析的。
+            // ② 本镜像内部的边：已解析的，加上"前驱恢复且目标确实是已知函数入口"的。
+            //
+            // 恢复出的地址如果不是函数入口，就不发内部边：`external == false`
+            // 的契约是"callee 是函数入口，两边都有反汇编、大小、CFG"，把别的
+            // 地址塞进去会让界面画出没有内容的节点（CLAUDE.md §7）。
+            if recovered {
+                if !known_starts.contains(&callee) {
+                    recovered_unmapped += 1;
+                    recovered_slots.push((e.caller, e.from_insn, callee));
+                    return None;
+                }
+                let mut edge = CallEdgeWire::internal(caller, hex16(callee), e.tail);
+                edge.recovered_indirect = true;
+                return Some(edge);
+            }
             if e.resolution != bitflip_analyze::CalleeResolution::Resolved {
                 // 落在 `__objc_stubs` 区域里却解不出名字：桩形态没认出来，
                 // 这条边只能保持未知 —— 但必须记账，不能让消息边悄悄消失。
@@ -2540,6 +2591,21 @@ fn build_call_graph_wire(
             objc_stub_unresolved.len()
         ));
     }
+    // 前驱恢复的总账：恢复了几条、其中多少条没能落到"导入槽 / 已知函数"上。
+    let recovered_edges = edges.iter().filter(|e| e.recovered_indirect).count();
+    if recovered_edges > 0 {
+        wire_notes.push(format!(
+            "调用图里有 {recovered_edges} 条边的目标**不在指令编码里**，由同一段直线上的前驱\
+             指令算出（`adrp` + `ldr` 取槽 / `adrp` + `add` 算地址）：这些边的 \
+             `recovered_indirect` 是 `true` —— 可以当推理看，不要当二进制自己说的话"
+        ));
+    }
+    if recovered_unmapped > 0 {
+        wire_notes.push(format!(
+            "另有 {recovered_unmapped} 条前驱恢复出的目标既不匹配导入槽、也不是已知函数入口 \
+             （槽里装的是运行时才填的值，或那个地址没有被识别成函数）：不发边，保持未知"
+        ));
+    }
     notes.extend(wire_notes.iter().cloned());
 
     let wire = CallGraphWire {
@@ -2560,7 +2626,17 @@ fn build_call_graph_wire(
             .map(|e| UnresolvedCallWire {
                 caller: hex16(e.caller),
                 insn: hex16(e.from_insn),
+                via_slot: None,
             })
+            .chain(
+                recovered_slots
+                    .iter()
+                    .map(|&(caller, insn, slot)| UnresolvedCallWire {
+                        caller: hex16(caller),
+                        insn: hex16(insn),
+                        via_slot: Some(hex16(slot)),
+                    }),
+            )
             .collect(),
         notes: wire_notes,
     };
@@ -4024,6 +4100,38 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("落在 `__objc_stubs` 区域里")),
             "没认出来的桩目标要在 notes 里记账：{notes:?}"
+        );
+    }
+
+    /// 前驱恢复出的槽不是导入槽、也不是函数入口时：不发边，但**目标取自哪个
+    /// 槽**要出现在 `unresolved` 里（用户在那里本来只看到"未解析"）。
+    ///
+    /// 指令用 LiveContainer 主二进制 0x100006560 的真实字节（`adrp` + `ldr` +
+    /// `blr`，抄自 `llvm-objdump -d`）。
+    #[test]
+    fn a_recovered_slot_appears_in_the_unresolved_list_with_its_slot() {
+        let words: [u32; 3] = [0xd000_0068, 0xf943_e108, 0xd63f_0100];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let insns = bitflip_arch::decoder_for(bitflip_arch::ArchSpec::aarch64()).decode_many(
+            &bytes,
+            0x1_0000_6560,
+            64,
+        );
+        // 调用方函数覆盖那三条指令所在的地址。
+        let functions = [function_wire(0x1_0000_6558, Some(0x1_0000_6580))];
+        let mut notes = Vec::new();
+        let (wire, _raw) = build_call_graph_wire(&insns, &functions, None, None, &mut notes);
+
+        assert!(wire.edges.is_empty(), "槽不是函数入口，不该发内部边");
+        assert_eq!(wire.unresolved.len(), 1, "{:#?}", wire.unresolved);
+        assert_eq!(
+            wire.unresolved[0].via_slot.as_deref(),
+            Some(hex16(0x1_0001_47c0).as_str()),
+            "把槽地址交给用户，而不是只说'未解析'"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("前驱")),
+            "恢复的账目要进 notes：{notes:?}"
         );
     }
 

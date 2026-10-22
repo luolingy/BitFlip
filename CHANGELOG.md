@@ -11,6 +11,61 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — 间接调用的前驱恢复（AArch64 / arm64e）（M12 第九片）
+
+`blr x8` 的目标不在指令编码里，M6 的立场是"不做数据流分析，未解析就如实标未
+解析"—— 于是 LiveContainer 主二进制上那 **15 处** `blr x8` 全都断开在图外，
+调用图在这些地方看起来像"没人调"。但其中一多半根本不需要数据流分析：寄存器
+的定义就写在**前一条或前两条**指令里。
+
+- **可证明的三连**（`crates/bitflip-arch/src/indirect.rs`，新模块）：
+
+  ```text
+  adrp x8, 0x100014000      ; 页基址
+  ldr  x8, [x8, #0x7c0]     ; 从这个槽里读指针   → 交出**槽地址**
+  blr  x8
+  ```
+
+  `adrp` + `add` 形态算出的则是**镜像内绝对地址**。两种结论分开建模
+  （`RecoveredTarget::Slot` / `Address`）：槽里装什么本层不知道，地址可以直接
+  交给函数归属判定。
+- **只在能证明时开口**：往前最多看 8 条，遇到**调用**（改写 caller-saved）、
+  **块边界**、或对目标寄存器的**另一次写**就判定证明链断，返回"未解析"；
+  带索引寻址的 `ldr`（`[x8, x9, lsl #3]`）、`ldur`、`ldp` 一律不认。
+  认错会让一条边指向错误地址，比留空更糟 —— 宁可少认。
+- **分析层多一种解析状态**：`CalleeResolution::IndirectRecovered`
+  （`indirect-recovered` / "间接调用，经前驱恢复"）。它与 `Resolved` **必须**
+  分得开：后者是二进制自己写的目标，前者是我们的推理（CLAUDE.md §7）。
+- **wire 上给用户两份新信息**：`CallEdgeWire.recovered_indirect`（这条边的目标
+  不在编码里）与 `UnresolvedCallWire.via_slot`（**目标取自哪个槽** —— 恢复出槽
+  却没落到导入表时，用户至少知道该去看哪儿，而不是只看到"未解析"）。
+- **不伪造边**：恢复出的槽如果既不是导入槽、也不是已知函数入口，就**不发边**，
+  只在 notes 里记账（`external == false` 的契约是"callee 是函数入口，有反汇编、
+  有大小、有 CFG"，塞别的地址进去等于画一个没有内容的节点）。
+- **真实样本**（`temp/LiveContainer.ipa` 主二进制，`llvm-objdump -d` 对过）：
+
+  | 项 | 值 |
+  | --- | --- |
+  | 间接调用（`blr x8`） | 15 |
+  | 前驱恢复到槽地址 | **8**（槽 `0x1000147b0` / `0x1000147c0` / `0x1000147d0` / `0x100014820`） |
+  | 仍无法恢复（真动态派发） | 7 |
+  | 命中导入槽 → 直接拿到导入名 | 0（这些槽在 `__DATA,__common`，运行时才填值） |
+
+  15 = 8 + 7，账目在 notes 里能对上；`/api/call-graph` 实测
+  `format_version=4`，8 个未解析调用点各自带 `via_slot`。
+- **arm64e**：capstone 把 `blraa`/`braa` 报成 `Flow::Call`、目标寄存器是第一个
+  操作数，所以恢复逻辑对它们自动生效；但手里**没有真实 arm64e 样本**，这条路径
+  只有合成编码的单测，验收状态如实标成"未在真实样本上验证"。
+- **黄金文件**：`callgraph_m3-mingw-static.exe.txt` 只改了那行"39 处间接调用
+  未解析"的措辞（PE/ELF 的边、计数一个没变），并新增 `#[ignore]` 的
+  `regenerate_goldens` 以便下次有意改动时用 Rust 重生成（`Set-Content` 会把
+  中文 note 写成乱码，§6.1）。
+- **API**：`bitflip-arch` 新增 `indirect` 模块（`ARCH_API_VERSION` 3 → 4）；
+  `CallEdgeWire` 新增 `recovered_indirect`、`UnresolvedCallWire` 新增 `via_slot`
+  ⇒ `ANALYSIS_FORMAT_VERSION` 3 → 4、`CORE_API_VERSION` 5 → 6、
+  `SERVER_API_VERSION` 5 → 6。
+- **界面**：web 的调用图视图给恢复边打"前驱恢复"标签，未解析调用点列出槽地址。
+
 ### 新增 — ObjC 名字：选择器、方法表与消息桩（M12 第八片）
 
 Objective-C 的**名字**不躺在符号表里，躺在几个专门的节里：`__objc_methname`

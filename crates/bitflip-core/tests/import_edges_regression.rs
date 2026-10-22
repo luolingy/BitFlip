@@ -89,6 +89,28 @@ fn render(name: &str, response: &bitflip_core::CallGraphWire) -> String {
     out
 }
 
+/// 重新生成黄金文件（**有意**改动调用图输出时手动跑一次）。
+///
+/// ```text
+/// cargo test -p bitflip-core --test import_edges_regression -- --ignored regenerate_goldens
+/// ```
+///
+/// 用 Rust 写文件而不是 PowerShell：黄金文件是 UTF-8，`Set-Content` 会按
+/// ANSI 写，中文 note 行会变成乱码（CLAUDE.md §6.1，本文件顶部也记着）。
+#[test]
+#[ignore = "手动：有意改动调用图输出后重新生成黄金文件"]
+fn regenerate_goldens() {
+    for name in FIXTURES {
+        let path = fixture(name);
+        assert!(path.is_file(), "缺少 fixture：{}", path.display());
+        let session = Session::open(&path, OpenOptions::default()).expect("open");
+        let job = session.detached_job();
+        let analysis = session.analysis(&job).expect("analysis");
+        let response = analysis.call_graph();
+        std::fs::write(golden_path(name), render(name, response)).expect("写黄金文件");
+    }
+}
+
 #[test]
 fn pe_and_elf_call_graphs_are_unchanged() {
     for name in FIXTURES {
