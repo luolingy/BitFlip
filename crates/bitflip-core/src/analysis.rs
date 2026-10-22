@@ -36,7 +36,10 @@ use crate::timing::Stages;
 /// `import_module`。调用图的 JSON 形状变了（每条边多三个字段），
 /// 所以这个号必须动 —— 消费方要能分辨"这版边里有没有外部边这一说"。
 /// `INFO_FORMAT_VERSION` 不动：`ObjectInfo` 一个字段都没变。
-pub const ANALYSIS_FORMAT_VERSION: u32 = 2;
+///
+/// 3（objc 名字这一片）：[`CallEdgeWire`] 新增 `objc_selector`。调用图的
+/// JSON 形状又变了（每条边多一个字段），所以再动一次。
+pub const ANALYSIS_FORMAT_VERSION: u32 = 3;
 
 /// 签名库这一遍的账目（M8）。
 ///
@@ -565,6 +568,13 @@ pub struct CallEdgeWire {
     pub import_name: Option<String>,
     /// 导入所在模块（Mach-O 的 dylib 路径）；`external == false` 时为 `null`。
     pub import_module: Option<String>,
+    /// 是 ObjC 消息边时，被调用方代表的**选择器名**（`__objc_stubs` 里的消息桩）。
+    ///
+    /// 这类边的 `external` 仍是 `false`：被调用方 `callee` 是镜像**内**的桩地址
+    /// （可以点进去看那几条 `adrp`+`ldr`+`br`），但这条边的**语义**是"发一条
+    /// 消息"—— 选择器就是消息的全部意义，所以名字挂在这里而不是 `import_name`。
+    /// 非消息边为 `null`。
+    pub objc_selector: Option<String>,
 }
 
 impl CallEdgeWire {
@@ -577,6 +587,7 @@ impl CallEdgeWire {
             external: false,
             import_name: None,
             import_module: None,
+            objc_selector: None,
         }
     }
 }
@@ -844,7 +855,78 @@ impl TargetAnalysis {
             }
         }
 
-        timing.mark("来源1-3.5 符号/导出/展开/起点/入口");
+        // ── 来源 3.7：ObjC 方法表与消息桩（名字写在 `__objc_*` 节里的事实）──
+        //
+        // `__objc_methlist` 每项写着"这个选择器的实现在这个地址"，`__objc_stubs`
+        // 每个桩写着"这条消息的选择器"（本片把这两张表解出来了，见 loader 的
+        // `format::macho::objc`）。它们与函数起点表同类：链接期写死的名字。
+        //
+        // 两条边界：
+        //
+        // 1. **只给方法实现点命名**：`imp` 地址是"这个方法在这"的事实；桩地址
+        //    是"这条消息的跳板"的事实。普通函数不被覆盖，`SymbolSource::ObjcMethod`
+        //    排在通用符号表之前（选择器是运行时分派用的名字本身）。
+        // 2. **解不出来的不猜**：`imp` 落在已映射空间之外（镜像基址不符、表损坏）
+        //    就不建候选，但计数要报出来；`__objc_stubs` 区域里没解出名字的桩
+        //    由调用图那边单独记账，这里不生成假名。
+        let mut objc_methods_named = 0usize;
+        let mut objc_methods_unmapped = 0usize;
+        for method in &object.objc.methods {
+            let Some(imp) = method.imp else { continue };
+            if method.selector.trim().is_empty() {
+                continue;
+            }
+            if disasm.space.read_u8(imp).is_none() {
+                objc_methods_unmapped += 1;
+                continue;
+            }
+            by_addr.entry(imp).or_default().push(SymbolCandidate {
+                addr: imp,
+                name: method.selector.clone(),
+                source: SymbolSource::ObjcMethod,
+                confidence: 75,
+            });
+            objc_methods_named += 1;
+        }
+        let mut objc_stubs_named = 0usize;
+        for stub in &object.objc.stubs {
+            if disasm.space.read_u8(stub.address).is_none() {
+                continue;
+            }
+            by_addr
+                .entry(stub.address)
+                .or_default()
+                .push(SymbolCandidate {
+                    addr: stub.address,
+                    name: stub.selector.clone(),
+                    source: SymbolSource::ObjcMethod,
+                    confidence: 75,
+                });
+            objc_stubs_named += 1;
+        }
+        if objc_methods_named > 0 || objc_stubs_named > 0 {
+            notes.push(format!(
+                "ObjC 方法表与消息桩给出名字：{} 个方法实现、{} 个消息桩（来源 objc-method）\
+                 {}",
+                objc_methods_named,
+                objc_stubs_named,
+                if objc_methods_unmapped > 0 {
+                    format!(
+                        "；{} 个方法实现地址落在已映射空间之外，未命名",
+                        objc_methods_unmapped
+                    )
+                } else {
+                    String::new()
+                }
+            ));
+        } else if objc_methods_unmapped > 0 {
+            notes.push(format!(
+                "ObjC 方法表里有 {} 个方法的实现地址落在已映射空间之外（镜像基址可能与实际不符）",
+                objc_methods_unmapped
+            ));
+        }
+
+        timing.mark("来源1-3.7 符号/导出/展开/起点/入口/objc");
 
         // ── 指令索引只解码一遍 ──
         //
@@ -1632,10 +1714,13 @@ impl TargetAnalysis {
         // `crate::import_edges` 的模块文档：PE/ELF 今天的行为被验收冻结）。
         let read_bytes = |addr: u64, len: usize| disasm.space.read(addr, len);
         let import_edges = ImportEdges::build(object, &read_bytes);
+        let objc_stub_index = ObjcStubIndex::from_object(object);
         let (call_graph, call_graph_raw) = build_call_graph_wire(
             decoded.as_slice(),
             &functions,
             import_edges.as_ref(),
+            (!objc_stub_index.by_addr.is_empty() || !objc_stub_index.section_ranges.is_empty())
+                .then_some(&objc_stub_index),
             &mut notes,
         );
 
@@ -2221,10 +2306,58 @@ fn decode_indexed_insns(disasm: &Disasm) -> Vec<bitflip_arch::DecodedInsn> {
 /// 是**调用到本镜像之外**：照样进 `edges`（否则调用图会静默少掉所有调外部
 /// 函数的部分），但标 `external = true` 并带上导入名与所在库。`callee`
 /// 保持调用指令编码里的那个地址，**不**伪造一个函数入口（CLAUDE.md §7）。
+/// `__objc_stubs` 消息桩索引：地址 → 选择器，外加桩区域的节范围。
+///
+/// 为什么要节范围：`by_addr` 只装**解出了名字**的桩；落在桩区域里却没解出
+/// 名字的调用目标（桩形态没认出来）也要被看见并记账 —— 那需要知道
+/// "这个地址在不在 `__objc_stubs` 里"，这回事由节范围回答。
+#[derive(Debug, Default)]
+struct ObjcStubIndex {
+    by_addr: std::collections::HashMap<u64, String>,
+    /// `__objc_stubs` 节的内存范围（起始地址, 大小）。
+    section_ranges: Vec<(u64, u64)>,
+}
+
+impl ObjcStubIndex {
+    /// 从 loader 对象构建（只有 Mach-O 会有非空结果）。
+    fn from_object(object: &bitflip_loader::object::Object) -> Self {
+        let mut index = Self::default();
+        for stub in &object.objc.stubs {
+            index
+                .by_addr
+                .entry(stub.address)
+                .or_insert_with(|| stub.selector.clone());
+        }
+        for section in &object.sections {
+            // loader 的对象模型里，节的显示名是 `段,节名`（见 format::macho）。
+            if section.name.ends_with("__objc_stubs") {
+                index
+                    .section_ranges
+                    .push((section.vaddr, section.file.size));
+            }
+        }
+        index
+    }
+
+    /// 这个地址是不是已知的消息桩；是则给出选择器。
+    fn selector_at(&self, address: u64) -> Option<&str> {
+        self.by_addr.get(&address).map(String::as_str)
+    }
+
+    /// 这个地址在不在 `__objc_stubs` 区域里（无论名字解没解出来）。
+    fn in_stub_region(&self, address: u64) -> bool {
+        self.section_ranges
+            .iter()
+            .any(|(start, size)| address >= *start && address < start.saturating_add(*size))
+    }
+}
+
 fn build_call_graph_wire(
     insns: &[bitflip_arch::DecodedInsn],
     functions: &[FunctionWire],
     imports: Option<&ImportEdges<'_>>,
+    // `__objc_stubs` 消息桩索引；非 Mach-O（或没有 objc 节）是空索引。
+    objc_stubs: Option<&ObjcStubIndex>,
     notes: &mut Vec<String>,
 ) -> (CallGraphWire, bitflip_analyze::CallGraph) {
     const HUB_LIMIT: usize = 20;
@@ -2252,6 +2385,10 @@ fn build_call_graph_wire(
     // 落在桩节里却没能解析成导入的目标 —— 这件事必须进 notes：桩识别失效
     // 是**静默**的，不说就是一整张图凭空少了边。
     let mut stub_unresolved: BTreeSet<u64> = BTreeSet::new();
+    // 解析成 ObjC 消息边的数量（不数进外部边：它们在本镜像内）。
+    let mut objc_message_edges = 0usize;
+    // 落在 `__objc_stubs` 里、却没被认成任何消息桩的调用目标（桩形态没认出来）。
+    let mut objc_stub_unresolved: BTreeSet<u64> = BTreeSet::new();
 
     let edges: Vec<CallEdgeWire> = graph
         .edges
@@ -2280,6 +2417,7 @@ fn build_call_graph_wire(
                         external: true,
                         import_name: import.and_then(|import| import.name.clone()),
                         import_module: import.map(|import| import.module.clone()),
+                        objc_selector: None,
                     });
                 }
                 if table.in_stub_section(callee) {
@@ -2287,8 +2425,33 @@ fn build_call_graph_wire(
                 }
             }
 
+            // ①.5 ObjC 消息桩：调用目标落在 `__objc_stubs` 里、且名字解出来了。
+            //
+            // 这类桩不是导入桩（选不了导入槽，`lookup_index` 对它们恒失败；
+            // 见 `crate::import_edges` 模块文档）。但桩的**语义**是发一条消息，
+            // 选择器就是那条边的名字 —— 这正是这张片上要给回的东西。
+            if let Some(stubs) = objc_stubs {
+                if let Some(selector) = stubs.selector_at(callee) {
+                    objc_message_edges += 1;
+                    return Some(CallEdgeWire {
+                        caller,
+                        callee: hex16(callee),
+                        tail: e.tail,
+                        external: false,
+                        import_name: None,
+                        import_module: None,
+                        objc_selector: Some(selector.to_string()),
+                    });
+                }
+            }
+
             // ② 本镜像内部的边：只要已解析的。
             if e.resolution != bitflip_analyze::CalleeResolution::Resolved {
+                // 落在 `__objc_stubs` 区域里却解不出名字：桩形态没认出来，
+                // 这条边只能保持未知 —— 但必须记账，不能让消息边悄悄消失。
+                if objc_stubs.is_some_and(|stubs| stubs.in_stub_region(callee)) {
+                    objc_stub_unresolved.insert(callee);
+                }
                 return None;
             }
             Some(CallEdgeWire::internal(caller, hex16(callee), e.tail))
@@ -2362,6 +2525,20 @@ fn build_call_graph_wire(
                 stub_unresolved.len()
             ));
         }
+    }
+    if objc_message_edges > 0 {
+        wire_notes.push(format!(
+            "调用图里有 {objc_message_edges} 条 ObjC 消息边（调用目标是 `__objc_stubs` 里的消息桩）：\
+             边的 `objc_selector` 是这条消息的选择器名 —— 边指向镜像内的桩地址，\
+             但语义是发给 objc_msgSend 的一条消息",
+        ));
+    }
+    if !objc_stub_unresolved.is_empty() {
+        wire_notes.push(format!(
+            "有 {} 个调用目标落在 `__objc_stubs` 区域里、却没被认成任何消息桩 \
+             （桩形态没认出来，或桩取的选择器槽不在 `__objc_selrefs` 里）：这些边的选择器保持未知",
+            objc_stub_unresolved.len()
+        ));
     }
     notes.extend(wire_notes.iter().cloned());
 
@@ -3678,7 +3855,7 @@ mod tests {
             call_insn(0x1030, Some(0x9000)), // 已知函数之外、也不是导入
         ];
         let mut notes = Vec::new();
-        let (wire, raw) = build_call_graph_wire(&insns, &functions, Some(&table), &mut notes);
+        let (wire, raw) = build_call_graph_wire(&insns, &functions, Some(&table), None, &mut notes);
 
         // 内部边原样 + 一条外部边。0x9000 那条保持原来的处理（丢掉）。
         assert_eq!(wire.edges.len(), 2, "边：{:#?}", wire.edges);
@@ -3769,7 +3946,8 @@ mod tests {
         let functions = [function_wire(0x1_0000_b000, Some(0x1_0000_b580))];
         let insns = vec![call_insn(0x1_0000_b400, Some(stub_addr))];
         let mut notes = Vec::new();
-        let (wire, _raw) = build_call_graph_wire(&insns, &functions, Some(&table), &mut notes);
+        let (wire, _raw) =
+            build_call_graph_wire(&insns, &functions, Some(&table), None, &mut notes);
 
         assert_eq!(
             wire.edges.len(),
@@ -3782,6 +3960,129 @@ mod tests {
         assert_eq!(edge.callee, hex16(stub_addr));
         assert_eq!(edge.import_name.as_deref(), Some("_NSLog"));
         assert!(notes.iter().any(|n| n.contains("1 条边指向导入符号")));
+    }
+
+    /// 规则 3：目标落在 `__objc_stubs` 消息桩上时，边带上选择器名。
+    #[test]
+    fn a_call_to_an_objc_stub_carries_the_selector() {
+        // 真实地址：LiveContainer 主二进制的 `__objc_stubs` 起点，第一条桩
+        // 0x10000b940 → URLByAppendingPathComponent:（loader 的 objc 真实样本
+        // 测试对过字节；这里只测"边怎么带名字"，桩本身由 loader 负责解）。
+        let mut index = ObjcStubIndex::default();
+        index
+            .by_addr
+            .insert(0x1_0000_b940, "URLByAppendingPathComponent:".to_string());
+        index.section_ranges.push((0x1_0000_b940, 0xf40));
+
+        let functions = [function_wire(0x1_0000_b000, Some(0x1_0000_b580))];
+        let insns = vec![call_insn(0x1_0000_b400, Some(0x1_0000_b940))];
+        let mut notes = Vec::new();
+        let (wire, _raw) =
+            build_call_graph_wire(&insns, &functions, None, Some(&index), &mut notes);
+
+        assert_eq!(
+            wire.edges.len(),
+            1,
+            "消息桩应当成为一条边：{:#?}",
+            wire.edges
+        );
+        let edge = &wire.edges[0];
+        assert!(!edge.external, "消息边的被调用方是镜像**内**的桩地址");
+        assert_eq!(edge.callee, hex16(0x1_0000_b940));
+        assert_eq!(
+            edge.objc_selector.as_deref(),
+            Some("URLByAppendingPathComponent:"),
+            "边的语义是'发这条消息'，选择器挂在 objc_selector 上"
+        );
+        assert!(notes.iter().any(|n| n.contains("ObjC 消息边")), "{notes:?}");
+        assert!(
+            wire.notes.iter().any(|n| n.contains("1 条 ObjC 消息边")),
+            "{:?}",
+            wire.notes
+        );
+    }
+
+    /// 规则 3 的兜底：落在桩区域里却解不出名字的目标必须记账，不许悄悄消失。
+    #[test]
+    fn an_unresolved_objc_stub_target_is_accounted_in_notes() {
+        let mut index = ObjcStubIndex::default();
+        index
+            .by_addr
+            .insert(0x1_0000_b940, "addedRootViewController".to_string());
+        index.section_ranges.push((0x1_0000_b940, 0xf40));
+
+        let functions = [function_wire(0x1_0000_b000, Some(0x1_0000_b580))];
+        // 0xb960 在桩区域里，但不在 by_addr（形态没认出来）。
+        let insns = vec![call_insn(0x1_0000_b400, Some(0x1_0000_b960))];
+        let mut notes = Vec::new();
+        let (wire, _raw) =
+            build_call_graph_wire(&insns, &functions, None, Some(&index), &mut notes);
+
+        assert!(wire.edges.is_empty(), "解不出名字就不该产生带名的消息边");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("落在 `__objc_stubs` 区域里")),
+            "没认出来的桩目标要在 notes 里记账：{notes:?}"
+        );
+    }
+
+    /// 桩索引：`from_object` 只认 `__objc_stubs` 节（显示名 `段,节名`）。
+    #[test]
+    fn stub_index_from_object_picks_only_objc_stubs_sections() {
+        let mut object = bitflip_loader::object::Object::new(
+            bitflip_loader::object::ObjectId::Plain,
+            bitflip_loader::ObjectKind::MachO,
+            bitflip_arch::ArchSpec::aarch64(),
+            bitflip_arch::Endian::Little,
+        );
+        // `Object` 的 objc 字段与 sections 都是公开的，可以直接构造。
+        object.objc.stubs.push(bitflip_loader::object::ObjcStub {
+            address: 0x1_0000_b940,
+            selector: "URLByAppendingPathComponent:".to_string(),
+        });
+        object.sections.push(bitflip_loader::object::Section {
+            name: "__TEXT,__objc_stubs".to_string(),
+            vaddr: 0x1_0000_b940,
+            file: bitflip_loader::object::FileRange {
+                offset: 0,
+                size: 0xf40,
+            },
+            perms: bitflip_loader::object::Perms::default(),
+            kind: bitflip_loader::object::ContentKind::Unknown,
+            loaded: true,
+        });
+        object.sections.push(bitflip_loader::object::Section {
+            name: "__TEXT,__stubs".to_string(),
+            vaddr: 0x1_0000_b588,
+            file: bitflip_loader::object::FileRange {
+                offset: 0,
+                size: 0x3a8,
+            },
+            perms: bitflip_loader::object::Perms::default(),
+            kind: bitflip_loader::object::ContentKind::Unknown,
+            loaded: true,
+        });
+
+        let index = ObjcStubIndex::from_object(&object);
+        assert_eq!(index.by_addr.len(), 1);
+        assert_eq!(
+            index.selector_at(0x1_0000_b940),
+            Some("URLByAppendingPathComponent:")
+        );
+        assert!(index.in_stub_region(0x1_0000_b940));
+        assert!(
+            index.in_stub_region(0x1_0000_b940 + 0xf3f),
+            "区域内最后一个字节"
+        );
+        assert!(
+            !index.in_stub_region(0x1_0000_b940 + 0xf40),
+            "区域外第一个字节"
+        );
+        assert!(
+            !index.in_stub_region(0x1_0000_b588),
+            "`__stubs` 不是消息桩区域"
+        );
     }
 }
 

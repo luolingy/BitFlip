@@ -669,6 +669,80 @@ pub struct FormatInfo {
     pub declared_size: Option<u64>,
 }
 
+/// ObjC 选择器引用（`__objc_selrefs` 里的一格）。
+///
+/// 一格就是一个**指针槽**：槽里的值指向 `__objc_methname` 里的选择器名。
+/// `slot` 是槽自己的地址（调用点用它来认"这条消息发的是哪个选择器"），
+/// `target` 是名字字符串的地址。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjcSelectorRef {
+    /// 槽地址（`__objc_selrefs` 里的那一格）。
+    pub slot: u64,
+    /// 槽指向的字符串地址（选择器名在 `__objc_methname` 里）。
+    pub target: u64,
+    /// 选择器名（`initWithPathForMainBundle:` 这种）。
+    pub name: String,
+}
+
+/// ObjC 方法（方法表里的一项）。
+///
+/// `types` 是类型编码（`v24@0:8@16` 这种），`imp` 是实现地址。
+/// 两者解不出来时是 `None` —— 那是**确实不知道**，不是"零值也不是空串"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjcMethod {
+    /// 方法表地址（`method_list_t` 自己的地址）。
+    pub list: u64,
+    /// 选择器名。
+    pub selector: String,
+    /// 类型编码。解不出时是 `None`。
+    pub types: Option<String>,
+    /// 实现地址（IMP）。解不出时是 `None`。
+    pub imp: Option<u64>,
+}
+
+/// ObjC 消息转发桩（`__objc_stubs` 里的一格）。
+///
+/// 这种桩先取出一个选择器，再跳到 `objc_msgSend`。**桩地址本身就是这条消息的
+/// 全部意义**：把桩解析成"调用了 objc_msgSend"会把选择器丢掉（见
+/// `bitflip_core::import_edges` 的模块文档）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjcStub {
+    /// 桩地址。
+    pub address: u64,
+    /// 桩对应的选择器名。
+    pub selector: String,
+}
+
+/// ObjC 元数据（来自 `__objc_*` 节）。
+///
+/// 只有一个二进制里真的带 objc 元数据时才有内容；**空表 ≠ "这个二进制没有
+/// objc"** —— 别的格式（PE/ELF/COFF）根本没有这套节，那种情形是
+/// "这个格式里没有这样一张表"（见 `notes`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjcMetadata {
+    /// 选择器引用（`__objc_selrefs`）。
+    pub selector_refs: Vec<ObjcSelectorRef>,
+    /// 方法（`__objc_methlist` 与类的方法表）。
+    pub methods: Vec<ObjcMethod>,
+    /// 消息转发桩（`__objc_stubs`）。
+    pub stubs: Vec<ObjcStub>,
+    /// 类名池（`__objc_classname`）里的名字。
+    pub class_names: Vec<String>,
+    /// 解析说明（降级、未能解析的部分）。
+    pub notes: Vec<String>,
+}
+
+impl ObjcMetadata {
+    /// 这份元数据里有没有任何内容。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.selector_refs.is_empty()
+            && self.methods.is_empty()
+            && self.stubs.is_empty()
+            && self.class_names.is_empty()
+    }
+}
+
 /// 解析结果：一个可分析的对象。
 #[derive(Debug, Clone)]
 pub struct Object {
@@ -730,6 +804,11 @@ pub struct Object {
     /// ELF 是 `e_flags`，PE/COFF 是 `Characteristics`。语义随架构变化，
     /// 因此保存原始值而不强行归一化 —— 强行归一化会丢掉信息并可能解读错误。
     pub header_flags: Option<u32>,
+    /// ObjC 元数据（选择器、方法、消息桩）。
+    ///
+    /// 只有 Mach-O 有这套概念。**其他格式是空表** —— 同样的如实未知，
+    /// 不是"这个二进制里没有 objc"。
+    pub objc: ObjcMetadata,
     /// 解析过程中的说明（降级、跳过、未支持项）。
     ///
     /// 这是"诚实"的载体：任何没解析出来的东西都要在这里留下痕迹，
@@ -813,6 +892,7 @@ impl Object {
             relocations: Vec::new(),
             unwind: Vec::new(),
             header_flags: None,
+            objc: ObjcMetadata::default(),
             notes: Vec::new(),
         }
     }

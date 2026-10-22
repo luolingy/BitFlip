@@ -377,6 +377,74 @@ export function App() {
             </>
           )}
 
+          {parsed &&
+            (parsed.objc.selector_ref_count > 0 ||
+              parsed.objc.method_count > 0 ||
+              parsed.objc.stub_count > 0 ||
+              parsed.objc.class_names.length > 0) && (
+              <>
+                <PaneTitle title="ObjC 元数据" />
+                {parsed.objc.class_names.length > 0 && (
+                  <p className="hint">
+                    类名：{parsed.objc.class_names.join("、")}
+                  </p>
+                )}
+                {parsed.objc.selector_ref_samples.length > 0 && (
+                  <ul className="notes">
+                    {parsed.objc.selector_ref_samples.map((sample) => (
+                      <li key={sample.slot} className="mono">
+                        0x{sample.slot} → {sample.name}
+                      </li>
+                    ))}
+                    {parsed.objc.selector_ref_count >
+                      parsed.objc.selector_ref_samples.length && (
+                      <li className="hint">
+                        … 共 {parsed.objc.selector_ref_count} 条选择器引用
+                      </li>
+                    )}
+                  </ul>
+                )}
+                {parsed.objc.method_samples.length > 0 && (
+                  <ul className="notes">
+                    {parsed.objc.method_samples.map((sample, index) => (
+                      <li key={`${sample.selector}-${index}`} className="mono">
+                        {sample.selector}
+                        {sample.types ? ` [${sample.types}]` : ""}
+                        {sample.imp ? ` @ 0x${sample.imp}` : ""}
+                      </li>
+                    ))}
+                    {parsed.objc.method_count >
+                      parsed.objc.method_samples.length && (
+                      <li className="hint">
+                        … 共 {parsed.objc.method_count} 个方法
+                      </li>
+                    )}
+                  </ul>
+                )}
+                {parsed.objc.stub_samples.length > 0 && (
+                  <ul className="notes">
+                    {parsed.objc.stub_samples.map((sample) => (
+                      <li key={sample.address} className="mono">
+                        0x{sample.address} → {sample.selector}
+                      </li>
+                    ))}
+                    {parsed.objc.stub_count > parsed.objc.stub_samples.length && (
+                      <li className="hint">
+                        … 共 {parsed.objc.stub_count} 个消息桩
+                      </li>
+                    )}
+                  </ul>
+                )}
+                {parsed.objc.notes.length > 0 && (
+                  <ul className="notes">
+                    {parsed.objc.notes.map((note) => (
+                      <li key={note}>{note}</li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+
           <PaneTitle title="本次运行" />
           <dl className="facts">
             <Fact label="服务版本" value={`v${health.version}`} />
@@ -610,6 +678,16 @@ function TargetFacts({ target, parsed }: { target: TargetInfo; parsed: ObjectInf
       {parsed && <Fact label="导出" value={String(parsed.exports.length)} />}
       {parsed && <Fact label="符号" value={String(parsed.symbols.length)} />}
       {parsed && <Fact label="重定位" value={String(parsed.relocations.length)} />}
+      {parsed &&
+        (parsed.objc.selector_ref_count > 0 ||
+          parsed.objc.method_count > 0 ||
+          parsed.objc.stub_count > 0 ||
+          parsed.objc.class_names.length > 0) && (
+          <Fact
+            label="ObjC"
+            value={`选择器 ${parsed.objc.selector_ref_count} · 方法 ${parsed.objc.method_count} · 消息桩 ${parsed.objc.stub_count} · 类名 ${parsed.objc.class_names.length}`}
+          />
+        )}
       {target.member_count > 0 && (
         <Fact
           label="归档成员"

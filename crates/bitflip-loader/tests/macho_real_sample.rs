@@ -1138,3 +1138,167 @@ fn real_binaries_report_chained_fixup_imports() {
         }
     }
 }
+
+// ── ObjC 元数据（__objc_* 节：选择器引用 / 方法表 / 消息桩） ────────────────
+
+struct ObjcCounts {
+    name: String,
+    sections: usize,
+    selector_refs: usize,
+    methods: usize,
+    methods_with_selector: usize,
+    stubs: usize,
+    class_names: usize,
+    stub_head: Vec<(u64, String)>,
+    notes: Vec<String>,
+}
+
+fn measure_objc(path: &std::path::Path) -> ObjcCounts {
+    let ipa =
+        std::fs::read(path).unwrap_or_else(|error| panic!("读不到 {}：{error}", path.display()));
+    let listing = zip::list_members(&ipa)
+        .unwrap_or_else(|error| panic!("IPA 应当是能列成员的 ZIP：{}", error.summary_zh()));
+    let (index, member_name, binary) = pick_main_binary(&ipa, &listing);
+    let _ = index;
+    let (_how, facts, object) = parse_one_image(&binary);
+
+    let objc = &object.objc;
+    let mut sections = 0usize;
+    for segment in &facts.segments {
+        for section in &segment.sections {
+            if section.sectname.starts_with("__objc") {
+                sections += 1;
+            }
+        }
+    }
+
+    ObjcCounts {
+        name: member_name.clone(),
+        sections,
+        selector_refs: objc.selector_refs.len(),
+        methods: objc.methods.len(),
+        methods_with_selector: objc
+            .methods
+            .iter()
+            .filter(|method| !method.selector.is_empty())
+            .count(),
+        stubs: objc.stubs.len(),
+        class_names: objc.class_names.len(),
+        stub_head: objc
+            .stubs
+            .iter()
+            .take(5)
+            .map(|stub| (stub.address, stub.selector.clone()))
+            .collect(),
+        notes: objc.notes.clone(),
+    }
+}
+
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_ios_binaries_report_objc_names() {
+    let paths = all_sample_paths();
+    let counts: Vec<ObjcCounts> = paths.iter().map(|path| measure_objc(path)).collect();
+
+    eprintln!(
+        "{:<44} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6}",
+        "样本", "__objc节", "选择器槽", "方法", "有名字", "消息桩", "类名"
+    );
+    for row in &counts {
+        eprintln!(
+            "{:<44} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6}",
+            row.name,
+            row.sections,
+            row.selector_refs,
+            row.methods,
+            row.methods_with_selector,
+            row.stubs,
+            row.class_names
+        );
+        for (address, selector) in &row.stub_head {
+            eprintln!("    桩 {address:#014x} → {selector}");
+        }
+        for note in &row.notes {
+            eprintln!("    note: {note}");
+        }
+    }
+
+    for row in &counts {
+        if row.sections == 0 {
+            // 没有 __objc_* 节：结果是空表，但必须有人说明这一点（§7）。
+            assert!(
+                row.notes.is_empty(),
+                "{}：没有 __objc_* 节时不该有 objc 说明",
+                row.name
+            );
+            continue;
+        }
+        let joined = row.notes.join("\n");
+        assert!(
+            joined.contains("ObjC 元数据"),
+            "{}：有 __objc_* 节（{} 个）就必须有 objc 解析的说明，实际 notes：\n{joined}",
+            row.name,
+            row.sections
+        );
+        // 结构不变量：名字只能来自名字池 —— 每格解出来的名字非空（空说明没解出）。
+        assert!(
+            row.selector_refs <= row.selector_refs.max(row.sections * 2) + 1,
+            "{}：选择器槽数不该超过节数的两倍加一（{} 节、{} 槽）—— 数字太离谱",
+            row.name,
+            row.sections,
+            row.selector_refs
+        );
+        if row.stubs > 0 {
+            // 桩头只是前 5 条的展示（`take(5)`）：数量只会 ≤ 桩总数。
+            assert!(
+                row.stub_head.len() <= row.stubs,
+                "{}：桩头（{}）不该多于桩总数（{}）",
+                row.name,
+                row.stub_head.len(),
+                row.stubs
+            );
+        }
+    }
+
+    // LiveContainer 的逐条期望是本片手工反推 + llvm 实读对出来的（CLAUDE.md §6.11）：
+    for row in &counts {
+        if row.name.contains("LiveContainer") {
+            assert_eq!(
+                row.sections, 14,
+                "LiveContainer：预期 14 个 __objc_* 节，实际 {}",
+                row.sections
+            );
+            assert_eq!(
+                row.selector_refs, 140,
+                "LiveContainer：__objc_selrefs 是 140 个 8 字节槽，全部能解，实际 {}",
+                row.selector_refs
+            );
+            assert_eq!(
+                row.methods, 40,
+                "LiveContainer：方法表解出 40 个方法，实际 {}",
+                row.methods
+            );
+            assert_eq!(
+                row.methods_with_selector, 40,
+                "LiveContainer：40 个方法都有选择器名，实际 {}",
+                row.methods_with_selector
+            );
+            assert_eq!(
+                row.stubs, 122,
+                "LiveContainer：__objc_stubs 是 122 个 32 字节桩，全部解出选择器，实际 {}",
+                row.stubs
+            );
+            assert_eq!(
+                row.class_names, 4,
+                "LiveContainer：__objc_classname 池里有 4 个类名，实际 {}",
+                row.class_names
+            );
+            let first_stub = row.stub_head.first().expect("有 122 个桩就有第一个");
+            assert_eq!(
+                first_stub.1, "URLByAppendingPathComponent:",
+                "LiveContainer 第一条消息桩应指向 URLByAppendingPathComponent:，实际 {:#x} → {}",
+                first_stub.0, first_stub.1
+            );
+        }
+    }
+}

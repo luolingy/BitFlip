@@ -24,6 +24,18 @@ pub enum SymbolSource {
     Export,
     /// 符号表：ELF `.symtab` / COFF 符号表。
     SymbolTable,
+    /// ObjC 方法表（`__objc_methlist`）：写着"这个选择器的实现在这个地址"。
+    ///
+    /// # 为什么排在导出表之后、通用符号表之前
+    ///
+    /// 这是编译期写死在文件里的**名字**：`objc_msgSend` 按选择器分派，
+    /// 运行时里这个实现就叫这个名字 —— 比符号表里的 C 符号更贴近函数的
+    /// 身份（符号表之于 ObjC 方法往往是实现细节，剥掉也就没了）。但它
+    /// 只覆盖方法实现点，不覆盖普通函数，所以不抢通用符号表的位置。
+    ///
+    /// 同一个地址可能出现多个选择器（如消息转发把不同选择器指到同一个
+    /// 实现）：`preferred` 取优先级与置信度最高的一个，其余候选保留。
+    ObjcMethod,
     /// 对象头里的入口点（`e_entry` / `AddressOfEntryPoint`）。
     ///
     /// 排在符号表**之后**：入口是"程序从这里开始执行"，是个强证据，
@@ -82,6 +94,7 @@ impl SymbolSource {
             Self::DebugInfo => "debug-info",
             Self::Export => "export",
             Self::SymbolTable => "symbol-table",
+            Self::ObjcMethod => "objc-method",
             Self::EntryPoint => "entry-point",
             Self::Unwind => "unwind",
             Self::FunctionStart => "function-start",
@@ -102,6 +115,7 @@ impl SymbolSource {
             Self::DebugInfo => "调试信息",
             Self::Export => "导出表",
             Self::SymbolTable => "符号表",
+            Self::ObjcMethod => "ObjC 方法表",
             Self::EntryPoint => "入口点",
             Self::Unwind => "展开表",
             Self::FunctionStart => "函数起点表",
@@ -122,6 +136,10 @@ impl SymbolSource {
             Self::DebugInfo => 20,
             Self::Export => 30,
             Self::SymbolTable => 40,
+            // ObjC 方法表：与符号表同为编译器写死的事实，但选择器是运行时
+            // 分派用的**名字**本身，比符号表的 C 符号更贴近实现的身份，
+            // 所以排在通用符号表之前；只覆盖方法实现点。
+            Self::ObjcMethod => 35,
             // 入口点比符号表弱、比展开表强：它是确定的事实（头里写着），
             // 但不确定是不是函数边界。
             Self::EntryPoint => 45,
@@ -236,6 +254,11 @@ mod tests {
         assert!(SymbolSource::User.priority() < SymbolSource::Signature.priority());
         assert!(SymbolSource::DebugInfo.priority() < SymbolSource::Export.priority());
         assert!(SymbolSource::Export.priority() < SymbolSource::SymbolTable.priority());
+        // ObjC 方法表：同为编译器写死的名字，但选择器是运行时**分派用的名字**，
+        // 比符号表的 C 符号更贴近方法实现的身份；只覆盖方法实现点，不抢通用
+        // 符号表的位置 —— 排序介于两者之间。
+        assert!(SymbolSource::Export.priority() < SymbolSource::ObjcMethod.priority());
+        assert!(SymbolSource::ObjcMethod.priority() < SymbolSource::SymbolTable.priority());
         assert!(SymbolSource::SymbolTable.priority() < SymbolSource::Unwind.priority());
         // 函数起点表紧随展开表：同类事实，但展开表的 end 是文件里写着的，
         // 这张表的 end 是推出来的 —— 顺序不能反过来。
@@ -250,6 +273,8 @@ mod tests {
         );
         assert_eq!(SymbolSource::Unwind.as_str(), "unwind");
         assert_eq!(SymbolSource::FunctionStart.as_str(), "function-start");
+        assert_eq!(SymbolSource::ObjcMethod.as_str(), "objc-method");
+        assert_eq!(SymbolSource::ObjcMethod.label_zh(), "ObjC 方法表");
         assert_eq!(SymbolSource::Export.label_zh(), "导出表");
         assert_eq!(SymbolSource::FunctionStart.label_zh(), "函数起点表");
     }

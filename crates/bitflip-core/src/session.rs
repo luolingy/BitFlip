@@ -33,7 +33,111 @@ fn hex16(value: u64) -> String {
 /// **M12 第三片同样不递增**：`ObjectInfo` 又多了 `function_starts`（同样是增量）。
 /// 变化的是**数据**而不是契约：Mach-O 的 `symbols` 以前恒为空（没解析）、现在会
 /// 真的有内容 —— 那正是这个字段一直以来的定义，不是新语义。
+///
+/// **本片（ObjC 名字）也不递增**：`ObjectInfo` 新增 `objc` 字段（同样是增量）。
 pub const INFO_FORMAT_VERSION: u32 = 1;
+
+/// 一个选择器引用槽的 wire 表示（`__objc_selrefs`：槽 → 名字）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObjcSelrefWire {
+    /// 槽地址（定长 hex）。
+    pub slot: String,
+    /// 选择器名（解出来才非空；没解出的槽在计数里、不在样例里）。
+    pub name: String,
+}
+
+/// 一个 ObjC 方法的 wire 表示（`__objc_methlist` 的一项）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObjcMethodWire {
+    /// 选择器名；没解出时为空串（原因在 notes）。
+    pub selector: String,
+    /// 类型编码（`@@:` 之类）；没解出时为 `null`。
+    pub types: Option<String>,
+    /// 实现地址（定长 hex）；没有实现地址时为 `null`。
+    pub imp: Option<String>,
+}
+
+/// 一个消息桩的 wire 表示（`__objc_stubs` 的一项）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObjcStubWire {
+    /// 桩地址（定长 hex）。
+    pub address: String,
+    /// 这条桩发的消息选择器。
+    pub selector: String,
+}
+
+/// ObjC 元数据的 wire 表示（增量字段：旧消费方忽略它即可）。
+///
+/// 只带**计数 + 样例 + 说明**，不带全量选择器/方法/桩列表：完整列表会在
+/// 分析层直接落在函数名与调用边上（目标级端点），这里把整份数据再物化一遍
+/// 只是让每次 `/api/info` 都多背几十 KB（CLAUDE.md §4 禁止全量物化）。
+/// 典型尺寸：LiveContainer 140 槽 / 40 方法 / 122 桩，样例各取前 12 条。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObjcInfoWire {
+    /// 类名池（`__objc_classname`；没有该节为空数组）。
+    pub class_names: Vec<String>,
+    /// 选择器引用槽总数。
+    pub selector_ref_count: usize,
+    /// 选择器引用样例（槽 → 名字，最多 12 条；按地址升序）。
+    pub selector_ref_samples: Vec<ObjcSelrefWire>,
+    /// 方法总数（含没解出选择器的）。
+    pub method_count: usize,
+    /// 方法样例（最多 12 条；按方法表顺序）。
+    pub method_samples: Vec<ObjcMethodWire>,
+    /// 消息桩总数。
+    pub stub_count: usize,
+    /// 消息桩样例（地址 → 选择器，最多 12 条；按地址升序）。
+    pub stub_samples: Vec<ObjcStubWire>,
+    /// 解析说明（降级、没解出的部分，§7：降级要写在界面上）。
+    pub notes: Vec<String>,
+}
+
+impl ObjcInfoWire {
+    /// 样例上限：界面展示"前几条 + 计数"就够，全量交给分析层。
+    const SAMPLE_LIMIT: usize = 12;
+
+    /// 由 loader 的 objc 元数据构造。非 Mach-O 是空表（`class_names` 为空、
+    /// 计数为 0、notes 为空 —— 不是"这个二进制没有 objc"，那要由
+    /// 解析说明里的 __objc_* 节计数来说）。
+    #[must_use]
+    pub fn from_loader(objc: &bitflip_loader::object::ObjcMetadata) -> Self {
+        Self {
+            class_names: objc.class_names.clone(),
+            selector_ref_count: objc.selector_refs.len(),
+            selector_ref_samples: objc
+                .selector_refs
+                .iter()
+                .take(Self::SAMPLE_LIMIT)
+                .map(|entry| ObjcSelrefWire {
+                    slot: hex16(entry.slot),
+                    name: entry.name.clone(),
+                })
+                .collect(),
+            method_count: objc.methods.len(),
+            method_samples: objc
+                .methods
+                .iter()
+                .take(Self::SAMPLE_LIMIT)
+                .map(|method| ObjcMethodWire {
+                    selector: method.selector.clone(),
+                    types: method.types.clone(),
+                    imp: method.imp.map(hex16),
+                })
+                .collect(),
+            stub_count: objc.stubs.len(),
+            stub_samples: objc
+                .stubs
+                .iter()
+                .take(Self::SAMPLE_LIMIT)
+                .map(|stub| ObjcStubWire {
+                    address: hex16(stub.address),
+                    selector: stub.selector.clone(),
+                })
+                .collect(),
+            notes: objc.notes.clone(),
+        }
+    }
+}
 
 /// 节的 wire 表示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -170,6 +274,12 @@ pub struct ObjectInfo {
     /// "这个格式里没有这样一张表"，不是"没有函数"（§7）。空数组的原因在 `notes` 里。
     /// 这是 M12 第三片新增的**增量**字段：旧消费方忽略它即可。
     pub function_starts: Vec<String>,
+    /// ObjC 元数据摘要（选择器引用 / 方法 / 消息桩的计数与样例）。
+    ///
+    /// 非 Mach-O 是空表加空 notes；Mach-O 没有 `__objc_*` 节时同样如此
+    /// （"这个文件里没有这套节"由 loader 的 objc notes 说明，这里不猜）。
+    /// 这是 objc 名字这一片新增的**增量**字段：旧消费方忽略它即可。
+    pub objc: ObjcInfoWire,
     /// 段（内存视角）。
     pub segments: Vec<SegmentInfo>,
     /// 节（文件视角）。
@@ -207,6 +317,7 @@ impl ObjectInfo {
                 .iter()
                 .map(|address| hex16(*address))
                 .collect(),
+            objc: ObjcInfoWire::from_loader(&object.objc),
             segments: object
                 .segments
                 .iter()

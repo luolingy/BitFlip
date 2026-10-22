@@ -104,7 +104,12 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// 又是增量字段，但公开结构体的形状变了（字面量构造会编译失败），
 /// 而且 `callee` 的含义多了一种：`external = true` 时它是桩/槽地址，
 /// **不是**函数入口 —— 消费方必须能分辨 ⇒ 版本号 +1。
-pub const CORE_API_VERSION: u32 = 4;
+///
+/// v5（objc 名字这一片）：[`CallEdgeWire`] 新增 `objc_selector`（消息边的
+/// 选择器名）；[`ObjectInfo`] 新增 `objc` 字段（计数 + 样例 + 说明）；
+/// [(`bitflip_loader`)`Object`] 新增 `objc: ObjcMetadata`（选择器/方法/桩）。
+/// 三个都是增量字段，但公开结构体的形状都变了（字面量构造会编译失败）⇒ +1。
+pub const CORE_API_VERSION: u32 = 5;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

@@ -287,6 +287,88 @@ fn print_parsed(parsed: &ObjectInfo) {
         }
     }
 
+    // ObjC 元数据（只有 Mach-O 且解出了东西才打印；PE/ELF 没有这套节）
+    if !parsed.objc.class_names.is_empty()
+        || parsed.objc.selector_ref_count > 0
+        || parsed.objc.method_count > 0
+        || parsed.objc.stub_count > 0
+    {
+        println!();
+        println!(
+            "ObjC 元数据  选择器引用 {} 个 · 方法 {} 个 · 消息桩 {} 个 · 类名 {} 个",
+            parsed.objc.selector_ref_count,
+            parsed.objc.method_count,
+            parsed.objc.stub_count,
+            parsed.objc.class_names.len()
+        );
+        if !parsed.objc.class_names.is_empty() {
+            println!(
+                "  类名        {}",
+                parsed
+                    .objc
+                    .class_names
+                    .iter()
+                    .take(12)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("、")
+            );
+            if parsed.objc.class_names.len() > 12 {
+                println!("  … 共 {} 个类名", parsed.objc.class_names.len());
+            }
+        }
+        if !parsed.objc.selector_ref_samples.is_empty() {
+            println!(
+                "  选择器（前 {} 条；槽 → 名）",
+                parsed.objc.selector_ref_samples.len()
+            );
+            for sample in &parsed.objc.selector_ref_samples {
+                println!("    0x{}  {}", sample.slot, sample.name);
+            }
+            if parsed.objc.selector_ref_count > parsed.objc.selector_ref_samples.len() {
+                println!("    … 共 {} 条", parsed.objc.selector_ref_count);
+            }
+        }
+        if !parsed.objc.method_samples.is_empty() {
+            println!(
+                "  方法（前 {} 条；选择器 [类型编码] @ 实现）",
+                parsed.objc.method_samples.len()
+            );
+            for sample in &parsed.objc.method_samples {
+                let types = sample
+                    .types
+                    .as_deref()
+                    .map_or_else(String::new, |types| format!(" [{types}]"));
+                let imp = sample
+                    .imp
+                    .as_deref()
+                    .map_or_else(String::new, |imp| format!(" @ 0x{imp}"));
+                println!("    {}{}{}", sample.selector, types, imp);
+            }
+            if parsed.objc.method_count > parsed.objc.method_samples.len() {
+                println!("    … 共 {} 个方法", parsed.objc.method_count);
+            }
+        }
+        if !parsed.objc.stub_samples.is_empty() {
+            println!(
+                "  消息桩（前 {} 条；桩 → 消息）",
+                parsed.objc.stub_samples.len()
+            );
+            for sample in &parsed.objc.stub_samples {
+                println!("    0x{}  →  {}", sample.address, sample.selector);
+            }
+            if parsed.objc.stub_count > parsed.objc.stub_samples.len() {
+                println!("    … 共 {} 个消息桩", parsed.objc.stub_count);
+            }
+        }
+        if !parsed.objc.notes.is_empty() {
+            println!("  ObjC 说明");
+            for note in &parsed.objc.notes {
+                println!("    · {note}");
+            }
+        }
+    }
+
     // 导出
     if !parsed.exports.is_empty() {
         println!();

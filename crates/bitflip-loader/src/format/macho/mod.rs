@@ -118,6 +118,7 @@ pub mod bind;
 pub mod chained;
 pub mod export_trie;
 pub mod fat;
+pub mod objc;
 
 pub use bind::{BindImport, BindKind};
 pub use chained::{ChainWalk, ChainedFixups, ChainedImport};
@@ -641,7 +642,21 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
     }
     let reader = Reader::with_base(bytes, base);
     let file = read_with(&reader)?;
-    Ok(build_object(&file, id))
+    let mut object = build_object(&file, id);
+    // ObjC 元数据（选择器名、方法表、消息桩）。这是**解析层**的事：
+    // 名字是文件里的事实，不是分析推断出来的。
+    object.objc = objc::parse(
+        bytes,
+        file.image_base.unwrap_or(0),
+        file.endian == Endian::Little,
+        file.is_64,
+        file.arch.arch,
+        &file.segments,
+    );
+    for note in object.objc.notes.clone() {
+        object.note(note);
+    }
+    Ok(object)
 }
 
 // ── 头部 ────────────────────────────────────────────────────────────────────
@@ -1802,6 +1817,9 @@ fn validate_memory_map(
 }
 
 /// 有 objc / swift 元数据节时说明"没解析"。
+///
+/// objc 的**名字**现在由 [`objc::parse`] 解析了，所以这里只说明**没做的部分**：
+/// swift 元数据仍然没有解析，objc 那边缺什么由 objc 模块自己的 notes 说明。
 fn note_objc_and_swift(segments: &[MachOSegment], notes: &mut Vec<String>) {
     let mut objc = 0usize;
     let mut swift = 0usize;
@@ -1817,8 +1835,8 @@ fn note_objc_and_swift(segments: &[MachOSegment], notes: &mut Vec<String>) {
     }
     if objc > 0 {
         notes.push(format!(
-            "有 {objc} 个 __objc_* 节（类名/方法名/选择器都在里面）：**没有解析**，\
-             所以这些名字不会出现在结果里"
+            "有 {objc} 个 __objc_* 节：选择器名、方法表与消息桩已解析（见 objc 元数据），\
+             但类与方法的**归属关系**（哪个方法属于哪个类）没有解析"
         ));
     }
     if swift > 0 {

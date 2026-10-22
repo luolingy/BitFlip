@@ -95,6 +95,42 @@ export interface RelocInfo {
   symbol: string | null;
 }
 
+/** 一个选择器引用样例（`__objc_selrefs` 槽 → 名字）。对应 `bitflip-core::ObjcSelrefWire`。 */
+export interface ObjcSelrefWire {
+  /** 定长 16 位小写十六进制槽地址。 */
+  slot: string;
+  name: string;
+}
+
+/** 一个方法样例（`__objc_methlist` 的一项）。对应 `bitflip-core::ObjcMethodWire`。 */
+export interface ObjcMethodWire {
+  selector: string;
+  /** 类型编码；没解出时为 null。 */
+  types: string | null;
+  /** 实现地址（定长 hex）；没有时为 null。 */
+  imp: string | null;
+}
+
+/** 一个消息桩样例（`__objc_stubs` 的一项）。对应 `bitflip-core::ObjcStubWire`。 */
+export interface ObjcStubWire {
+  /** 定长 16 位小写十六进制桩地址。 */
+  address: string;
+  selector: string;
+}
+
+/** ObjC 元数据摘要。对应 `bitflip-core::ObjcInfoWire`。非 Mach-O 全是空表。 */
+export interface ObjcInfo {
+  class_names: string[];
+  selector_ref_count: number;
+  /** 最多 12 条样例；全量计数看 `selector_ref_count`。 */
+  selector_ref_samples: ObjcSelrefWire[];
+  method_count: number;
+  method_samples: ObjcMethodWire[];
+  stub_count: number;
+  stub_samples: ObjcStubWire[];
+  notes: string[];
+}
+
 /** 完整解析结果。对应 `bitflip-core::ObjectInfo`。 */
 export interface ObjectInfo {
   id: string;
@@ -105,6 +141,14 @@ export interface ObjectInfo {
   is_executable: boolean;
   is_relocatable: boolean;
   is_stripped: boolean;
+  /** Mach-O 的 LC_UUID（32 个小写 hex）；非 Mach-O 是 null。 */
+  uuid: string | null;
+  /** Mach-O 的依赖库名；非 Mach-O 是空数组。 */
+  dylibs: string[];
+  /** Mach-O LC_FUNCTION_STARTS 的函数起点（定长 hex）；非 Mach-O 是空数组。 */
+  function_starts: string[];
+  /** ObjC 元数据摘要（选择器/方法/消息桩）。非 Mach-O 是空表。 */
+  objc: ObjcInfo;
   segments: SegmentInfo[];
   sections: SectionInfo[];
   imports: ImportInfo[];
