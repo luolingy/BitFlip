@@ -178,9 +178,12 @@ pub struct PatchTarget {
     bytes: Vec<u8>,
     object: Object,
     lock: LockState,
-    /// 代码签名区（虚拟地址区间）。这一版恒为 `None`：**没接上 `LC_CODE_SIGNATURE`
-    /// 解析，所以不知道签名区在哪** —— 这是"如实未知"，不是"没有签名区"。
-    /// 保留字段，接上解析后在这里填，`site_at` 的检查点就已经就位。
+    /// 代码签名区（**文件偏移**区间，闭开 `[start, end)`）。
+    ///
+    /// `None` = 这个目标没有代码签名概念（PE/ELF/COFF），或 Mach-O 里没有
+    /// `LC_CODE_SIGNATURE`。「不知道」与「没有」在这里都是 `None`，对打补丁而言
+    /// 效果一致（都不额外拦），但 loader 那边会区分。改到这段会使签名失效，
+    /// 所以 `site_at` 会拒绝落在其中的改动。
     code_signature: Option<Vec<(u64, u64)>>,
 }
 
@@ -214,18 +217,37 @@ impl PatchTarget {
                     detail: error.to_string(),
                 }
             })?;
+
+        // 代码签名区：只有 Mach-O 有 `LC_CODE_SIGNATURE` 这个概念。从 Mach-O 的
+        // 结构解析里取它的**文件范围**（`dataoff` / `datasize`），转成"文件偏移区间"。
+        // 其它格式（PE/ELF/COFF）没有这个概念 ⇒ `None`，那是如实未知，不是"没签名"。
+        let code_signature = match kind {
+            ObjectKind::MachO => bitflip_loader::format::macho::read(&bytes)
+                .ok()
+                .and_then(|facts| facts.code_signature)
+                .map(|range| vec![(range.dataoff, range.dataoff.saturating_add(range.datasize))]),
+            _ => None,
+        };
+
         Ok(Self {
             path,
             bytes,
             object,
             lock: LockState::Locked,
-            code_signature: None,
+            code_signature,
         })
     }
 
     /// 只读视图下的目标路径。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 只给测试用：直接指定代码签名区，绕开"必须是一份真 Mach-O"的约束，
+    /// 好把签名区的拒绝逻辑单独测透（边界、命中、不命中）。
+    #[cfg(test)]
+    fn set_code_signature_for_test(&mut self, ranges: Option<Vec<(u64, u64)>>) {
+        self.code_signature = ranges;
     }
 
     /// 对象格式。
@@ -338,24 +360,8 @@ impl PatchTarget {
             });
         }
 
-        // 2) 不能碰代码签名区（改了就使签名失效，且往往连累整个镜像）。
-        if let Some(ranges) = &self.code_signature {
-            for (start, size) in ranges {
-                let sig_end = start.saturating_add(*size);
-                if vaddr < sig_end && *start < end_vaddr {
-                    return Err(PatchError::PlanRejected {
-                        index,
-                        reason: format!(
-                            "改动 {}..{} 落在代码签名区 {}..{}：签名会失效，拒绝",
-                            hex(vaddr),
-                            hex(end_vaddr),
-                            hex(*start),
-                            hex(sig_end)
-                        ),
-                    });
-                }
-            }
-        }
+        // 2) 边界检查之后去查代码签名区（见下面第 3 步之后）—— 签名区是**文件偏移**，
+        //    要先把 file_offset 算出来才能比。
 
         // 3) 字节必须真的在文件里（file_offset + len ≤ 文件长度）。
         let file_offset = segment
@@ -380,6 +386,23 @@ impl PatchTarget {
                     file_end
                 ),
             });
+        }
+
+        // 4) 不能碰代码签名区：改了就使签名失效，且往往连累整个镜像。
+        //    签名区是按**文件偏移**给的（`LC_CODE_SIGNATURE` 的 dataoff/datasize），
+        //    所以在这一步拿 `[file_offset, file_end)` 去比。闭开区间求交。
+        if let Some(ranges) = &self.code_signature {
+            for (start, end) in ranges {
+                if file_offset < *end && *start < file_end {
+                    return Err(PatchError::PlanRejected {
+                        index,
+                        reason: format!(
+                            "改动（文件偏移 {}..{}）落在代码签名区 {}..{}：签名会失效，拒绝",
+                            file_offset, file_end, start, end
+                        ),
+                    });
+                }
+            }
         }
 
         let start = file_offset as usize;
@@ -781,5 +804,69 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&plan.copy_path);
+    }
+
+    // ── 代码签名区拒绝（本轮）──
+    //
+    // 签名区是**文件偏移**区间。段内容在文件 0x1000..0x1100，vaddr 0x401000。
+    // 把签名区设成文件 [0x1010, 0x1020)，验证：命中被拒、边界不算命中、
+    // 之后允许。
+
+    #[test]
+    fn write_inside_code_signature_is_rejected() {
+        let path = write_temp("sig-hit.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        // 文件 0x1010..0x1020 是签名区；写 0x1010 起 2 字节正好落在里面。
+        target.set_code_signature_for_test(Some(vec![(0x1010, 0x1020)]));
+        let err = target
+            .plan(&[(0x401010, vec![0x90u8, 0x90])])
+            .expect_err("落在签名区应当被拒");
+        match err {
+            PatchError::PlanRejected { index, reason } => {
+                assert_eq!(index, 0);
+                assert!(reason.contains("签名"), "原因要提到签名：{reason}");
+            }
+            other => panic!("期望 PlanRejected，实际 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_ending_exactly_at_signature_start_is_allowed() {
+        // 写 0x100F 一字节 → 文件 [0x100F, 0x1010)，与签名区 [0x1010,0x1020) 不相交。
+        // 闭开区间求交：边界接触不算命中。
+        let path = write_temp("sig-edge.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.set_code_signature_for_test(Some(vec![(0x1010, 0x1020)]));
+        let plan = target
+            .plan(&[(0x40100F, vec![0x90u8])])
+            .expect("恰好顶到签名区边界应当允许");
+        assert_eq!(plan.sites[0].file_offset, 0x100F);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_after_signature_end_is_allowed() {
+        let path = write_temp("sig-after.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.set_code_signature_for_test(Some(vec![(0x1010, 0x1020)]));
+        // 0x1020 起 1 字节：起点等于签名区末尾（闭开），不相交。
+        let plan = target
+            .plan(&[(0x401020, vec![0x90u8])])
+            .expect("签名区之后应当允许");
+        assert_eq!(plan.sites[0].file_offset, 0x1020);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn no_code_signature_does_not_block() {
+        // 普通 ELF 没有签名概念（code_signature 为 None）：同样的地址不该被拦。
+        let path = write_temp("sig-none.exe", &minimal_elf64_exec());
+        let target = PatchTarget::open(&path).expect("打开");
+        let plan = target
+            .plan(&[(0x401010, vec![0x90u8, 0x90])])
+            .expect("没有签名区就不拦");
+        assert_eq!(plan.sites[0].file_offset, 0x1010);
+        let _ = std::fs::remove_file(&path);
     }
 }

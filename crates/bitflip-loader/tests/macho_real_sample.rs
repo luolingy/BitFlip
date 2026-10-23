@@ -1480,3 +1480,99 @@ fn real_ios_binaries_report_objc_class_ownership() {
         pj.named_classes
     );
 }
+
+/// `LC_CODE_SIGNATURE` 的文件范围（真实样本来验证）。
+struct CodeSigCounts {
+    name: String,
+    file_len: u64,
+    signature: Option<macho::LinkeditRange>,
+    notes: Vec<String>,
+}
+
+fn measure_codesig(path: &std::path::Path) -> CodeSigCounts {
+    let ipa =
+        std::fs::read(path).unwrap_or_else(|error| panic!("读不到 {}：{error}", path.display()));
+    let listing = zip::list_members(&ipa)
+        .unwrap_or_else(|error| panic!("IPA 应当是能列成员的 ZIP：{}", error.summary_zh()));
+    let (_index, member_name, binary) = pick_main_binary(&ipa, &listing);
+    let (_how, facts, _object) = parse_one_image(&binary);
+    CodeSigCounts {
+        name: member_name.clone(),
+        file_len: binary.len() as u64,
+        signature: facts.code_signature,
+        notes: facts.notes.clone(),
+    }
+}
+
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_ios_binaries_report_code_signature_range() {
+    let paths = all_sample_paths();
+    let counts: Vec<CodeSigCounts> = paths.iter().map(|path| measure_codesig(path)).collect();
+
+    eprintln!(
+        "{:<44} {:>10} {:>10} {:>10}",
+        "样本", "文件字节", "签名 off", "签名长"
+    );
+    for row in &counts {
+        let (off, size) = match row.signature {
+            Some(range) => (range.dataoff, range.datasize),
+            None => (0, 0),
+        };
+        eprintln!(
+            "{:<44} {:>10} {:>10} {:>10}",
+            row.name, row.file_len, off, size
+        );
+        for note in &row.notes {
+            if note.contains("签名") {
+                eprintln!("    note: {note}");
+            }
+        }
+    }
+
+    // LiveContainer 的逐条期望来自 `llvm-objdump --macho --private-headers` 的实读
+    // （CLAUDE.md §6.11：断言来自 oracle，不是来自解析代码）：
+    //   cmd LC_CODE_SIGNATURE
+    //   dataoff 134928   datasize 16720
+    // 文件 151648 字节 → 签名区落在文件末尾那段（[134928, 151648)）。
+    let lc = counts
+        .iter()
+        .find(|row| row.name.contains("LiveContainer"))
+        .expect("样本里应当有 LiveContainer");
+    let sig = lc.signature.unwrap_or_else(|| {
+        panic!(
+            "LiveContainer 有 LC_CODE_SIGNATURE，必须读出范围；notes：{:?}",
+            lc.notes
+        )
+    });
+    assert_eq!(
+        sig.dataoff, 134928,
+        "LiveContainer 签名 dataoff 应与 llvm-objdump 一致"
+    );
+    assert_eq!(
+        sig.datasize, 16720,
+        "LiveContainer 签名 datasize 应与 llvm-objdump 一致"
+    );
+    assert_eq!(
+        sig.dataoff + sig.datasize,
+        lc.file_len,
+        "签名数据应当正好铺到文件末尾（{} + {} = {}）",
+        sig.dataoff,
+        sig.datasize,
+        lc.file_len
+    );
+
+    // 每个有签名区的样本，签名区都必须落在文件范围内（不越界）。
+    for row in &counts {
+        if let Some(range) = row.signature {
+            assert!(
+                range.dataoff + range.datasize <= row.file_len,
+                "{}：签名区 {}..{} 超出了文件 {} 字节",
+                row.name,
+                range.dataoff,
+                range.dataoff + range.datasize,
+                row.file_len
+            );
+        }
+    }
+}

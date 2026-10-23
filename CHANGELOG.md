@@ -5,6 +5,34 @@
 
 ## [Unreleased]
 
+### 新增 — 打补丁模块接上代码签名区（`LC_CODE_SIGNATURE`）
+
+`bitflip-patch` 上一版对"代码签名区"是 `None`（不知道签名区在哪）。这一版把它接实：
+落在签名区内的改动会被拒绝，而不是等写坏了签名才发现。
+
+- **loader 侧**：`LC_CODE_SIGNATURE` 此前只记 `has_codesig = true`，`dataoff`/
+  `datasize` 被丢掉。现在读出来放进 `MachOFile::code_signature: Option<LinkeditRange>`
+  （`dataoff` / `datasize`，**文件偏移**，不是虚拟地址 —— 签名数据在 `__LINKEDIT`，
+  往往不映射到可打补丁的段）。notes 也改成报出实际区间。仍然**只记位置，不做校验**。
+- **patch 侧**：`PatchTarget::open` 对 Mach-O 走 `macho::read` 取签名范围，存成
+  **文件偏移区间**；`site_at` 在算出 `file_offset` 之后用闭开区间求交，落在里面的改动
+  如实拒绝（说明"文件偏移 X..Y 落在代码签名区 A..B"）。PE/ELF/COFF 没有这个概念 ⇒
+  仍是 `None`，不额外拦（这不是"没签名"，是"这个格式没有签名区这一说"）。
+- **实测交叉核对**（`llvm-objdump --macho --private-headers` 当 oracle）：
+
+  | 样本 | 文件字节 | 签名 dataoff | 签名 datasize |
+  | --- | --- | --- | --- |
+  | LiveContainer | 151648 | 134928 | 16720 |
+  | SideStore | 19611632 | 19364128 | 247504 |
+  | PojavLauncher | 1176816 | 1159712 | 17104 |
+
+  LiveContainer 的 `dataoff`/`datasize` 与 llvm-objdump **逐字一致**，且
+  `dataoff + datasize = 文件字节数`（签名数据正铺到文件末尾）。
+- **测试**：`bitflip-patch` 新增 4 条（签名区内命中被拒、恰好顶到签名区起点允许、
+  签名区之后允许、无签名概念不拦）；真实样本测试新增
+  `real_ios_binaries_report_code_signature_range`（`#[ignore]`，LiveContainer 值写死 +
+  所有样本签名区不越界）。
+
 ### 新增 — 打补丁模块 `bitflip-patch` 的只读地基与解锁闸门
 
 新增附属 crate `bitflip-patch`（依赖 `bitflip-loader`，不依赖 core/server —— 单向）。
@@ -19,8 +47,7 @@
 - **只写副本**：`apply` 写 `xxx.patched`，原文件在磁盘上保持不变；副本已存在则拒绝覆盖。
 - **边界如实拒绝（§7）**：越界、落在 BSS / 无文件字节的段、跨段、触及代码签名区，都
   逐条拒绝并说明是第几处、为什么，不吞掉。
-  - 诚实说明：这一版**没接 `LC_CODE_SIGNATURE` 解析**，所以"签名区"边界仍是
-    `Option::None`（= "不知道签名区在哪"，不是"没有签名区"）；检查点已就位，接上后填。
+  - （首版时签名区边界还是 `None`；见上方"接上代码签名区"一条，现已接实。）
 - **记账**：`apply` 返回 `ApplyReport`（改了哪几段、多少字节、文件大小前后）。
 - **粒度说明**：归一化对象模型只到**段**这一层（`Segment { vaddr, file, kind }`），
   所以守卫按段做（段级足以表达"这段在不在文件里"）；本模块只做**段内等长替换**，

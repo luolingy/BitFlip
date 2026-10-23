@@ -410,8 +410,25 @@ pub struct MachOFile {
     /// [`ChainedImport::iat_slot`]）；`chains` 为 `None` 时地址未知，原因在 `notes`
     /// 里（没有链描述 / 没有镜像基址换不出地址）。
     pub chained_fixups: Option<ChainedFixups>,
+    /// `LC_CODE_SIGNATURE` 指出的代码签名数据在**文件里的范围**（`dataoff` / `datasize`）。
+    ///
+    /// `None` = 没有这条命令（或读不出范围）。这里**只记位置，不做签名校验** ——
+    /// 校验是另一件事。给打补丁模块用：改到这段会使签名失效，所以那边要拒。
+    pub code_signature: Option<LinkeditRange>,
     /// 解析过程中的说明（降级、跳过、没做的部分）。
     pub notes: Vec<String>,
+}
+
+/// 一段 `linkedit_data_command` 指出的文件范围（`dataoff` / `datasize`）。
+///
+/// 用于 `LC_CODE_SIGNATURE`：标出"签名数据在文件里的哪一段"。字段是**文件偏移**，
+/// 不是虚拟地址（签名数据在 `__LINKEDIT` 里，往往不映射到可打补丁的段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkeditRange {
+    /// 文件偏移。
+    pub dataoff: u64,
+    /// 字节数。
+    pub datasize: u64,
 }
 
 /// `dyld_info_command` 的十个 `uint32` 字段（`mach-o/loader.h`）。
@@ -796,6 +813,9 @@ struct CommandFacts {
     exports_trie: Option<LinkeditData>,
     /// `LC_DYLD_CHAINED_FIXUPS` 的 `linkedit_data_command`。
     chained_fixups: Option<LinkeditData>,
+    /// `LC_CODE_SIGNATURE` 的 `linkedit_data_command`（签名数据在文件里的位置）。
+    /// `None` = 没有这条命令；存在时给出 `dataoff` / `datasize`。
+    codesig: Option<LinkeditData>,
     has_codesig: bool,
     unhandled: Vec<u32>,
     /// 命令本身合法、但需要说明的事（重复命令等）。逐条走到 `notes` 里。
@@ -1236,7 +1256,20 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
         }
     }
     if facts.has_codesig {
-        notes.push("存在 LC_CODE_SIGNATURE：只记录存在性，**没有做签名校验**".to_string());
+        match &facts.codesig {
+            Some(range) => notes.push(format!(
+                "存在 LC_CODE_SIGNATURE：签名数据在文件偏移 {}..{}（{} 字节）；\
+                 只记录位置，**没有做签名校验**",
+                range.dataoff,
+                range.dataoff.saturating_add(range.datasize),
+                range.datasize
+            )),
+            None => notes.push(
+                "存在 LC_CODE_SIGNATURE，但读不出它的文件范围；只记录存在性，\
+                 **没有做签名校验**"
+                    .to_string(),
+            ),
+        }
     }
     note_objc_and_swift(&facts.segments, &mut notes);
     if !facts.unhandled.is_empty() {
@@ -1296,6 +1329,10 @@ fn read_with(reader: &Reader<'_>) -> Result<MachOFile, ParseError> {
         exports,
         imports,
         chained_fixups,
+        code_signature: facts.codesig.map(|range| LinkeditRange {
+            dataoff: range.dataoff,
+            datasize: range.datasize,
+        }),
         notes,
     })
 }
@@ -1424,7 +1461,22 @@ fn read_commands(
                     )?);
                 }
             }
-            LC_CODE_SIGNATURE => facts.has_codesig = true,
+            LC_CODE_SIGNATURE => {
+                facts.has_codesig = true;
+                if facts.codesig.is_some() {
+                    facts
+                        .notes
+                        .push("有多条 LC_CODE_SIGNATURE：只用第一条，其余忽略".to_string());
+                } else {
+                    // 顺手读出 `linkedit_data_command` 的文件范围（dataoff/datasize），
+                    // 供打补丁模块判断"别碰签名区"。这里仍**不做校验**，只记位置。
+                    facts.codesig = Some(read_linkedit_data(
+                        &view,
+                        endianness,
+                        "linkedit_data_command（LC_CODE_SIGNATURE）",
+                    )?);
+                }
+            }
             // LC_ID_DYLIB 是"我是谁"，不是依赖；其余命令本片不解析。
             LC_ID_DYLIB => {}
             other => facts.unhandled.push(other),
