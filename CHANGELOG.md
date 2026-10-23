@@ -11,6 +11,50 @@
 > 各阶段的"完成情况（据实记录）"为准**，那里有逐条状态表与取舍说明。
 > 补齐本文件属于待办，不是"没有发生过"。
 
+### 新增 — ObjC 归属：类、方法表与类别挂上名字（M12 第十片）
+
+上一片解出了选择器、方法表、消息桩，但**只有裸选择器**：界面上有一百多个
+`setup`、`viewDidLoad`，看不出它们分别属于哪个类，也没法给函数起
+`-[LiveContainer setup]` 这种名字。这一片把 `__objc_classlist` /
+`__objc_catlist` 走通，补上**归属**。
+
+- **类**（`class_t` → `data` → `class_ro_t`）：类名、父类名、实例方法表、
+  元类里的类方法表、`ivar` 名、遵循的协议名。布局按 objc4 头文件逐字段算
+  （64 位 `class_ro_t` 多一个 4 字节 `reserved`，漏了它类名会读在 +20 上）——
+  单测的合成镜像也按同一份规格独立拼，不是在解析代码上跑一遍自己（§6.11）。
+- **类别**（`category_t`）：类别名 + 被扩展的类名 + 实例/类方法。类别没有自己
+  的类，归属落在它扩展的那个类上。
+- **符号名升级**：方法实现的名字从裸选择器变成归属限定名 ——
+  `-[类 选择器]`、`+[类 选择器]`、`-[类(类别) 选择器]`。类名读不到时**退回**
+  裸选择器，不编造 `-[? sel]`。
+- **不猜**：父类/被扩展类是指向别的库的 bind 指针时，归属关系标未知并记账
+  （"这些归属关系只能标未知"）；`ivar` 表布局不认识时 ivar 名留空并记账。
+- **顺手修掉一个会丢数据的旧坑**：`Ctx` 原来用"节名 → 位置"的单值表找
+  "地址属于哪个节"，现代二进制里 `__objc_const` 在 `__DATA` 与 `__DATA_CONST`
+  里**同名重复**，只认第一个会让另一段里的 `class_ro_t` 变成"不在任何节里"。
+  改成按地址范围查全部节（`ranges`）。
+- **真实样本实测**（`llvm-objdump` 与二进制自身符号表当基准）：
+
+  | 样本 | 类 | 解出类名 | 有方法 | 类别 | 类别方法 |
+  | --- | --- | --- | --- | --- | --- |
+  | LiveContainer | 1 | 1 | 1 | 4 | 21 |
+  | PojavLauncher | 38 | 38 | 37 | 8 | 12 |
+  | SideStore | 304 | 127 | 123 | 7 | 19 |
+
+  LiveContainer 的类方法名与二进制符号表里的 `+[LCSharedUtils …]` /
+  `___xx+[LCSharedUtils …]_block_invoke` **逐字对得上**；类别也对得上二进制里
+  `+[NSString(Localization) enBundle]` 那种名字。SideStore 上 177 个类名读不到
+  （`class_ro_t.name` 不是可读的 cstring 指针），如实进 notes，不编号。
+- **wire / CLI / Web**：`ObjcInfoWire` 新增 `class_count`/`class_samples`/
+  `category_count`/`category_samples`（样例最多 12 条，增量字段，
+  `INFO_FORMAT_VERSION` 不递增）；`info` 增加"类 / 类别"两段，
+  Web 的"ObjC 元数据"里列出类（`-实例 +类`、父类、协议）与类别。
+- **API**：`ObjcMetadata` 新增 `classes` / `categories` 与
+  `ObjcClass` / `ObjcCategory` 类型 ⇒ `CORE_API_VERSION` 6 → 7、
+  `SERVER_API_VERSION` 6 → 7。
+- **工具**：新增 `#[ignore]` 的真实样本测试
+  `real_ios_binaries_report_objc_class_ownership`（符号表当 oracle）。
+
 ### 新增 — 间接调用的前驱恢复（AArch64 / arm64e）（M12 第九片）
 
 `blr x8` 的目标不在指令编码里，M6 的立场是"不做数据流分析，未解析就如实标未

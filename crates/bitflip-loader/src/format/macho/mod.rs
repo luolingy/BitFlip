@@ -1835,8 +1835,9 @@ fn note_objc_and_swift(segments: &[MachOSegment], notes: &mut Vec<String>) {
     }
     if objc > 0 {
         notes.push(format!(
-            "有 {objc} 个 __objc_* 节：选择器名、方法表与消息桩已解析（见 objc 元数据），\
-             但类与方法的**归属关系**（哪个方法属于哪个类）没有解析"
+            "有 {objc} 个 __objc_* 节：选择器名、方法表、消息桩与类/类别的**归属关系**\
+             （哪个方法属于哪个类）已解析（见 objc 元数据）—— 解不出来的部分\
+             （外部父类、读不到的名字）在 objc 元数据的说明里逐条记账"
         ));
     }
     if swift > 0 {

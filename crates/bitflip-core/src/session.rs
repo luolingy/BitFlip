@@ -66,6 +66,50 @@ pub struct ObjcStubWire {
     pub selector: String,
 }
 
+/// 一个 ObjC 类的 wire 表示（`__objc_classlist` 的一项）。
+///
+/// 只带"归属"必需的几样：类名、父类名、方法数、变量数、协议数，外加前几条
+/// 方法名样例。完整方法列表落在分析层的函数名里（同上：不在 `/api/info`
+/// 里全量物化）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObjcClassWire {
+    /// 类对象地址（定长 hex）。
+    pub address: String,
+    /// 类名；读不到时为 `null`（不拿类名池里的名字去凑）。
+    pub name: Option<String>,
+    /// 父类名；父类在别的库（bind）时为 `null`。
+    pub superclass: Option<String>,
+    /// 实例方法数。
+    pub instance_method_count: usize,
+    /// 类方法数。
+    pub class_method_count: usize,
+    /// 实例方法选择器样例（最多 `SAMPLE_LIMIT` 条）。
+    pub method_samples: Vec<String>,
+    /// 类方法选择器样例（最多 `SAMPLE_LIMIT` 条）。
+    pub class_method_samples: Vec<String>,
+    /// 实例变量名。
+    pub ivars: Vec<String>,
+    /// 遵循的协议名。
+    pub protocols: Vec<String>,
+}
+
+/// 一个 ObjC 类别的 wire 表示（`__objc_catlist` 的一项）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObjcCategoryWire {
+    /// 类别对象地址（定长 hex）。
+    pub address: String,
+    /// 类别名；读不到时 `null`。
+    pub name: Option<String>,
+    /// 被扩展的类名；在别的库时 `null`。
+    pub class_name: Option<String>,
+    /// 实例方法数。
+    pub instance_method_count: usize,
+    /// 类方法数。
+    pub class_method_count: usize,
+    /// 实例方法选择器样例（最多 `SAMPLE_LIMIT` 条）。
+    pub method_samples: Vec<String>,
+}
+
 /// ObjC 元数据的 wire 表示（增量字段：旧消费方忽略它即可）。
 ///
 /// 只带**计数 + 样例 + 说明**，不带全量选择器/方法/桩列表：完整列表会在
@@ -88,6 +132,14 @@ pub struct ObjcInfoWire {
     pub stub_count: usize,
     /// 消息桩样例（地址 → 选择器，最多 12 条；按地址升序）。
     pub stub_samples: Vec<ObjcStubWire>,
+    /// 类总数（`__objc_classlist`）。
+    pub class_count: usize,
+    /// 类样例（最多 12 条；按类表顺序）。
+    pub class_samples: Vec<ObjcClassWire>,
+    /// 类别总数（`__objc_catlist`）。
+    pub category_count: usize,
+    /// 类别样例（最多 12 条）。
+    pub category_samples: Vec<ObjcCategoryWire>,
     /// 解析说明（降级、没解出的部分，§7：降级要写在界面上）。
     pub notes: Vec<String>,
 }
@@ -132,6 +184,52 @@ impl ObjcInfoWire {
                 .map(|stub| ObjcStubWire {
                     address: hex16(stub.address),
                     selector: stub.selector.clone(),
+                })
+                .collect(),
+            class_count: objc.classes.len(),
+            class_samples: objc
+                .classes
+                .iter()
+                .take(Self::SAMPLE_LIMIT)
+                .map(|class| ObjcClassWire {
+                    address: hex16(class.address),
+                    name: class.name.clone(),
+                    superclass: class.superclass.clone(),
+                    instance_method_count: class.instance_methods.len(),
+                    class_method_count: class.class_methods.len(),
+                    method_samples: class
+                        .instance_methods
+                        .iter()
+                        .take(Self::SAMPLE_LIMIT)
+                        .map(|method| method.selector.clone())
+                        .collect(),
+                    class_method_samples: class
+                        .class_methods
+                        .iter()
+                        .take(Self::SAMPLE_LIMIT)
+                        .map(|method| method.selector.clone())
+                        .collect(),
+                    ivars: class.ivars.clone(),
+                    protocols: class.protocols.clone(),
+                })
+                .collect(),
+            category_count: objc.categories.len(),
+            category_samples: objc
+                .categories
+                .iter()
+                .take(Self::SAMPLE_LIMIT)
+                .map(|category| ObjcCategoryWire {
+                    address: hex16(category.address),
+                    name: category.name.clone(),
+                    class_name: category.class_name.clone(),
+                    instance_method_count: category.instance_methods.len(),
+                    class_method_count: category.class_methods.len(),
+                    method_samples: category
+                        .instance_methods
+                        .iter()
+                        .take(Self::SAMPLE_LIMIT)
+                        .map(|method| method.selector.clone())
+                        .collect(),
                 })
                 .collect(),
             notes: objc.notes.clone(),

@@ -292,6 +292,8 @@ fn print_parsed(parsed: &ObjectInfo) {
         || parsed.objc.selector_ref_count > 0
         || parsed.objc.method_count > 0
         || parsed.objc.stub_count > 0
+        || parsed.objc.class_count > 0
+        || parsed.objc.category_count > 0
     {
         println!();
         println!(
@@ -315,6 +317,61 @@ fn print_parsed(parsed: &ObjectInfo) {
             );
             if parsed.objc.class_names.len() > 12 {
                 println!("  … 共 {} 个类名", parsed.objc.class_names.len());
+            }
+        }
+        // 归属关系：类 → 方法。这是本片要给的东西：不只"有这个选择器"，
+        // 而是"这个选择器属于这个类"。
+        if !parsed.objc.class_samples.is_empty() {
+            println!(
+                "  类（共 {} 个；`-` 实例方法 / `+` 类方法）",
+                parsed.objc.class_count
+            );
+            for class in &parsed.objc.class_samples {
+                println!(
+                    "    {}  {}   -{} +{}{}",
+                    class.address,
+                    class.name.as_deref().unwrap_or("（类名未知）"),
+                    class.instance_method_count,
+                    class.class_method_count,
+                    class
+                        .superclass
+                        .as_deref()
+                        .map(|superclass| format!("   : {superclass}"))
+                        .unwrap_or_default()
+                );
+                let shown: Vec<&str> = class
+                    .method_samples
+                    .iter()
+                    .chain(class.class_method_samples.iter())
+                    .take(6)
+                    .map(String::as_str)
+                    .collect();
+                if !shown.is_empty() {
+                    println!("      方法：{}", shown.join("、"));
+                }
+            }
+            if parsed.objc.class_count > parsed.objc.class_samples.len() {
+                println!("    … 共 {} 个类", parsed.objc.class_count);
+            }
+        }
+        if !parsed.objc.category_samples.is_empty() {
+            println!("  类别（共 {} 个）", parsed.objc.category_count);
+            for category in &parsed.objc.category_samples {
+                println!(
+                    "    {}  {}{}   -{} +{}",
+                    category.address,
+                    category.class_name.as_deref().unwrap_or("（外部类）"),
+                    category
+                        .name
+                        .as_deref()
+                        .map(|name| format!("({name})"))
+                        .unwrap_or_default(),
+                    category.instance_method_count,
+                    category.class_method_count
+                );
+            }
+            if parsed.objc.category_count > parsed.objc.category_samples.len() {
+                println!("    … 共 {} 个类别", parsed.objc.category_count);
             }
         }
         if !parsed.objc.selector_ref_samples.is_empty() {

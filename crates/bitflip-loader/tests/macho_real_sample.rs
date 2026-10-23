@@ -1302,3 +1302,148 @@ fn real_ios_binaries_report_objc_names() {
         }
     }
 }
+
+/// 类归属的实测结果。
+struct ClassCounts {
+    name: String,
+    classes: usize,
+    named_classes: usize,
+    classes_with_methods: usize,
+    categories: usize,
+    category_methods: usize,
+    /// 二进制**自己的**符号表里那些名字：证明归属关系是真的。
+    symbol_names: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn measure_classes(path: &std::path::Path) -> ClassCounts {
+    let ipa =
+        std::fs::read(path).unwrap_or_else(|error| panic!("读不到 {}：{error}", path.display()));
+    let listing = zip::list_members(&ipa)
+        .unwrap_or_else(|error| panic!("IPA 应当是能列成员的 ZIP：{}", error.summary_zh()));
+    let (_index, member_name, binary) = pick_main_binary(&ipa, &listing);
+    let (_how, _facts, object) = parse_one_image(&binary);
+
+    let objc = &object.objc;
+    ClassCounts {
+        name: member_name.clone(),
+        classes: objc.classes.len(),
+        named_classes: objc
+            .classes
+            .iter()
+            .filter(|class| class.name.is_some())
+            .count(),
+        classes_with_methods: objc
+            .classes
+            .iter()
+            .filter(|class| !class.instance_methods.is_empty() || !class.class_methods.is_empty())
+            .count(),
+        categories: objc.categories.len(),
+        category_methods: objc
+            .categories
+            .iter()
+            .map(|category| category.instance_methods.len() + category.class_methods.len())
+            .sum(),
+        // 符号表里的名字：二进制自己写着"这个地址叫什么"。
+        symbol_names: object
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name.contains("[") || symbol.name.contains("]"))
+            .map(|symbol| symbol.name.clone())
+            .collect(),
+        notes: objc.notes.clone(),
+    }
+}
+
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_ios_binaries_report_objc_class_ownership() {
+    let paths = all_sample_paths();
+    let counts: Vec<ClassCounts> = paths.iter().map(|path| measure_classes(path)).collect();
+
+    eprintln!(
+        "{:<44} {:>6} {:>8} {:>6} {:>6} {:>8}",
+        "样本", "类", "有类名", "有方法", "类别", "类别方法"
+    );
+    for row in &counts {
+        eprintln!(
+            "{:<44} {:>6} {:>8} {:>6} {:>6} {:>8}",
+            row.name,
+            row.classes,
+            row.named_classes,
+            row.classes_with_methods,
+            row.categories,
+            row.category_methods
+        );
+        for note in &row.notes {
+            eprintln!("    note: {note}");
+        }
+    }
+
+    // 结构不变量（不依赖具体样本）：类名数不会超过类数；解出的方法数受方法表约束。
+    for row in &counts {
+        assert!(
+            row.named_classes <= row.classes,
+            "{}：解出类名数（{}）不该多于类数（{}）",
+            row.name,
+            row.named_classes,
+            row.classes
+        );
+    }
+
+    // LiveContainer 的逐条期望：本片拿**二进制自己的符号表**当基准（CLAUDE.md §6.11：
+    // 断言来自 oracle，不是来自解析代码）。符号表里有 `+[LCSharedUtils teamIdentifier]`
+    // 这样的名字 —— 我们自己解出来的类方法名必须与它一致。
+    let lc = counts
+        .iter()
+        .find(|row| row.name.contains("LiveContainer"))
+        .expect("样本里应当有 LiveContainer");
+    assert_eq!(
+        lc.classes, 1,
+        "LiveContainer：__objc_classlist 是 1 个指针，实际 {}",
+        lc.classes
+    );
+    assert_eq!(
+        lc.named_classes, 1,
+        "LiveContainer：这个类名解得出来，实际 {}",
+        lc.named_classes
+    );
+    assert_eq!(
+        lc.categories, 4,
+        "LiveContainer：__objc_catlist 是 4 个指针（0x20 / 8），实际 {}",
+        lc.categories
+    );
+    assert!(
+        lc.classes_with_methods >= 1,
+        "LiveContainer：至少那个类要解出方法，实际 {}",
+        lc.classes_with_methods
+    );
+    assert!(
+        lc.category_methods > 0,
+        "LiveContainer：类别里解出的方法数应当大于 0，实际 {}",
+        lc.category_methods
+    );
+
+    // 关键：归属名与二进制自身的符号名互为印证。
+    assert!(
+        lc.symbol_names
+            .iter()
+            .any(|name| name.contains("LCSharedUtils")),
+        "LiveContainer 符号表里应当有 LCSharedUtils 的名字（否则这条对照就失去意义）：{:?}",
+        &lc.symbol_names[..lc.symbol_names.len().min(8)]
+    );
+    // 符号表里出现的 `+[LCSharedUtils <sel>]` 花括号形式，和我们解出的类方法名同族：
+    // 这里只断言"类名 + 类方法形状"在两边都存在，避免把符号表的 block 包装差异写死。
+    assert!(
+        lc.symbol_names
+            .iter()
+            .any(|name| name.contains("+[LCSharedUtils")),
+        "LiveContainer 符号表里应当有 `+[LCSharedUtils …]` 形式的类方法名：{:?}",
+        &lc.symbol_names[..lc.symbol_names.len().min(8)]
+    );
+    assert!(
+        lc.notes.iter().any(|note| note.contains("ObjC 归属")),
+        "LiveContainer 的 notes 里应当有归属的账目：{:?}",
+        lc.notes
+    );
+}

@@ -43,7 +43,7 @@ pub const TOKEN_QUERY: &str = "token";
 ///
 /// 与 `bitflip_core::CORE_API_VERSION` **同步**：服务转发的是 core 的类型，
 /// 两者形状一变就得一起变（`bitflip-cli` 的 `version` 测试钉住这条一致性）。
-pub const SERVER_API_VERSION: u32 = 6;
+pub const SERVER_API_VERSION: u32 = 7;
 
 /// 程序名。
 pub const APP_NAME: &str = "bitflip";

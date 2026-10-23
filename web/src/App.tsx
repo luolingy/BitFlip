@@ -381,6 +381,8 @@ export function App() {
             (parsed.objc.selector_ref_count > 0 ||
               parsed.objc.method_count > 0 ||
               parsed.objc.stub_count > 0 ||
+              parsed.objc.class_count > 0 ||
+              parsed.objc.category_count > 0 ||
               parsed.objc.class_names.length > 0) && (
               <>
                 <PaneTitle title="ObjC 元数据" />
@@ -431,6 +433,42 @@ export function App() {
                     {parsed.objc.stub_count > parsed.objc.stub_samples.length && (
                       <li className="hint">
                         … 共 {parsed.objc.stub_count} 个消息桩
+                      </li>
+                    )}
+                  </ul>
+                )}
+                {parsed.objc.class_samples.length > 0 && (
+                  <ul className="notes">
+                    {parsed.objc.class_samples.map((sample) => (
+                      <li key={sample.address} className="mono">
+                        {sample.name ?? "（类名未知）"}
+                        {sample.superclass ? ` : ${sample.superclass}` : ""}
+                        {` · -${sample.instance_method_count} +${sample.class_method_count}`}
+                        {sample.protocols.length > 0
+                          ? ` · 协议 ${sample.protocols.join(",")}`
+                          : ""}
+                      </li>
+                    ))}
+                    {parsed.objc.class_count > parsed.objc.class_samples.length && (
+                      <li className="hint">
+                        … 共 {parsed.objc.class_count} 个类
+                      </li>
+                    )}
+                  </ul>
+                )}
+                {parsed.objc.category_samples.length > 0 && (
+                  <ul className="notes">
+                    {parsed.objc.category_samples.map((sample) => (
+                      <li key={sample.address} className="mono">
+                        {sample.class_name ?? "（外部类）"}
+                        {sample.name ? `(${sample.name})` : ""}
+                        {` · -${sample.instance_method_count} +${sample.class_method_count}`}
+                      </li>
+                    ))}
+                    {parsed.objc.category_count >
+                      parsed.objc.category_samples.length && (
+                      <li className="hint">
+                        … 共 {parsed.objc.category_count} 个类别
                       </li>
                     )}
                   </ul>

@@ -887,7 +887,58 @@ impl TargetAnalysis {
         // 2. **解不出来的不猜**：`imp` 落在已映射空间之外（镜像基址不符、表损坏）
         //    就不建候选，但计数要报出来；`__objc_stubs` 区域里没解出名字的桩
         //    由调用图那边单独记账，这里不生成假名。
+        // 归属限定名：`-[类 选择器]` / `+[类 选择器]` / `-[类(类别) 选择器]`。
+        //
+        // 有归属时用限定名，没有时退回裸选择器 —— 裸选择器是"这个地址实现了
+        // 这个选择器"，限定名是"这个地址是**这个类的**这个方法"，后者信息更多。
+        // 只有 class_ro_t → baseMethods → imp 这条链解出来才有资格用限定名；
+        // 类名解不出来（`name: None`）时**不**编造 `-[? sel]`，退回裸选择器。
+        let mut qualified: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
+        for class in &object.objc.classes {
+            let Some(name) = class.name.as_deref() else {
+                continue;
+            };
+            for method in &class.instance_methods {
+                if let Some(imp) = method.imp {
+                    qualified
+                        .entry(imp)
+                        .or_insert_with(|| format!("-[{name} {}]", method.selector));
+                }
+            }
+            for method in &class.class_methods {
+                if let Some(imp) = method.imp {
+                    qualified
+                        .entry(imp)
+                        .or_insert_with(|| format!("+[{name} {}]", method.selector));
+                }
+            }
+        }
+        for category in &object.objc.categories {
+            let Some(category_name) = category.name.as_deref() else {
+                continue;
+            };
+            let Some(class_name) = category.class_name.as_deref() else {
+                continue;
+            };
+            for method in &category.instance_methods {
+                if let Some(imp) = method.imp {
+                    qualified.entry(imp).or_insert_with(|| {
+                        format!("-[{class_name}({category_name}) {}]", method.selector)
+                    });
+                }
+            }
+            for method in &category.class_methods {
+                if let Some(imp) = method.imp {
+                    qualified.entry(imp).or_insert_with(|| {
+                        format!("+[{class_name}({category_name}) {}]", method.selector)
+                    });
+                }
+            }
+        }
+
         let mut objc_methods_named = 0usize;
+        let mut objc_methods_qualified = 0usize;
         let mut objc_methods_unmapped = 0usize;
         for method in &object.objc.methods {
             let Some(imp) = method.imp else { continue };
@@ -898,9 +949,17 @@ impl TargetAnalysis {
                 objc_methods_unmapped += 1;
                 continue;
             }
+            // 有归属就用限定名（`-[LiveContainer setup]`），没有就裸选择器。
+            let (name, qualified_here) = match qualified.get(&imp) {
+                Some(name) => (name.clone(), true),
+                None => (method.selector.clone(), false),
+            };
+            if qualified_here {
+                objc_methods_qualified += 1;
+            }
             by_addr.entry(imp).or_default().push(SymbolCandidate {
                 addr: imp,
-                name: method.selector.clone(),
+                name,
                 source: SymbolSource::ObjcMethod,
                 confidence: 75,
             });
@@ -924,9 +983,10 @@ impl TargetAnalysis {
         }
         if objc_methods_named > 0 || objc_stubs_named > 0 {
             notes.push(format!(
-                "ObjC 方法表与消息桩给出名字：{} 个方法实现、{} 个消息桩（来源 objc-method）\
-                 {}",
+                "ObjC 方法表与消息桩给出名字：{} 个方法实现（其中 {} 个带类归属，形如 `-[类 选择器]`）、\
+                 {} 个消息桩（来源 objc-method）{}",
                 objc_methods_named,
+                objc_methods_qualified,
                 objc_stubs_named,
                 if objc_methods_unmapped > 0 {
                     format!(

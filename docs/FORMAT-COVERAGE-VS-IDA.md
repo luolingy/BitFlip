@@ -33,7 +33,7 @@ IDA 官方文档明确说这个列表**不完整**（"The list contains some, bu
 | Linear Executable (LE) | ✗ |
 | **Portable Executable (PE)** (x86, x64, ARM, etc) | **✓ 已解析** |
 | Windows CE PE (ARM, SH-3, SH-4, MIPS) | ✗ |
-| **Mach-O for OS X and iOS** (x86, x64, ARM, PPC) | **△ 结构层 + 符号表 + 函数起点已解析**（M12：头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`/`LC_FUNCTION_STARTS`；dyld 绑定、objc/swift、代码签名校验**未做**；ppc/ppc64 能解析也能解码） |
+| **Mach-O for OS X and iOS** (x86, x64, ARM, PPC) | **△ 结构层 + 符号表 + 函数起点 + dyld 绑定 + ObjC 名字与归属已解析**（M12：头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`/`LC_FUNCTION_STARTS`/链式修复导入/ObjC 选择器·方法表·消息桩·类与类别归属；swift 元数据、代码签名校验**未做**；ppc/ppc64 能解析也能解码） |
 | Apple Dyld Shared Cache (DSC) | ✗ |
 | **Dalvik Executable (DEX)** | **△ 结构层已解析**（M11：清单/调用图/`dex-smali`/`dex-dot-cfg`；**不**接机器码反汇编流水线） |
 | EPOC (Symbian OS executable) | ✗ |

@@ -118,6 +118,32 @@ export interface ObjcStubWire {
   selector: string;
 }
 
+/** 一个类的样例（`__objc_classlist` 的一项）。对应 `bitflip-core::ObjcClassWire`。 */
+export interface ObjcClassWire {
+  address: string;
+  /** 类名；读不到时为 null（不拿类名池里的名字去凑）。 */
+  name: string | null;
+  /** 父类名；父类在别的库（bind）时为 null。 */
+  superclass: string | null;
+  instance_method_count: number;
+  class_method_count: number;
+  method_samples: string[];
+  class_method_samples: string[];
+  ivars: string[];
+  protocols: string[];
+}
+
+/** 一个类别的样例（`__objc_catlist` 的一项）。对应 `bitflip-core::ObjcCategoryWire`。 */
+export interface ObjcCategoryWire {
+  address: string;
+  name: string | null;
+  /** 被扩展的类名；在别的库时为 null。 */
+  class_name: string | null;
+  instance_method_count: number;
+  class_method_count: number;
+  method_samples: string[];
+}
+
 /** ObjC 元数据摘要。对应 `bitflip-core::ObjcInfoWire`。非 Mach-O 全是空表。 */
 export interface ObjcInfo {
   class_names: string[];
@@ -128,6 +154,12 @@ export interface ObjcInfo {
   method_samples: ObjcMethodWire[];
   stub_count: number;
   stub_samples: ObjcStubWire[];
+  /** 类总数（`__objc_classlist`）。 */
+  class_count: number;
+  class_samples: ObjcClassWire[];
+  /** 类别总数（`__objc_catlist`）。 */
+  category_count: number;
+  category_samples: ObjcCategoryWire[];
   notes: string[];
 }
 

@@ -113,7 +113,7 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// v6（间接调用前驱恢复这一片）：[`CallEdgeWire`] 新增 `recovered_indirect`
 /// （目标是推理出来的而不是编码里写的）；[`bitflip_analyze::CalleeResolution`]
 /// 新增 `IndirectRecovered` 变体。同样是增量 + 形状变化 ⇒ +1。
-pub const CORE_API_VERSION: u32 = 6;
+pub const CORE_API_VERSION: u32 = 7;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

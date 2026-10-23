@@ -60,7 +60,7 @@ use std::collections::HashMap;
 
 use bitflip_arch::Arch;
 
-use crate::object::{ObjcMetadata, ObjcMethod, ObjcSelectorRef, ObjcStub};
+use crate::object::{ObjcCategory, ObjcClass, ObjcMetadata, ObjcMethod, ObjcSelectorRef, ObjcStub};
 
 use super::{MachOSection, MachOSegment};
 
@@ -74,6 +74,11 @@ const SEC_METHTYPE: &str = "__objc_methtype";
 const SEC_SELREFS: &str = "__objc_selrefs";
 /// 方法表。
 const SEC_METHLIST: &str = "__objc_methlist";
+/// 消息转发桩。
+/// 类表（类的归属关系从这儿开始）。
+const SEC_CLASSLIST: &str = "__objc_classlist";
+/// 类别表。
+const SEC_CATLIST: &str = "__objc_catlist";
 /// 消息转发桩。
 const SEC_STUBS: &str = "__objc_stubs";
 
@@ -126,8 +131,15 @@ struct Ctx<'a> {
     little: bool,
     /// 指针宽度（字节）。
     ptr_size: u64,
-    /// 节名 → 位置。
+    /// 节名 → 位置（每个名字只留第一个，用于按名取节）。
     sections: HashMap<&'a str, SectionInfo>,
+    /// **所有**有文件数据的节（含同名重复），用于"这个地址落在哪个节里"。
+    ///
+    /// 为什么不能只用 `sections`：现代二进制里 `__objc_const` 会同时出现在
+    /// `__DATA` 和 `__DATA_CONST` 两个段里，同名。只认第一个的话，落在另一个
+    /// 段里的 `class_ro_t` 就"不在任何节里"，于是类名读不出来 —— 实测在
+    /// SideStore 上这让 177 个类丢了名字。按地址范围查才是对的。
+    ranges: Vec<SectionInfo>,
 }
 
 impl<'a> Ctx<'a> {
@@ -140,20 +152,23 @@ impl<'a> Ctx<'a> {
         segments: &'a [MachOSegment],
     ) -> Self {
         let mut sections = HashMap::new();
+        let mut ranges = Vec::new();
         for segment in segments {
             for section in &segment.sections {
                 if section.size == 0 || super::is_zerofill_section(section.flags) {
                     continue;
                 }
+                let info = SectionInfo {
+                    addr: section.addr,
+                    size: section.size,
+                    offset: u64::from(section.offset),
+                };
                 // 同名节只认第一个（文件里不该有两个同名节；真有了也只取第一个，
                 // 不猜哪个是真的）。
-                sections
-                    .entry(section.sectname.as_str())
-                    .or_insert(SectionInfo {
-                        addr: section.addr,
-                        size: section.size,
-                        offset: u64::from(section.offset),
-                    });
+                sections.entry(section.sectname.as_str()).or_insert(info);
+                // 但"地址属于哪个节"必须看**全部**节，否则同名重复段里的数据
+                // 会被当成"不在任何节里"（见 `ranges` 的文档）。
+                ranges.push(info);
             }
         }
         Self {
@@ -162,6 +177,7 @@ impl<'a> Ctx<'a> {
             little,
             ptr_size: if is_64 { 8 } else { 4 },
             sections,
+            ranges,
         }
     }
 
@@ -172,7 +188,7 @@ impl<'a> Ctx<'a> {
 
     /// 虚拟地址落在哪个节里。
     fn section_containing(&self, vaddr: u64) -> Option<&SectionInfo> {
-        self.sections.values().find(|section| {
+        self.ranges.iter().find(|section| {
             vaddr >= section.addr && vaddr < section.addr.saturating_add(section.size)
         })
     }
@@ -367,15 +383,31 @@ pub(crate) fn parse(
         .map(|entry| (entry.slot, entry.name.clone()))
         .collect();
 
-    // 方法表。
+    // 方法表（`__objc_methlist`：老 ABI 的连续扫描）。
     let (methods, unnamed_methods) = parse_method_lists(&ctx, &selectors_by_slot, &methtypes);
+
+    // 类与类别：归属关系。现代二进制里每个类的方法表是独立的一张，
+    // 上面那一步只看得到 `__objc_methlist` 那一节（往往是空的）。
+    let (classes, class_account) = parse_classes(&ctx, &selectors_by_slot, &methtypes);
+    let (categories, category_account) = parse_categories(&ctx, &selectors_by_slot, &methtypes);
 
     // 消息转发桩。
     let (stubs, not_selector) = parse_stubs(&ctx, &selectors_by_slot, arch);
 
+    let class_methods_total: usize = classes
+        .iter()
+        .map(|class| class.instance_methods.len() + class.class_methods.len())
+        .sum();
+    let category_methods_total: usize = categories
+        .iter()
+        .map(|category| category.instance_methods.len() + category.class_methods.len())
+        .sum();
+
     meta.selector_refs = selector_refs;
     meta.methods = methods;
     meta.stubs = stubs;
+    meta.classes = classes;
+    meta.categories = categories;
     meta.class_names = class_names;
 
     // 说明（CLAUDE.md §7：降级要写在界面上）。
@@ -417,6 +449,56 @@ pub(crate) fn parse(
              （例如取 GOT 条目）：按事实不当作消息桩"
         ));
     }
+    // 归属关系：类与类别。这一段的账目要单独说 —— "有类名"和"知道方法属于谁"
+    // 是两件事，后者才是这张片要给的东西。
+    if !meta.classes.is_empty() || !meta.categories.is_empty() {
+        let named_classes = meta
+            .classes
+            .iter()
+            .filter(|class| class.name.is_some())
+            .count();
+        notes.push(format!(
+            "ObjC 归属：{} 个类（{} 个解出类名）、{} 个类别；类里解出方法 {} 个、类别里解出方法 {} 个",
+            meta.classes.len(),
+            named_classes,
+            meta.categories.len(),
+            class_methods_total,
+            category_methods_total,
+        ));
+    }
+    if class_account.superclass_bound + category_account.superclass_bound > 0 {
+        notes.push(format!(
+            "有 {} 个类/类别指向的父类（或被扩展的类）是链式修复的 bind 指针 —— 那个类在**别的库**里，\
+             静态文件里没有它的名字，所以这些归属关系只能标未知",
+            class_account.superclass_bound + category_account.superclass_bound
+        ));
+    }
+    if class_account.name_unresolved + category_account.name_unresolved > 0 {
+        notes.push(format!(
+            "有 {} 个类/类别的名字没解出来（`class_ro_t.name` 或 `category_t.name` 读不到）",
+            class_account.name_unresolved + category_account.name_unresolved
+        ));
+    }
+    if class_account.ro_unresolved + class_account.metaclass_unresolved > 0 {
+        notes.push(format!(
+            "有 {} 个类的 `class_ro_t` 解不出来、{} 个类的元类解不出来：这些类只有名字，\
+             方法表读不到（这不等于「这个类没有方法」）",
+            class_account.ro_unresolved, class_account.metaclass_unresolved
+        ));
+    }
+    if class_account.pointer_unresolved + category_account.pointer_unresolved > 0 {
+        notes.push(format!(
+            "类表/类别表里有 {} 个指针解不出来（bind 或坏指针）：这些项整条跳过",
+            class_account.pointer_unresolved + category_account.pointer_unresolved
+        ));
+    }
+    if class_account.ivars_unparsed + category_account.ivars_unparsed > 0 {
+        notes.push(format!(
+            "有 {} 张 ivar 表的 `entsize` 不是已知布局（20 相对偏移 / 32 绝对指针）：\
+             ivar 名按事实不猜，留空",
+            class_account.ivars_unparsed + category_account.ivars_unparsed
+        ));
+    }
     meta.notes = notes;
     meta
 }
@@ -435,55 +517,75 @@ fn parse_method_lists(
         return (methods, unnamed);
     };
 
-    let mut offset = 0u64;
-    while offset + 8 <= section.size {
-        let Some(entsize_flags) = ctx.u32_at(section.offset + offset) else {
+    // 老 ABI 把**所有**方法表连成一节，所以这里要一张接一张地走。
+    // 现代二进制里每个类的方法表是独立的，由 `parse_classes` 直接按指针解。
+    let end = section.addr + section.size;
+    let mut addr = section.addr;
+    while addr + 8 <= end {
+        let Some((list, list_unnamed, next)) =
+            parse_method_list_at(ctx, addr, selectors_by_slot, methtypes)
+        else {
             break;
         };
-        let Some(count) = ctx.u32_at(section.offset + offset + 4) else {
-            break;
-        };
-        let entsize = entsize_flags & 0xFFFF;
-        if !matches!(entsize, 8 | 12 | 24) {
-            break;
-        }
-        if count > MAX_METHODS_PER_LIST {
+        methods.extend(list);
+        unnamed += list_unnamed;
+        if next <= addr {
+            // 不前进就停：表头是坏的时候不能原地转圈。
             break;
         }
-        for index in 0..u64::from(count) {
-            let entry = offset + 8 + index * u64::from(entsize);
-            if entry + u64::from(entsize) > section.size {
-                break;
-            }
-            let entry_addr = section.addr + entry;
-            let file_offset = section.offset + entry;
-            let Some(method) = decode_method(
-                ctx,
-                file_offset,
-                entry_addr,
-                entsize,
-                selectors_by_slot,
-                methtypes,
-            ) else {
-                continue;
-            };
-            if method.selector.is_empty() {
-                unnamed += 1;
-                continue;
-            }
-            methods.push(method);
-        }
-        // 下一个方法表：`8 + count * entsize`，按 8 字节对齐
-        // （方法表里含指针，运行时保持指针对齐）。
-        let mut next = offset + 8 + u64::from(count) * u64::from(entsize);
-        let aligned_addr = (section.addr + next + 7) & !7;
-        let aligned = aligned_addr.saturating_sub(section.addr);
-        if aligned < section.size {
-            next = aligned;
-        }
-        offset = next;
+        addr = next;
     }
     (methods, unnamed)
+}
+
+/// 解**一张**方法表（`method_list_t`）。
+///
+/// 返回 `(方法, 无名项数, 表尾之后的对齐地址)`。经典 ABI 里方法表是首尾相接的
+/// 一节，所以要靠 `next` 接着往下走；现代二进制里 `class_ro_t.baseMethods`
+/// 直接指着某一张表，只需要第一项。
+fn parse_method_list_at(
+    ctx: &Ctx<'_>,
+    list_addr: u64,
+    selectors_by_slot: &HashMap<u64, String>,
+    methtypes: &HashMap<u64, String>,
+) -> Option<(Vec<ObjcMethod>, usize, u64)> {
+    let mut methods = Vec::new();
+    let mut unnamed = 0usize;
+
+    let header = ctx.file_offset(list_addr)?;
+    let entsize_flags = ctx.u32_at(header)?;
+    let count = ctx.u32_at(header + 4)?;
+    let entsize = entsize_flags & 0xFFFF;
+    // 只认已实现过的三种布局（见 `decode_method`）；其余形态如实不认。
+    if !matches!(entsize, 8 | 12 | 24) || count > MAX_METHODS_PER_LIST {
+        return None;
+    }
+
+    for index in 0..u64::from(count) {
+        let entry_addr = list_addr + 8 + index * u64::from(entsize);
+        let Some(file_offset) = ctx.file_offset(entry_addr) else {
+            break;
+        };
+        let Some(method) = decode_method(
+            ctx,
+            file_offset,
+            entry_addr,
+            entsize,
+            selectors_by_slot,
+            methtypes,
+        ) else {
+            continue;
+        };
+        if method.selector.is_empty() {
+            unnamed += 1;
+            continue;
+        }
+        methods.push(method);
+    }
+
+    // 表尾按 8 字节对齐（方法表里含指针，运行时保持指针对齐）。
+    let next = (list_addr + 8 + u64::from(count) * u64::from(entsize) + 7) & !7;
+    Some((methods, unnamed, next))
 }
 
 /// 解一个方法项。
@@ -683,6 +785,386 @@ fn decode_ldr_imm64(insn: u32) -> Option<(u64, u8, u8)> {
     ))
 }
 
+// ───────────────────────── 类与类别：归属关系 ─────────────────────────
+
+/// `class_ro_t` 里几个字段的偏移（按指针宽度分）。
+///
+/// 偏移照 objc4 的头文件（`objc-runtime-new.h`）逐字段累加，**不是**照本文件的
+/// 解析代码反推（CLAUDE.md §6.11）：
+///
+/// ```text
+/// 64 位：flags(4) instanceStart(4) instanceSize(4) reserved(4)
+///        ivarLayout(8)@16 name(8)@24 baseMethodList(8)@32
+///        baseProtocols(8)@40 ivars(8)@48 weakIvarLayout(8)@56 baseProperties(8)@64
+/// 32 位：flags(4) instanceStart(4) instanceSize(4)
+///        ivarLayout(4)@12 name(4)@16 baseMethodList(4)@20
+///        baseProtocols(4)@24 ivars(4)@28 …
+/// ```
+///
+/// 64 位多出来的那个 4 字节 `reserved` 是关键：漏了它，`name` 会读在 +20 上，
+/// 于是类名恒为空 —— 而单测若按同一个错误假设拼镜像，会一路绿着（§6.11 的原话）。
+#[derive(Debug, Clone, Copy)]
+struct RoLayout {
+    name: u64,
+    methods: u64,
+    protocols: u64,
+    ivars: u64,
+}
+
+impl RoLayout {
+    fn for_ctx(ctx: &Ctx<'_>) -> Self {
+        if ctx.ptr_size == 8 {
+            Self {
+                name: 24,
+                methods: 32,
+                protocols: 40,
+                ivars: 48,
+            }
+        } else {
+            Self {
+                name: 16,
+                methods: 20,
+                protocols: 24,
+                ivars: 28,
+            }
+        }
+    }
+}
+
+/// 从 `class_t` 的地址读出类名。
+///
+/// 路径：`class_t.data`（第 5 个指针）→ `class_ro_t` → `name`。
+/// 任何一步解不出来就是 `None`，不拿 `__objc_classname` 池里的名字去凑。
+fn class_name_at(ctx: &Ctx<'_>, class_addr: u64) -> Option<String> {
+    let layout = RoLayout::for_ctx(ctx);
+    let Pointer::Address(ro) = ctx.resolve_pointer(class_addr + 4 * ctx.ptr_size) else {
+        return None;
+    };
+    let Pointer::Address(name) = ctx.resolve_pointer(ro + layout.name) else {
+        return None;
+    };
+    ctx.cstring(name).filter(|text| !text.is_empty())
+}
+
+/// 解一张类方法表指针（`class_ro_t.baseMethods` 那个槽）。
+fn methods_at(
+    ctx: &Ctx<'_>,
+    field_addr: u64,
+    selectors_by_slot: &HashMap<u64, String>,
+    methtypes: &HashMap<u64, String>,
+    unnamed: &mut usize,
+) -> Vec<ObjcMethod> {
+    let Pointer::Address(list) = ctx.resolve_pointer(field_addr) else {
+        return Vec::new();
+    };
+    match parse_method_list_at(ctx, list, selectors_by_slot, methtypes) {
+        Some((methods, list_unnamed, _next)) => {
+            *unnamed += list_unnamed;
+            methods
+        }
+        None => Vec::new(),
+    }
+}
+
+/// 解协议名列表（`protocol_list_t`）：`count` + `protocol_t*[count]`，
+/// `protocol_t` 的第 2 个字段就是协议名。
+fn protocols_at(ctx: &Ctx<'_>, field_addr: u64) -> Vec<String> {
+    let Pointer::Address(list) = ctx.resolve_pointer(field_addr) else {
+        return Vec::new();
+    };
+    let Some(header) = ctx.file_offset(list) else {
+        return Vec::new();
+    };
+    let Some(count) = ctx.u64_at(header) else {
+        return Vec::new();
+    };
+    if count > MAX_METHODS_PER_LIST as u64 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for index in 1..=count {
+        let entry = list + index * ctx.ptr_size;
+        let Pointer::Address(protocol) = ctx.resolve_pointer(entry) else {
+            continue;
+        };
+        let Pointer::Address(name) = ctx.resolve_pointer(protocol + ctx.ptr_size) else {
+            continue;
+        };
+        if let Some(text) = ctx.cstring(name) {
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+    }
+    out
+}
+
+/// 解实例变量名（`ivar_list_t`）。
+///
+/// `ivar_t` 有两种布局，按表头的 `entsize` 分：
+///
+/// * `32`（64 位绝对指针）：offset(8) name(8)@+8 type(8) alignment(4) size(4)
+/// * `20`（相对偏移）：offset(i32) name(i32)@+4 type(i32) alignment(4) size(4)
+///
+/// 别的 `entsize` 一律不认并记账 —— 认错布局读出来的是别处的字节，
+/// 那种"名字"比没有更糟。
+fn ivars_at(ctx: &Ctx<'_>, field_addr: u64, unparsed: &mut usize) -> Vec<String> {
+    let Pointer::Address(list) = ctx.resolve_pointer(field_addr) else {
+        return Vec::new();
+    };
+    let Some(header) = ctx.file_offset(list) else {
+        return Vec::new();
+    };
+    let (Some(entsize), Some(count)) = (ctx.u32_at(header), ctx.u32_at(header + 4)) else {
+        return Vec::new();
+    };
+    if count > MAX_METHODS_PER_LIST {
+        return Vec::new();
+    }
+    if !matches!(entsize, 20 | 32) {
+        *unparsed += 1;
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for index in 0..u64::from(count) {
+        let entry = list + 8 + index * u64::from(entsize);
+        let name = if entsize == 32 {
+            match ctx.resolve_pointer(entry + 8) {
+                Pointer::Address(addr) => ctx.cstring(addr),
+                _ => None,
+            }
+        } else {
+            let Some(offset) = ctx.file_offset(entry + 4) else {
+                continue;
+            };
+            let Some(relative) = ctx.i32_at(offset) else {
+                continue;
+            };
+            ctx.cstring(relative_address(entry + 4, relative))
+        };
+        if let Some(text) = name {
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+    }
+    out
+}
+
+/// 解一张类表（`__objc_classlist`）。
+///
+/// 返回 `(类列表, 解不出类名的项数)`。
+fn parse_classes(
+    ctx: &Ctx<'_>,
+    selectors_by_slot: &HashMap<u64, String>,
+    methtypes: &HashMap<u64, String>,
+) -> (Vec<ObjcClass>, ClassAccount) {
+    let mut classes = Vec::new();
+    let mut account = ClassAccount::default();
+    let Some(section) = ctx.section(SEC_CLASSLIST) else {
+        return (classes, account);
+    };
+    let layout = RoLayout::for_ctx(ctx);
+    let count = section.size / ctx.ptr_size;
+
+    for index in 0..count {
+        let slot = section.addr + index * ctx.ptr_size;
+        // 类指针本身也可能是 bind（类的实现在别的 dylib 里）：那种情形只能记账。
+        let Pointer::Address(class_addr) = ctx.resolve_pointer(slot) else {
+            account.pointer_unresolved += 1;
+            continue;
+        };
+        let mut entry = ObjcClass {
+            address: class_addr,
+            ..ObjcClass::default()
+        };
+        entry.name = class_name_at(ctx, class_addr);
+        if entry.name.is_none() {
+            account.name_unresolved += 1;
+        }
+
+        // 父类：`nil` 根类、或 bind（父类在别的库里）。
+        match ctx.resolve_pointer(class_addr + ctx.ptr_size) {
+            Pointer::Address(super_addr) => {
+                entry.superclass = class_name_at(ctx, super_addr);
+                if entry.superclass.is_none() {
+                    account.superclass_unresolved += 1;
+                }
+            }
+            Pointer::Bound => account.superclass_bound += 1,
+            Pointer::Unknown => {}
+        }
+
+        if let Pointer::Address(ro) = ctx.resolve_pointer(class_addr + 4 * ctx.ptr_size) {
+            entry.instance_methods = methods_at(
+                ctx,
+                ro + layout.methods,
+                selectors_by_slot,
+                methtypes,
+                &mut account.unnamed_methods,
+            );
+            entry.protocols = protocols_at(ctx, ro + layout.protocols);
+            entry.ivars = ivars_at(ctx, ro + layout.ivars, &mut account.ivars_unparsed);
+        } else {
+            account.ro_unresolved += 1;
+        }
+
+        // 类方法在**元类**的 `class_ro_t` 里：`class_t.isa` → 元类 → data。
+        if let Pointer::Address(meta) = ctx.resolve_pointer(class_addr) {
+            if let Pointer::Address(ro) = ctx.resolve_pointer(meta + 4 * ctx.ptr_size) {
+                entry.class_methods = methods_at(
+                    ctx,
+                    ro + layout.methods,
+                    selectors_by_slot,
+                    methtypes,
+                    &mut account.unnamed_methods,
+                );
+            } else {
+                account.metaclass_unresolved += 1;
+            }
+        } else {
+            account.metaclass_unresolved += 1;
+        }
+
+        classes.push(entry);
+    }
+    (classes, account)
+}
+
+/// 解一张类别表（`__objc_catlist`）。
+///
+/// `category_t` 的布局（`objc-runtime-new.h`，全是指针）：
+///
+/// ```text
+/// +0  name                  +1*ptr  cls
+/// +2*ptr instanceMethods    +3*ptr  classMethods
+/// +4*ptr protocols          +5*ptr  instanceProperties
+/// ```
+fn parse_categories(
+    ctx: &Ctx<'_>,
+    selectors_by_slot: &HashMap<u64, String>,
+    methtypes: &HashMap<u64, String>,
+) -> (Vec<ObjcCategory>, ClassAccount) {
+    let mut categories = Vec::new();
+    let mut account = ClassAccount::default();
+    let Some(section) = ctx.section(SEC_CATLIST) else {
+        return (categories, account);
+    };
+    let count = section.size / ctx.ptr_size;
+
+    for index in 0..count {
+        let slot = section.addr + index * ctx.ptr_size;
+        let Pointer::Address(cat_addr) = ctx.resolve_pointer(slot) else {
+            account.pointer_unresolved += 1;
+            continue;
+        };
+        let mut entry = ObjcCategory {
+            address: cat_addr,
+            ..ObjcCategory::default()
+        };
+        if let Pointer::Address(name) = ctx.resolve_pointer(cat_addr) {
+            entry.name = ctx.cstring(name).filter(|text| !text.is_empty());
+        }
+        if entry.name.is_none() {
+            account.name_unresolved += 1;
+        }
+        // 被扩展的类：指针指向一个 `class_t`（本地类）或是 bind（外部类）。
+        match ctx.resolve_pointer(cat_addr + ctx.ptr_size) {
+            Pointer::Address(class_addr) => {
+                entry.class_name = class_name_at(ctx, class_addr);
+                if entry.class_name.is_none() {
+                    account.superclass_unresolved += 1;
+                }
+            }
+            Pointer::Bound => account.superclass_bound += 1,
+            Pointer::Unknown => {}
+        }
+        entry.instance_methods = methods_at(
+            ctx,
+            cat_addr + 2 * ctx.ptr_size,
+            selectors_by_slot,
+            methtypes,
+            &mut account.unnamed_methods,
+        );
+        entry.class_methods = methods_at(
+            ctx,
+            cat_addr + 3 * ctx.ptr_size,
+            selectors_by_slot,
+            methtypes,
+            &mut account.unnamed_methods,
+        );
+        categories.push(entry);
+    }
+    (categories, account)
+}
+
+/// 类/类别解析的账目（CLAUDE.md §7：解不出来的要能说清是哪一种"解不出来"）。
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassAccount {
+    /// 表项指针本身解不出来（bind 或坏指针）。
+    pointer_unresolved: usize,
+    /// 类名/类别名解不出来。
+    name_unresolved: usize,
+    /// 父类指针是 bind：父类在别的库里，静态文件里没有名字。
+    superclass_bound: usize,
+    /// 父类/被扩展类的名字解不出来。
+    superclass_unresolved: usize,
+    /// `class_ro_t` 解不出来。
+    ro_unresolved: usize,
+    /// 元类（类方法所在）解不出来。
+    metaclass_unresolved: usize,
+    /// 方法表里没解出名字的项。
+    unnamed_methods: usize,
+    /// ivar 表布局不认识。
+    ivars_unparsed: usize,
+}
+
+/// 把一张 `class_ro_t` 读成 `(类名, 实例方法, 类方法, ivar, 协议)` —— 只给测试用。
+///
+/// 单测要单独验一个类对象的各个字段，又不想把整套 `parse` 的产物搬来搬去。
+#[cfg(test)]
+fn decode_class_for_test(
+    ctx: &Ctx<'_>,
+    class_addr: u64,
+    selectors_by_slot: &HashMap<u64, String>,
+    methtypes: &HashMap<u64, String>,
+) -> ObjcClass {
+    let layout = RoLayout::for_ctx(ctx);
+    let mut unnamed = 0usize;
+    let mut ivars_unparsed = 0usize;
+    let mut out = ObjcClass {
+        address: class_addr,
+        ..ObjcClass::default()
+    };
+    out.name = class_name_at(ctx, class_addr);
+    if let Pointer::Address(super_addr) = ctx.resolve_pointer(class_addr + ctx.ptr_size) {
+        out.superclass = class_name_at(ctx, super_addr);
+    }
+    if let Pointer::Address(ro) = ctx.resolve_pointer(class_addr + 4 * ctx.ptr_size) {
+        out.instance_methods = methods_at(
+            ctx,
+            ro + layout.methods,
+            selectors_by_slot,
+            methtypes,
+            &mut unnamed,
+        );
+        out.protocols = protocols_at(ctx, ro + layout.protocols);
+        out.ivars = ivars_at(ctx, ro + layout.ivars, &mut ivars_unparsed);
+    }
+    if let Pointer::Address(meta) = ctx.resolve_pointer(class_addr) {
+        if let Pointer::Address(ro) = ctx.resolve_pointer(meta + 4 * ctx.ptr_size) {
+            out.class_methods = methods_at(
+                ctx,
+                ro + layout.methods,
+                selectors_by_slot,
+                methtypes,
+                &mut unnamed,
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unusual_byte_groupings)] // 测试里的地址字面量按节偏移紧凑书写
 mod tests {
@@ -870,5 +1352,251 @@ mod tests {
             "{:?}",
             meta.notes
         );
+    }
+
+    // ───────────────── 类 / 类别的归属关系 ─────────────────
+
+    /// 写一个 32 位小端。
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// 写一个 64 位小端。
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// 写一个"链式 rebase 指针"：值是相对镜像基址的偏移（§ `resolve_pointer`）。
+    fn put_rebase(bytes: &mut [u8], offset: usize, target_vaddr: u64) {
+        put_u64(bytes, offset, target_vaddr - 0x1_0000_0000);
+    }
+
+    /// 写一个"相对字段自己地址"的 int32（现代方法表 ABI）。
+    fn put_rel32(bytes: &mut [u8], entry_vaddr: u64, field_in_entry: u64, target_vaddr: u64) {
+        let field_vaddr = entry_vaddr + field_in_entry;
+        let relative = (target_vaddr as i64 - field_vaddr as i64) as i32;
+        let offset =
+            usize::try_from(field_vaddr - 0x1_0000_0000).expect("测试地址在 0x100000000 之上");
+        bytes[offset..offset + 4].copy_from_slice(&relative.to_le_bytes());
+    }
+
+    /// 合成一份"有类、有类别"的镜像。
+    ///
+    /// 布局**照 objc4 的结构定义算**（不是从解析代码反推，CLAUDE.md §6.11）：
+    /// `class_t` 五个指针 40 字节、`class_ro_t` 的字段偏移见 `RoLayout` 的文档、
+    /// `method_list_t` 是 8 字节表头 + `entsize` 项、`category_t` 六个指针。
+    ///
+    /// 地址约定：镜像基址 0x1_0000_0000，段覆盖 0x2000 字节，文件偏移 = 地址低位。
+    ///
+    /// | 区 | 地址 | 内容 |
+    /// | --- | --- | --- |
+    /// | 类表 | 0x1000 | 1 格 → `class_t` 0x1800 |
+    /// | 类别表 | 0x1100 | 1 格 → `category_t` 0x1900 |
+    /// | 名字池 | 0x1200… | 选择器、类名、类别名、协议名 |
+    /// | const | 0x1300 | 类 ro、元类 ro、方法表、协议表、ivar 表 |
+    /// | data | 0x1800 | class_t、元类 class_t、category_t、父类 class_t 与 ro |
+    ///
+    /// `superclass_bind` 为真时父类指针写成 bind（父类在别的库），用来验"如实标未知"。
+    fn class_fixture(superclass_bind: bool) -> (Vec<u8>, Vec<MachOSegment>) {
+        let mut bytes = vec![0u8; 0x2000];
+
+        // ── 名字池（都是 NUL 结尾的 cstring）──
+        let names: &[(usize, &str)] = &[
+            (0x1200, "setup"),
+            (0x1210, "shared"),
+            (0x1220, "doHook:"),
+            (0x1240, "MyClass"),
+            (0x1250, "MyParent"),
+            (0x1260, "MyProto"),
+            (0x1270, "Hooks"),
+            (0x1280, "count"),  // ivar 名
+            (0x1290, "v8@0:4"), // 类型编码
+        ];
+        for &(offset, text) in names {
+            bytes[offset..offset + text.len()].copy_from_slice(text.as_bytes());
+            bytes[offset + text.len()] = 0;
+        }
+
+        // ── 类表 / 类别表：各一格 rebase 指针 ──
+        put_rebase(&mut bytes, 0x1000, 0x1_0000_1800); // → class_t
+        put_rebase(&mut bytes, 0x1100, 0x1_0000_1900); // → category_t
+
+        // ── 类 ro（0x1300，64 位布局）──
+        put_u32(&mut bytes, 0x1300, 0x0); // flags
+        put_u32(&mut bytes, 0x1304, 8); // instanceStart
+        put_u32(&mut bytes, 0x1308, 16); // instanceSize
+        put_u32(&mut bytes, 0x130c, 0); // reserved（64 位专有！）
+        put_u64(&mut bytes, 0x1310, 0); // ivarLayout = nil
+        put_rebase(&mut bytes, 0x1318, 0x1_0000_1240); // name → "MyClass"
+        put_rebase(&mut bytes, 0x1320, 0x1_0000_1600); // baseMethods
+        put_rebase(&mut bytes, 0x1328, 0x1_0000_1700); // baseProtocols
+        put_rebase(&mut bytes, 0x1330, 0x1_0000_1740); // ivars
+                                                       // weakIvarLayout(0x1338) 与 baseProperties(0x1340) 留 0。
+
+        // ── 元类 ro（0x1380）：flags 带 RO_META(1)，baseMethods 是类方法表 ──
+        put_u32(&mut bytes, 0x1380, 0x1); // flags = RO_META
+        put_rebase(&mut bytes, 0x1380 + 0x18, 0x1_0000_1240); // name → "MyClass"
+        put_rebase(&mut bytes, 0x1380 + 0x20, 0x1_0000_1650); // baseMethods（类方法）
+
+        // ── 实例方法表（0x1600）：表头 8 字节 + 1 项 entsize 12 ──
+        put_u32(&mut bytes, 0x1600, 0x0c); // entsize = 12
+        put_u32(&mut bytes, 0x1604, 1); // count = 1
+                                        // entry 在 0x1608：name @+0、types @+4、imp @+8
+        put_rel32(&mut bytes, 0x1_0000_1608, 0, 0x1_0000_1200); // → "setup"
+        put_rel32(&mut bytes, 0x1_0000_1608, 4, 0x1_0000_1290); // → "v8@0:4"
+        put_rel32(&mut bytes, 0x1_0000_1608, 8, 0x1_0000_0a00); // imp
+
+        // ── 类方法表（0x1650）：1 项 → "shared" ──
+        put_u32(&mut bytes, 0x1650, 0x0c);
+        put_u32(&mut bytes, 0x1654, 1);
+        put_rel32(&mut bytes, 0x1_0000_1658, 0, 0x1_0000_1210);
+        put_rel32(&mut bytes, 0x1_0000_1658, 4, 0x1_0000_1290);
+        put_rel32(&mut bytes, 0x1_0000_1658, 8, 0x1_0000_0a40);
+
+        // ── 类别方法表（0x1680）：1 项 → "doHook:" ──
+        put_u32(&mut bytes, 0x1680, 0x0c);
+        put_u32(&mut bytes, 0x1684, 1);
+        put_rel32(&mut bytes, 0x1_0000_1688, 0, 0x1_0000_1220);
+        put_rel32(&mut bytes, 0x1_0000_1688, 4, 0x1_0000_1290);
+        put_rel32(&mut bytes, 0x1_0000_1688, 8, 0x1_0000_0b00);
+
+        // ── 协议表（0x1700）：count 1 + protocol_t* ──
+        put_u64(&mut bytes, 0x1700, 1); // count（无符号指针）
+        put_rebase(&mut bytes, 0x1708, 0x1_0000_1720); // → protocol_t
+                                                       // protocol_t（0x1720）：isa、name。
+        put_rebase(&mut bytes, 0x1728, 0x1_0000_1260); // name → "MyProto"
+
+        // ── ivar 表（0x1740）：表头 8 字节 + 1 项 entsize 32（绝对指针）──
+        put_u32(&mut bytes, 0x1740, 32); // entsize = 32
+        put_u32(&mut bytes, 0x1744, 1); // count = 1
+                                        // entry 在 0x1748：offset(0)、name@+8、type@+16
+        put_rebase(&mut bytes, 0x1748 + 8, 0x1_0000_1280); // name → "count"
+        put_u32(&mut bytes, 0x1748 + 24, 3); // alignment_raw
+        put_u32(&mut bytes, 0x1748 + 28, 8); // size
+
+        // ── class_t（0x1800）：isa、superclass、cache、vtable、data ──
+        put_rebase(&mut bytes, 0x1800, 0x1_0000_1880); // isa → 元类 class_t
+        if superclass_bind {
+            // bind 指针：高位置 1（CHAINED_BIND），低位是符号池序号。
+            put_u64(&mut bytes, 0x1800 + 8, 0x8000_0000_0000_0064);
+        } else {
+            put_rebase(&mut bytes, 0x1800 + 8, 0x1_0000_1a00); // superclass → 父类 class_t
+        }
+        put_rebase(&mut bytes, 0x1800 + 32, 0x1_0000_1300); // data → 类 ro
+
+        // ── 元类 class_t（0x1880）：data 指向元类 ro ──
+        put_rebase(&mut bytes, 0x1880 + 32, 0x1_0000_1380);
+
+        // ── category_t（0x1900）：name、cls、instanceMethods、classMethods ──
+        put_rebase(&mut bytes, 0x1900, 0x1_0000_1270); // name → "Hooks"
+        put_rebase(&mut bytes, 0x1900 + 8, 0x1_0000_1a00); // cls → 父类（复用）
+        put_rebase(&mut bytes, 0x1900 + 16, 0x1_0000_1680); // instanceMethods
+
+        // ── 父类 class_t（0x1a00）与父类 ro（0x1a40）──
+        put_rebase(&mut bytes, 0x1a00 + 32, 0x1_0000_1a40);
+        put_rebase(&mut bytes, 0x1a40 + 0x18, 0x1_0000_1250); // name → "MyParent"
+
+        let sections = vec![
+            section("__objc_classlist", 0x1_0000_1000, 8, 0x1000),
+            section("__objc_catlist", 0x1_0000_1100, 8, 0x1100),
+            section("__objc_classname", 0x1_0000_1200, 0x100, 0x1200),
+            section("__objc_const", 0x1_0000_1300, 0x500, 0x1300),
+            section("__objc_data", 0x1_0000_1800, 0x300, 0x1800),
+        ];
+        let segments = vec![MachOSegment {
+            name: "__DATA".to_string(),
+            vmaddr: 0x1_0000_0000,
+            vmsize: 0x2000,
+            fileoff: 0,
+            filesize: 0x2000,
+            maxprot: 3,
+            initprot: 3,
+            sections,
+        }];
+        (bytes, segments)
+    }
+
+    #[test]
+    fn a_class_ro_yields_name_superclass_methods_ivars_and_protocols() {
+        let (bytes, segments) = class_fixture(false);
+        let ctx = Ctx::new(&bytes, 0x1_0000_0000, true, true, &segments);
+
+        let class = decode_class_for_test(&ctx, 0x1_0000_1800, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            class.name.as_deref(),
+            Some("MyClass"),
+            "类名在 ro +24（64 位有 reserved）"
+        );
+        assert_eq!(
+            class.superclass.as_deref(),
+            Some("MyParent"),
+            "父类走 superclass → ro.name"
+        );
+
+        // 实例方法：相对偏移 ABI（entsize 12）。
+        assert_eq!(class.instance_methods.len(), 1);
+        let method = &class.instance_methods[0];
+        assert_eq!(method.selector, "setup");
+        assert_eq!(method.types.as_deref(), Some("v8@0:4"));
+        assert_eq!(method.imp, Some(0x1_0000_0a00));
+
+        // 类方法在元类的 ro 里。
+        assert_eq!(class.class_methods.len(), 1);
+        assert_eq!(class.class_methods[0].selector, "shared");
+        assert_eq!(class.class_methods[0].imp, Some(0x1_0000_0a40));
+
+        // ivar 与协议。
+        assert_eq!(class.ivars, vec!["count".to_string()]);
+        assert_eq!(class.protocols, vec!["MyProto".to_string()]);
+    }
+
+    #[test]
+    fn a_category_carries_its_owner_class_and_methods() {
+        let (bytes, segments) = class_fixture(false);
+
+        let meta = parse(&bytes, 0x1_0000_0000, true, true, Arch::Aarch64, &segments);
+
+        assert_eq!(meta.categories.len(), 1);
+        let category = &meta.categories[0];
+        assert_eq!(category.name.as_deref(), Some("Hooks"));
+        assert_eq!(category.class_name.as_deref(), Some("MyParent"));
+        assert_eq!(category.instance_methods.len(), 1);
+        assert_eq!(category.instance_methods[0].selector, "doHook:");
+        assert_eq!(category.instance_methods[0].imp, Some(0x1_0000_0b00));
+    }
+
+    #[test]
+    fn a_bound_superclass_is_reported_as_unknown_not_invented() {
+        let (bytes, segments) = class_fixture(true);
+        let ctx = Ctx::new(&bytes, 0x1_0000_0000, true, true, &segments);
+
+        let (classes, account) = parse_classes(&ctx, &HashMap::new(), &HashMap::new());
+        assert_eq!(classes.len(), 1);
+        assert_eq!(
+            classes[0].superclass, None,
+            "父类是 bind（在别的库里）⇒ 名字未知，不许编造"
+        );
+        assert_eq!(account.superclass_bound, 1, "这件事要记账");
+        assert_eq!(
+            classes[0].name.as_deref(),
+            Some("MyClass"),
+            "类本身的名字照样解得出来"
+        );
+    }
+
+    #[test]
+    fn the_full_parse_reports_class_ownership_in_notes() {
+        let (bytes, segments) = class_fixture(false);
+        let meta = parse(&bytes, 0x1_0000_0000, true, true, Arch::Aarch64, &segments);
+
+        assert!(
+            meta.notes.iter().any(|note| note.contains("ObjC 归属")),
+            "归属的账目要在 notes 里：{:?}",
+            meta.notes
+        );
+        assert!(!meta.is_empty());
+        assert_eq!(meta.classes.len(), 1);
+        assert_eq!(meta.categories.len(), 1);
     }
 }

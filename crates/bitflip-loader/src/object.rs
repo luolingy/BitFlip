@@ -713,6 +713,54 @@ pub struct ObjcStub {
     pub selector: String,
 }
 
+/// ObjC 类（`__objc_classlist` 里的一格解出来的）。
+///
+/// 这张表回答的是**归属**问题：前面那一版的 objc 解析只给"选择器 → 实现地址"，
+/// 于是界面上只有一百多个裸选择器，看不出它们分别属于哪个类。类结构
+/// （`class_t` → `class_ro_t`）里写着类名与方法表的连接，所以这里能说
+/// "`-[LiveContainer setup]`"而不只是"`setup`"。
+///
+/// 每一项都可能是 `None`：名字读不到、父类指针是 bind（父类在别的库里）——
+/// 那是**确实不知道**，不编造（CLAUDE.md §7）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjcClass {
+    /// 类对象地址（`class_t` 自己的地址）。
+    pub address: u64,
+    /// 类名（来自 `class_ro_t.name`）。读不到时 `None`。
+    pub name: Option<String>,
+    /// 父类名（`class_t.superclass` → 父类的 `class_ro_t.name`）。
+    ///
+    /// 父类是外部符号（例如 `NSObject` 来自 Foundation）时指针是 bind，
+    /// 静态文件里没有名字 ⇒ `None`。
+    pub superclass: Option<String>,
+    /// 实例方法（`class_ro_t.baseMethods`）。
+    pub instance_methods: Vec<ObjcMethod>,
+    /// 类方法（元类的 `class_ro_t.baseMethods`）。
+    pub class_methods: Vec<ObjcMethod>,
+    /// 实例变量名（`class_ro_t.ivars`）。
+    pub ivars: Vec<String>,
+    /// 遵循的协议名（`class_ro_t.baseProtocols`）。
+    pub protocols: Vec<String>,
+}
+
+/// ObjC 类别（`__objc_catlist` 里的一格）。
+///
+/// 类别**没有自己的类**：它给已有的类加方法。所以这里的 `class_name` 是
+/// "被扩展的类"，`name` 是类别自己的名字（`LiveContainer (Hooks)` 里的 `Hooks`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjcCategory {
+    /// 类别对象地址（`category_t` 自己的地址）。
+    pub address: u64,
+    /// 类别名（`category_t.name`）。
+    pub name: Option<String>,
+    /// 被扩展的类名（`category_t.cls` → 那个类的 `class_ro_t.name`）。
+    pub class_name: Option<String>,
+    /// 类别里的实例方法。
+    pub instance_methods: Vec<ObjcMethod>,
+    /// 类别里的类方法。
+    pub class_methods: Vec<ObjcMethod>,
+}
+
 /// ObjC 元数据（来自 `__objc_*` 节）。
 ///
 /// 只有一个二进制里真的带 objc 元数据时才有内容；**空表 ≠ "这个二进制没有
@@ -723,9 +771,17 @@ pub struct ObjcMetadata {
     /// 选择器引用（`__objc_selrefs`）。
     pub selector_refs: Vec<ObjcSelectorRef>,
     /// 方法（`__objc_methlist` 与类的方法表）。
+    ///
+    /// 只有 `__objc_methlist` 里那部分（老 ABI 会把所有方法表连成一节）；
+    /// 现代二进制里每个类的方法表是**独立的**，那部分在 [`Self::classes`] 与
+    /// [`Self::categories`] 里，按类归属给出来。
     pub methods: Vec<ObjcMethod>,
     /// 消息转发桩（`__objc_stubs`）。
     pub stubs: Vec<ObjcStub>,
+    /// 类（`__objc_classlist`）：类名 + 实例方法 + 类方法 + ivar + 协议。
+    pub classes: Vec<ObjcClass>,
+    /// 类别（`__objc_catlist`）。
+    pub categories: Vec<ObjcCategory>,
     /// 类名池（`__objc_classname`）里的名字。
     pub class_names: Vec<String>,
     /// 解析说明（降级、未能解析的部分）。
@@ -739,6 +795,8 @@ impl ObjcMetadata {
         self.selector_refs.is_empty()
             && self.methods.is_empty()
             && self.stubs.is_empty()
+            && self.classes.is_empty()
+            && self.categories.is_empty()
             && self.class_names.is_empty()
     }
 }
