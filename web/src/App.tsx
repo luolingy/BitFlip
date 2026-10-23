@@ -21,6 +21,7 @@ import { MembersView } from "./MembersView";
 import { DexView } from "./DexView";
 import { readDexUrl } from "./dexUrl";
 import { ScriptConsole } from "./ScriptConsole";
+import { PatchView } from "./PatchView";
 import {
   ArgScanView,
   CallGraphView,
@@ -65,6 +66,7 @@ type ViewId =
   | "frames"
   | "xref-search"
   | "reachability"
+  | "patch"
   | "script";
 
 const NAV_SECTIONS: readonly {
@@ -99,6 +101,8 @@ const NAV_SECTIONS: readonly {
   // 可达性回答"这一片代码是不是活的"（但必须连着未解析数一起读）。
   { id: "xref-search", title: "交叉引用搜索", milestone: "M6", hint: "按类型/来源/范围过滤全表", ready: true },
   { id: "reachability", title: "可达性", milestone: "M6", hint: "从入口沿调用边的可达集（下界）", ready: true },
+  // 打补丁：默认只读预览计划，"解锁并写出副本"是显式点击的按钮。
+  { id: "patch", title: "打补丁", milestone: "P1", hint: "预览计划（只读）/ 解锁后写 .patched 副本", ready: true },
   // M7：脚本控制台。入口放在最后 —— 它是"把前面这些能力连起来自动化"的地方，
   // 而不是又一个看数据的视图。
   { id: "script", title: "脚本控制台", milestone: "M7", hint: "写脚本读分析结果、批量写标注", ready: true },
@@ -124,6 +128,7 @@ const VIEW_TITLES: Record<ViewId, string> = {
   frames: "栈帧 / 局部变量",
   "xref-search": "交叉引用搜索",
   reachability: "可达性",
+  patch: "打补丁",
   script: "脚本控制台",
 };
 
@@ -338,6 +343,8 @@ export function App() {
             <XrefSearchView token={token} onNavigate={navigate} />
           ) : view === "reachability" ? (
             <ReachabilityView token={token} onNavigate={navigate} />
+          ) : view === "patch" ? (
+            <PatchView token={token} />
           ) : view === "script" ? (
             <ScriptConsole token={token} />
           ) : parsed ? (

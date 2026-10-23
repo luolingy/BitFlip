@@ -5,6 +5,36 @@
 
 ## [Unreleased]
 
+### 新增 — 打补丁接到 CLI 与 Web：默认只读预览，「解锁」是显式一步
+
+把这两轮做的 `bitflip-patch` 地基变成用户真正能用上的东西。安全语义一路贯穿：
+**默认只读**，写盘是"显式解锁"那一步，且只写 `xxx.patched` 副本，原文件始终不动。
+
+- **CLI `bitflip-cli patch`**：
+  - `patch <目标> --edit 0x401000=9090`（可重复）：只打印计划 diff（虚拟地址 /
+    文件偏移 / 原字节 / 新字节 / 所属段），一行不写盘；
+  - 加 `--apply` 才是那次"显式解锁"，写出 `xxx.patched` 副本并打印记账
+    （改了几字节、哪几段、大小前后）；
+  - `--json` 给脚本用的稳定契约；`--arch/--base/--mode` 在 patch 上会报错
+    （打补丁依据目标自身段/偏移，不猜架构）。
+- **Web 新增「打补丁」视图**：输入地址与字节 → 「预览计划（只读）」看 diff 表 →
+  「解锁并写出副本」按钮才调写盘接口。门前设在**服务端**：
+  `POST /api/patch/apply` 要求请求体里 `confirm_unlock: true`，缺省/`false` 一律 400，
+  绝不会"忘了点按钮就偷偷写了"。
+- **服务端两个新端点**：`POST /api/patch/plan`（只读）与 `POST /api/patch/apply`
+  （需 `confirm_unlock`）。都是纯新增 HTTP 路由、请求/响应自带 JSON，**没有改动任何
+  core 公开类型的形状**，所以 `CORE_API_VERSION` / `SERVER_API_VERSION` **不动**（它们跟
+  的是 core 形状，不是端点数）。
+- **实测**（真实 IPA 主二进制 LiveContainer）：
+  - `--plan`：`0x100001000` → 文件偏移 0x1000、`__TEXT`、原字节 0000 → 新字节 9090，只读；
+  - `--apply`：写出副本、大小 151648→151648 未变、**原文件 SHA-256 前后一致（未改动）**；
+  - 打到签名区（文件偏移 134928..）：**被拒**，原因是"落在代码签名区 …：签名会失效"。
+- **测试**：CLI 新增 8 条（hex 解析、地址解析、只读不写盘、apply 写副本且原文件不变、
+  越界被拒、JSON 契约）；服务端新增 6 条（含"未确认解锁被拒且不写盘"、"确认后写副本
+  且原文件不变"、"plan 只读"）；web `tsc --noEmit` 与 `vite build` 通过。
+- **依赖**：`bitflip-patch` 进 workspace 依赖；`bitflip-cli`、`bitflip-server` 依赖它
+  （单向，不引入循环）。
+
 ### 新增 — 打补丁模块接上代码签名区（`LC_CODE_SIGNATURE`）
 
 `bitflip-patch` 上一版对"代码签名区"是 `None`（不知道签名区在哪）。这一版把它接实：

@@ -92,6 +92,8 @@ pub enum Command {
     Diff(DiffArgs),
     /// 启动本地 Web 服务
     Serve(ServeArgs),
+    /// 打补丁：预览计划（只读）或写出 `.patched` 副本（需显式 --apply）
+    Patch(PatchArgs),
     /// 打印版本与 API 版本
     Version,
 }
@@ -575,6 +577,29 @@ pub struct ServeArgs {
     pub raw: RawOverrideArgs,
 }
 
+/// `patch` 参数（把 `bitflip-patch` 接到命令行）。
+///
+/// 默认**只读**：只打印计划（不走 `--apply` 就一行也不写盘）。
+/// 只有显式 `--apply` 才会解锁并写出 `.patched` 副本 —— 原文件永不原地覆写。
+#[derive(Debug, Args)]
+pub struct PatchArgs {
+    /// 目标文件（必须是 PE/ELF/Mach-O 这类有段/偏移的可执行对象，不能是容器/归档）
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 一处改动：`地址=十六进制字节`，可重复。例如 `--edit 0x401000=9090`
+    #[arg(long = "edit", value_name = "ADDR=HEX")]
+    pub edit: Vec<String>,
+    /// 写副本 `xxx.patched`。不给就只读预览计划，不写盘。
+    #[arg(long)]
+    pub apply: bool,
+    /// 输出 JSON（稳定的 wire 契约，供脚本消费）
+    #[arg(long)]
+    pub json: bool,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,6 +1077,41 @@ mod tests {
         assert!(
             Cli::try_parse_from(["bitflip-cli", "diff", "a", "b", "--base", "0x400000"]).is_err(),
             "diff 不该接受 --base：同上"
+        );
+    }
+
+    /// `patch` 子命令能带上目标、`--edit`、`--apply`、`--json`。
+    #[test]
+    fn patch_subcommand_parses_edits_and_flags() {
+        let cli = Cli::try_parse_from([
+            "bitflip-cli",
+            "patch",
+            "app.exe",
+            "--edit",
+            "0x401000=9090",
+            "--edit",
+            "0x401002=c3",
+            "--apply",
+            "--json",
+        ])
+        .expect("patch 应当能解析");
+        match cli.command {
+            Command::Patch(args) => {
+                assert_eq!(args.target, std::path::PathBuf::from("app.exe"));
+                assert_eq!(args.edit, vec!["0x401000=9090", "0x401002=c3"]);
+                assert!(args.apply);
+                assert!(args.json);
+            }
+            _ => panic!("应当是 Patch 子命令"),
+        }
+    }
+
+    /// `patch` 不给目标应当解析失败。
+    #[test]
+    fn patch_requires_a_target() {
+        assert!(
+            Cli::try_parse_from(["bitflip-cli", "patch"]).is_err(),
+            "patch 不给目标应当解析失败"
         );
     }
 }

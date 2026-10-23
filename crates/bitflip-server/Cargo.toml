@@ -13,6 +13,7 @@ categories.workspace = true
 [dependencies]
 bitflip-core = { workspace = true }
 bitflip-script = { workspace = true }
+bitflip-patch = { workspace = true }
 axum = { workspace = true }
 mime_guess = { workspace = true }
 rand = { workspace = true }

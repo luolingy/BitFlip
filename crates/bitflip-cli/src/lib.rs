@@ -8,6 +8,7 @@ mod export;
 mod info;
 mod manifest;
 mod members;
+mod patch;
 mod serve;
 mod signature;
 mod tracing_setup;
@@ -18,7 +19,7 @@ use clap::Parser;
 
 pub use cli::{
     Cli, Command, DexArgs, DiffArgs, ExportArgs, FunctionsArgs, InfoArgs, MembersArgs, OpenCli,
-    RawOverrideArgs, ServeArgs, SignatureArgs, SignatureBuildArgs, SignatureCommand,
+    PatchArgs, RawOverrideArgs, ServeArgs, SignatureArgs, SignatureBuildArgs, SignatureCommand,
     SignatureInfoArgs, SymbolArgs,
 };
 pub use dex::{build_json as build_dex_json, build_text as build_dex_text, run_dex};
@@ -27,6 +28,7 @@ pub use export::run_export;
 pub use info::run_info;
 pub use manifest::run_manifest;
 pub use members::{run_functions, run_members, run_symbol};
+pub use patch::run_patch;
 pub use serve::{serve_blocking, ServeRequest};
 pub use signature::run_signature;
 
@@ -66,6 +68,7 @@ pub fn cli_main() -> ExitCode {
         Command::Signature(args) => report(run_signature(&args)),
         Command::Export(args) => report(run_export(&args)),
         Command::Diff(args) => report(run_diff(&args)),
+        Command::Patch(args) => report(run_patch(&args)),
         Command::Serve(args) => {
             let open_options = match args.raw.to_open_options() {
                 Ok(o) => o,

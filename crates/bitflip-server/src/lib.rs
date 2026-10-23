@@ -12,6 +12,7 @@
 
 mod assets;
 mod dex;
+mod patch;
 pub mod script;
 
 use std::collections::BTreeSet;
@@ -43,6 +44,10 @@ pub const TOKEN_QUERY: &str = "token";
 ///
 /// 与 `bitflip_core::CORE_API_VERSION` **同步**：服务转发的是 core 的类型，
 /// 两者形状一变就得一起变（`bitflip-cli` 的 `version` 测试钉住这条一致性）。
+///
+/// 注意：`POST /api/patch/plan` 与 `POST /api/patch/apply` 是**纯新增的 HTTP
+/// 路由**，请求/响应是它们自己的 JSON，没有改动任何 core 公开类型的形状，
+/// 所以这个号**不动**（它跟的是 core 形状，不是端点数）。
 pub const SERVER_API_VERSION: u32 = 7;
 
 /// 程序名。
@@ -472,6 +477,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hex", get(hex))
         .route("/api/export", get(export))
         .route("/api/diff", get(diff))
+        // ── 打补丁（`bitflip-patch`） ──
+        // plan 只读；apply 要求请求体显式带 confirm_unlock:true（门在服务端，不在前端）。
+        // 两者都只写 `xxx.patched` 副本，原文件在磁盘上始终不动。
+        .route("/api/patch/plan", post(patch::plan))
+        .route("/api/patch/apply", post(patch::apply))
         // ── M2b：DEX（APK / .dex） ──
         // 独立的端点族，不塞进 `/api/sections` / `/api/insns`：DEX 没有段表、
         // 没有线性地址，硬塞会让前端拿到"看起来正常、实际没意义"的数据（ADR-0020）。

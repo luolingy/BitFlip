@@ -18,6 +18,7 @@ path = "src/main.rs"
 bitflip-core = { workspace = true }
 bitflip-server = { workspace = true }
 bitflip-signature = { workspace = true }
+bitflip-patch = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

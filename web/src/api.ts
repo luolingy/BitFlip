@@ -1479,14 +1479,112 @@ async function requestJson(
   }
 }
 
+// ── 打补丁（bitflip-patch） ──────────────────────────────────────────────────
+
+/** 一处改动：`{ vaddr, new_hex }`。 */
+export interface PatchEditWire {
+  /** 虚拟地址（十进制或 0x 十六进制字符串）。 */
+  vaddr: string;
+  /** 新字节（十六进制字符串，偶数位）。 */
+  new_hex: string;
+}
+
+/** 计划里的一处改动（服务端回填 `original` / `file_offset` / `segment`）。 */
+export interface PatchSiteWire {
+  vaddr: string;
+  file_offset: number;
+  original: string;
+  new: string;
+  segment: string | null;
+}
+
+/** `POST /api/patch/plan` 的响应：只读预览，`written` 恒为 false。 */
+export interface PatchPlanResponse {
+  ok: boolean;
+  written: boolean;
+  target: string;
+  kind: string;
+  copy_path: string;
+  changed_bytes: number;
+  segments: string[];
+  sites: PatchSiteWire[];
+}
+
+/** `POST /api/patch/apply` 的响应（写了副本之后）。 */
+export interface PatchApplyResponse {
+  ok: boolean;
+  written: boolean;
+  copy_path: string;
+  original_path: string;
+  changed_bytes: number;
+  segments: string[];
+  size_before: number;
+  size_after: number;
+  original_untouched: boolean;
+}
+
+/** POST 一个返回 JSON 的请求（与 `requestJson` 不同，这里把响应体读出来）。 */
+async function postJsonResult<T>(
+  path: string,
+  token: string | null,
+  body: unknown,
+): Promise<T> {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (token) {
+    headers["x-bitflip-token"] = token;
+  }
+  const response = await fetch(path, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let message = `请求失败（HTTP ${response.status}）`;
+    try {
+      const parsed: unknown = await response.json();
+      if (parsed && typeof parsed === "object" && "error" in parsed) {
+        const raw = (parsed as { error: unknown }).error;
+        if (typeof raw === "string") {
+          message = raw;
+        }
+      }
+    } catch {
+      // 响应体不是 JSON：保留默认信息。
+    }
+    throw new ApiError(response.status, message);
+  }
+  return (await response.json()) as T;
+}
+
+/** 只读预览补丁计划（永不写盘）。 */
+export function fetchPatchPlan(
+  token: string | null,
+  edits: PatchEditWire[],
+): Promise<PatchPlanResponse> {
+  return postJsonResult<PatchPlanResponse>("/api/patch/plan", token, { edits });
+}
+
+/**
+ * 写出补丁副本。**这是唯一写盘的动作**，且服务端要求 `confirm_unlock: true`
+ * 才会真正写 —— 对应界面上的「解锁并写出副本」按钮。
+ */
+export function applyPatch(
+  token: string | null,
+  edits: PatchEditWire[],
+): Promise<PatchApplyResponse> {
+  return postJsonResult<PatchApplyResponse>("/api/patch/apply", token, {
+    edits,
+    confirm_unlock: true,
+  });
+}
+
 /**
  * 把用户输入的地址规范成定长 16 位小写十六进制。
  *
  * 返回 `null` 表示输入不是合法地址 —— **不要**回退到 0：
  * 那会让用户以为自己跳转成功了，其实只是回到了文件开头。
  */
-export function normalizeAddress(input: string): string | null {
-  const trimmed = input.trim().replace(/^0x/i, "");
+export function normalizeAddress(input: string): string | null {  const trimmed = input.trim().replace(/^0x/i, "");
   if (!/^[0-9a-fA-F]{1,16}$/.test(trimmed)) {
     return null;
   }

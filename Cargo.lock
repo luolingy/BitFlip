@@ -229,6 +229,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bitflip-core",
+ "bitflip-patch",
  "bitflip-server",
  "bitflip-signature",
  "clap",
@@ -325,6 +326,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "bitflip-core",
+ "bitflip-patch",
  "bitflip-script",
  "mime_guess",
  "rand 0.8.8",
