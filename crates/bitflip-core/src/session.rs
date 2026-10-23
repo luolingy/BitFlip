@@ -2340,17 +2340,29 @@ mod tests {
         let mut meta = SwiftMetadata::default();
         meta.type_count = 3;
         meta.types = vec![
-            SwiftSymbol { address: 0x1000, name: "Foo".into() },
-            SwiftSymbol { address: 0x1008, name: "Bar".into() },
+            SwiftSymbol {
+                address: 0x1000,
+                name: "Foo".into(),
+            },
+            SwiftSymbol {
+                address: 0x1008,
+                name: "Bar".into(),
+            },
         ];
         meta.protocol_count = 1;
-        meta.protocols = vec![SwiftSymbol { address: 0x2000, name: "Baz".into() }];
+        meta.protocols = vec![SwiftSymbol {
+            address: 0x2000,
+            name: "Baz".into(),
+        }];
         meta.has_entry = true;
         meta.notes = vec!["示例说明".into()];
         let wire = SwiftInfoWire::from_loader(&meta);
         assert_eq!(wire.type_count, 3, "type_count 是条目数，不是解出数");
         assert_eq!(wire.types_named, 2, "解出两个名字");
-        assert_eq!(wire.type_samples, vec!["Foo".to_string(), "Bar".to_string()]);
+        assert_eq!(
+            wire.type_samples,
+            vec!["Foo".to_string(), "Bar".to_string()]
+        );
         assert_eq!(wire.protocol_count, 1);
         assert_eq!(wire.protocol_samples, vec!["Baz".to_string()]);
         assert!(wire.has_entry);
