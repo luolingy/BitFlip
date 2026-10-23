@@ -5,6 +5,40 @@
 
 ## [Unreleased]
 
+### 修复 — ObjC 类名大批读不出来：`class_t.data` 的低 3 位标志没清（M12 第十片·补）
+
+上一片（M12 第十片）落地 ObjC 归属后，SideStore 主二进制 304 个类里**有 177 个类名
+读不出来**。本片查出根因并修掉。
+
+- **根因**：`class_t.data` 不是干净的 rebase 指针 —— objc4 里它存的是
+  `ro | 标志位`，**低 3 位被借去放标志**（`FAST_DATA_MASK = 0x00007ffffffffff8`
+  就是专门清这几位的）。上一片沿用了通用 rebase 掩码 `0xF_FFFF_FFFF`，保留了低 3 位，
+  于是 `class_ro_t` 读在偏 2 字节的位置 —— `flags`/`name` 全是垃圾，类名恒空。
+  这不是 Swift 布局问题：解出来的正是 `_TtC9SideStore12ImportExport` 这类
+  Swift 类名，只是地址偏了。
+- **修法**：`Ctx::resolve_class_data` 专解 `class_t.data`，按 `FAST_DATA_MASK` 清位；
+  其余槽（`isa`/`superclass`/`ro.name`）仍是干净的指针，仍走 `resolve_pointer`。
+- **同时保住老文件**：无链式修复的老 Mach-O（如 PojavLauncher）里 `data` 是
+  **已解好的绝对地址**。只做 `base + offset` 会把 base 加两遍、全数解不出 ——
+  所以 `resolve_class_data` 保留两级回退：先当偏移，不行当绝对值。
+  （这个坑是本片自己引入又当场发现并补测的：加掩码时一度让 PojavLauncher 从
+  38/38 掉到 0/38。）
+- **实测（`llvm-objdump` + 二进制自身符号表当基准）**：
+
+  | 样本 | 类 | 修前解出类名 | 修后解出类名 | 修前方法 | 修后方法 |
+  | --- | --- | --- | --- | --- | --- |
+  | LiveContainer | 1 | 1 | 1 | 19 | 19 |
+  | SideStore | 304 | **127** | **304** | 1828 | **2759** |
+  | PojavLauncher | 38 | 38 | 38 | 731 | 731 |
+
+  PojavLauncher 全程 38/38、不回退，证明绝对值回退路径是对的。
+- **测试**：合成镜像的 `data` 槽改成按真实 ABI 或上标志位（`put_class_data`），
+  让单测能测出"掩码没清低 3 位"这个缺陷；新增"绝对值 data 指针不许加两遍 base"
+  的用例。真实样本测试补 SideStore 304/304、PojavLauncher 38/38 的回归断言。
+- **不改 API/格式版本**：只修正解出来的结果，`ObjectInfo` 形状与
+  `INFO_FORMAT_VERSION` / `CORE_API_VERSION` / `SERVER_API_VERSION` 都不动。
+
+
 > **缺记声明**：M3 / M4 / M5 / M6 四个阶段的条目在本文件中**缺失** ——
 > 本次补记时没有把握据实重建（只能从提交标题反推，那正是本项目禁止的"看起来对"）。
 > 这四个阶段各自交付了什么、哪些交付物只做了一部分，**以 `docs/PLAN.md` 里

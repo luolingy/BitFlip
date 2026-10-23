@@ -1446,4 +1446,37 @@ fn real_ios_binaries_report_objc_class_ownership() {
         "LiveContainer 的 notes 里应当有归属的账目：{:?}",
         lc.notes
     );
+
+    // 回归守卫（本片修掉的真缺陷）：`class_t.data` 低 3 位是标志位，必须按
+    // `FAST_DATA_MASK` 清掉，否则 `class_ro_t` 读偏 2 字节、类名恒空。
+    // 修前 SideStore 只有 127/304 解出类名、PojavLauncher 还是老式绝对值指针
+    // （不能加两遍 base）。两边现在都必须全解出来 —— 少一个就说明掩码/回退又坏了。
+    let ss = counts
+        .iter()
+        .find(|row| row.name.contains("SideStore"))
+        .expect("样本里应当有 SideStore");
+    assert_eq!(
+        ss.classes, 304,
+        "SideStore：__objc_classlist 304 个指针，实际 {}",
+        ss.classes
+    );
+    assert_eq!(
+        ss.named_classes, 304,
+        "SideStore：304 个类名都要解出来（data 低 3 位标志位要被 FAST_DATA_MASK 清掉），实际 {}",
+        ss.named_classes
+    );
+    let pj = counts
+        .iter()
+        .find(|row| row.name.contains("PojavLauncher"))
+        .expect("样本里应当有 PojavLauncher");
+    assert_eq!(
+        pj.classes, 38,
+        "PojavLauncher：__objc_classlist 38 个指针，实际 {}",
+        pj.classes
+    );
+    assert_eq!(
+        pj.named_classes, 38,
+        "PojavLauncher：38 个类名都要解出来（老式绝对值 data 指针不能加两遍 base），实际 {}",
+        pj.named_classes
+    );
 }

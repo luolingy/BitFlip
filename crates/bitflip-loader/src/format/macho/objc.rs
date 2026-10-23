@@ -87,6 +87,19 @@ const REBASE_TARGET_MASK: u64 = 0xF_FFFF_FFFF;
 /// 链式修复的 bind 标志（最高位）：目标是符号池里的符号，静态文件里没有地址。
 const CHAINED_BIND: u64 = 1 << 63;
 
+/// `class_t.data` 的掩码（objc4 `objc-runtime-new.h` 的 `FAST_DATA_MASK`）。
+///
+/// `class_t.data` 不是一条干净的 rebase 指针：**低 3 位被借去放标志位**
+/// （`rw_t` 实现相关，实测 SideStore 上是 `0b010`），高位还可能带指针认证/
+/// 链式修复残留位。必须按 `FAST_DATA_MASK` 把低 3 位和 47 位以上的位一起清掉，
+/// 否则 `class_ro_t` 会读在偏 2 字节的位置 —— `flags`/`name` 全是垃圾，类名恒空。
+///
+/// 这是实测出来的：SideStore 的 304 个类里 177 个名字读不出来，逐个走
+/// `class_t.data → ro → name` 发现 `data` 的低位是 `0x2`，而 `ro` 落在
+/// `…e1a` 这种非 8 字节对齐的地址上；换成 `& FAST_DATA_MASK` 后
+/// `_TtC9SideStore12ImportExport` 这类 Swift 类名立刻出来了。
+const FAST_DATA_MASK: u64 = 0x0000_7fff_ffff_fff8;
+
 /// 一个方法表里最多认多少个方法。
 ///
 /// `count` 是文件里的 32 位数，损坏的文件能给出天文数字。不设上限的话，
@@ -260,6 +273,40 @@ impl<'a> Ctx<'a> {
         // 没有链式修复的老文件：槽里就是普通指针。
         if self.section_containing(raw).is_some() {
             return Pointer::Address(raw);
+        }
+        Pointer::Unknown
+    }
+
+    /// 解开 `class_t.data`（`class_t` 的第 5 个指针）→ `class_ro_t`。
+    ///
+    /// 与 [`Self::resolve_pointer`] 的两点区别：
+    /// 1. 按 `FAST_DATA_MASK` 清掉低 3 位标志位（见该常量的文档）。`class_t.data`
+    ///    是唯一这样"脏"的槽；`superclass`、`isa`、`ro.name` 仍是干净的 rebase 指针。
+    /// 2. 保留与 `resolve_pointer` 相同的两级回退：先当链式修复的 rebase 偏移
+    ///    （`base + offset`），不行再当**已经解好的绝对地址**。老 Mach-O（没有链式
+    ///    修复，例如 PojavLauncher）里 `data` 就是绝对指针，只做 rebase 会把它
+    ///    多加一遍 base —— 那样 PojavLauncher 的 38 个类会全数解不出。
+    fn resolve_class_data(&self, vaddr: u64) -> Pointer {
+        let Some(offset) = self.file_offset(vaddr) else {
+            return Pointer::Unknown;
+        };
+        let Some(raw) = self.u64_at(offset) else {
+            return Pointer::Unknown;
+        };
+        if raw == 0 {
+            return Pointer::Unknown;
+        }
+        if raw & CHAINED_BIND != 0 {
+            return Pointer::Bound;
+        }
+        let masked = raw & FAST_DATA_MASK;
+        let rebased = self.base.wrapping_add(masked);
+        if self.section_containing(rebased).is_some() {
+            return Pointer::Address(rebased);
+        }
+        // 老文件：槽里就是绝对指针（已含基址），不能再加 base。
+        if self.section_containing(masked).is_some() {
+            return Pointer::Address(masked);
         }
         Pointer::Unknown
     }
@@ -837,7 +884,7 @@ impl RoLayout {
 /// 任何一步解不出来就是 `None`，不拿 `__objc_classname` 池里的名字去凑。
 fn class_name_at(ctx: &Ctx<'_>, class_addr: u64) -> Option<String> {
     let layout = RoLayout::for_ctx(ctx);
-    let Pointer::Address(ro) = ctx.resolve_pointer(class_addr + 4 * ctx.ptr_size) else {
+    let Pointer::Address(ro) = ctx.resolve_class_data(class_addr + 4 * ctx.ptr_size) else {
         return None;
     };
     let Pointer::Address(name) = ctx.resolve_pointer(ro + layout.name) else {
@@ -995,7 +1042,7 @@ fn parse_classes(
             Pointer::Unknown => {}
         }
 
-        if let Pointer::Address(ro) = ctx.resolve_pointer(class_addr + 4 * ctx.ptr_size) {
+        if let Pointer::Address(ro) = ctx.resolve_class_data(class_addr + 4 * ctx.ptr_size) {
             entry.instance_methods = methods_at(
                 ctx,
                 ro + layout.methods,
@@ -1011,7 +1058,7 @@ fn parse_classes(
 
         // 类方法在**元类**的 `class_ro_t` 里：`class_t.isa` → 元类 → data。
         if let Pointer::Address(meta) = ctx.resolve_pointer(class_addr) {
-            if let Pointer::Address(ro) = ctx.resolve_pointer(meta + 4 * ctx.ptr_size) {
+            if let Pointer::Address(ro) = ctx.resolve_class_data(meta + 4 * ctx.ptr_size) {
                 entry.class_methods = methods_at(
                     ctx,
                     ro + layout.methods,
@@ -1140,7 +1187,7 @@ fn decode_class_for_test(
     if let Pointer::Address(super_addr) = ctx.resolve_pointer(class_addr + ctx.ptr_size) {
         out.superclass = class_name_at(ctx, super_addr);
     }
-    if let Pointer::Address(ro) = ctx.resolve_pointer(class_addr + 4 * ctx.ptr_size) {
+    if let Pointer::Address(ro) = ctx.resolve_class_data(class_addr + 4 * ctx.ptr_size) {
         out.instance_methods = methods_at(
             ctx,
             ro + layout.methods,
@@ -1152,7 +1199,7 @@ fn decode_class_for_test(
         out.ivars = ivars_at(ctx, ro + layout.ivars, &mut ivars_unparsed);
     }
     if let Pointer::Address(meta) = ctx.resolve_pointer(class_addr) {
-        if let Pointer::Address(ro) = ctx.resolve_pointer(meta + 4 * ctx.ptr_size) {
+        if let Pointer::Address(ro) = ctx.resolve_class_data(meta + 4 * ctx.ptr_size) {
             out.class_methods = methods_at(
                 ctx,
                 ro + layout.methods,
@@ -1371,6 +1418,15 @@ mod tests {
         put_u64(bytes, offset, target_vaddr - 0x1_0000_0000);
     }
 
+    /// 写一个 `class_t.data` 槽：rebase 偏移**再或上低 3 位标志**（真实 ABI）。
+    ///
+    /// objc4 里 `data` 存的是 `ro | 标志位`，读的时候要 `& FAST_DATA_MASK` 把标志位
+    /// 清掉。这里故意或上 `0b010`（实测 SideStore 上看到的值），让单测覆盖
+    /// "掩码必须清低 3 位"这件事。
+    fn put_class_data(bytes: &mut [u8], offset: usize, target_vaddr: u64) {
+        put_u64(bytes, offset, (target_vaddr - 0x1_0000_0000) | 0b010);
+    }
+
     /// 写一个"相对字段自己地址"的 int32（现代方法表 ABI）。
     fn put_rel32(bytes: &mut [u8], entry_vaddr: u64, field_in_entry: u64, target_vaddr: u64) {
         let field_vaddr = entry_vaddr + field_in_entry;
@@ -1482,10 +1538,12 @@ mod tests {
         } else {
             put_rebase(&mut bytes, 0x1800 + 8, 0x1_0000_1a00); // superclass → 父类 class_t
         }
-        put_rebase(&mut bytes, 0x1800 + 32, 0x1_0000_1300); // data → 类 ro
+        // data 槽按**真实 ABI** 写：低 3 位带标志位（objc4 的 FAST_DATA_MASK 只清这几位）。
+        // 不这么写，测试就测不出"掩码没清低 3 位"这个真实缺陷（§6.11，实测 SideStore）。
+        put_class_data(&mut bytes, 0x1800 + 32, 0x1_0000_1300); // data → 类 ro
 
         // ── 元类 class_t（0x1880）：data 指向元类 ro ──
-        put_rebase(&mut bytes, 0x1880 + 32, 0x1_0000_1380);
+        put_class_data(&mut bytes, 0x1880 + 32, 0x1_0000_1380);
 
         // ── category_t（0x1900）：name、cls、instanceMethods、classMethods ──
         put_rebase(&mut bytes, 0x1900, 0x1_0000_1270); // name → "Hooks"
@@ -1493,7 +1551,7 @@ mod tests {
         put_rebase(&mut bytes, 0x1900 + 16, 0x1_0000_1680); // instanceMethods
 
         // ── 父类 class_t（0x1a00）与父类 ro（0x1a40）──
-        put_rebase(&mut bytes, 0x1a00 + 32, 0x1_0000_1a40);
+        put_class_data(&mut bytes, 0x1a00 + 32, 0x1_0000_1a40);
         put_rebase(&mut bytes, 0x1a40 + 0x18, 0x1_0000_1250); // name → "MyParent"
 
         let sections = vec![
@@ -1549,6 +1607,31 @@ mod tests {
         // ivar 与协议。
         assert_eq!(class.ivars, vec!["count".to_string()]);
         assert_eq!(class.protocols, vec!["MyProto".to_string()]);
+    }
+
+    /// 老 Mach-O（无链式修复）里 `class_t.data` 是**已解好的绝对指针**：
+    /// 不能再加一遍 `base`。PojavLauncher 就是这种，且它的 `data` 低 3 位是 0。
+    #[test]
+    fn an_absolute_class_data_pointer_is_resolved_without_adding_base_again() {
+        let (mut bytes, segments) = class_fixture(false);
+        // 把三处 data 槽改写成绝对指针（class / metaclass / parent class）。
+        for (off, target) in [
+            (0x1800 + 32usize, 0x1_0000_1300u64),
+            (0x1880 + 32, 0x1_0000_1380),
+            (0x1a00 + 32, 0x1_0000_1a40),
+        ] {
+            // 绝对指针 = 目标虚拟地址本身（已含基址）；FF 是"普通指针"的高位残留，
+            // 用 0 高位即可，这里就写裸绝对值。
+            put_u64(&mut bytes, off, target);
+        }
+        let ctx = Ctx::new(&bytes, 0x1_0000_0000, true, true, &segments);
+        let class = decode_class_for_test(&ctx, 0x1_0000_1800, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            class.name.as_deref(),
+            Some("MyClass"),
+            "绝对值 data 也必须能解出类名（不许把 base 加两遍）"
+        );
+        assert_eq!(class.instance_methods.len(), 1);
     }
 
     #[test]
