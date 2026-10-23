@@ -175,6 +175,7 @@ pub(super) async fn apply(State(state): State<AppState>, Json(body): Json<ApplyB
         "original_path": path.to_string_lossy(),
         "changed_bytes": report.changed_bytes,
         "segments": report.segments,
+        "sections": report.sections,
         "size_before": report.size_before,
         "size_after": report.size_after,
         "original_untouched": true,
@@ -197,6 +198,7 @@ fn plan_json(
                 "original": hex_bytes(&site.original),
                 "new": hex_bytes(&site.new),
                 "segment": site.segment,
+                "section": site.section,
             })
         })
         .collect();
@@ -208,6 +210,7 @@ fn plan_json(
         "copy_path": plan.copy_path.to_string_lossy(),
         "changed_bytes": plan.changed_bytes(),
         "segments": plan.touched_segments(),
+        "sections": plan.touched_sections(),
         "sites": sites,
     })
 }

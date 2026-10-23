@@ -205,7 +205,8 @@ function PlanPanel({
       <p className="hint">
         目标 <span className="mono">{plan.target}</span>（{plan.kind}）· 副本{" "}
         <span className="mono">{plan.copy_path}</span> · 改动 {plan.changed_bytes} 字节 ·
-        段 {plan.segments.length > 0 ? plan.segments.join("、") : "（无）"}
+        段 {plan.segments.length > 0 ? plan.segments.join("、") : "（无）"} · 节{" "}
+        {plan.sections.length > 0 ? plan.sections.join("、") : "（无）"}
       </p>
       <table className="data-table">
         <thead>
@@ -216,6 +217,7 @@ function PlanPanel({
             <th>原字节</th>
             <th>新字节</th>
             <th>段</th>
+            <th>节</th>
           </tr>
         </thead>
         <tbody>
@@ -227,6 +229,7 @@ function PlanPanel({
               <td className="mono">{site.original}</td>
               <td className="mono">{site.new}</td>
               <td>{site.segment ?? "（段外）"}</td>
+              <td>{site.section ?? "（无节信息）"}</td>
             </tr>
           ))}
         </tbody>
@@ -254,6 +257,10 @@ function PlanPanel({
           {applyState.report.changed_bytes} 字节 · 段{" "}
           {applyState.report.segments.length > 0
             ? applyState.report.segments.join("、")
+            : "（无）"}{" "}
+          · 节{" "}
+          {applyState.report.sections.length > 0
+            ? applyState.report.sections.join("、")
             : "（无）"}{" "}
           · 大小 {applyState.report.size_before} → {applyState.report.size_after} 字节 ·{" "}
           原文件 <span className="mono">{applyState.report.original_path}</span>{" "}

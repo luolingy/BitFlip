@@ -1489,13 +1489,14 @@ export interface PatchEditWire {
   new_hex: string;
 }
 
-/** 计划里的一处改动（服务端回填 `original` / `file_offset` / `segment`）。 */
+/** 计划里的一处改动（服务端回填 `original` / `file_offset` / `segment` / `section`）。 */
 export interface PatchSiteWire {
   vaddr: string;
   file_offset: number;
   original: string;
   new: string;
   segment: string | null;
+  section: string | null;
 }
 
 /** `POST /api/patch/plan` 的响应：只读预览，`written` 恒为 false。 */
@@ -1507,6 +1508,7 @@ export interface PatchPlanResponse {
   copy_path: string;
   changed_bytes: number;
   segments: string[];
+  sections: string[];
   sites: PatchSiteWire[];
 }
 
@@ -1518,6 +1520,7 @@ export interface PatchApplyResponse {
   original_path: string;
   changed_bytes: number;
   segments: string[];
+  sections: string[];
   size_before: number;
   size_after: number;
   original_untouched: boolean;

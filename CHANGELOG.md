@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+### 改进 — 打补丁的守卫与标签细化到**节级**（`__TEXT,__text`）
+
+之前 `bitflip-patch` 只到**段**这一层：改一处 `__TEXT` 里的指令，diff 上只写"段
+`__TEXT`"。但同一段里 `__text`（代码）、`__cstring`（字符串）、`__const` 是不同的
+东西 —— 审查时看到"改的是 `__TEXT,__text` 里的一条指令"比"改的是 `__TEXT`"有用得多。
+
+- **`PatchSite` 新增 `section`**（`段名,节名`，例如 `__TEXT,__text`）：能定位到节时
+  给出；节表为空 / 节不覆盖该地址时是 `None`（**不猜**，退回段级）。
+- **守卫收紧**：跨出**节**末尾即拒绝（此前只挡"跨段"）。校验顺序仍是：段内 → 节内 →
+  文件内 → 不碰代码签名区。落在 Mach-O 头部页（`__TEXT` 里但不在任何命名节，如
+  0x100001000）时如实报"（无节信息）"而不是硬编一个节名。
+- **`ApplyReport` 新增 `sections`**；`touched_sections()` 与 `touched_segments()` 并列。
+- **CLI / Web / 服务端**：diff 表新增"节"列，改动摘要与 JSON 增加 `sections` /
+  `section` 字段。CLI 文本：`改动 1 处 · 2 字节 · 段 __TEXT · 节 __TEXT,__text`。
+- **真实样本**：LiveContainer 主二进制，`0x100004000`（`__TEXT,__text` 起点）→
+  段 `__TEXT`、节 `__TEXT,__text`，原字节 `b0 01`；`--apply` 写副本、大小不变、原文件
+  一字节未变。新增 `crates/bitflip-cli/tests/patch_cli.rs` 两条 `#[ignore]` 真实二进制
+  测试钉住"节级标签 + 只写副本 + 原文件不变"。
+- **测试**：patch crate +4（节标签、跨节拒绝、恰好顶到节末尾允许、未加载节不参与）。
+
 ### 新增 — Swift 元数据：从 `__swift5_*` 解出类型/协议名（M12）
 
 Swift 节此前只是"列出来，没解析"。这一片把**能低风险读出**的部分接上：

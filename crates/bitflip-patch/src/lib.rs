@@ -117,6 +117,12 @@ pub struct PatchSite {
     pub new: Vec<u8>,
     /// 这一处落在哪个段（段的 `name`）；落在段外时是 `None`。
     pub segment: Option<String>,
+    /// 这一处落在哪个节（`段名,节名`，例如 `__TEXT,__text`）。
+    ///
+    /// 比 `segment` 更细：同一段里 `__text`（代码）与 `__cstring`（字符串）是两回事，
+    /// 审查时看到"改的是 __TEXT,__text 里的一条指令"比"改的是 __TEXT"有用得多。
+    /// 该格式的节不覆盖这里（或节表为空）时为 `None` —— 不猜。
+    pub section: Option<String>,
 }
 
 /// 一份待审查的补丁计划。**不持有任何磁盘句柄**，构造它没有任何副作用。
@@ -152,6 +158,18 @@ impl PatchPlan {
         names.dedup();
         names
     }
+
+    /// 计划里涉及哪些节（`段名,节名`；没有节信息的条目不计入）。
+    pub fn touched_sections(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .sites
+            .iter()
+            .filter_map(|site| site.section.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 /// 一次 `apply` 之后的记账。
@@ -163,6 +181,8 @@ pub struct ApplyReport {
     pub changed_bytes: usize,
     /// 涉及哪些段。
     pub segments: Vec<String>,
+    /// 涉及哪些节（`段名,节名`；没有节信息的条目不计入）。
+    pub sections: Vec<String>,
     /// 写之前的文件字节数。
     pub size_before: u64,
     /// 写之后的文件字节数（等长替换，正常应等于 `size_before`）。
@@ -248,6 +268,13 @@ impl PatchTarget {
     #[cfg(test)]
     fn set_code_signature_for_test(&mut self, ranges: Option<Vec<(u64, u64)>>) {
         self.code_signature = ranges;
+    }
+
+    /// 只给测试用：往对象里塞节表，好在 ELF 样本上把**节级**守卫与标签测透
+    /// （合成 ELF 只带 PHDR、没有节表，正常拿不到节）。
+    #[cfg(test)]
+    fn set_sections_for_test(&mut self, sections: Vec<bitflip_loader::object::Section>) {
+        self.object.sections = sections;
     }
 
     /// 对象格式。
@@ -360,6 +387,26 @@ impl PatchTarget {
             });
         }
 
+        // 1b) **节级细化**：能定位到节时，边界收紧到节，并记下节名（比段名更有用：
+        //     同一段里 __text / __cstring / __const 是不同的东西）。定位不到节
+        //     （该格式没有节表 / 节不覆盖这段）时退回到段，`section` 记 None（不猜）。
+        let section = self.section_covering(vaddr);
+        if let Some(view) = &section {
+            let section_end = view.vaddr.saturating_add(view.file_size);
+            if end_vaddr > section_end {
+                return Err(PatchError::PlanRejected {
+                    index,
+                    reason: format!(
+                        "改动 {}..{} 跨出了节 {} 的末尾 {}：本模块只做节内等长替换",
+                        hex(vaddr),
+                        hex(end_vaddr),
+                        view.label,
+                        hex(section_end)
+                    ),
+                });
+            }
+        }
+
         // 2) 边界检查之后去查代码签名区（见下面第 3 步之后）—— 签名区是**文件偏移**，
         //    要先把 file_offset 算出来才能比。
 
@@ -413,7 +460,36 @@ impl PatchTarget {
             original,
             new,
             segment: Some(segment.label.clone()),
+            section: section.map(|view| view.label),
         })
+    }
+
+    /// 找到 `vaddr` 所在的、**在文件里有字节**的节（比段更细）。
+    ///
+    /// 节的显示名是 `段名,节名`（与 loader 的 `section_display_name` 一致）。
+    /// 该格式没有节表（节列表为空）或节不覆盖这段时返回 `None`，调用方退回段级。
+    fn section_covering(&self, vaddr: u64) -> Option<SectionView> {
+        for section in &self.object.sections {
+            // 不加载的节（调试信息等）与零长节不参与：它们不该是补丁落点。
+            if !section.loaded {
+                continue;
+            }
+            if matches!(section.kind, bitflip_loader::object::ContentKind::Bss) {
+                continue;
+            }
+            if section.file.size == 0 {
+                continue;
+            }
+            let file_end_vaddr = section.vaddr.saturating_add(section.file.size);
+            if vaddr >= section.vaddr && vaddr < file_end_vaddr {
+                return Some(SectionView {
+                    vaddr: section.vaddr,
+                    file_size: section.file.size,
+                    label: section.name.clone(),
+                });
+            }
+        }
+        None
     }
 
     /// 找到 `vaddr` 所在的、**在文件里有字节**的段。
@@ -516,6 +592,7 @@ impl PatchTarget {
             copy_path: plan.copy_path.clone(),
             changed_bytes: plan.changed_bytes(),
             segments: plan.touched_segments(),
+            sections: plan.touched_sections(),
             size_before: self.bytes.len() as u64,
             size_after: patched.len() as u64,
         })
@@ -547,6 +624,17 @@ struct SegmentView {
     /// 段在文件里的起始偏移。
     file_offset: u64,
     /// 段名。
+    label: String,
+}
+
+/// 一个节的最小视图（只在内部做节级边界判断与标签用）。
+#[derive(Debug, Clone)]
+struct SectionView {
+    /// 节起始虚拟地址。
+    vaddr: u64,
+    /// 节在**文件里**的字节数。
+    file_size: u64,
+    /// 节的显示名（`段名,节名`）。
     label: String,
 }
 
@@ -867,6 +955,106 @@ mod tests {
             .plan(&[(0x401010, vec![0x90u8, 0x90])])
             .expect("没有签名区就不拦");
         assert_eq!(plan.sites[0].file_offset, 0x1010);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── 节级粒度 ─────────────────────────────────────────────────────────
+
+    /// 造一个只在 vaddr `addr` 起、`size` 字节、文件偏移 `offset` 的节。
+    fn section(
+        name: &str,
+        addr: u64,
+        size: u64,
+        offset: u64,
+        loaded: bool,
+    ) -> bitflip_loader::object::Section {
+        bitflip_loader::object::Section {
+            name: name.to_string(),
+            vaddr: addr,
+            file: bitflip_loader::object::FileRange { offset, size },
+            perms: bitflip_loader::object::Perms {
+                read: true,
+                write: false,
+                execute: name.ends_with("__text"),
+            },
+            kind: bitflip_loader::object::ContentKind::Code,
+            loaded,
+        }
+    }
+
+    #[test]
+    fn site_reports_section_label_when_a_section_covers_it() {
+        // 合成 ELF 的段是 0x401000..0x401100（文件 0x1000..0x1100）。
+        // 塞一个 __TEXT,__text 节覆盖 0x401000..0x401080（文件 0x1000..0x1080）。
+        let path = write_temp("sect-label.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.set_sections_for_test(vec![section("__TEXT,__text", 0x401000, 0x80, 0x1000, true)]);
+        let plan = target
+            .plan(&[(0x401010, vec![0x90u8, 0x90])])
+            .expect("落在节内应当允许");
+        assert_eq!(
+            plan.sites[0].section.as_deref(),
+            Some("__TEXT,__text"),
+            "应报出节名而不是段名"
+        );
+        assert!(plan.sites[0].segment.is_some(), "段名仍在");
+        assert_eq!(plan.touched_sections(), vec!["__TEXT,__text".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_crossing_section_boundary_is_rejected() {
+        // 节只到 0x401080；写 0x40107F..0x401081（2 字节）跨出节末尾 → 拒绝。
+        let path = write_temp("sect-cross.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.set_sections_for_test(vec![section("__TEXT,__text", 0x401000, 0x80, 0x1000, true)]);
+        let error = target
+            .plan(&[(0x40107F, vec![0x90u8, 0x90])])
+            .expect_err("跨节应当被拒");
+        match error {
+            PatchError::PlanRejected { reason, .. } => {
+                assert!(
+                    reason.contains("__TEXT,__text"),
+                    "拒绝原因应点名节：{reason}"
+                );
+                assert!(reason.contains("节"), "{reason}");
+            }
+            other => panic!("期望 PlanRejected，得到 {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_ending_exactly_at_section_end_is_allowed() {
+        // 节到 0x401080；写 0x40107E..0x401080（2 字节）恰好顶到节末尾 → 允许。
+        let path = write_temp("sect-edge.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.set_sections_for_test(vec![section("__TEXT,__text", 0x401000, 0x80, 0x1000, true)]);
+        let plan = target
+            .plan(&[(0x40107E, vec![0x90u8, 0x90])])
+            .expect("恰好顶到节末尾应当允许");
+        assert_eq!(plan.sites[0].file_offset, 0x107E);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unloaded_section_is_ignored_for_section_label() {
+        // 节存在但未加载（loaded=false）：不参与节级定位，`section` 应为 None（不猜），
+        // 守卫退回段级（于是这段里仍可打，只是标签是段名）。
+        let path = write_temp("sect-unloaded.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.set_sections_for_test(vec![section(
+            "__DWARF,__debug",
+            0x401000,
+            0x80,
+            0x1000,
+            false,
+        )]);
+        let plan = target
+            .plan(&[(0x401010, vec![0x90u8])])
+            .expect("段内仍可打");
+        assert!(plan.sites[0].section.is_none(), "未加载节不该被当落点");
+        assert!(plan.touched_sections().is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

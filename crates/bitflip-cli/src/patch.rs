@@ -52,12 +52,17 @@ pub fn run_patch(args: &PatchArgs) -> anyhow::Result<()> {
     println!();
     println!("已写出副本  {}", report.copy_path.display());
     println!(
-        "改动        {} 字节 · 段 {}",
+        "改动        {} 字节 · 段 {} · 节 {}",
         report.changed_bytes,
         if report.segments.is_empty() {
             "（无）".to_string()
         } else {
             report.segments.join("、")
+        },
+        if report.sections.is_empty() {
+            "（无）".to_string()
+        } else {
+            report.sections.join("、")
         }
     );
     println!(
@@ -154,29 +159,35 @@ fn print_plan(target: &PatchTarget, plan: &PatchPlan) {
     );
     println!("副本        {}", plan.copy_path.display());
     println!(
-        "改动        {} 处 · {} 字节 · 段 {}",
+        "改动        {} 处 · {} 字节 · 段 {} · 节 {}",
         plan.sites.len(),
         plan.changed_bytes(),
         if plan.touched_segments().is_empty() {
             "（无）".to_string()
         } else {
             plan.touched_segments().join("、")
+        },
+        if plan.touched_sections().is_empty() {
+            "（无）".to_string()
+        } else {
+            plan.touched_sections().join("、")
         }
     );
     println!();
     println!(
-        "  {:<20} {:<12} {:<6} {:<10} {:<10} 段",
+        "  {:<20} {:<12} {:<6} {:<10} {:<10} 段 / 节",
         "虚拟地址", "文件偏移", "长度", "原字节", "新字节"
     );
     for site in &plan.sites {
         println!(
-            "  0x{:<18x} 0x{:<10x} {:<6} {:<10} {:<10} {}",
+            "  0x{:<18x} 0x{:<10x} {:<6} {:<10} {:<10} {} / {}",
             site.vaddr,
             site.file_offset,
             site.new.len(),
             hex_bytes(&site.original),
             hex_bytes(&site.new),
             site.segment.as_deref().unwrap_or("（段外）"),
+            site.section.as_deref().unwrap_or("（无节信息）"),
         );
     }
 }
@@ -192,6 +203,7 @@ fn print_json(target: &PatchTarget, plan: &PatchPlan, apply: bool) -> anyhow::Re
                 "original": hex_bytes(&site.original),
                 "new": hex_bytes(&site.new),
                 "segment": site.segment,
+                "section": site.section,
             })
         })
         .collect();
@@ -201,6 +213,7 @@ fn print_json(target: &PatchTarget, plan: &PatchPlan, apply: bool) -> anyhow::Re
         "copy_path": plan.copy_path.to_string_lossy(),
         "changed_bytes": plan.changed_bytes(),
         "segments": plan.touched_segments(),
+        "sections": plan.touched_sections(),
         "sites": sites,
         // 只读预览时明确写"没有写盘"；`--apply` 的实际写在人类模式里给，这里只要契约。
         "apply_requested": apply,
