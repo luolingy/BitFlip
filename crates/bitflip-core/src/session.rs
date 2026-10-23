@@ -237,6 +237,75 @@ impl ObjcInfoWire {
     }
 }
 
+/// Swift 元数据的 wire 表示（`__swift5_*`，只有 Mach-O 有）。
+///
+/// 只给**能低风险读出**的东西：类型/协议的名字与计数。字段布局、反映射等要跟着
+/// 完整类型元数据重建，没做（§7）；哪些节没解析由 loader 的 swift notes 逐条说明。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct SwiftInfoWire {
+    /// 类型总数（`__swift5_types` 条目数）。
+    pub type_count: usize,
+    /// 解出名字的类型数。
+    pub types_named: usize,
+    /// 类型名样例（最多 12 条；按节内顺序）。
+    pub type_samples: Vec<String>,
+    /// 协议总数（`__swift5_protos` 条目数）。
+    pub protocol_count: usize,
+    /// 解出名字的协议数。
+    pub protocols_named: usize,
+    /// 协议名样例（最多 12 条）。
+    pub protocol_samples: Vec<String>,
+    /// `__swift5_entry` 是否存在（Swift 入口点）。
+    pub has_entry: bool,
+    /// 存在但没解析的 Swift 节（名 + 字节数）。
+    pub unparsed_sections: Vec<(String, u64)>,
+    /// 条目里相对指针解不出来的个数。
+    pub skipped: usize,
+    /// 解析说明（降级、跳过、未做项）。
+    pub notes: Vec<String>,
+}
+
+impl SwiftInfoWire {
+    /// 样例上限：与 objc 一致，界面展示"前几条 + 计数"就够。
+    const SAMPLE_LIMIT: usize = 12;
+
+    /// 由 loader 的 swift 元数据构造。非 Mach-O 是没有 `__swift5_*` 节，于是空表。
+    #[must_use]
+    pub fn from_loader(swift: &bitflip_loader::object::SwiftMetadata) -> Self {
+        Self {
+            type_count: swift.type_count,
+            types_named: swift.types.len(),
+            type_samples: swift
+                .types
+                .iter()
+                .take(Self::SAMPLE_LIMIT)
+                .map(|symbol| symbol.name.clone())
+                .collect(),
+            protocol_count: swift.protocol_count,
+            protocols_named: swift.protocols.len(),
+            protocol_samples: swift
+                .protocols
+                .iter()
+                .take(Self::SAMPLE_LIMIT)
+                .map(|symbol| symbol.name.clone())
+                .collect(),
+            has_entry: swift.has_entry,
+            unparsed_sections: swift.unparsed_sections.clone(),
+            skipped: swift.skipped,
+            notes: swift.notes.clone(),
+        }
+    }
+
+    /// 有没有任何内容（用于界面"没 Swift 就什么都不显示"）。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.type_count == 0
+            && self.protocol_count == 0
+            && !self.has_entry
+            && self.unparsed_sections.is_empty()
+    }
+}
+
 /// 节的 wire 表示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SectionInfo {
@@ -378,6 +447,12 @@ pub struct ObjectInfo {
     /// （"这个文件里没有这套节"由 loader 的 objc notes 说明，这里不猜）。
     /// 这是 objc 名字这一片新增的**增量**字段：旧消费方忽略它即可。
     pub objc: ObjcInfoWire,
+    /// Swift 元数据摘要（`__swift5_*`）：类型 / 协议的计数与样例名。
+    ///
+    /// 非 Mach-O 是空表加空 notes；Mach-O 没有 `__swift5_*` 节时同样如此。
+    /// **只给能低风险读出的东西**：类型/协议名；字段布局等更深的语义没有做，
+    /// loader 的 swift notes 会逐节说明哪些没解析（§7）。
+    pub swift: SwiftInfoWire,
     /// 段（内存视角）。
     pub segments: Vec<SegmentInfo>,
     /// 节（文件视角）。
@@ -416,6 +491,7 @@ impl ObjectInfo {
                 .map(|address| hex16(*address))
                 .collect(),
             objc: ObjcInfoWire::from_loader(&object.objc),
+            swift: SwiftInfoWire::from_loader(&object.swift),
             segments: object
                 .segments
                 .iter()
@@ -2248,6 +2324,38 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swift_info_wire_from_empty_loader_metadata_is_empty() {
+        let wire = SwiftInfoWire::from_loader(&bitflip_loader::object::SwiftMetadata::default());
+        assert!(wire.is_empty());
+        assert_eq!(wire.type_count, 0);
+        assert!(wire.type_samples.is_empty());
+        assert!(wire.notes.is_empty());
+    }
+
+    #[test]
+    fn swift_info_wire_projects_counts_and_samples() {
+        use bitflip_loader::object::{SwiftMetadata, SwiftSymbol};
+        let mut meta = SwiftMetadata::default();
+        meta.type_count = 3;
+        meta.types = vec![
+            SwiftSymbol { address: 0x1000, name: "Foo".into() },
+            SwiftSymbol { address: 0x1008, name: "Bar".into() },
+        ];
+        meta.protocol_count = 1;
+        meta.protocols = vec![SwiftSymbol { address: 0x2000, name: "Baz".into() }];
+        meta.has_entry = true;
+        meta.notes = vec!["示例说明".into()];
+        let wire = SwiftInfoWire::from_loader(&meta);
+        assert_eq!(wire.type_count, 3, "type_count 是条目数，不是解出数");
+        assert_eq!(wire.types_named, 2, "解出两个名字");
+        assert_eq!(wire.type_samples, vec!["Foo".to_string(), "Bar".to_string()]);
+        assert_eq!(wire.protocol_count, 1);
+        assert_eq!(wire.protocol_samples, vec!["Baz".to_string()]);
+        assert!(wire.has_entry);
+        assert!(!wire.is_empty());
+    }
 
     /// 构造一个最小的 64 位 x86_64 ELF 头（与 loader 的测试保持一致）。
     fn elf64_x86_64() -> Vec<u8> {

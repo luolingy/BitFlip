@@ -801,6 +801,53 @@ impl ObjcMetadata {
     }
 }
 
+/// 一个 Swift 描述符解出来的名字（mangled）。
+///
+/// 保留 mangled 原文而**不做** Swift demangle：demangle 是完整的符号文法还原，
+/// 做不好会把名字搅乱；mangled 名本身已可读（`_$s7SideStore12ImportExportC`），
+/// 下游可自行决定要不要 demangle。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwiftSymbol {
+    /// 描述符自身地址（虚拟地址）。
+    pub address: u64,
+    /// mangled 名字（文件里的原始字节，读到第一个 NUL 为止）。
+    pub name: String,
+}
+
+/// Swift 元数据（`__swift5_*`）的解析结果。**尽量少猜**：解不出来的计入 `skipped` 并说明。
+///
+/// 只有 Mach-O 有这套节；其它格式是空表（"这个格式没有这个概念"，§7）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SwiftMetadata {
+    /// `__swift5_types` 里的类型（解出名字的那些）。
+    pub types: Vec<SwiftSymbol>,
+    /// `__swift5_protos` 里的协议（解出名字的那些）。
+    pub protocols: Vec<SwiftSymbol>,
+    /// `__swift5_entry` 是否存在（Swift 入口点）。
+    pub has_entry: bool,
+    /// 类型条目总数（含没解出名字的），用于"解出几个 / 一共几个"的对照。
+    pub type_count: usize,
+    /// 协议条目总数。
+    pub protocol_count: usize,
+    /// 存在但**没有解析**的其它 Swift 节（节名 + 字节数），如实列出。
+    pub unparsed_sections: Vec<(String, u64)>,
+    /// 条目里相对指针解不出来的个数（越界 / 落在非节区 / 名字不是合法 C 串）。
+    pub skipped: usize,
+    /// 解析说明（降级、跳过、未做项）。
+    pub notes: Vec<String>,
+}
+
+impl SwiftMetadata {
+    /// 这份元数据里有没有任何内容（用于"没 Swift 就什么都不显示"）。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
+            && self.protocols.is_empty()
+            && !self.has_entry
+            && self.unparsed_sections.is_empty()
+    }
+}
+
 /// 解析结果：一个可分析的对象。
 #[derive(Debug, Clone)]
 pub struct Object {
@@ -867,6 +914,11 @@ pub struct Object {
     /// 只有 Mach-O 有这套概念。**其他格式是空表** —— 同样的如实未知，
     /// 不是"这个二进制里没有 objc"。
     pub objc: ObjcMetadata,
+    /// Swift 元数据（`__swift5_*`）。
+    ///
+    /// 只有 Mach-O 有这套节。**其他格式是空表** —— 与 `objc` 一样，是"这个格式没有
+    /// 这个概念"，不是"这个二进制里没有 Swift 代码"的否定结论（§7）。
+    pub swift: SwiftMetadata,
     /// 解析过程中的说明（降级、跳过、未支持项）。
     ///
     /// 这是"诚实"的载体：任何没解析出来的东西都要在这里留下痕迹，
@@ -951,6 +1003,7 @@ impl Object {
             unwind: Vec::new(),
             header_flags: None,
             objc: ObjcMetadata::default(),
+            swift: SwiftMetadata::default(),
             notes: Vec::new(),
         }
     }

@@ -48,7 +48,9 @@ pub const TOKEN_QUERY: &str = "token";
 /// 注意：`POST /api/patch/plan` 与 `POST /api/patch/apply` 是**纯新增的 HTTP
 /// 路由**，请求/响应是它们自己的 JSON，没有改动任何 core 公开类型的形状，
 /// 所以这个号**不动**（它跟的是 core 形状，不是端点数）。
-pub const SERVER_API_VERSION: u32 = 7;
+///
+/// v8：与 core 同步（`ObjectInfo` 新增 `swift` 字段，形状变化）。
+pub const SERVER_API_VERSION: u32 = 8;
 
 /// 程序名。
 pub const APP_NAME: &str = "bitflip";

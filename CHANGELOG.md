@@ -5,6 +5,35 @@
 
 ## [Unreleased]
 
+### 新增 — Swift 元数据：从 `__swift5_*` 解出类型/协议名（M12）
+
+Swift 节此前只是"列出来，没解析"。这一片把**能低风险读出**的部分接上：
+`__swift5_types` / `__swift5_protos` 里每个条目是 4 字节**相对**指针，指向描述符
+（`ContextDescriptor`），描述符偏移 8 处的相对指针指向名字串。解出类型个数与名字、
+协议个数与名字、`__swift5_entry` 是否存在。
+
+- **loader**：新增 `format::macho::swift` 模块（复用 `objc` 的 `Ctx` 节表/读字节能力，
+  不重复造）。`Object` 新增 `swift: SwiftMetadata`（非 Mach-O 是空表，§7）。
+  解不出的描述符计入 `skipped` 并在 notes 说明，**不编造**。
+- **只做名字，不做字段布局**：`__swift5_fieldmd` / `__swift5_reflstr` /
+  `__swift5_typeref` / `__swift5_assocty` 等**只如实列节名与字节数，不假装解析**
+  （字段/反映射要跟着完整类型元数据重建，读错比不读更糟）。
+- **core**：`ObjectInfo` 新增 `swift: SwiftInfoWire`（计数 + 样例名 + 未解析节 + notes）。
+  这是公开结构体的形状变化 ⇒ `CORE_API_VERSION` 7→8（`SERVER_API_VERSION`
+  同步到 8；`bitflip-cli version` 的一致性测试已更新）。
+- **真实样本交叉核对**（`--ignored`）：
+
+  | 样本 | 类型（解出/总） | 协议（解出/总） | 入口 | 跳过 |
+  | --- | --- | --- | --- | --- |
+  | SideStore | 511/511 | 58/58 | 是 | 0 |
+  | LiveContainer（嵌套 App.app） | 3/3 | 0/0 | 是 | 0 |
+  | LiveContainer（主）、PojavLauncher | 0/0 | 0/0 | 否 | 0 |
+
+  SideStore 的 511 个类型名、58 个协议名全部解出，0 跳过；名字是可读的 Swift 标识符
+  （`ImportExport`、`SendAppOperation` 等）。
+- **测试**：loader 新增 3 条 swift 单测（单个描述符解名、无 Swift 节空表、未解析节如实列出）
+  + 真实样本测试；core 新增 2 条投影测试。
+
 ### 新增 — 打补丁接到 CLI 与 Web：默认只读预览，「解锁」是显式一步
 
 把这两轮做的 `bitflip-patch` 地基变成用户真正能用上的东西。安全语义一路贯穿：

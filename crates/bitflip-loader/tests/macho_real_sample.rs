@@ -1576,3 +1576,106 @@ fn real_ios_binaries_report_code_signature_range() {
         }
     }
 }
+
+/// 一个样本的 Swift 元数据计数（打印与断言共用）。
+struct SwiftCounts {
+    name: String,
+    type_count: usize,
+    types_named: usize,
+    protocol_count: usize,
+    protocols_named: usize,
+    has_entry: bool,
+    unparsed: usize,
+    skipped: usize,
+    sample_types: Vec<String>,
+}
+
+fn measure_swift(path: &std::path::Path) -> SwiftCounts {
+    let ipa =
+        std::fs::read(path).unwrap_or_else(|error| panic!("读不到 {}：{error}", path.display()));
+    let listing = zip::list_members(&ipa)
+        .unwrap_or_else(|error| panic!("IPA 应当是能列成员的 ZIP：{}", error.summary_zh()));
+    let (_index, member_name, binary) = pick_main_binary(&ipa, &listing);
+    let (_how, _facts, object) = parse_one_image(&binary);
+    let swift = &object.swift;
+    SwiftCounts {
+        name: member_name.clone(),
+        type_count: swift.type_count,
+        types_named: swift.types.len(),
+        protocol_count: swift.protocol_count,
+        protocols_named: swift.protocols.len(),
+        has_entry: swift.has_entry,
+        unparsed: swift.unparsed_sections.len(),
+        skipped: swift.skipped,
+        sample_types: swift
+            .types
+            .iter()
+            .take(5)
+            .map(|symbol| symbol.name.clone())
+            .collect(),
+    }
+}
+
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_ios_binaries_report_swift_metadata() {
+    let paths = all_sample_paths();
+    let counts: Vec<SwiftCounts> = paths.iter().map(|path| measure_swift(path)).collect();
+
+    for row in &counts {
+        eprintln!(
+            "{:<44} type={:>4}/{:>4} proto={:>3}/{:>3} entry={} skipped={} unparsed={} samples={:?}",
+            row.name,
+            row.types_named,
+            row.type_count,
+            row.protocols_named,
+            row.protocol_count,
+            row.has_entry,
+            row.skipped,
+            row.unparsed,
+            row.sample_types
+        );
+    }
+
+    // SideStore 有完整的 Swift 5 节：类型与协议都必须解出一批，且入口存在。
+    let ss = counts
+        .iter()
+        .find(|row| row.name.contains("SideStore"))
+        .expect("样本里应当有 SideStore");
+    assert!(
+        ss.type_count > 0,
+        "SideStore 的 __swift5_types 应该有类型，实际 {}",
+        ss.type_count
+    );
+    assert!(
+        ss.types_named > 0,
+        "SideStore 应当解出一批类型名，实际 {}",
+        ss.types_named
+    );
+    assert!(
+        ss.protocol_count > 0 && ss.protocols_named > 0,
+        "SideStore 的 __swift5_protos 应该解出协议名（{}/{}）",
+        ss.protocols_named,
+        ss.protocol_count
+    );
+    // 解出的名字必须是可读的 Swift 标识符（字母开头、无控制字符），不是乱码。
+    assert!(
+        ss.sample_types.iter().all(|name| name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_graphic() || c == ' ')),
+        "解出的名字应当是可读的 Swift 标识符，实际 {:?}",
+        ss.sample_types
+    );
+    // 其余样本即使没有 Swift 节，也不该 panic（空表即"没有"，§7）。
+    for row in &counts {
+        assert!(
+            row.types_named <= row.type_count,
+            "{}：解出的名字数 {} 不该多于条目数 {}",
+            row.name,
+            row.types_named,
+            row.type_count
+        );
+    }
+}

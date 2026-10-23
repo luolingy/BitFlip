@@ -113,7 +113,13 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// v6（间接调用前驱恢复这一片）：[`CallEdgeWire`] 新增 `recovered_indirect`
 /// （目标是推理出来的而不是编码里写的）；[`bitflip_analyze::CalleeResolution`]
 /// 新增 `IndirectRecovered` 变体。同样是增量 + 形状变化 ⇒ +1。
-pub const CORE_API_VERSION: u32 = 7;
+///
+/// v7：`SERVER_API_VERSION` 与 core 同步到 7（之前一版）。
+///
+/// v8（Swift 元数据这一片）：[`crate::session::ObjectInfo`] 新增 `swift:
+/// SwiftInfoWire`（`__swift5_*` 的类型/协议名与计数）。公开结构体的形状变了
+/// （字面量构造会编译失败）⇒ +1；`SERVER_API_VERSION` 同步 +1。
+pub const CORE_API_VERSION: u32 = 8;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

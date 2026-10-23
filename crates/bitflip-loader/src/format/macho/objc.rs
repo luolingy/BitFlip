@@ -114,13 +114,13 @@ const MAX_STUB_INSNS: usize = 1 << 20;
 
 /// 一个节在文件里的位置。
 #[derive(Debug, Clone, Copy)]
-struct SectionInfo {
+pub(super) struct SectionInfo {
     /// 虚拟地址。
-    addr: u64,
+    pub(super) addr: u64,
     /// 字节数（**文件里**的字节数；零填充节没有文件数据）。
-    size: u64,
+    pub(super) size: u64,
     /// 文件偏移。
-    offset: u64,
+    pub(super) offset: u64,
 }
 
 /// 一个指针的静态解析结果。
@@ -135,7 +135,7 @@ enum Pointer {
 }
 
 /// 解析上下文：文件字节 + 节表 + 镜像基址。
-struct Ctx<'a> {
+pub(super) struct Ctx<'a> {
     /// 文件字节。
     bytes: &'a [u8],
     /// 镜像基址（rebase 偏移是相对它的）。
@@ -157,7 +157,7 @@ struct Ctx<'a> {
 
 impl<'a> Ctx<'a> {
     /// 建上下文。
-    fn new(
+    pub(super) fn new(
         bytes: &'a [u8],
         base: u64,
         little: bool,
@@ -195,7 +195,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// 取节。
-    fn section(&self, name: &str) -> Option<&SectionInfo> {
+    pub(super) fn section(&self, name: &str) -> Option<&SectionInfo> {
         self.sections.get(name)
     }
 
@@ -207,13 +207,13 @@ impl<'a> Ctx<'a> {
     }
 
     /// 虚拟地址 → 文件偏移。
-    fn file_offset(&self, vaddr: u64) -> Option<u64> {
+    pub(super) fn file_offset(&self, vaddr: u64) -> Option<u64> {
         let section = self.section_containing(vaddr)?;
         Some(section.offset + (vaddr - section.addr))
     }
 
     /// 读一个 32 位小端/大端值。
-    fn u32_at(&self, file_offset: u64) -> Option<u32> {
+    pub(super) fn u32_at(&self, file_offset: u64) -> Option<u32> {
         let start = usize::try_from(file_offset).ok()?;
         let arr: [u8; 4] = self
             .bytes
@@ -243,7 +243,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// 读一个 32 位有符号相对偏移。
-    fn i32_at(&self, file_offset: u64) -> Option<i32> {
+    pub(super) fn i32_at(&self, file_offset: u64) -> Option<i32> {
         self.u32_at(file_offset).map(|value| value as i32)
     }
 
@@ -312,7 +312,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// 读一个以 NUL 结尾的字符串（范围限在所在节内）。
-    fn cstring(&self, vaddr: u64) -> Option<String> {
+    pub(super) fn cstring(&self, vaddr: u64) -> Option<String> {
         let section = self.section_containing(vaddr)?;
         let start = usize::try_from(section.offset).ok()?;
         let offset_in_section = usize::try_from(vaddr - section.addr).ok()?;

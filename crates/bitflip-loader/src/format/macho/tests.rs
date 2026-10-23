@@ -741,7 +741,10 @@ fn the_arm64e_subtype_is_noted() {
 }
 
 #[test]
-fn objc_and_swift_sections_are_listed_but_not_parsed() {
+fn objc_and_swift_sections_appear_in_the_overview_note() {
+    // 名称不再叫 "not parsed"：objc 名字与 swift 类型/协议名现在都会解析。
+    // 这条只钉住"总览 note 仍然提到这两类节"，具体解析结果由 objc / swift 各自的
+    // 单测与真实样本测试覆盖。
     let spec = fixture::ThinSpec::new64(fixture::CPU_TYPE_ARM64, 0)
         .segment(
             fixture::SegmentSpec::new("__DATA", 0x1_0000_4000, 0x4000, 0x1000, 0x100)

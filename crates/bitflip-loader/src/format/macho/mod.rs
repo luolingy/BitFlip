@@ -119,6 +119,7 @@ pub mod chained;
 pub mod export_trie;
 pub mod fat;
 pub mod objc;
+pub mod swift;
 
 pub use bind::{BindImport, BindKind};
 pub use chained::{ChainWalk, ChainedFixups, ChainedImport};
@@ -671,6 +672,17 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
         &file.segments,
     );
     for note in object.objc.notes.clone() {
+        object.note(note);
+    }
+    // Swift 元数据（`__swift5_*`）。同样属于解析层：类型/协议名是文件里的事实。
+    object.swift = swift::parse(
+        bytes,
+        file.image_base.unwrap_or(0),
+        file.endian == Endian::Little,
+        file.is_64,
+        &file.segments,
+    );
+    for note in object.swift.notes.clone() {
         object.note(note);
     }
     Ok(object)
@@ -1868,10 +1880,11 @@ fn validate_memory_map(
     Ok(())
 }
 
-/// 有 objc / swift 元数据节时说明"没解析"。
+/// 有 objc / swift 元数据节时说明**解析到了什么**。
 ///
-/// objc 的**名字**现在由 [`objc::parse`] 解析了，所以这里只说明**没做的部分**：
-/// swift 元数据仍然没有解析，objc 那边缺什么由 objc 模块自己的 notes 说明。
+/// objc 的名字由 [`objc::parse`] 解析，swift 的类型/协议名由 [`swift::parse`] 解析；
+/// 两个模块各自把"解不出来的部分"写进自己的 notes。这里只做一句**总览**，不重复
+/// 它们的细节（细节在各自的元数据里）。
 fn note_objc_and_swift(segments: &[MachOSegment], notes: &mut Vec<String>) {
     let mut objc = 0usize;
     let mut swift = 0usize;
@@ -1894,8 +1907,9 @@ fn note_objc_and_swift(segments: &[MachOSegment], notes: &mut Vec<String>) {
     }
     if swift > 0 {
         notes.push(format!(
-            "有 {swift} 个 __swift* 节：**没有解析**，Swift 类型/函数名不会出现在结果里，\
-             也没有做 name demangling"
+            "有 {swift} 个 __swift* 节：类型/协议名已从 __swift5_types/__swift5_protos 解析\
+             （见 swift 元数据）；字段布局、反映射等需要完整类型元数据重建的部分**没有**\
+             解析，逐节列在 swift 元数据里（不编造）"
         ));
     }
 }
