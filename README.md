@@ -142,6 +142,7 @@ crates/
   bitflip-arch/     指令解码与架构描述（ABI、寄存器、调用约定）
   bitflip-analyze/  分析流水线：作业、进度、取消、阶段 S1–S9
   bitflip-symbols/  符号来源与优先级（符号表、导出、unwind、DWARF/PDB、签名库）
+  bitflip-patch/    可执行文件打补丁（默认只读；显式解锁后写 .patched 副本，不原地覆写）
   bitflip-project/  工程库（可写）：用户标注为主数据，分析结果为可重建派生物
   bitflip-server/   本地 HTTP/WS 服务 + 内嵌 SPA
   bitflip-cli/      CLI 实现（`bitflip` 与 `bitflip-cli` 共用）

@@ -289,6 +289,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitflip-patch"
+version = "0.0.1"
+dependencies = [
+ "bitflip-loader",
+ "thiserror",
+]
+
+[[package]]
 name = "bitflip-project"
 version = "0.0.1"
 dependencies = [
