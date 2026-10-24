@@ -20,6 +20,7 @@ mod pseudo;
 mod scan;
 mod strings;
 mod structs;
+mod structurize;
 mod xref;
 
 pub use addrspace::{
@@ -71,6 +72,7 @@ pub use scan::{
 };
 pub use strings::{extract_strings, StringEncoding, StringEntry, StringOptions};
 pub use structs::{infer_struct_fields, StructCandidate, StructField, StructReport};
+pub use structurize::decompile_structured;
 pub use xref::{xrefs_of, xrefs_of_all, Xref, XrefKind};
 
 /// 本 crate 的公共 API 版本。

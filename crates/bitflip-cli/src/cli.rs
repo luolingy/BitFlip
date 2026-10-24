@@ -412,10 +412,13 @@ pub struct ExportArgs {
     #[arg(value_name = "TARGET")]
     pub target: PathBuf,
     /// 导出格式：asm-intel、asm-att、json-functions、json-symbols、json-xrefs、
-    /// dot-cfg、pseudo-c、dex-json、dex-smali、dex-dot-cfg
+    /// json-structs、json-libraries、dot-cfg、pseudo-c、pseudo-c-structured、
+    /// dex-json、dex-smali、dex-dot-cfg
     ///
-    /// 前七个是机器码视图（按地址选），后三个是 DEX 视图（按类 / 方法选）。
+    /// 机器码视图（按地址选）：除 dex-* 之外的格式；DEX 视图（按类 / 方法选）：dex-*。
     /// 两套选择器不能混用：把 `--function` 给 DEX 格式会**报错**，不静默忽略。
+    /// pseudo-c 是扁平的（条件跳转写成 goto）；pseudo-c-structured 会还原
+    /// if/else/while/do-while（形态拿不准处仍保留 goto）。
     #[arg(long, value_name = "FORMAT", default_value = "asm-intel")]
     pub format: String,
     /// 输出文件；缺省写标准输出

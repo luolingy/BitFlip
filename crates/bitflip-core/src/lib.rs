@@ -97,6 +97,7 @@ pub use bitflip_analyze::{
 /// 嵌入方需要构造它而不必直接依赖 `bitflip-analyze`。
 pub use bitflip_analyze::ScanOptions as DisasmScanOptions;
 
+pub use bitflip_analyze::decompile_structured;
 /// 结构体字段布局的**疑似**推断（阶段 2）：纯函数，输入解码后的指令流。
 /// **启发式、非真实 C 类型**，边界见 [`bitflip_analyze::structs`]。
 pub use bitflip_analyze::{infer_struct_fields, StructCandidate, StructField, StructReport};

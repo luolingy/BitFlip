@@ -57,12 +57,16 @@ pub struct PseudocodeFunction {
     pub entry: u64,
     /// 函数名。来自符号表/签名库；没有就是 `None`（**不编造** `func_xxx`，§7）。
     pub name: Option<String>,
-    /// 是否做了控制流结构化。本模块恒为 `false`。
+    /// 是否做了控制流结构化。`decompile_function` 恒为 `false`；
+    /// `decompile_structured` 在**全函数控制流都被结构化、没有残留 goto** 时为 `true`。
     ///
     /// 这个字段存在的意义是**让调用方不必猜测**当前输出的语义级别：
     /// `false` 时用户看到的是"每块一段、跳转是 goto"，`true` 才是真正的结构。
     /// 把它写成常量而不是省略，是因为省略会让人以为默认就是结构化的。
     pub structured: bool,
+    /// 结构化渲染的函数体（每行带缩进与行尾地址注释），`structured` 为 `true` 时使用；
+    /// 为 `None` 时渲染走"按块 per-block"的老路径。**两种渲染都逐句可追溯到指令地址。**
+    pub structured_body: Option<Vec<String>>,
     /// 按基本块分组的语句。
     pub blocks: Vec<PseudocodeBlock>,
     /// 语句总数。
@@ -109,6 +113,17 @@ pub enum PseudocodeNote {
     ///
     /// 这条**必定存在**，因为它决定了用户该怎么读这份输出。
     FlatGoto,
+    /// 已做控制流结构化：`if`/`else`/`while`/`do-while` 都是从 CFG 还原的，函数内无残留 `goto`。
+    Structured,
+    /// 只做到了**部分**结构化：其余控制流仍以 `goto` 出现。
+    PartiallyStructured {
+        /// 仍以 `goto` 形式出现的控制转移数。
+        residual_gotos: usize,
+        /// 已并入结构的块数。
+        structured_blocks: usize,
+        /// 函数的基本块总数。
+        total_blocks: usize,
+    },
     /// 输出被截断。
     Truncated {
         /// 已输出的语句数。
@@ -149,6 +164,19 @@ impl PseudocodeNote {
                  不是还原出的 if/while/for"
                     .to_string()
             }
+            Self::Structured => {
+                "已做控制流结构化：if/else/while/do-while 从控制流图还原，函数内无残留 goto"
+                    .to_string()
+            }
+            Self::PartiallyStructured {
+                residual_gotos,
+                structured_blocks,
+                total_blocks,
+            } => format!(
+                "部分结构化：{structured_blocks}/{total_blocks} 个基本块并入了 if/while 结构；\
+                 其余基本块按原样（顺序/跳转）输出，其中 {residual_gotos} 处控制转移退化为 goto\
+                 （循环等形态本片未完整还原，如实保留）"
+            ),
             Self::Truncated { emitted, dropped } => format!(
                 "输出被截断：已输出 {emitted} 条语句，丢弃 {dropped} 条（超过上限 {MAX_STATEMENTS}）"
             ),
@@ -225,10 +253,17 @@ pub fn render_function_text(f: &PseudocodeFunction) -> String {
         "void {}(void) {{",
         sanitize_identifier(f.name.as_deref().unwrap_or("sub"))
     );
-    for b in &f.blocks {
-        let _ = writeln!(out, "  // block {:#x}..{:#x}", b.start, b.end);
-        for s in &b.statements {
-            let _ = writeln!(out, "  {:#x}: {};", s.addr, s.text);
+    if let Some(body) = &f.structured_body {
+        // 结构化渲染：每行自带缩进与地址追溯。
+        for line in body {
+            let _ = writeln!(out, "{line}");
+        }
+    } else {
+        for b in &f.blocks {
+            let _ = writeln!(out, "  // block {:#x}..{:#x}", b.start, b.end);
+            for s in &b.statements {
+                let _ = writeln!(out, "  {:#x}: {};", s.addr, s.text);
+            }
         }
     }
     out.push_str("}\n");
@@ -363,6 +398,7 @@ pub fn decompile_function(
         entry,
         name: name.map(str::to_string),
         structured: false,
+        structured_body: None,
         blocks,
         statement_count,
         truncated,
@@ -376,7 +412,12 @@ pub fn decompile_function(
 /// 返回 `Ok(None)` 表示这条指令**有意不产生语句**（`nop` 之类），
 /// 返回 `Err(reason)` 表示**翻译不了**：调用方必须把它当作缺失来报告，
 /// 而不是当作"这条指令无关紧要"。
-fn translate(insn: &DecodedInsn, namer: RegisterNamer<'_>) -> Result<Option<String>, String> {
+/// `pub(crate)` 是为了让 [`crate::structurize`] 复用同一套指令翻译，
+/// 避免两处翻译逻辑漂移（一处改了另一处没改，是这类工具最难查的 bug）。
+pub(crate) fn translate(
+    insn: &DecodedInsn,
+    namer: RegisterNamer<'_>,
+) -> Result<Option<String>, String> {
     let m = insn.mnemonic;
     let ops = &insn.operands;
 
@@ -460,7 +501,7 @@ fn insn_name(m: bitflip_arch::MnemonicId) -> String {
 /// 注意：这里给出的是**条件本身**，不含两侧操作数 —— 因为标志位（x86 的 ZF/CF…）
 /// 不是可读的变量，把它们猜成两个操作数的比较需要数据流分析。
 /// 因此 x86 上会输出 `flags_lt` 这类**显式的占位**，而不是看起来像比较的 `a < b`。
-fn condition_text(c: ConditionCode) -> String {
+pub(crate) fn condition_text(c: ConditionCode) -> String {
     // 条件码的语义是"基于标志位"，不是"基于操作数"。
     // 所以统一写成标志位形式，并让名字一眼看出它是标志而不是变量。
     format!("/* {c:?} */ flags")

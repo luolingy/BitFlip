@@ -75,6 +75,10 @@ pub enum ExportFormat {
     /// 见 `docs/DECOMPILER-SCOPE.md`：这不是反编译器，条件跳转以 `goto` 出现，
     /// 不还原 if/while/for，不做类型推断。用户必须知道这一点才能正确理解输出。
     PseudoC,
+    /// C 风格伪代码，**做了控制流结构化**：可归约 CFG 上的 `if`/`else`/`while`/`do-while`
+    /// 从控制流图还原；形态拿不准的地方仍退回 `if (cond) goto`（如实标注部分结构化）。
+    /// 有界子集，不做类型推断。
+    PseudoCStructured,
     /// DEX 结构快照（JSON）。见 `docs/APK-DEX-DESIGN.md` §M2c 与 ADR-0021。
     DexJson,
     /// DEX 的 smali 风格文本（**我们自己的渲染路径**，不是可回汇编的源文件）。
@@ -97,6 +101,7 @@ impl ExportFormat {
             Self::JsonLibraries => "json-libraries",
             Self::DotCfg => "dot-cfg",
             Self::PseudoC => "pseudo-c",
+            Self::PseudoCStructured => "pseudo-c-structured",
             Self::DexJson => "dex-json",
             Self::DexSmali => "dex-smali",
             Self::DexDotCfg => "dex-dot-cfg",
@@ -116,6 +121,7 @@ impl ExportFormat {
             Self::JsonLibraries,
             Self::DotCfg,
             Self::PseudoC,
+            Self::PseudoCStructured,
             Self::DexJson,
             Self::DexSmali,
             Self::DexDotCfg,
@@ -507,7 +513,27 @@ fn export_with_disasm_prebuilt(
         }
         ExportFormat::PseudoC => {
             let analysis = session.analysis(&job)?;
-            write_pseudo_c(session, &mut writer, &analysis, options, &meta, &mut notes)?
+            write_pseudo_c(
+                session,
+                &mut writer,
+                &analysis,
+                options,
+                &meta,
+                &mut notes,
+                false,
+            )?
+        }
+        ExportFormat::PseudoCStructured => {
+            let analysis = session.analysis(&job)?;
+            write_pseudo_c(
+                session,
+                &mut writer,
+                &analysis,
+                options,
+                &meta,
+                &mut notes,
+                true,
+            )?
         }
     };
 
@@ -903,6 +929,7 @@ fn write_pseudo_c(
     options: &ExportOptions,
     meta: &ExportMeta,
     notes: &mut Vec<String>,
+    structured: bool,
 ) -> Result<u64, BitflipError> {
     let disasm = session.disassemble(crate::DisasmScanOptions::default())?;
 
@@ -923,10 +950,18 @@ fn write_pseudo_c(
     };
 
     writer.push_raw(&pseudo_header(meta, options));
-    writer.push_raw(
-        "# 说明：这是**有界子集**，不是反编译器。条件跳转以 goto 出现，\
-         未还原 if/while/for；未做类型推断。\n",
-    );
+    if structured {
+        writer.push_raw(
+            "# 说明：这是**有界子集**，不是反编译器。已做控制流结构化：可归约 CFG 上的 \
+             if/else/while/do-while 从控制流图还原，形态拿不准处仍保留 if (cond) goto；\
+             未做类型推断。\n",
+        );
+    } else {
+        writer.push_raw(
+            "# 说明：这是**有界子集**，不是反编译器。条件跳转以 goto 出现，\
+             未还原 if/while/for；未做类型推断。\n",
+        );
+    }
     writer.push_raw("# 每条语句前的地址是它来自哪条指令 —— 请对着反汇编核对，不要直接相信。\n");
 
     let mut selected: Vec<&crate::CfgWire> = analysis
@@ -986,8 +1021,11 @@ fn write_pseudo_c(
 
         let insns = disasm.decode_range(from, to);
         let inner = bitflip_analyze::Cfg::build(&insns);
-        let code =
-            bitflip_analyze::decompile_function(entry, name.as_deref(), &insns, &inner, &namer);
+        let code = if structured {
+            bitflip_analyze::decompile_structured(entry, name.as_deref(), &insns, &inner, &namer)
+        } else {
+            bitflip_analyze::decompile_function(entry, name.as_deref(), &insns, &inner, &namer)
+        };
 
         statements += code.statement_count as u64;
         for note in &code.notes {
@@ -1030,11 +1068,20 @@ fn write_pseudo_c(
             "共 {untranslated} 条指令无法翻译成 C 语句（输出里是注释）：这些位置**没有**被猜成某个表达式"
         ));
     }
-    notes.push(
-        "伪代码是有界子集：条件跳转以 goto 出现、未做类型推断、未做控制流结构化。\
-         不要把它当作可编译的源码，也不要当作「已还原的逻辑」"
-            .to_string(),
-    );
+    if structured {
+        notes.push(
+            "伪代码是有界子集：已做控制流结构化（if/else/while/do-while 从 CFG 还原，\
+             形态拿不准处仍保留 if (cond) goto）、未做类型推断。\
+             不要把它当作可编译的源码，也不要当作「已还原的逻辑」"
+                .to_string(),
+        );
+    } else {
+        notes.push(
+            "伪代码是有界子集：条件跳转以 goto 出现、未做类型推断、未做控制流结构化。\
+             不要把它当作可编译的源码，也不要当作「已还原的逻辑」"
+                .to_string(),
+        );
+    }
     Ok(statements)
 }
 

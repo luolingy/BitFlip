@@ -5,6 +5,27 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第一片：控制流结构化（`export --format pseudo-c-structured`）
+
+- 新模块 `bitflip-analyze::structurize`（`decompile_structured`）：在扁平伪代码之上做
+  **控制流结构化**，把可归约 CFG 上的 `if` / `if-else` / `do-while` 从控制流图还原成嵌套缩进
+  的结构；**形态拿不准的（不可归约、多重回边、复杂重汇合、预测试 while 头部在更早块）一律退回
+  `if (cond) goto`**，不为了"看起来像反编译结果"而猜结构。
+- `PseudocodeFunction` 新增 `structured: bool`（**仅当全函数无残留 goto 时为真**）与
+  `structured_body: Option<Vec<String>>`（结构化渲染，每行带缩进与行尾 `/* @0xADDR */` 追溯）；
+  新增 [`PseudocodeNote::Structured`] 与 [`PseudocodeNote::PartiallyStructured`]（给出
+  并入结构的块数 / 总块数 / 退化 goto 数——**如实告诉用户这份输出了多少结构**）。
+- 新导出格式 `pseudo-c-structured`（CLI `export` 与 HTTP `/export?format=pseudo-c-structured`
+  同一实现，服务端动态枚举自动可用）；原 `pseudo-c` 保持**扁平**行为不变，二者只差 `structured`
+  开关。机器码视图，不做类型推断。
+- 结构算法：迭代支配集合 + 近似直接后支配点（join）；`if` 用 join 判定单臂/双臂；`do-while`
+  仅在"回边目标即当前条件块（自环头）、body 单出口回到头部"时还原，其余留给下一片（while）。
+- 真实核对：CAltKit(arm64) 的 `block_invoke` 还原出嵌套 `if`/`else`/内层 `if`；kernel32.dll
+  (x86_64) 120KB 段内 133 个 `if`、54 个 `else`、192 处退化 `goto`，每个函数如实标注
+  "并入 N/M 块"或"无残留 goto"。
+- analyze 211（+4 单测：线性全结构化 / if-then / 循环形 goto 或 while / 结构或部分结构化标注）/
+  core 73 / cli 40 全过；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 2 第三片：依赖库识别（`export --format json-libraries`）
 
 - 新导出格式 `json-libraries`：把导入表按**库**聚合，回答"这个二进制依赖哪些库、每个库贡献了
