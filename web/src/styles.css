@@ -227,6 +227,48 @@ code {
   color: var(--text-dim);
 }
 
+/* ── 代码签名摘要：结论徽标 ──────────────────────────────────────────────
+   只用颜色区分"内容是否被改 / 结构是否读出"，**不暗示可信**。
+   ok=一致、err=内容已改、warn=结构读不出、neutral=ad-hoc/算法不支持、dim=未签名。 */
+.sig-verdict {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.sig-ok {
+  color: #3fb950;
+  border-color: #2ea043;
+}
+
+.sig-err {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.sig-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.sig-neutral {
+  color: var(--accent);
+  border-color: var(--border);
+}
+
+.sig-dim {
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+.sig-ent-value {
+  color: var(--text);
+}
+
 /* ── 中间：反汇编 ────────────────────────────────────────────────────── */
 
 .toolbar {

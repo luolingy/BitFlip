@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 新增 — Web 信息面板展示代码签名摘要（M12）
+
+把前两片的成果落地成可见的一块：信息面板新增"代码签名"分区，渲染
+`ObjectInfo.signature`（`SignatureInfoWire`）。
+
+- 结论徽标按严重度配色：`Intact`（完整性一致，绿）/ `AdHoc`（ad-hoc 签名，中性）/
+  `Mismatch`（内容已改，红）/ `UnsupportedAlgorithm`（中性）/ `Malformed`（黄）/
+  `NotSigned`（灰）。**只用"内容是否被改"的措辞，绝不暗示"已验签/可信/安全"**。
+- 展示 identifier / 算法 / 哈希覆盖（codeLimit·页大小）/ 逐页校验（`verified/code_slots`）/
+  CMS 证书槽有无 / requirements 有无与字节数。
+- entitlements 逐条 `key = value`（bool/string/strings 显示真值，其它标"未解"）；
+  DER 形态只报存在、requirements 只报存在（与 loader 语义一致）。
+- 非 Mach-O（`applicable=false`）不显示该分区。
+- 只改前端（`web/src/App.tsx`、`web/src/styles.css`），不动 wire 契约；`npm run build`
+  （typecheck + vite）通过。
+
 ### 新增 — 代码签名里的 entitlements / requirements **事实**（M12）
 
 在上一片"有界完整性校验"之上，把签名里**明写着、可读**的两块事实解出来：

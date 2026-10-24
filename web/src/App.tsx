@@ -13,6 +13,7 @@ import {
   type SectionInfo,
   type SegmentInfo,
   type SectionsResponse,
+  type SignatureInfoWire,
   type TargetInfo,
 } from "./api";
 import { DisassemblyView } from "./DisassemblyView";
@@ -490,6 +491,8 @@ export function App() {
               </>
             )}
 
+          {parsed && <CodeSignatureSection signature={parsed.signature} />}
+
           <PaneTitle title="本次运行" />
           <dl className="facts">
             <Fact label="服务版本" value={`v${health.version}`} />
@@ -684,11 +687,123 @@ function Shell({ children }: { children: ReactNode }) {
   return <div className="app">{children}</div>;
 }
 
-function PaneTitle({ title }: { title: string }) {
-  return <h2 className="pane-title">{title}</h2>;
+/// 代码签名摘要面板。
+///
+/// 只讲**完整性**（内容是否自签名以来被改过）与**明文事实**（entitlements /
+/// requirements），措辞严格避免"已验签 / 可信 / 安全"——本工具不做信任链校验。
+/// 非 Mach-O（`applicable=false`）不显示这块。
+function CodeSignatureSection({ signature }: { signature: SignatureInfoWire }) {
+  if (!signature.applicable) return null;
+
+  // verdict → (中文说明, 样式变体)。样式只用于区分严重度，不暗示可信。
+  const verdictView = ((): { label: string; tone: string; detail: string } => {
+    switch (signature.verdict) {
+      case "Intact":
+        return {
+          label: "完整性一致",
+          tone: "ok",
+          detail: "内容与签名里存的哈希逐页一致（自签名以来未被改过）",
+        };
+      case "AdHoc":
+        return {
+          label: "ad-hoc 签名",
+          tone: "neutral",
+          detail: "ad-hoc 签名（无证书/CMS），内容与哈希一致",
+        };
+      case "Mismatch":
+        return {
+          label: "内容已改",
+          tone: "err",
+          detail: signature.first_mismatch != null
+            ? `第 ${signature.first_mismatch} 页起哈希对不上：文件内容自签名以来被改过`
+            : "有页面哈希对不上：文件内容自签名以来被改过",
+        };
+      case "UnsupportedAlgorithm":
+        return {
+          label: "算法不支持",
+          tone: "neutral",
+          detail: "算法本工具没接（只校 SHA-1 / SHA-256），只看得到结构，未判完整性",
+        };
+      case "Malformed":
+        return {
+          label: "结构读不出",
+          tone: "warn",
+          detail: "签名区结构解析失败（SuperBlob / CodeDirectory 魔数或长度不对）",
+        };
+      case "NotSigned":
+      default:
+        return { label: "未签名", tone: "dim", detail: "这个 Mach-O 没有 LC_CODE_SIGNATURE" };
+    }
+  })();
+
+  return (
+    <>
+      <PaneTitle title="代码签名" />
+      <p>
+        <span className={`sig-verdict sig-${verdictView.tone}`}>{verdictView.label}</span>{" "}
+        <span className="hint">{verdictView.detail}</span>
+      </p>
+      <p className="hint">
+        仅校验完整性（逐页哈希）；<strong>未校</strong>信任链（CMS/X.509）、资源封印与需求校验。
+      </p>
+
+      {signature.present && (
+        <dl className="facts">
+          <Fact label="标识符" value={signature.identifier || "（未知）"} />
+          <Fact label="算法" value={signature.algorithm || "（未知）"} />
+          <Fact
+            label="哈希覆盖"
+            value={`codeLimit ${formatSize(signature.code_limit)} · 页 ${formatSize(signature.page_size)}`}
+          />
+          <Fact
+            label="逐页校验"
+            value={`${signature.verified_slots} / ${signature.code_slots} 页一致`}
+          />
+          <Fact label="CMS 证书槽" value={signature.has_cms_signature ? "有" : "无（ad-hoc）"} />
+          <Fact label="需求 (requirements)" value={signature.has_requirements ? `有 · ${formatSize(signature.requirements_size)}` : "无"} />
+        </dl>
+      )}
+
+      {signature.entitlements.length > 0 && (
+        <>
+          <p className="hint">
+            Entitlements（{signature.entitlements.length} 条
+            {signature.entitlements_has_der_form ? "，另有 DER 形态未解" : ""}）：
+          </p>
+          <ul className="notes">
+            {signature.entitlements.map((item, index) => (
+              <li key={`${item.key}-${index}`} className="mono">
+                {item.key}
+                {item.kind === "bool" || item.kind === "string" || item.kind === "strings" ? (
+                  <span className="sig-ent-value"> = {item.value}</span>
+                ) : (
+                  <span className="hint"> = {item.value}（未解）</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {signature.entitlements.length === 0 && signature.entitlements_has_der_form && (
+        <p className="hint">只有 DER 形态的 entitlements（本工具不解，未展示）。</p>
+      )}
+
+      {signature.notes.length > 0 && (
+        <ul className="notes">
+          {signature.notes.map((note) => (
+            <li key={note} className="hint">
+              {note}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
 }
 
-function Fact({ label, value }: { label: string; value: string }) {
+function PaneTitle({ title }: { title: string }) {
+  return <h2 className="pane-title">{title}</h2>;
+}function Fact({ label, value }: { label: string; value: string }) {
   return (
     <>
       <dt>{label}</dt>
