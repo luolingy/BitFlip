@@ -5,6 +5,36 @@
 
 ## [Unreleased]
 
+### 新增 — 代码签名里的 entitlements / requirements **事实**（M12）
+
+在上一片"有界完整性校验"之上，把签名里**明写着、可读**的两块事实解出来：
+`CSSLOT_ENTITLEMENTS`（type 5）与 `CSSLOT_REQUIREMENTS`（type 2）blob。
+
+- **entitlements**：blob 头是 `fade7171` + 大端长度，载荷是 XML plist。用轻量解析
+  （**不引 plist 依赖**）把 `<key>` + 值抽成键值：布尔 / 字符串 / 字符串数组解出真值，
+  嵌套 dict / data / integer 等标 `Other(标签名)`（没解就标没解，不编造）。同时探测
+  是否存在 **DER 形态**（`fade7172`）：存在但不解，只置 `entitlements_has_der_form`。
+- **requirements**：只报**存在**与 blob 头字节数，**不实现需求表达式求值**（那是独立的
+  opcode 语言 + 证书/信息项匹配，超出有界范围）。
+- **loader** `CodeSignature` 新增 `entitlements: Option<Entitlements>` 与
+  `requirements: Requirements`（`Entitlements{ list, has_der_form }`、
+  `Requirements{ present, size }`）。
+- **core**：`SignatureInfoWire` 新增 `entitlements: Vec<EntitlementWire>` /
+  `entitlements_has_der_form` / `has_requirements` / `requirements_size`；形状变化 ⇒
+  `CORE_API_VERSION` 9→10、`SERVER_API_VERSION` 同步 10（cli version 测试已更新）。
+- **Web**：`api.ts` 补 `EntitlementWire` 与 `SignatureInfoWire` 新字段镜像。
+- **真实样本交叉核对**（`--ignored`，实测值）：
+
+  | 样本 | entitlements 键 | get-task-allow | application-identifier | requirements |
+  | --- | --- | --- | --- | --- |
+  | LiveContainer | 10 | true | AAAAA11111.com.kdt.livecontainer | 有 |
+  | Stapxs QQ App.app | 0（无该 blob） | — | — | 有 |
+  | SideStore | 6 | true | XYZ0123456.com.SideStore.SideStore | 有 |
+  | PojavLauncher | 10 | true | —（无该键） | 有 |
+- **测试**：codesign 新增 3 条单测（plist 解析标量/数组/Others、entitlements blob 解析 +
+  DER 探测、非 entitlements 魔数→空列表）；loader 真实样本测试补齐 entitlements 断言；
+  core 投影测试补齐 entitlements/requirements 断言。
+
 ### 新增 — 代码签名的**有界完整性校验**（M12）
 
 此前 `LC_CODE_SIGNATURE` 只记"存在、不校验"。这一片把它变成一件可离线复现、

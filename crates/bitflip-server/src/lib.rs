@@ -52,7 +52,9 @@ pub const TOKEN_QUERY: &str = "token";
 /// v8：与 core 同步（`ObjectInfo` 新增 `swift` 字段，形状变化）。
 ///
 /// v9：与 core 同步（`ObjectInfo` 新增 `signature` 字段，形状变化）。
-pub const SERVER_API_VERSION: u32 = 9;
+///
+/// v10：与 core 同步（`SignatureInfoWire` 新增 entitlements/requirements 字段）。
+pub const SERVER_API_VERSION: u32 = 10;
 
 /// 程序名。
 pub const APP_NAME: &str = "bitflip";

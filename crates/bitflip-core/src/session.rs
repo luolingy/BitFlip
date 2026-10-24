@@ -336,8 +336,50 @@ pub struct SignatureInfoWire {
     pub first_mismatch: Option<u64>,
     /// 是否带 CMS 签名槽（非 ad-hoc）。
     pub has_cms_signature: bool,
+    /// 从 XML entitlements blob 解出的键值（按 plist 顺序）；没有就是空列表。
+    pub entitlements: Vec<EntitlementWire>,
+    /// 是否还存在 DER 形态的 entitlements（存在但不解内容）。
+    pub entitlements_has_der_form: bool,
+    /// 是否有 requirements blob（只报存在，不实现需求表达式求值）。
+    pub has_requirements: bool,
+    /// requirements blob 头声明的字节数（含 8 字节 blob 头）。
+    pub requirements_size: u64,
     /// 解析与校验说明（降级、未做项，§7）。
     pub notes: Vec<String>,
+}
+
+/// 一条 entitlement 的 wire 表示。
+///
+/// `value` 是**展示用**的文本：布尔渲染成 `true`/`false`，字符串原样，字符串数组用
+/// `, ` 连接，其它形态渲染成 `<标签名>`（表示"没解"，不编造）。同时给 `kind` 让前端能
+/// 区分类型，而不是只看一段文字。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EntitlementWire {
+    /// 键。
+    pub key: String,
+    /// 类型：`bool` / `string` / `strings` / `other`。
+    pub kind: String,
+    /// 展示用值文本（见上）。
+    pub value: String,
+}
+
+impl EntitlementWire {
+    /// 由 loader 的 `Entitlement` 构造。
+    #[must_use]
+    pub fn from_loader(entitlement: &bitflip_loader::object::Entitlement) -> Self {
+        use bitflip_loader::object::EntitlementValue;
+        let (kind, value) = match &entitlement.value {
+            EntitlementValue::Bool(b) => ("bool".to_string(), b.to_string()),
+            EntitlementValue::String(s) => ("string".to_string(), s.clone()),
+            EntitlementValue::Strings(items) => ("strings".to_string(), items.join(", ")),
+            EntitlementValue::Other(tag) => ("other".to_string(), format!("<{tag}>")),
+        };
+        Self {
+            key: entitlement.key.clone(),
+            kind,
+            value,
+        }
+    }
 }
 
 impl SignatureInfoWire {
@@ -373,6 +415,14 @@ impl SignatureInfoWire {
             verified_slots: sig.verified_slots,
             first_mismatch: sig.first_mismatch,
             has_cms_signature: sig.has_cms_signature,
+            entitlements: sig
+                .entitlements
+                .as_ref()
+                .map(|e| e.list.iter().map(EntitlementWire::from_loader).collect())
+                .unwrap_or_default(),
+            entitlements_has_der_form: sig.entitlements.as_ref().is_some_and(|e| e.has_der_form),
+            has_requirements: sig.requirements.present,
+            requirements_size: sig.requirements.size,
             notes: sig.notes.clone(),
         }
     }
@@ -2479,6 +2529,23 @@ mod tests {
             verified_slots: 2,
             first_mismatch: None,
             has_cms_signature: false,
+            entitlements: Some(bitflip_loader::object::Entitlements {
+                list: vec![
+                    bitflip_loader::object::Entitlement {
+                        key: "get-task-allow".into(),
+                        value: bitflip_loader::object::EntitlementValue::Bool(true),
+                    },
+                    bitflip_loader::object::Entitlement {
+                        key: "application-identifier".into(),
+                        value: bitflip_loader::object::EntitlementValue::String("Q.com.x".into()),
+                    },
+                ],
+                has_der_form: true,
+            }),
+            requirements: bitflip_loader::object::Requirements {
+                present: true,
+                size: 96,
+            },
             verdict: CodeSignVerdict::AdHoc,
             notes: vec![],
         };
@@ -2488,6 +2555,16 @@ mod tests {
         assert_eq!(wire.algorithm, "SHA-256");
         assert_eq!(wire.code_slots, 2);
         assert_eq!(wire.verified_slots, 2);
+        // entitlements 投影：键值、类型、DER 形态、requirements。
+        assert_eq!(wire.entitlements.len(), 2);
+        assert_eq!(wire.entitlements[0].key, "get-task-allow");
+        assert_eq!(wire.entitlements[0].kind, "bool");
+        assert_eq!(wire.entitlements[0].value, "true");
+        assert_eq!(wire.entitlements[1].kind, "string");
+        assert_eq!(wire.entitlements[1].value, "Q.com.x");
+        assert!(wire.entitlements_has_der_form);
+        assert!(wire.has_requirements);
+        assert_eq!(wire.requirements_size, 96);
 
         // 篡改：verdict=Mismatch，first_mismatch 透传。
         let tampered = CodeSignature {

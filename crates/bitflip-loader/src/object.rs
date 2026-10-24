@@ -909,6 +909,73 @@ pub enum CodeSignVerdict {
     Mismatch,
 }
 
+/// 一条 entitlement 的值（XML plist 里能低风险识别的那几种）。
+///
+/// 只解**标量布尔/字符串**与**字符串数组**——这是 iOS entitlements 的绝大多数形态。
+/// 更复杂的嵌套（dict 里套 dict、data 等）不强行解，标 `Other`（§7：不知道就说不知道）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntitlementValue {
+    /// `<true/>` / `<false/>`。
+    Bool(bool),
+    /// `<string>…</string>`。
+    String(String),
+    /// `<array>` 里的一串 `<string>`。
+    Strings(Vec<String>),
+    /// 其它形态（嵌套 dict / data / integer / real …）：**没解**，只保留原始元素名。
+    Other(String),
+}
+
+/// 一条 entitlement：键 + 值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entitlement {
+    /// 键（如 `get-task-allow`、`application-identifier`）。
+    pub key: String,
+    /// 值。
+    pub value: EntitlementValue,
+}
+
+/// 从签名里解出的 entitlements 事实。
+///
+/// `list` 是 XML plist（`CSSLOT_ENTITLEMENTS`，magic `0xfade7171`）里按出现顺序解出的键值。
+/// 另外记录是否还存在 **DER 形态**的 entitlements（`0xfade7172`）：那个是另一种编码，
+/// 本模块**不解**，只报存在（不猜内容）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Entitlements {
+    /// 解出的键值（按 plist 里的顺序）。
+    pub list: Vec<Entitlement>,
+    /// 是否还存在 DER 编码的 entitlements（`0xfade7172`）：存在但不解。
+    pub has_der_form: bool,
+}
+
+impl Entitlements {
+    /// 有没有任何内容。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty() && !self.has_der_form
+    }
+
+    /// 按 key 找一条（便于调用方取 `get-task-allow` 之类）。
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&EntitlementValue> {
+        self.list
+            .iter()
+            .find(|item| item.key == key)
+            .map(|item| &item.value)
+    }
+}
+
+/// 需求（`CSSLOT_REQUIREMENTS`，type 2）blob 的存在性事实。
+///
+/// **只报存在与字节数，不实现需求表达式求值**——那是一个独立的表达式语言（opcode 流 +
+/// 证书/信息项匹配），超出"有界、可离线复现"的范围。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Requirements {
+    /// 是否有 requirements blob。
+    pub present: bool,
+    /// blob 头里声明的字节数（含 8 字节 blob 头）。
+    pub size: u64,
+}
+
 /// 一个 Mach-O 的代码签名摘要 + 有界完整性校验结果。
 ///
 /// **只校验完整性**：逐页重算文件哈希、与 CodeDirectory 里存的 code slot 比对。
@@ -934,6 +1001,10 @@ pub struct CodeSignature {
     pub first_mismatch: Option<u64>,
     /// SuperBlob 里是否带 CMS 签名槽（`CSSLOT_SIGNATURESLOT`，type 0x1000）。
     pub has_cms_signature: bool,
+    /// 从 XML entitlements blob 解出的键值（没有就是 `None`，不编造）。
+    pub entitlements: Option<Entitlements>,
+    /// 需求（type 2）blob 的存在性事实（不实现求值）。
+    pub requirements: Requirements,
     /// 结论。
     pub verdict: CodeSignVerdict,
     /// 解析与校验说明（降级、未做项，§7）。
@@ -965,6 +1036,8 @@ impl CodeSignature {
             verified_slots: 0,
             first_mismatch: None,
             has_cms_signature: false,
+            entitlements: None,
+            requirements: Requirements::default(),
             verdict: CodeSignVerdict::NotSigned,
             notes: vec!["没有 LC_CODE_SIGNATURE：这个 Mach-O 未签名".to_string()],
         }

@@ -123,7 +123,11 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// v9（代码签名有界校验这一片）：[`crate::session::ObjectInfo`] 新增 `signature:
 /// SignatureInfoWire`（完整性结论/算法/identifier/slot 计数）。同样是公开结构体的
 /// 形状变化 ⇒ +1；`SERVER_API_VERSION` 同步 +1。
-pub const CORE_API_VERSION: u32 = 9;
+///
+/// v10（entitlements/requirements 事实这一片）：[`crate::session::SignatureInfoWire`]
+/// 新增 `entitlements` / `entitlements_has_der_form` / `has_requirements` /
+/// `requirements_size`。公开结构体形状变化 ⇒ +1；`SERVER_API_VERSION` 同步 +1。
+pub const CORE_API_VERSION: u32 = 10;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

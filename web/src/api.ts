@@ -193,7 +193,24 @@ export interface SignatureInfoWire {
   verified_slots: number;
   first_mismatch: number | null;
   has_cms_signature: boolean;
+  /** 从 XML entitlements blob 解出的键值（展示用）。 */
+  entitlements: EntitlementWire[];
+  /** 是否还存在 DER 形态的 entitlements（存在但不解内容）。 */
+  entitlements_has_der_form: boolean;
+  /** 是否有 requirements blob（只报存在）。 */
+  has_requirements: boolean;
+  /** requirements blob 头声明的字节数。 */
+  requirements_size: number;
   notes: string[];
+}
+
+/** 一条 entitlement（展示用）。对应 `bitflip-core::EntitlementWire`。 */
+export interface EntitlementWire {
+  key: string;
+  /** bool / string / strings / other。 */
+  kind: string;
+  /** 展示用值文本。 */
+  value: string;
 }
 
 export interface ObjectInfo {

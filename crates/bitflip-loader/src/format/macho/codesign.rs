@@ -1,8 +1,12 @@
 //! 代码签名的**有界**解析与完整性校验（`LC_CODE_SIGNATURE` → SuperBlob → CodeDirectory）。
 //!
-//! 这里只做一件可离线复现、结论确定的事：**逐页重算文件哈希，与 CodeDirectory 里存的
-//! code slot 比对**，判断"文件内容是否自签名以来被改过"。改过 → 签名失效（哪怕只是
-//! 一个字节）。这与"这个签名是否可信"是两回事：
+//! 这里做两件可离线复现、结论确定的事：
+//! 1. **完整性**：逐页重算文件哈希，与 CodeDirectory 里存的 code slot 比对，判断
+//!    "文件内容是否自签名以来被改过"。改过 → 签名失效（哪怕只是一个字节）。
+//! 2. **明文事实**：解出 entitlements（XML plist，`fade7171`）的键值，并记录
+//!    requirements blob（type 2）的存在与大小。
+//!
+//! 这两件都与"这个签名是否可信"是两回事：
 //!
 //! **不做（明确边界，写进 `notes`）**：
 //! - CMS / X.509 信任链校验（签名者证书是否被 Apple 信任）；
@@ -38,16 +42,27 @@
 use bitflip_arch::Endian;
 
 use super::LinkeditRange;
-use crate::object::{CodeSignVerdict, CodeSignature, HashAlgorithm};
+use crate::object::{
+    CodeSignVerdict, CodeSignature, Entitlement, EntitlementValue, Entitlements, HashAlgorithm,
+    Requirements,
+};
 
 /// SuperBlob 魔数（大端）。
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
 /// CodeDirectory 魔数（大端）。
 const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
+/// 内嵌 entitlements（XML plist）blob 魔数。
+const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
+/// 内嵌 entitlements（DER 编码）blob 魔数：存在但不解。
+const CSMAGIC_EMBEDDED_DER_ENTITLEMENTS: u32 = 0xfade_7172;
 /// `CSSLOT_CODEDIRECTORY`（SuperBlob 里的 blob 类型）。
 const CSSLOT_CODEDIRECTORY: u32 = 0;
 /// `CSSLOT_SIGNATURESLOT`（CMS / X.509 签名槽；有它 = 非 ad-hoc）。
 const CSSLOT_SIGNATURESLOT: u32 = 0x1000;
+/// `CSSLOT_REQUIREMENTS`（需求 blob）。
+const CSSLOT_REQUIREMENTS: u32 = 2;
+/// `CSSLOT_ENTITLEMENTS`（entitlements blob）。
+const CSSLOT_ENTITLEMENTS: u32 = 5;
 /// CodeDirectory 头部到 `pageSizeLog` 为止的固定长度（含 spare2 前）。
 const CD_FIXED_LEN: usize = 44;
 
@@ -85,6 +100,8 @@ pub(super) fn parse(bytes: &[u8], range: LinkeditRange, endian: Endian) -> CodeS
         verified_slots: 0,
         first_mismatch: None,
         has_cms_signature: false,
+        entitlements: None,
+        requirements: Requirements::default(),
         verdict: CodeSignVerdict::Malformed,
         notes: Vec::new(),
     };
@@ -133,8 +150,9 @@ pub(super) fn parse(bytes: &[u8], range: LinkeditRange, endian: Endian) -> CodeS
         return signature;
     }
 
-    // ── 遍历 BlobIndex，找 CodeDirectory、记 CMS 槽存在性 ──
+    // ── 遍历 BlobIndex，找 CodeDirectory、entitlements、requirements、CMS 槽 ──
     let mut code_directory_offset: Option<usize> = None;
+    let mut entitlements_offset: Option<usize> = None;
     for index in 0..count as usize {
         let entry = 12 + index * 8;
         let (Some(blob_type), Some(blob_off)) = (be_u32(blob, entry), be_u32(blob, entry + 4))
@@ -148,7 +166,20 @@ pub(super) fn parse(bytes: &[u8], range: LinkeditRange, endian: Endian) -> CodeS
             code_directory_offset = Some(blob_off as usize);
         } else if blob_type == CSSLOT_SIGNATURESLOT {
             signature.has_cms_signature = true;
+        } else if blob_type == CSSLOT_ENTITLEMENTS {
+            entitlements_offset = Some(blob_off as usize);
+        } else if blob_type == CSSLOT_REQUIREMENTS {
+            // 需求 blob 只报存在与字节数，不实现表达式求值。
+            signature.requirements.present = true;
+            if let Some(length) = be_u32(blob, blob_off as usize + 4) {
+                signature.requirements.size = u64::from(length);
+            }
         }
+    }
+
+    // entitlements：解 XML plist；同时探测 DER 形态是否也在这块数据里。
+    if let Some(offset) = entitlements_offset {
+        signature.entitlements = parse_entitlements(blob, offset);
     }
 
     let Some(cd_offset) = code_directory_offset else {
@@ -330,12 +361,157 @@ pub(super) fn parse(bytes: &[u8], range: LinkeditRange, endian: Endian) -> CodeS
     signature
 }
 
+/// 解析 entitlements blob（`blob[offset..]`）里的 XML plist。
+///
+/// `blob` 是整个签名区；`offset` 是 entitlements blob 在其中的偏移。blob 头是
+/// magic(`fade7171`) + 长度（均为大端 u32），XML 从第 8 字节起。
+///
+/// 只解标量（bool/string）与字符串数组；其它形态标 `Other`。解不出来返回 `None`
+/// 并把原因写给调用方（§7：不编造）。同时探测这块数据里是否还有 DER 形态
+/// （`fade7172`）——它不解，只置 `has_der_form`。
+fn parse_entitlements(blob: &[u8], offset: usize) -> Option<Entitlements> {
+    let header = blob.get(offset..)?;
+    let magic = be_u32(header, 0)?;
+    if magic != CSMAGIC_EMBEDDED_ENTITLEMENTS {
+        // 不是 XML entitlements（可能是别的类型或损坏），如实返回 None。
+        return Some(Entitlements {
+            list: Vec::new(),
+            has_der_form: magic == CSMAGIC_EMBEDDED_DER_ENTITLEMENTS,
+        });
+    }
+    let length = be_u32(header, 4)? as usize;
+    // blob 头 8 字节 + 载荷；载荷边界至少 8，且不超过这块数据。
+    if length < 8 {
+        return Some(Entitlements::default());
+    }
+    let body = header.get(8..length.min(header.len()))?;
+    let xml = std::str::from_utf8(body).ok()?;
+
+    let list = parse_plist_dict(xml);
+    // DER 形态：整块签名区里可能存在一个 `fade7172` 头（通常紧跟 XML blob）。
+    let has_der_form = find_der_entitlements(blob);
+    Some(Entitlements { list, has_der_form })
+}
+
+/// 在一块数据里扫 `fade7172`（DER entitlements 魔数）头。
+fn find_der_entitlements(blob: &[u8]) -> bool {
+    let needle = CSMAGIC_EMBEDDED_DER_ENTITLEMENTS.to_be_bytes();
+    blob.windows(4).any(|window| window == needle)
+}
+
+/// 从一段 XML plist 的字符串里，按 `<key>…</key>` + 随后的值元素，抽成键值列表。
+///
+/// **刻意轻量**：不引入 plist 依赖，只认最常见形态。规则：
+/// - `<key>NAME</key>` 后面紧跟一个值元素，构成一条；
+/// - 值元素：`<true/>`/`<false/>`→`Bool`；`<string>V</string>`→`String`；
+///   `<array>` 里的连续 `<string>`→`Strings`；其它（`<dict>`/`<data>`/`<integer>`…）→`Other(标签名)`。
+///
+/// 这不是通用 XML 解析器：只对标准 `plutil -convert xml1` 风格的 entitlements 成立。
+/// 解不出的条目一律标 `Other`，不猜。
+fn parse_plist_dict(xml: &str) -> Vec<Entitlement> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+
+    while let Some(key_open) = rest.find("<key>") {
+        let after_open = &rest[key_open + 5..];
+        let Some(key_close) = after_open.find("</key>") else {
+            break;
+        };
+        let key = decode_entities(after_open[..key_close].trim());
+        let after_key = &after_open[key_close + 6..];
+        let trimmed = after_key.trim_start();
+
+        let (value, consumed_len) = parse_value(trimmed);
+        out.push(Entitlement { key, value });
+
+        // 跳过本条的键 + 值，继续找下一条 key。
+        // 用值元素的结束位置推进（consumed_len 是相对 trimmed 的字节数）。
+        let skip = (after_key.len() - trimmed.len()) + consumed_len;
+        if skip == 0 || skip > after_key.len() {
+            break;
+        }
+        rest = &after_key[skip..];
+    }
+    out
+}
+
+/// 从 `s`（已 trim_start，以某个值元素开头）解析一个值，返回 `(值, 消耗字节数)`。
+fn parse_value(s: &str) -> (EntitlementValue, usize) {
+    if let Some(after) = s.strip_prefix("<true/>") {
+        return (EntitlementValue::Bool(true), s.len() - after.len());
+    }
+    if let Some(after) = s.strip_prefix("<false/>") {
+        return (EntitlementValue::Bool(false), s.len() - after.len());
+    }
+    if let Some(rest) = s.strip_prefix("<string>") {
+        if let Some(close) = rest.find("</string>") {
+            let value = decode_entities(rest[..close].trim());
+            return (
+                EntitlementValue::String(value),
+                "<string>".len() + close + "</string>".len(),
+            );
+        }
+    }
+    if s.starts_with("<array>") {
+        let array_close = s.find("</array>");
+        let end = array_close.map_or(s.len(), |close| close + "</array>".len());
+        let block = &s[..end];
+        let mut items = Vec::new();
+        let mut cursor = block;
+        while let Some(open) = cursor.find("<string>") {
+            let after = &cursor[open + "<string>".len()..];
+            let Some(close) = after.find("</string>") else {
+                break;
+            };
+            items.push(decode_entities(after[..close].trim()));
+            cursor = &after[close + "</string>".len()..];
+        }
+        return (EntitlementValue::Strings(items), end);
+    }
+    // 其它形态：抓标签名，标 Other，消耗到整个元素的匹配结束（用宽松的定位）。
+    let tag = s
+        .strip_prefix('<')
+        .and_then(|t| {
+            t.split(|c: char| c == '>' || c.is_whitespace() || c == '/')
+                .next()
+        })
+        .unwrap_or("")
+        .to_string();
+    // 尝试推进到该标签的闭合（或自闭合）。
+    let consumed = tag_end(s, &tag);
+    (EntitlementValue::Other(tag), consumed)
+}
+
+/// 尽力估算一个非白名单元素在 `s` 里占的字节数：成对 `<x>…</x>` 到 `</x>`；否则到第一个 `>`。
+fn tag_end(s: &str, tag: &str) -> usize {
+    if tag.is_empty() {
+        return s.len();
+    }
+    let close = format!("</{tag}>");
+    if let Some(pos) = s.find(&close) {
+        return pos + close.len();
+    }
+    // 没成对闭合：推进到第一个 `>` 之后（自闭合或空元素）。
+    if let Some(gt) = s.find('>') {
+        return gt + 1;
+    }
+    s.len()
+}
+
+/// 解 XML 里最常见的几个实体（entitlements 值里偶见 `&amp;` 等）。
+fn decode_entities(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 /// SHA-1 摘要（20 字节）。
 fn sha1_digest(data: &[u8]) -> Option<Vec<u8>> {
     use sha1::{Digest, Sha1};
     Some(Sha1::digest(data).to_vec())
 }
-
 /// SHA-256 摘要（32 字节）。
 fn sha256_digest(data: &[u8]) -> Option<Vec<u8>> {
     use sha2::{Digest, Sha256};
@@ -469,5 +645,79 @@ mod tests {
             Endian::Little,
         );
         assert_eq!(sig.verdict, CodeSignVerdict::Malformed);
+    }
+
+    #[test]
+    fn plist_parser_extracts_scalars_arrays_and_others() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>get-task-allow</key><true/>
+  <key>aps-environment</key><string>development</string>
+  <key>application-identifier</key><string>ABC.com.example</string>
+  <key>com.apple.security.application-groups</key>
+  <array><string>group.one</string><string>group.two</string></array>
+  <key>weird</key><dict><key>n</key><integer>1</integer></dict>
+</dict></plist>"#;
+        let list = parse_plist_dict(xml);
+        let keys: Vec<&str> = list.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "get-task-allow",
+                "aps-environment",
+                "application-identifier",
+                "com.apple.security.application-groups",
+                "weird"
+            ]
+        );
+        assert_eq!(list[0].value, EntitlementValue::Bool(true));
+        assert_eq!(
+            list[1].value,
+            EntitlementValue::String("development".to_string())
+        );
+        assert_eq!(
+            list[3].value,
+            EntitlementValue::Strings(vec!["group.one".to_string(), "group.two".to_string()])
+        );
+        // 嵌套 dict 不解，标 Other。
+        assert!(matches!(list[4].value, EntitlementValue::Other(_)));
+    }
+
+    #[test]
+    fn entitlements_blob_is_parsed_and_der_form_detected() {
+        // 造一个 entitlements blob：fade7171 + 长度 + XML，随后跟一个 DER 头 fade7172。
+        let xml = r#"<?xml version="1.0"?><plist version="1.0"><dict><key>get-task-allow</key><true/><key>application-identifier</key><string>Q.com.x</string></dict></plist>"#;
+        let xml_bytes = xml.as_bytes();
+        let blob_len = 8 + xml_bytes.len();
+        let mut blob = vec![0u8; blob_len + 8];
+        blob[0..4].copy_from_slice(&CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes());
+        blob[4..8].copy_from_slice(&(blob_len as u32).to_be_bytes());
+        blob[8..8 + xml_bytes.len()].copy_from_slice(xml_bytes);
+        // 尾部 DER 头
+        blob[blob_len..blob_len + 4]
+            .copy_from_slice(&CSMAGIC_EMBEDDED_DER_ENTITLEMENTS.to_be_bytes());
+
+        let ent = parse_entitlements(&blob, 0).expect("能解析 entitlements");
+        assert_eq!(ent.list.len(), 2);
+        assert_eq!(
+            ent.get("get-task-allow"),
+            Some(&EntitlementValue::Bool(true))
+        );
+        assert_eq!(
+            ent.get("application-identifier"),
+            Some(&EntitlementValue::String("Q.com.x".to_string()))
+        );
+        assert!(ent.has_der_form, "应探测到 DER 形态");
+        assert!(!ent.is_empty());
+    }
+
+    #[test]
+    fn non_entitlements_magic_yields_empty_list() {
+        // 头不是 fade7171 → 空列表（不编造），has_der_form 按 magic 判断。
+        let mut blob = vec![0u8; 16];
+        blob[0..4].copy_from_slice(&CSMAGIC_EMBEDDED_DER_ENTITLEMENTS.to_be_bytes());
+        let ent = parse_entitlements(&blob, 0).expect("返回 Some");
+        assert!(ent.list.is_empty());
+        assert!(ent.has_der_form);
     }
 }

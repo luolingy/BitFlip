@@ -1691,12 +1691,20 @@ struct SignCounts {
     verified: u64,
     first_mismatch: Option<u64>,
     has_cms: bool,
+    /// entitlements 键的数量（None → 0）。
+    ent_count: usize,
+    /// `get-task-allow` 的值（没这条 → None）。
+    get_task_allow: Option<bool>,
+    /// `application-identifier` 的值（没这条 → None）。
+    app_id: Option<String>,
+    /// 是否有 requirements blob。
+    has_requirements: bool,
 }
 
 #[test]
 #[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
 fn real_ios_binaries_report_code_signature_verdicts() {
-    use bitflip_loader::object::CodeSignVerdict;
+    use bitflip_loader::object::{CodeSignVerdict, EntitlementValue};
 
     let paths = all_sample_paths();
     let mut rows = Vec::new();
@@ -1716,29 +1724,55 @@ fn real_ios_binaries_report_code_signature_verdicts() {
                 verified: 0,
                 first_mismatch: None,
                 has_cms: false,
+                ent_count: 0,
+                get_task_allow: None,
+                app_id: None,
+                has_requirements: false,
             },
-            Some(sig) => SignCounts {
-                name: member_name.clone(),
-                present: true,
-                verdict: format!("{:?}", sig.verdict),
-                algorithm: sig.algorithm.name().to_string(),
-                identifier: sig.identifier.clone(),
-                slots: sig.code_slots,
-                verified: sig.verified_slots,
-                first_mismatch: sig.first_mismatch,
-                has_cms: sig.has_cms_signature,
-            },
+            Some(sig) => {
+                let ent = sig.entitlements.as_ref();
+                let get_task_allow =
+                    ent.and_then(|e| e.get("get-task-allow"))
+                        .and_then(|v| match v {
+                            EntitlementValue::Bool(b) => Some(*b),
+                            _ => None,
+                        });
+                let app_id =
+                    ent.and_then(|e| e.get("application-identifier"))
+                        .and_then(|v| match v {
+                            EntitlementValue::String(s) => Some(s.clone()),
+                            _ => None,
+                        });
+                SignCounts {
+                    name: member_name.clone(),
+                    present: true,
+                    verdict: format!("{:?}", sig.verdict),
+                    algorithm: sig.algorithm.name().to_string(),
+                    identifier: sig.identifier.clone(),
+                    slots: sig.code_slots,
+                    verified: sig.verified_slots,
+                    first_mismatch: sig.first_mismatch,
+                    has_cms: sig.has_cms_signature,
+                    ent_count: ent.map_or(0, |e| e.list.len()),
+                    get_task_allow,
+                    app_id,
+                    has_requirements: sig.requirements.present,
+                }
+            }
         };
         eprintln!(
-            "{:<44} present={} verdict={:<10} alg={:<10} slots={}(verify {}) cms={} mismatch={:?} id={}",
+            "{:<44} verdict={:<8} alg={:<8} slots={}(verify {}) cms={} mismatch={:?} ent={} gta={:?} appid={:?} req={} id={}",
             row.name,
-            row.present,
             row.verdict,
             row.algorithm,
             row.slots,
             row.verified,
             row.has_cms,
             row.first_mismatch,
+            row.ent_count,
+            row.get_task_allow,
+            row.app_id,
+            row.has_requirements,
             row.identifier
         );
         rows.push(row);
@@ -1762,6 +1796,19 @@ fn real_ios_binaries_report_code_signature_verdicts() {
         "LiveContainer 所有 code page 都应一致"
     );
     assert_eq!(lc.slots, 33, "实测 LiveContainer 33 个 code slot");
+    // LiveContainer 的 entitlements：明文 XML plist，解出关键项。
+    assert!(lc.ent_count > 0, "LiveContainer 应有 entitlements");
+    assert_eq!(
+        lc.get_task_allow,
+        Some(true),
+        "LiveContainer 实测 get-task-allow = true"
+    );
+    assert_eq!(
+        lc.app_id.as_deref(),
+        Some("AAAAA11111.com.kdt.livecontainer"),
+        "LiveContainer 实测 application-identifier"
+    );
+    assert!(lc.has_requirements, "LiveContainer 应带 requirements blob");
 
     // SideStore 是 SHA-1、带 CMS；完整性结论要么 Intact 要么 Mismatch（样本可能被动过），
     // 但一定要读出结构、算法与 slot 数，且 verified ≤ slots。
@@ -1779,6 +1826,19 @@ fn real_ios_binaries_report_code_signature_verdicts() {
         "SideStore verdict 应为 Intact 或 Mismatch，实际 {}",
         ss.verdict
     );
+    // SideStore 的 entitlements：dev 签名，含 team-identifier / aps-environment。
+    assert!(ss.ent_count > 0, "SideStore 应有 entitlements");
+    assert_eq!(
+        ss.get_task_allow,
+        Some(true),
+        "SideStore 实测 get-task-allow = true"
+    );
+    assert_eq!(
+        ss.app_id.as_deref(),
+        Some("XYZ0123456.com.SideStore.SideStore"),
+        "SideStore 实测 application-identifier"
+    );
+    assert!(ss.has_requirements, "SideStore 应带 requirements blob");
     // 全部样本（无论有没有签名）都不该 panic，verdict 是枚举之一。
     for row in &rows {
         if row.present {
