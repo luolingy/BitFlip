@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第二片：完整自然循环识别（`while` / `do-while`）
+
+- `structurize` 新增**自然循环**识别（`compute_natural_loops`）：对每条回边 `b→h`（`h` 支配 `b`）
+  按标准算法求循环体 `{h} ∪ {能到 b 且不经 h 的块}`；`emit_loop` 据此把循环头结构化成：
+  - **预测试 `while`**：头部是条件块，一个后继在体内（体入口）、另一个是唯一出口
+    → `while (继续条件) { 体 }`；
+  - **`do-while`**：头部即回边判断块、两个后继都在体内、出口由体内某块给出
+    → `do { 体 } while (cond);`。
+  形态不唯一（多重回边、头部两后继都在体内且无单一出口、不可归约）**一律不猜**，退回 `if goto`。
+- 循环体发射改为**带上界集合 `bound` 的递归**（`emit_from(..., bound)`）：体内可继续嵌套结构
+  化 `if`/`while`，遇到体外的块即作为区域边界停下，由循环处理出口后继续。`emit_if` 同样接受
+  `bound`，join 落在体外时自然收口。
+- 真实核对：kernel32.dll(x86_64) 同一 120KB 段 `while` 由 0 → 7，退化 `goto` 由 192 → 118，
+  `if`/`else` 随之重排（122/51）；循环体内嵌套 `if` 正确缩进。
+- analyze 212（+1 预测试 while 单测）/ core 73 / cli 40 全过；fmt/clippy(-D warnings) 干净；
+  arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第一片：控制流结构化（`export --format pseudo-c-structured`）
 
 - 新模块 `bitflip-analyze::structurize`（`decompile_structured`）：在扁平伪代码之上做

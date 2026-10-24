@@ -74,12 +74,13 @@ pub fn decompile_structured(
 
     let dom = compute_dominators(&block_map, start);
     let ipdom = compute_immediate_postdominators(&block_map);
+    let natural_loops = compute_natural_loops(&block_map, &dom);
 
     let mut builder = Builder {
         by_addr: &by_addr,
         blocks: &block_map,
-        dom: &dom,
         ipdom: &ipdom,
+        natural_loops: &natural_loops,
         namer,
         visited: BTreeSet::new(),
         lines: Vec::new(),
@@ -87,7 +88,7 @@ pub fn decompile_structured(
         structured_blocks: 0,
         budget: MAX_STRUCT_LINES,
     };
-    builder.emit_from(start, None, 0);
+    builder.emit_from(start, None, 0, None);
 
     let built = Built {
         lines: builder.lines,
@@ -130,8 +131,9 @@ const MAX_STRUCT_LINES: usize = 8000;
 struct Builder<'a> {
     by_addr: &'a BTreeMap<u64, &'a DecodedInsn>,
     blocks: &'a BTreeMap<u64, &'a crate::cfg::BasicBlock>,
-    dom: &'a BTreeMap<u64, BTreeSet<u64>>,
     ipdom: &'a BTreeMap<u64, Option<u64>>,
+    /// 自然循环：回边头 → 循环体块集合（含头）。由 `compute_natural_loops` 预算。
+    natural_loops: &'a BTreeMap<u64, BTreeSet<u64>>,
     namer: RegisterNamer<'a>,
     visited: BTreeSet<u64>,
     lines: Vec<Line>,
@@ -177,17 +179,27 @@ impl Builder<'_> {
             .map(|(&a, _)| a)
     }
 
-    /// 从 `cur` 开始，一直发射到 `stop`（不含）为止，返回是否正常到达 stop。
+    /// 从 `cur` 开始发射到 `stop`（不含）为止。
     ///
-    /// `stop == None` 表示直到控制流自然结束（ret / 无后继）。
-    fn emit_from(&mut self, mut cur: u64, stop: Option<u64>, indent: usize) {
+    /// `bound` 为 `Some` 时表示只在给定块集合内展开（用于循环体）：遇到集合外的块就当作
+    /// 区域边界停下，由调用方接着从边界外继续。`None` 表示整个函数。
+    fn emit_from(
+        &mut self,
+        mut cur: u64,
+        stop: Option<u64>,
+        indent: usize,
+        bound: Option<&BTreeSet<u64>>,
+    ) {
         loop {
             if Some(cur) == stop {
                 return;
             }
+            // 到了区域边界（循环体外）就停，交给上层。
+            if bound.is_some_and(|b| !b.contains(&cur)) {
+                return;
+            }
             if self.visited.contains(&cur) {
-                // 回到已发射过的块（数据上不该走到这里，正常回边在循环里处理）。
-                // 安全兜底：记为 goto，不再展开。
+                // 回到已发射过的块（正常回边应在 emit_loop 里处理，走到这里属异常兜底）。
                 self.push(indent, format!("goto {cur:#x};"));
                 self.residual_gotos += 1;
                 return;
@@ -196,6 +208,12 @@ impl Builder<'_> {
                 return;
             };
             if self.lines.len() >= self.budget {
+                return;
+            }
+
+            // 循环头：若当前块是某自然循环的头且尚未发射，优先结构化成 while/do-while。
+            // 形态没把握时 `emit_loop` 返回 false，继续按普通块处理（多半走向 goto 兜底）。
+            if self.natural_loops.contains_key(&cur) && self.emit_loop(cur, indent, stop, bound) {
                 return;
             }
 
@@ -214,16 +232,7 @@ impl Builder<'_> {
 
             match last_insn.map(|i| i.flow) {
                 Some(Flow::Branch { conditional: true }) => {
-                    // 条件块：先看是不是循环回边（某个后继支配当前块）。
-                    if let Some(header) = self.loop_header_of(cur, succs) {
-                        if self.emit_loop(cur, header, indent) {
-                            // 循环发射后：cur 已推进到循环出口（或有 goto 兜底）。
-                            // emit_loop 不改变 cur；此处直接 return（循环自身处理出口）。
-                            return;
-                        }
-                        // 循环形态没把握 → 落到普通条件处理（大概率走 goto）。
-                    }
-                    if self.emit_if(cur, last_insn, succs, stop, indent) {
+                    if self.emit_if(cur, last_insn, succs, stop, indent, bound) {
                         return;
                     }
                     // 兜底：整块发射 + 两个后继都写成 goto。
@@ -239,16 +248,6 @@ impl Builder<'_> {
                 Some(Flow::Branch { conditional: false }) => {
                     // 无条件跳转（单后继）。
                     if let Some(&t) = succs.first() {
-                        // 若是循环回边（t 支配 cur）→ 结构化成 loop 尾。
-                        if self.dominates(t, cur) {
-                            self.emit_block_stmts(cur, indent, true);
-                            self.visited.insert(cur);
-                            self.structured_blocks += 1;
-                            // 交给外层循环处理；这里用 goto 兜底（不猜）。
-                            self.push(indent, format!("goto {t:#x}; /* 回边 */"));
-                            self.residual_gotos += 1;
-                            return;
-                        }
                         self.emit_block_stmts(cur, indent, true);
                         self.visited.insert(cur);
                         self.structured_blocks += 1;
@@ -277,16 +276,6 @@ impl Builder<'_> {
         }
     }
 
-    /// 若 `succs` 里存在一个支配 `cur` 的后继（回边目标），返回该回边头。
-    fn loop_header_of(&self, cur: u64, succs: &[u64]) -> Option<u64> {
-        succs.iter().copied().find(|&s| self.dominates(s, cur))
-    }
-
-    /// `a` 是否支配 `b`。
-    fn dominates(&self, a: u64, b: u64) -> bool {
-        self.dom.get(&b).is_some_and(|set| set.contains(&a))
-    }
-
     /// 尝试把一个条件块结构化为 `if / if-else`。成功返回 true。
     ///
     /// 用后支配 join 判定：
@@ -299,6 +288,7 @@ impl Builder<'_> {
         succs: &[u64],
         stop: Option<u64>,
         indent: usize,
+        bound: Option<&BTreeSet<u64>>,
     ) -> bool {
         let (taken, fall) = match self.split_branch(cur, last_insn, succs) {
             Some(x) => x,
@@ -332,14 +322,14 @@ impl Builder<'_> {
             self.structured_blocks += 1;
             self.push(indent, format!("if (!({cond})) {{"));
             let before = self.visited.len();
-            self.emit_from(fall, Some(join), indent + 1);
+            self.emit_from(fall, Some(join), indent + 1, bound);
             if self.visited.len() == before {
                 // 什么也没发射（异常形态）→ 回退成 goto，避免输出空 if。
                 self.push(indent + 1, format!("goto {fall:#x};"));
                 self.residual_gotos += 1;
             }
             self.push(indent, "}".to_string());
-            self.emit_from(join, stop, indent);
+            self.emit_from(join, stop, indent, bound);
             return true;
         }
         if join == fall {
@@ -348,9 +338,9 @@ impl Builder<'_> {
             self.visited.insert(cur);
             self.structured_blocks += 1;
             self.push(indent, format!("if ({cond}) {{"));
-            self.emit_from(taken, Some(join), indent + 1);
+            self.emit_from(taken, Some(join), indent + 1, bound);
             self.push(indent, "}".to_string());
-            self.emit_from(join, stop, indent);
+            self.emit_from(join, stop, indent, bound);
             return true;
         }
         // if/else：两支都在 join 汇合。
@@ -358,114 +348,148 @@ impl Builder<'_> {
         self.visited.insert(cur);
         self.structured_blocks += 1;
         self.push(indent, format!("if ({cond}) {{"));
-        self.emit_from(taken, Some(join), indent + 1);
+        self.emit_from(taken, Some(join), indent + 1, bound);
         self.push(indent, "} else {".to_string());
-        self.emit_from(fall, Some(join), indent + 1);
+        self.emit_from(fall, Some(join), indent + 1, bound);
         self.push(indent, "}".to_string());
-        self.emit_from(join, stop, indent);
+        self.emit_from(join, stop, indent, bound);
         true
     }
 
-    /// 尝试结构化循环（do-while / while）。成功返回 true。
+    /// 尝试把一个**自然循环头**结构化为 `while` 或 `do-while`。成功返回 true。
     ///
-    /// 仅处理**单回边、头部是条件块**的自然循环；其余退回 false（由调用方 goto 兜底）。
-    fn emit_loop(&mut self, cur: u64, header: u64, indent: usize) -> bool {
-        // 目前只处理“回边目标就是当前条件块”（head == cur）的自环/头部在 cur 的形态，
-        // 且要求 cur 的另一个后继（顺序出口）不回到循环体 —— 即标准 for/while 头。
-        if header != cur {
-            // 回边指向更早的头：需要更完整的自然循环识别，本片不猜 → 交给 goto 兜底。
+    /// 输入 `header` 由 `natural_loops` 保证是一个真回边头（存在块跳回它且它支配那个块）。
+    /// 支持两种形态：
+    /// - **预测试 while**：头部是条件块，一个后继在循环体内（体入口），另一个后继是循环**出口**。
+    ///   `while (继续条件) { 体 }`；
+    /// - **do-while**：头部是条件块，体在某一侧，执行完体后由回边块判断是否再回头部。
+    ///   这里只在头部自身就是那个“回边判断块”（body 先跑、末尾回跳头部）时还原成
+    ///   `do { 体 } while (cond);`。
+    ///
+    /// 其余形态（多重回边、头部条件块两个后继都在体内且无单一出口、不可归约）**一律不猜**，
+    /// 返回 false 交给上层 goto 兜底。
+    fn emit_loop(
+        &mut self,
+        header: u64,
+        indent: usize,
+        stop: Option<u64>,
+        outer_bound: Option<&BTreeSet<u64>>,
+    ) -> bool {
+        let Some(body) = self.natural_loops.get(&header).cloned() else {
+            return false;
+        };
+        if body.len() < 2 || self.visited.contains(&header) {
             return false;
         }
-        let Some(b) = self.blocks.get(&cur).copied() else {
-            return false;
-        };
-        let succs = b.successors.clone();
-        if succs.len() != 2 {
+        // 已经在发射中（体内遇到头部）→ 不重复结构化。
+        if outer_bound.is_some_and(|b| !b.contains(&header)) {
             return false;
         }
-        let last_insn = self
-            .last_insn_addr(b)
-            .and_then(|a| self.by_addr.get(&a).copied());
-        let Some((taken, fall)) = self.split_branch(cur, last_insn, &succs) else {
+
+        let Some(hb) = self.blocks.get(&header).copied() else {
             return false;
         };
-        let Some(insn) = last_insn else {
+        // 头部必须是条件块（带两个后继）。
+        let Some(hlast) = self
+            .last_insn_addr(hb)
+            .and_then(|a| self.by_addr.get(&a).copied())
+        else {
             return false;
         };
-        let cond = insn
+        if !matches!(hlast.flow, Flow::Branch { conditional: true }) {
+            return false;
+        }
+        let Some((taken, fall)) = self.split_branch(header, Some(hlast), &hb.successors.clone())
+        else {
+            return false;
+        };
+        let cond = hlast
             .condition
             .map_or_else(|| "/* 条件未知 */".to_string(), condition_text);
 
-        // 形态：自环头 cur，taken == cur（回边回自身）→ do-while：body 在 fall 一侧，
-        // 先执行 body 再判断；只有当 body 最终回到 cur 时才成立。
-        if taken == cur {
-            // 检查 fall 一侧是否能回到 cur（回边存在）。
-            if !self.reaches(fall, cur) {
+        // 循环出口：体集合中、后继落在体外的目标（必须唯一，否则不猜）。
+        let mut exits: BTreeSet<u64> = BTreeSet::new();
+        for &m in &body {
+            if let Some(mb) = self.blocks.get(&m) {
+                for &s in &mb.successors {
+                    if !body.contains(&s) {
+                        exits.insert(s);
+                    }
+                }
+            }
+        }
+
+        // —— 形态 A：预测试 while ——
+        // 头部一个后继在体内（体入口），另一个后继是唯一出口。
+        let in_body = |x: u64| body.contains(&x) && x != header;
+        if in_body(taken) ^ in_body(fall) {
+            let (entry, exit) = if in_body(taken) {
+                (taken, fall)
+            } else {
+                (fall, taken)
+            };
+            // 出口必须是（或就是）唯一出口，且 exit 在体外。
+            if !body.contains(&exit) && (exits.len() == 1 && exits.contains(&exit)) {
+                // 继续条件：体入口是 taken → while(cond)；体入口是 fall → while(!cond)。
+                let continue_cond = if in_body(taken) {
+                    cond.clone()
+                } else {
+                    format!("!({cond})")
+                };
+                self.emit_block_stmts(header, indent, true);
+                self.visited.insert(header);
+                self.structured_blocks += 1;
+                self.push(
+                    indent,
+                    format!("while ({continue_cond}) {{ /* @{header:#x} */"),
+                );
+                let before = self.visited.len();
+                self.emit_from(entry, Some(header), indent + 1, Some(&body));
+                if self.visited.len() == before {
+                    // 体没发射（异常）→ 收回，退回 false 由上层 goto。
+                    self.push(indent, format!("}} /* 循环体未能结构化 */ goto {exit:#x};"));
+                    self.residual_gotos += 1;
+                    return true;
+                }
+                self.push(indent, "}".to_string());
+                // 循环后继续：从出口按外层上下文发射。
+                self.emit_from(exit, stop, indent, outer_bound);
+                return true;
+            }
+        }
+
+        // —— 形态 B：do-while ——
+        // 头部即回边判断块（体先执行，末尾回跳头部）。判定：头部两个后继都在体内（或一个是自身），
+        // 且没有“头部直接跳到体外”的出口；出口由体内某块的体外后继给出。
+        let header_exits: Vec<u64> = hb
+            .successors
+            .iter()
+            .copied()
+            .filter(|&s| !body.contains(&s))
+            .collect();
+        if header_exits.is_empty() && exits.len() == 1 {
+            let exit = *exits.iter().next().unwrap();
+            // 体入口：头部的某个体内后继里，能回到头部的那一支先跑。取 taken/fall 中在体内的那个。
+            let entry = if in_body(taken) { taken } else { fall };
+            if !in_body(entry) {
                 return false;
             }
-            self.emit_block_stmts(cur, indent, true);
-            self.visited.insert(cur);
+            self.emit_block_stmts(header, indent, true);
+            self.visited.insert(header);
             self.structured_blocks += 1;
-            self.push(indent, "do {".to_string());
+            self.push(indent, format!("do {{ /* @{header:#x} */"));
             let before = self.visited.len();
-            // body：从 fall 发射到 cur（不含），但跳过 cur 自身重复发射。
-            self.emit_body_until(fall, cur, indent + 1);
+            self.emit_from(entry, Some(header), indent + 1, Some(&body));
             if self.visited.len() == before {
                 return false;
             }
-            self.push(indent, format!("}} while ({cond}); /* @{:#x} */", cur));
-            self.emit_from(cur, None, indent); // cur 已 visited → 会走 goto 兜底或直接返回
+            self.push(indent, format!("}} while ({cond});"));
+            self.emit_from(exit, stop, indent, outer_bound);
             return true;
         }
-        // 其他形态（预测试 while 需要更完整建模）本片不做 → goto 兜底。
-        false
-    }
 
-    /// 发射循环体：从 `from` 到 `until`（不含），但到 `until` 时**不发射**它（头部重复检查）。
-    fn emit_body_until(&mut self, from: u64, until: u64, indent: usize) {
-        let mut cur = from;
-        let mut guard = 0usize;
-        loop {
-            guard += 1;
-            if guard > self.blocks.len() * 2 + 4 {
-                break;
-            }
-            if cur == until || self.visited.contains(&cur) {
-                break;
-            }
-            let Some(b) = self.blocks.get(&cur).copied() else {
-                break;
-            };
-            if b.terminal || b.successors.is_empty() {
-                self.emit_block_stmts(cur, indent, false);
-                self.visited.insert(cur);
-                self.structured_blocks += 1;
-                break;
-            }
-            // 单后继顺序块：发射后前进。
-            if b.successors.len() == 1 && !b.successors.contains(&until) {
-                self.emit_block_stmts(cur, indent, false);
-                self.visited.insert(cur);
-                self.structured_blocks += 1;
-                cur = b.successors[0];
-                continue;
-            }
-            if b.successors.len() == 1 && b.successors.contains(&until) {
-                self.emit_block_stmts(cur, indent, false);
-                self.visited.insert(cur);
-                self.structured_blocks += 1;
-                break;
-            }
-            // 复杂体（条件/多后继）：本片不结构化，整块发射并 goto，放弃这个循环。
-            self.emit_block_stmts(cur, indent, true);
-            self.visited.insert(cur);
-            self.structured_blocks += 1;
-            for &s in &b.successors {
-                self.push(indent, format!("goto {s:#x};"));
-                self.residual_gotos += 1;
-            }
-            break;
-        }
+        // 形态不确定 → 不猜。
+        false
     }
 
     /// 拆分条件块的两个后继：`(taken, fall)`。taken = 分支指令的 target 所在块。
@@ -491,28 +515,48 @@ impl Builder<'_> {
             }
         }
     }
+}
 
-    /// `from` 能否沿后继到达 `to`（在本函数块图内）。
-    fn reaches(&self, from: u64, to: u64) -> bool {
-        let mut seen = BTreeSet::new();
-        let mut stack = vec![from];
-        while let Some(x) = stack.pop() {
-            if x == to {
-                return true;
-            }
-            if !seen.insert(x) {
+/// 计算所有**自然循环**：对每条回边 `b -> h`（`h` 支配 `b`），循环体 = `{h} ∪ {能到达 b 且
+/// 不经过 h 的块}`（标准算法）。返回 `h -> 循环体块集合`。不可归约图里若某头出现多回边、
+/// 体会合并，仍能给出一个集合；但 `emit_loop` 会在形态不唯一时拒绝结构化（不猜）。
+fn compute_natural_loops(
+    blocks: &BTreeMap<u64, &crate::cfg::BasicBlock>,
+    dom: &BTreeMap<u64, BTreeSet<u64>>,
+) -> BTreeMap<u64, BTreeSet<u64>> {
+    let dominates = |h: u64, b: u64| dom.get(&b).is_some_and(|s| s.contains(&h));
+    let mut loops: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+
+    for (&b, block) in blocks {
+        for &s in &block.successors {
+            // 回边：后继支配当前块。
+            if !dominates(s, b) {
                 continue;
             }
-            if let Some(b) = self.blocks.get(&x) {
-                for &s in &b.successors {
-                    if !seen.contains(&s) {
-                        stack.push(s);
+            let header = s;
+            let mut body: BTreeSet<u64> = BTreeSet::new();
+            body.insert(header);
+            body.insert(b);
+            // 从 b 反向沿前驱扩展，凡不经过 header 的块都并入循环体。
+            let mut stack: Vec<u64> = vec![b];
+            let mut seen: BTreeSet<u64> = BTreeSet::new();
+            while let Some(x) = stack.pop() {
+                if x == header || !seen.insert(x) {
+                    continue;
+                }
+                body.insert(x);
+                if let Some(xb) = blocks.get(&x) {
+                    for &p in &xb.predecessors {
+                        if p != header && !seen.contains(&p) {
+                            stack.push(p);
+                        }
                     }
                 }
             }
+            loops.entry(header).or_default().extend(body);
         }
-        false
     }
+    loops
 }
 
 /// 迭代计算支配集合（块首地址 → 支配它的块首集合，含自身）。
@@ -749,6 +793,27 @@ mod tests {
         assert!(
             joined.contains("while") || joined.contains("goto"),
             "循环应表现为 while/do 或 goto：\n{joined}"
+        );
+    }
+
+    #[test]
+    fn pretest_while_structured() {
+        // 0x1000: jcc 0x1010(出口)  —— 头部是条件块
+        // 0x1004: nop（循环体）
+        // 0x1008: jmp 0x1000（回边）
+        // 0x1010: ret（出口）
+        let insns = vec![
+            jcc(0x1000, 0x1010),
+            nop(0x1004),
+            jmp(0x1008, 0x1000),
+            ret(0x1010),
+        ];
+        let f = build(insns);
+        let body = f.structured_body.as_ref().unwrap();
+        let joined = body.join("\n");
+        assert!(
+            joined.contains("while ("),
+            "预测试循环应还原成 while：\n{joined}"
         );
     }
 
