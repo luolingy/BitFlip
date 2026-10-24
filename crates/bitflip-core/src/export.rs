@@ -65,6 +65,9 @@ pub enum ExportFormat {
     JsonXrefs,
     /// 疑似结构体字段布局（JSON）。**启发式、非真实 C 类型**：见 `bitflip_analyze::structs`。
     JsonStructs,
+    /// 依赖库识别（JSON）：按库聚合导入符号，回答"这个二进制依赖哪些库、每库贡献多少导入"。
+    /// 数据来自导入表/依赖库列表（**客观**，不猜）。
+    JsonLibraries,
     /// 控制流图（Graphviz DOT）。
     DotCfg,
     /// C 风格伪代码（**有界子集**：单基本块表达式视图，不做控制流结构化）。
@@ -91,6 +94,7 @@ impl ExportFormat {
             Self::JsonSymbols => "json-symbols",
             Self::JsonXrefs => "json-xrefs",
             Self::JsonStructs => "json-structs",
+            Self::JsonLibraries => "json-libraries",
             Self::DotCfg => "dot-cfg",
             Self::PseudoC => "pseudo-c",
             Self::DexJson => "dex-json",
@@ -109,6 +113,7 @@ impl ExportFormat {
             Self::JsonSymbols,
             Self::JsonXrefs,
             Self::JsonStructs,
+            Self::JsonLibraries,
             Self::DotCfg,
             Self::PseudoC,
             Self::DexJson,
@@ -492,6 +497,9 @@ fn export_with_disasm_prebuilt(
         }
         ExportFormat::JsonStructs => {
             write_json_structs(&mut writer, session, options, &meta, &mut notes)?
+        }
+        ExportFormat::JsonLibraries => {
+            write_json_libraries(&mut writer, session.parsed(), options, &meta, &mut notes)?
         }
         ExportFormat::DotCfg => {
             let analysis = session.analysis(&job)?;
@@ -2037,6 +2045,166 @@ fn write_json_structs(
     Ok(selected.len() as u64)
 }
 
+/// 一条按库聚合的记录（[`group_imports`] 产出）。
+struct LibraryGroup {
+    module: String,
+    import_count: usize,
+    named_count: usize,
+    ordinal_only_count: usize,
+    sample_names: Vec<String>,
+    has_iat_slots: bool,
+}
+
+/// 把一个导入列表按 `module` 聚合成库分组（纯函数，便于单测）。
+///
+/// 空 `module` 归到 `"<未命名模块>"`（不假装它没有库）；样本名字去重、保序、截断到
+/// `SAMPLE_LIMIT`；分组按 `module` 升序。
+fn group_imports(imports: &[crate::ImportInfo]) -> Vec<LibraryGroup> {
+    const UNNAMED: &str = "<未命名模块>";
+    const SAMPLE_LIMIT: usize = 12;
+
+    let mut by_module: std::collections::BTreeMap<String, Vec<&crate::ImportInfo>> =
+        std::collections::BTreeMap::new();
+    for import in imports {
+        let key = if import.module.is_empty() {
+            UNNAMED.to_string()
+        } else {
+            import.module.clone()
+        };
+        by_module.entry(key).or_default().push(import);
+    }
+
+    by_module
+        .into_iter()
+        .map(|(module, imports)| {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut sample_names = Vec::new();
+            let mut named_count = 0usize;
+            for i in &imports {
+                if let Some(name) = &i.name {
+                    named_count += 1;
+                    if seen.insert(name.clone()) && sample_names.len() < SAMPLE_LIMIT {
+                        sample_names.push(name.clone());
+                    }
+                }
+            }
+            LibraryGroup {
+                import_count: imports.len(),
+                named_count,
+                ordinal_only_count: imports.len() - named_count,
+                sample_names,
+                has_iat_slots: imports.iter().any(|i| i.iat_slot.is_some()),
+                module,
+            }
+        })
+        .collect()
+}
+
+/// 依赖库识别（JSON）：按库聚合导入符号。
+///
+/// 数据**客观**：来自导入表（`ImportInfo.module`）与依赖库列表（Mach-O `dylibs`），不做猜测。
+/// 回答"这个二进制依赖哪些库、每个库贡献了多少导入、哪些名字/序号"。
+/// 不是 FLIRT 那类"识别静态链接的库函数"——那是签名库的职责，需要用户提供静态库生成。
+fn write_json_libraries(
+    writer: &mut ExportWriter,
+    parsed: Option<&ObjectInfo>,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let Some(parsed) = parsed else {
+        return Err(BitflipError::unavailable(
+            "目标尚未成功解析，没有导入表可做库识别（原因见 info 的说明）",
+        ));
+    };
+
+    let in_range = |address: &str| -> bool {
+        match options.range {
+            None => true,
+            Some((from, to)) => {
+                let value = u64::from_str_radix(address, 16).unwrap_or(0);
+                value >= from && value < to
+            }
+        }
+    };
+    let import_in_range =
+        |import: &crate::ImportInfo| -> bool { import.iat_slot.as_deref().is_none_or(in_range) };
+
+    // 先按范围过滤导入，再按库聚合（分组只认过滤后的集合）。
+    let filtered: Vec<crate::ImportInfo> = parsed
+        .imports
+        .iter()
+        .filter(|import| import_in_range(import))
+        .cloned()
+        .collect();
+    let groups = group_imports(&filtered);
+
+    const UNNAMED: &str = "<未命名模块>";
+    let libraries: Vec<_> = groups
+        .iter()
+        .map(|g| {
+            json!({
+                "module": g.module,
+                "import_count": g.import_count,
+                "named_count": g.named_count,
+                "ordinal_only_count": g.ordinal_only_count,
+                "sample_names": g.sample_names,
+                "has_iat_slots": g.has_iat_slots,
+            })
+        })
+        .collect();
+
+    // 声明的依赖库（Mach-O dylibs）与实际导入模块的差异——如实说明，不掩盖。
+    // 但只有**存在**声明的 dylib 列表时才做这个对比：PE/ELF 没有 dylib 概念，
+    // 拿空列表去比会把每个导入模块都列成"未声明"，那是噪声而不是事实。
+    let declared: std::collections::BTreeSet<&str> =
+        parsed.dylibs.iter().map(String::as_str).collect();
+    let seen: std::collections::BTreeSet<&str> = groups.iter().map(|g| g.module.as_str()).collect();
+    let (declared_without_imports, imported_but_not_declared): (Vec<&str>, Vec<&str>) =
+        if declared.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let missing = declared.difference(&seen).copied().collect();
+            let extra = seen
+                .difference(&declared)
+                .copied()
+                .filter(|m| *m != UNNAMED)
+                .collect();
+            (missing, extra)
+        };
+
+    let document = json!({
+        "format_version": EXPORT_FORMAT_VERSION,
+        "producer": meta.producer,
+        "meta": meta,
+        "totals": {
+            "libraries": libraries.len(),
+            "imports": filtered.len(),
+            "declared_dylibs": parsed.dylibs.len(),
+        },
+        "declared_dylibs": parsed.dylibs,
+        "libraries": libraries,
+        "declared_without_imports": declared_without_imports,
+        "imported_but_not_declared": imported_but_not_declared,
+        "object_notes": parsed.notes,
+    });
+
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|error| BitflipError::Internal(format!("序列化依赖库识别失败：{error}")))?;
+    write_document(writer, &text, options, "依赖库识别表")?;
+
+    if parsed.imports.is_empty() {
+        notes.push(
+            "目标没有导入表（可能是静态链接、已剥离，或本身不依赖外部符号）：库识别只能给出空的依赖列表"
+                .to_string(),
+        );
+    }
+    for note in &parsed.notes {
+        notes.push(format!("解析说明：{note}"));
+    }
+    Ok(filtered.len() as u64)
+}
+
 /// 把一个已构造好的 JSON 文档写出去。
 ///
 /// JSON 是**单个文档**：截断它只会得到解析不了的半份，所以超预算时
@@ -2259,6 +2427,68 @@ fn dot_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn import(module: &str, name: Option<&str>, iat: Option<&str>) -> crate::ImportInfo {
+        crate::ImportInfo {
+            module: module.to_string(),
+            name: name.map(str::to_string),
+            ordinal: None,
+            iat_slot: iat.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn group_imports_buckets_by_module_and_counts() {
+        let imports = vec![
+            import(
+                "KERNEL32.dll",
+                Some("CreateFileW"),
+                Some("0000000140001000"),
+            ),
+            import(
+                "KERNEL32.dll",
+                Some("CreateFileW"),
+                Some("0000000140001008"),
+            ),
+            import(
+                "KERNEL32.dll",
+                Some("CloseHandle"),
+                Some("0000000140001010"),
+            ),
+            import("ntdll.dll", None, Some("0000000140001018")), // 序号导入，无名
+            import("", Some("orphan"), Some("0000000140001020")), // 空 module
+        ];
+        let groups = group_imports(&imports);
+        assert_eq!(groups.len(), 3, "KERNEL32 / ntdll / 未命名");
+        let k = groups.iter().find(|g| g.module == "KERNEL32.dll").unwrap();
+        assert_eq!(k.import_count, 3);
+        assert_eq!(k.named_count, 3);
+        assert_eq!(k.ordinal_only_count, 0);
+        // 样本名字去重保序：CreateFileW 只出现一次。
+        assert_eq!(k.sample_names, vec!["CreateFileW", "CloseHandle"]);
+        assert!(k.has_iat_slots);
+
+        let n = groups.iter().find(|g| g.module == "ntdll.dll").unwrap();
+        assert_eq!(n.import_count, 1);
+        assert_eq!(n.named_count, 0);
+        assert_eq!(n.ordinal_only_count, 1);
+        assert!(n.sample_names.is_empty());
+
+        let u = groups.iter().find(|g| g.module == "<未命名模块>").unwrap();
+        assert_eq!(u.named_count, 1);
+    }
+
+    #[test]
+    fn group_imports_sample_names_capped() {
+        let imports: Vec<crate::ImportInfo> = (0..20)
+            .map(|i| import("lib", Some(&format!("sym{i}")), None))
+            .collect();
+        let groups = group_imports(&imports);
+        let g = &groups[0];
+        assert_eq!(g.import_count, 20);
+        assert_eq!(g.sample_names.len(), 12, "样本上限 12");
+        assert!(!g.has_iat_slots);
+    }
 
     #[test]
     fn export_format_names_round_trip() {

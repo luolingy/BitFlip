@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 2 第三片：依赖库识别（`export --format json-libraries`）
+
+- 新导出格式 `json-libraries`：把导入表按**库**聚合，回答"这个二进制依赖哪些库、每个库贡献了
+  多少导入、哪些名字/序号"。字段：`declared_dylibs`（Mach-O 声明的依赖库）、`libraries`
+  （每库 `import_count` / `named_count` / `ordinal_only_count` / 去重保序 `sample_names` /
+  `has_iat_slots`）、`declared_without_imports` 与 `imported_but_not_declared`（声明与实际的差异）。
+- 数据**客观**：来自导入表（`ImportInfo.module`）与依赖库列表，不做猜测。**不是** FLIRT 那种
+  "识别静态链接的库函数"——那是签名库的职责（需用户提供静态库生成），本格式只做依赖/导入的
+  客观聚合。CLI `export` 与 HTTP `/export?format=json-libraries` 同一实现（服务端动态枚举，自动可用）。
+- 诚实处理平台差异：PE/ELF 没有 dylib 概念，`declared` 为空时**不做**"未声明"对比（否则会把每个
+  导入模块都误列成"未声明"，那是噪声）；空 module 归到 `<未命名模块>`，不假装没有库。
+- 抽出纯函数 `group_imports` 并按库聚合（便于单测）：2 项单测覆盖分桶计数、样本去重保序、
+  样本上限 12、序号导入与空 module。
+- 真实核对：CAltKit（arm64）4 个库/64 导入（CoreFoundation 47、Foundation 8、libSystem 3、
+  libobjc 6），声明与实际一致（差集均空）；kernel32.dll（x86_64）98 个库/1264 导入（ntdll 378、
+  KERNELBASE 90…），PE 差集正确为空。
+- core 73 / cli 40 全过；fmt/clippy 干净；arch-layering 门禁 OK。
+
 ### 变更 — 阶段 2 第二片：结构体推断接入 `export --format json-structs`
 
 - 新导出格式 `json-structs`：把结构体推断输出成稳定 JSON（`totals` / `candidates` / `notes` /
