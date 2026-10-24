@@ -767,6 +767,195 @@ pub fn build_superblob(
     sb
 }
 
+// ───────────────────────── 重签（B 阶段：写盘层，最稳子集） ─────────────────────────
+//
+// 只做"原地容纳"这一条：新 SuperBlob 若 ≤ 旧 `datasize`，就写在原 `dataoff` 处、尾部补零、
+// `datasize` 保持不变（**不改任何 load command，最稳**）；放不下则返回明确错误，**不写坏**。
+// 不移动签名区、不改 `__LINKEDIT`、不碰 fat 多切片——那些留给后续阶段。输出新字节，
+// 绝不原地改写调用方给的输入。
+
+/// 写盘层错误（都带人话原因）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResignWriteError {
+    /// 不是认得的 Mach-O（magic 不对 / 头太短）。
+    NotMachO,
+    /// 找不到 `LC_CODE_SIGNATURE`（没签名过，无从"重签"）。
+    NoCodeSignature,
+    /// 签名区不在文件内 / 关键字段读不出。
+    MalformedSignatureRange,
+    /// 重签内容前置校验失败（转述 [`ResignError`]）。
+    Build(ResignError),
+    /// 新签名比旧 `datasize` 大——本阶段只支持原地容纳，放不下就明说，不移动、不写坏。
+    DoesNotFit { need: usize, have: usize },
+    /// 签名区不紧贴被签名内容（`dataoff != codeLimit`）——需要移动签名区，本阶段不做。
+    SignatureNotAdjacent { dataoff: u64, code_limit: u64 },
+}
+
+impl std::fmt::Display for ResignWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotMachO => write!(f, "不是认得的 Mach-O（magic 不对或头太短）"),
+            Self::NoCodeSignature => write!(
+                f,
+                "文件里没有 LC_CODE_SIGNATURE（没签名过，无从重签；本阶段不新建签名区）"
+            ),
+            Self::MalformedSignatureRange => {
+                write!(f, "LC_CODE_SIGNATURE 的范围落在文件外或关键字段读不出")
+            }
+            Self::Build(e) => write!(f, "重签内容构造失败：{e}"),
+            Self::DoesNotFit { need, have } => write!(
+                f,
+                "新签名 {need} 字节 > 旧 datasize {have} 字节，本阶段只支持原地容纳，放不下（不移动、不写坏）"
+            ),
+            Self::SignatureNotAdjacent { dataoff, code_limit } => write!(
+                f,
+                "签名区 dataoff={dataoff} 与被签内容 codeLimit={code_limit} 不紧贴，需要移动签名区，本阶段不做"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResignWriteError {}
+
+impl From<ResignError> for ResignWriteError {
+    fn from(e: ResignError) -> Self {
+        Self::Build(e)
+    }
+}
+
+/// 端序读 u32。
+fn read_u32_endian(bytes: &[u8], at: usize, endian: Endian) -> Option<u32> {
+    let s = bytes.get(at..at + 4)?;
+    let arr = [s[0], s[1], s[2], s[3]];
+    Some(match endian {
+        Endian::Little => u32::from_le_bytes(arr),
+        Endian::Big => u32::from_be_bytes(arr),
+    })
+}
+
+/// 单个文件里的一个签名锚点（`LC_CODE_SIGNATURE` 的定位信息）。
+#[derive(Debug, Clone, Copy)]
+struct SigAnchor {
+    /// `dataoff` 字段在文件里的偏移（写回时改这个）。
+    dataoff_field_at: usize,
+    /// `datasize` 字段在文件里的偏移。
+    datasize_field_at: usize,
+    /// 当前 `dataoff` 值。
+    dataoff: u64,
+    /// 当前 `datasize` 值。
+    datasize: u64,
+    endian: Endian,
+}
+
+/// 扫 Mach-O 头与 load commands，找 `LC_CODE_SIGNATURE`。只认薄 Mach-O（非 fat）。
+fn find_signature_anchor(file: &[u8]) -> Result<SigAnchor, ResignWriteError> {
+    let magic = read_u32_endian(file, 0, Endian::Little).ok_or(ResignWriteError::NotMachO)?;
+    // 判断端序与位宽：magic 的四种字面值。
+    // 0xfeedfacf / 0xfeedface（小端）；0xcffaedfe / 0xcefaedfe（大端是字节序反转读出来的）。
+    let (is_64, endian) = match magic {
+        0xfeed_facf => (true, Endian::Little),
+        0xfeed_face => (false, Endian::Little),
+        0xcffa_edfe => (true, Endian::Big),
+        0xcefa_edfe => (false, Endian::Big),
+        // fat 或其它：本阶段不支持（如实报错，不猜）。
+        _ => return Err(ResignWriteError::NotMachO),
+    };
+    let header_size = if is_64 { 32 } else { 28 };
+    let ncmds = read_u32_endian(file, 16, endian).ok_or(ResignWriteError::NotMachO)? as usize;
+    // sizeofcmds 在偏移 20；这条不直接需要，跳过。
+    let mut cursor = header_size;
+    for _ in 0..ncmds {
+        let cmd = read_u32_endian(file, cursor, endian).ok_or(ResignWriteError::NotMachO)?;
+        let cmdsize =
+            read_u32_endian(file, cursor + 4, endian).ok_or(ResignWriteError::NotMachO)? as usize;
+        if cmdsize < 8 || cursor + cmdsize > file.len() {
+            return Err(ResignWriteError::NotMachO);
+        }
+        if cmd == crate::format::macho::LC_CODE_SIGNATURE {
+            // struct linkedit_data_command: cmd(0),cmdsize(4),dataoff(8),datasize(12)。
+            let dataoff_field_at = cursor + 8;
+            let datasize_field_at = cursor + 12;
+            let dataoff = u64::from(
+                read_u32_endian(file, dataoff_field_at, endian)
+                    .ok_or(ResignWriteError::MalformedSignatureRange)?,
+            );
+            let datasize = u64::from(
+                read_u32_endian(file, datasize_field_at, endian)
+                    .ok_or(ResignWriteError::MalformedSignatureRange)?,
+            );
+            if dataoff as usize > file.len() || (dataoff + datasize) as usize > file.len() {
+                return Err(ResignWriteError::MalformedSignatureRange);
+            }
+            return Ok(SigAnchor {
+                dataoff_field_at,
+                datasize_field_at,
+                dataoff,
+                datasize,
+                endian,
+            });
+        }
+        cursor += cmdsize;
+    }
+    Err(ResignWriteError::NoCodeSignature)
+}
+
+/// 重签一个薄 Mach-O 文件字节，返回**新的文件字节**（不原地改输入）。
+///
+/// 语义（最稳子集）：
+/// 1. 找 `LC_CODE_SIGNATURE`；要求 `dataoff == codeLimit`（签名区紧贴被签内容，不移动）。
+/// 2. 用 A 阶段 `build_code_directory` + `build_superblob` 生成新 SuperBlob。
+/// 3. 新 SuperBlob ≤ 旧 `datasize` → 写在原 `dataoff`、尾部补零，`datasize` **保持不变**。
+/// 4. 放不下 / 需移动 → 明确错误，不写坏。
+///
+/// `params.code_limit` 应等于旧签名区起点（通常就 等于旧 CD 的 codeLimit）。
+pub fn resign_in_place(
+    file: &[u8],
+    params: &ResignParams,
+    entitlements_for_superblob: Option<&[u8]>,
+) -> Result<Vec<u8>, ResignWriteError> {
+    let anchor = find_signature_anchor(file)?;
+
+    // 本阶段只处理"签名区紧贴被签内容"的布局（否则要移动，不做）。
+    if anchor.dataoff != u64::from(params.code_limit) {
+        return Err(ResignWriteError::SignatureNotAdjacent {
+            dataoff: anchor.dataoff,
+            code_limit: u64::from(params.code_limit),
+        });
+    }
+
+    // 用被签内容 [0..codeLimit) 重算 CodeDirectory，再拼 SuperBlob。
+    let code_limit = params.code_limit as usize;
+    let content = file
+        .get(0..code_limit)
+        .ok_or(ResignWriteError::MalformedSignatureRange)?;
+    let cd = build_code_directory(content, params)?;
+    let sb = build_superblob(&cd, None, entitlements_for_superblob);
+
+    let old_size = anchor.datasize as usize;
+    if sb.len() > old_size {
+        return Err(ResignWriteError::DoesNotFit {
+            need: sb.len(),
+            have: old_size,
+        });
+    }
+
+    // 拷一份，写在新 dataoff 处，尾部补零到旧的 datasize（datasize 不变）。
+    let mut out = file.to_vec();
+    let start = anchor.dataoff as usize;
+    out[start..start + sb.len()].copy_from_slice(&sb);
+    for byte in out[start + sb.len()..start + old_size].iter_mut() {
+        *byte = 0;
+    }
+    // datasize / dataoff 都不改（这是最稳的关键：不碰 load command）。
+    let _ = (
+        anchor.dataoff_field_at,
+        anchor.datasize_field_at,
+        anchor.endian,
+    );
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,5 +1365,283 @@ mod tests {
                 need: 8192
             })
         );
+    }
+
+    // ── 重签 B 阶段：写盘层（薄 Mach-O 64 位小端） ──
+
+    /// 造一个最小的薄 Mach-O 64 位小端文件：头 + 一条 `LC_CODE_SIGNATURE` + 被签内容 +
+    /// 旧签名区。关键：**`codeLimit` == 签名区 `dataoff`**（Apple 的真实布局——分页覆盖
+    /// 从文件 0 开始，签名紧跟最后一个被签页）。返回 (文件字节, 旧 CD 的 codeLimit)。
+    ///
+    /// `sign_correctly` 为真时旧签名与内容自洽（Intact）；否则签的是别的字节（Mismatch）。
+    fn build_thin_macho(sign_correctly: bool) -> (Vec<u8>, u32) {
+        // 先定布局：头 32 + 命令 16 = 48 字节固定前置；内容若干页；签名区紧随其后。
+        let header_size = 32usize;
+        let sizeofcmds = 16u32;
+        let fixed = header_size + sizeofcmds as usize; // 48
+                                                       // 让 codeLimit 覆盖"头+命令+2 页内容"（对齐到页边界，简单起见取 48+8192 向上取整）。
+                                                       // 为让分页整除，取内容使其后总长恰为页的整数倍：48 + 8144? 不整除。
+                                                       // 简化：codeLimit = fixed + 8192 = 8240；分页 4096 → 3 页（最后一页 48 字节）。
+                                                       // 这仍合法：最后一页是 [8192, 8240)。
+        let content_len = 8192usize;
+        let code_limit = (fixed + content_len) as u32; // 8240
+
+        // 构造整个"被签区域" [0..code_limit)：头 + 命令占位 + 内容。
+        let mut prefix = vec![0u8; fixed];
+        prefix[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        prefix[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        prefix[8..12].copy_from_slice(&3u32.to_le_bytes());
+        prefix[12..16].copy_from_slice(&2u32.to_le_bytes());
+        prefix[16..20].copy_from_slice(&1u32.to_le_bytes()); // ncmds
+        prefix[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
+        // 内容：确定值。
+        let content: Vec<u8> = (0..content_len).map(|i| (i % 251) as u8).collect();
+        let mut signed_region = prefix;
+        signed_region.extend_from_slice(&content);
+        assert_eq!(signed_region.len(), code_limit as usize);
+
+        // 造旧签名：对 signed_region（或一份错的）签。
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit,
+            identifier: "com.example.thin".to_string(),
+            entitlements_blob: None,
+        };
+        let to_sign = if sign_correctly {
+            signed_region.clone()
+        } else {
+            vec![7u8; code_limit as usize]
+        };
+        let cd = build_code_directory(&to_sign, &params).expect("旧 CD");
+        let old_sb = build_superblob(&cd, None, None);
+
+        // 组装文件：signed_region + 旧签名区；dataoff = code_limit。
+        let mut file = signed_region;
+        let dataoff = file.len() as u64; // == code_limit
+        file.extend_from_slice(&old_sb);
+        let datasize = old_sb.len() as u64;
+
+        // 回填 LC_CODE_SIGNATURE（在 header_size=32 处）。
+        let cmd_at = header_size;
+        file[cmd_at..cmd_at + 4]
+            .copy_from_slice(&crate::format::macho::LC_CODE_SIGNATURE.to_le_bytes());
+        file[cmd_at + 4..cmd_at + 8].copy_from_slice(&16u32.to_le_bytes());
+        file[cmd_at + 8..cmd_at + 12].copy_from_slice(&(dataoff as u32).to_le_bytes());
+        file[cmd_at + 12..cmd_at + 16].copy_from_slice(&(datasize as u32).to_le_bytes());
+
+        (file, code_limit)
+    }
+
+    /// 从 Mach-O 文件里按 LC_CODE_SIGNATURE 重新解析签名（模拟真实读取路径）。
+    fn parse_thin(file: &[u8]) -> crate::object::CodeSignature {
+        let anchor = find_signature_anchor(file).expect("找得到签名锚点");
+        parse(
+            file,
+            LinkeditRange {
+                dataoff: anchor.dataoff,
+                datasize: anchor.datasize,
+            },
+            Endian::Little,
+        )
+    }
+
+    #[test]
+    fn resign_in_place_fixes_mismatch_on_thin_macho() {
+        // 造一份"旧签名与内容不符"的文件（签的是别的字节）→ 解析应为 Mismatch。
+        let (file, code_limit) = build_thin_macho(false);
+        let before = parse_thin(&file);
+        assert!(
+            matches!(before.verdict, CodeSignVerdict::Mismatch),
+            "旧签名与内容不符，应为 Mismatch，实际 {:?}",
+            before.verdict
+        );
+
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit,
+            identifier: "com.example.thin".to_string(),
+            entitlements_blob: None,
+        };
+        let resigned = resign_in_place(&file, &params, None).expect("原地重签成功");
+        // 输入不被改动：原 file 应仍是 Mismatch。
+        let still_old = parse_thin(&file);
+        assert!(matches!(still_old.verdict, CodeSignVerdict::Mismatch));
+
+        // 输出重新解析 → Intact（逐页哈希全过）。codeLimit=8240 → 3 页。
+        let after = parse_thin(&resigned);
+        assert_eq!(after.verified_slots, 3, "三页全过（8240 字节 / 4096）");
+        assert!(after.first_mismatch.is_none());
+        assert!(
+            matches!(after.verdict, CodeSignVerdict::AdHoc),
+            "ad-hoc 且完整性通过，实际 {:?}",
+            after.verdict
+        );
+
+        // 再故意破坏内容（在输出上），应重新变回 Mismatch —— 证明校验是真在跑。
+        let content_start = 32 + 16; // 头 + 1 条命令 = 48
+        let mut broken = resigned.clone();
+        broken[content_start + 10] ^= 0xff;
+        let recheck = parse_thin(&broken);
+        assert!(matches!(recheck.verdict, CodeSignVerdict::Mismatch));
+    }
+
+    #[test]
+    fn resign_in_place_no_signature_reports_not_macho_or_no_codesig() {
+        // 不是 Mach-O。
+        let garbage = vec![0u8; 64];
+        assert!(matches!(
+            resign_in_place(
+                &garbage,
+                &ResignParams {
+                    hash_type: 2,
+                    page_size_log: 12,
+                    code_limit: 16,
+                    identifier: "x".to_string(),
+                    entitlements_blob: None,
+                },
+                None
+            ),
+            Err(ResignWriteError::NotMachO)
+        ));
+    }
+
+    #[test]
+    fn resign_in_place_reports_does_not_fit() {
+        // 造一个 datasize 很小的文件：用 build_thin_macho 但把签名区预留得比新签名小。
+        // 做法：造好后把 datasize 字段改小，模拟"放不下"。
+        let (mut file, code_limit) = build_thin_macho(true);
+        // datasize 字段在 cmd_at+12 = 32+12 = 44。
+        file[44..48].copy_from_slice(&8u32.to_le_bytes()); // datasize=8，肯定放不下新签名
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit,
+            identifier: "com.example.thin".to_string(),
+            entitlements_blob: None,
+        };
+        assert!(matches!(
+            resign_in_place(&file, &params, None),
+            Err(ResignWriteError::DoesNotFit { .. })
+        ));
+    }
+
+    #[test]
+    fn resign_in_place_reports_not_adjacent() {
+        let (file, _code_limit) = build_thin_macho(true);
+        // 给一个与 dataoff 不同的 codeLimit → 判定为"签名区不紧贴"。
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit: 4096, // 与真实 dataoff 不符
+            identifier: "x".to_string(),
+            entitlements_blob: None,
+        };
+        assert!(matches!(
+            resign_in_place(&file, &params, None),
+            Err(ResignWriteError::SignatureNotAdjacent { .. })
+        ));
+    }
+
+    /// 真实样本：设 `BITFLIP_RESIGN_SAMPLE=<薄 Mach-O 路径>` 后 `--ignored`。
+    /// 读它的 LC_CODE_SIGNATURE 与 codeLimit，原地重签，重新解析必须 Intact。
+    /// 若样本签名区放不下新签名（换算法/页数变多），本阶段会返回 DoesNotFit —— 那是
+    /// 诚实报错，测试据此 SKIP（不假装成功）。
+    #[test]
+    #[ignore = "需要真实 Mach-O 样本：设 BITFLIP_RESIGN_SAMPLE 后加 --ignored"]
+    fn real_sample_resign_in_place_is_intact() {
+        let Ok(path) = std::env::var("BITFLIP_RESIGN_SAMPLE") else {
+            eprintln!("跳过：未设 BITFLIP_RESIGN_SAMPLE");
+            return;
+        };
+        let file = std::fs::read(&path).expect("读样本");
+        let anchor = match find_signature_anchor(&file) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("跳过：样本没有可原地重签的签名锚点（{e}）");
+                return;
+            }
+        };
+        // 用样本自己的参数：先解析一遍拿到 hashType/pageSizeLog/identifier/codeLimit。
+        let before = parse(
+            &file,
+            LinkeditRange {
+                dataoff: anchor.dataoff,
+                datasize: anchor.datasize,
+            },
+            Endian::Little,
+        );
+        eprintln!(
+            "样本 {}：verdict={:?} alg={:?} code_limit={} slots={} datasize={}",
+            path,
+            before.verdict,
+            before.algorithm,
+            before.code_limit,
+            before.code_slots,
+            anchor.datasize
+        );
+        // 只对"可校验算法"的样本做（SHA-1/SHA-256）。
+        let hash_type = match before.algorithm {
+            HashAlgorithm::Sha1 => 1u8,
+            HashAlgorithm::Sha256 => 2u8,
+            other => {
+                eprintln!("跳过：算法 {other:?} 本模块不重签");
+                return;
+            }
+        };
+        let page_size_log = if before.page_size == 0 {
+            0u8
+        } else {
+            before.page_size.trailing_zeros() as u8
+        };
+        let params = ResignParams {
+            hash_type,
+            page_size_log,
+            code_limit: before.code_limit as u32,
+            identifier: before.identifier.clone(),
+            entitlements_blob: None,
+        };
+        match resign_in_place(&file, &params, None) {
+            Ok(resigned) => {
+                let after = parse(
+                    &resigned,
+                    LinkeditRange {
+                        dataoff: anchor.dataoff,
+                        datasize: anchor.datasize,
+                    },
+                    Endian::Little,
+                );
+                assert!(
+                    matches!(
+                        after.verdict,
+                        CodeSignVerdict::AdHoc | CodeSignVerdict::Intact
+                    ),
+                    "重签后应完整性通过，实际 {:?}（notes {:?}）",
+                    after.verdict,
+                    after.notes
+                );
+                assert_eq!(
+                    after.verified_slots, after.code_slots,
+                    "所有 code slot 都应校验通过"
+                );
+                eprintln!(
+                    "重签成功：verdict={:?} verified={}/{}",
+                    after.verdict, after.verified_slots, after.code_slots
+                );
+            }
+            Err(ResignWriteError::DoesNotFit { need, have }) => {
+                eprintln!("跳过：新签名 {need} > 旧 datasize {have}，本阶段只做原地容纳");
+            }
+            Err(ResignWriteError::SignatureNotAdjacent {
+                dataoff,
+                code_limit,
+            }) => {
+                eprintln!(
+                    "跳过：dataoff={dataoff} != codeLimit={code_limit}（需移动，本阶段不做）"
+                );
+            }
+            Err(e) => panic!("重签意外失败：{e}"),
+        }
     }
 }

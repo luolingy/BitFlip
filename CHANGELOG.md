@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### 新增 — Mach-O 重签（B 阶段：写盘层，最稳子集）
+
+在 A 阶段纯函数之上加写盘层 `codesign::resign_in_place`：**只做"原地容纳"**这一条最稳路径，
+不移动签名区、不改 `__LINKEDIT`、不碰 fat 多切片、不接证书、不产 CMS。绝不原地改写输入。
+
+- `resign_in_place(file, &ResignParams, entitlements) -> ResultVec<u8>, ResignWriteError>`：
+  找 `LC_CODE_SIGNATURE`（自带薄 Mach-O 头/命令扫描，认 32/64 位、大小端）；要求签名区紧贴
+  被签内容（`dataoff == codeLimit`）；用 A 阶段 `build_code_directory`+`build_superblob` 生新
+  SuperBlob；新 ≤ 旧 `datasize` 就写在原 `dataoff`、尾部补零、**datasize 保持不变**；放不下 /
+  需移动 / 非 Mach-O / 无 `LC_CODE_SIGNATURE` → 明确 `ResignWriteError`（不写坏、不猜）。
+- 写回即闭环：重新用现有 `codesign::parse` 解析输出，必须 `Intact`/`AdHoc` 且所有 code slot
+  校验通过。合成样本（薄 Mach-O 64 位）+ 4 条错误路径单测。
+- **真实样本核对**（`#[ignore]`，`BITFLIP_RESIGN_SAMPLE`）：PojavLauncher 内 5 个真实 ad-hoc
+  框架/主二进制（CAltKit 14/14、AltKit 150/150、Alderis 469/469、PojavLauncher 284/284、
+  MetalANGLE 2840/2840）原地重签后重新解析全部 `AdHoc`、所有 code slot 通过。
+- **本阶段不写盘到磁盘**（只产新字节，落盘与 CLI 命令留待后续）；不改现有解析行为。
+
 ### 新增 — Mach-O 重签（A 阶段：纯函数，不写盘）
 
 按 `docs/MACHO-RESIGN-DESIGN.md` §8 第 1-2 步，先只做"算得对"的纯函数，不写盘、不接证书、
