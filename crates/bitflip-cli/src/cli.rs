@@ -96,6 +96,8 @@ pub enum Command {
     Patch(PatchArgs),
     /// 重签一个 Mach-O 的副本（ad-hoc，需显式 --apply；绝不原地改）
     Resign(ResignArgs),
+    /// 批量重签一个 .app 里所有 Mach-O 副本，并让 CodeResources 清单自洽（需 --apply）
+    ResignApp(ResignAppArgs),
     /// 打印版本与 API 版本
     Version,
 }
@@ -619,6 +621,28 @@ pub struct ResignArgs {
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
     /// 只读：解释为什么不能重签（不做任何写入），等价于默认行为
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `resign-app` 参数：批量重签一个 `.app` 里所有 Mach-O，并让 `CodeResources` 清单自洽。
+///
+/// 默认**只读预览**（列出包里二进制、可否重签、CodeResources 受影响条目，不写盘）。
+/// `--apply` 才写出 `xxx.resigned.app` 目录（复制整棵树、替换重签后的 Mach-O、按新哈希重算
+/// CodeResources）。原包不动。ad-hoc：不接证书、不产 CMS；CodeResources 只是**尽力自洽**、
+/// **不是可信封印**，真机仍需 `codesign` 复核。
+#[derive(Debug, Args)]
+pub struct ResignAppArgs {
+    /// 目标：一个 `.app` 包目录
+    #[arg(value_name = "APP")]
+    pub target: PathBuf,
+    /// 写出 `xxx.resigned.app` 目录。不给就只读预览，不写盘。
+    #[arg(long)]
+    pub apply: bool,
+    /// 输出目录（与 `--apply` 搭配；默认在目标旁加 `.resigned`）
+    #[arg(long, value_name = "DIR")]
+    pub output: Option<PathBuf>,
+    /// 输出 JSON（稳定的 wire 契约，供脚本消费）
     #[arg(long)]
     pub json: bool,
 }

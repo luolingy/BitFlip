@@ -119,8 +119,11 @@ ad-hoc 重签（`codesign -s -` 的等价物）**不需要证书**，步骤是�
    `LC_CODE_SIGNATURE` 与 `__LINKEDIT` 的 `filesize/vmsize`；第 0 页（含 load command）先定稿再
    算哈希。真实样本强制 SHA-256 触发追加，CAltKit 14/14、Alderis 469/469、MetalANGLE 2840/2840 全过。
 6. ✅ fat 多切片 / 通用二进制（E 阶段）：`resign_macho_file` 按头分派，`resign_fat` 逐 slice 重签
-   并重排 offset、重建 fat 头；合成 2-slice 全过。`.app` 内多二进制可逐个调用（本命令按文件）。
-7. ⬜ 正式重签（带 CMS / 开发者身份 / 私钥）——按 §5/§7 **不做**，需单独立项与密钥隔离。
+   并重排 offset、重建 fat 头；合成 2-slice 全过。
+7. ✅ `.app` 批量重签 + CodeResources 自洽（F 阶段）：`bitflip-cli resign-app` 遍历包内所有 Mach-O
+   逐个重签、写 `xxx.resigned.app`、按新哈希重算 CodeResources（**尽力自洽、非可信封印**，真机仍需
+   `codesign`）。真实 PojavLauncher.app：88 个二进制全部可重签、87/303 条目重算并核实一致。
+8. ⬜ 正式重签（带 CMS / 开发者身份 / 私钥）——按 §5/§7 **不做**，需单独立项与密钥隔离。
 
 —— 以上为设计。**是否批准、以及批准到哪一步（只到 1-2 的纯函数？还是含 3-4 的写盘？），
 请你定。** 未获批准前不写任何重签实现代码。

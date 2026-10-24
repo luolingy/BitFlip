@@ -74,6 +74,13 @@ pub fn parse_code_resources(bytes: &[u8]) -> CodeResourcesSummary {
 /// 时返回 [`ResignWriteError`]，不写坏、不猜。
 pub use bitflip_loader::format::macho::codesign::{resign_macho_file, ResignWriteError};
 
+/// `CodeResources` 的哈希抽取/重写（F 阶段：`.app` 批量重签后让封印清单**数量/哈希自洽**）。
+/// **尽力而为、不可信**：没有 Apple 私钥，真机仍需 `codesign` 复核。二进制 plist 不支持。
+pub use bitflip_loader::format::macho::code_resources::{
+    extract_hashes as extract_code_resource_hashes, rewrite_hashes as rewrite_code_resource_hashes,
+    CodeResourceHash,
+};
+
 pub use session::{
     AnalysisSummary, ExportInfo, ImportInfo, ObjectInfo, OpenOptions, RelocInfo, SectionInfo,
     SegmentInfo, Session, SymbolInfo, TargetInfo, INFO_FORMAT_VERSION, MAX_FULL_PARSE_BYTES,

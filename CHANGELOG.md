@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+### 新增 — 重签 F 阶段：`.app` 批量重签 + CodeResources 清单自洽
+
+新命令 `bitflip-cli resign-app <X.app> [--apply] [--output DIR] [--json]`：遍历包内所有 Mach-O
+（主可执行 + Frameworks/PlugIns/Helpers/*.dylib …），逐个重签；默认只读预览，`--apply` 才写出
+`xxx.resigned.app`（复制整棵树、替换重签后的二进制、按新哈希重算 `CodeResources`）。原包不动。
+
+- loader `code_resources` 扩展：`extract_hashes` / `rewrite_hashes` / `CodeResourceHash`——从 XML
+  plist 的 `files`(SHA-1) / `files2`(`hash`=SHA-1, `hash2`=SHA-256) 抽出并按 base64 重写；带自带
+  极简 base64 编解码（不引新依赖）。二进制 plist 不支持（返回 None，不猜）。
+- **关键正确性**：真实 CodeResources 里 **同一路径在 `files` 与 `files2` 各出现一次**，重写必须
+  定位"紧跟 `<data>` / 紧跟 `<dict>`"的那一处，否则会改错条目——已用 `find_key_followed_by`
+  消歧（初版按首现改，导致 CAltKit 的 hash2 没更新，已修并核实 match=True）。
+- 边界：ad-hoc，不接证书、不产 CMS；`CodeResources` 只是**尽力自洽**、**不是可信封印**（无 Apple
+  私钥），真机仍需 `codesign` 复核——输出与帮助里都明确标注。
+- **真实样本核对**：`.smoke-logs/scratch-app` 的 PojavLauncher.app——枚举 **88 个 Mach-O 全部可
+  重签**，303 条封印条目中 87 条（对应二进制）哈希失配被重算；`--apply` 后逐项复核：CAltKit /
+  Alderis 的 `hash2` 与新文件 SHA-256 一致、未改动的 Info.plist 仍一致、重签二进制 `parse` 仍
+  Intact（CAltKit 14/14、主二进制 284/284）。
+- loader 326 / cli 40 全过（+3 loader、+2 cli 单测）；fmt/clippy 干净。
+
 ### 新增 — 重签 E 阶段：fat / 通用 Mach-O 多切片
 
 `resign_macho_file` 现在**按文件头自动分派**：`FAT_MAGIC`(0xcafebabe) / `FAT_MAGIC_64`(0xcafebabf)

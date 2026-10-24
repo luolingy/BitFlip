@@ -26,6 +26,9 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# `.app` 批量重签要按 CodeResources 重算 SHA-1/SHA-256（与 loader 同一套 sha1/sha2 实现）。
+sha1 = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
