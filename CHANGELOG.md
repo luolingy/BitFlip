@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### 新增 — 签名库同形命中时如实报"N 个候选之一"（M8）
+
+此前同一段字节同时命中多个库函数名（同形无法区分）时，只在账目里记一个**数字**
+（`ambiguous`），用户看不到"是哪几个名字在打架"。现在把这些候选如实列出来——
+但**仍然不替用户挑一个名字**（那会把 50% 误率伪装成一次成功识别，§7）。
+
+- `SignatureUseWire` 新增 `ambiguous_samples: Vec<AmbiguousMatchWire>`（地址 + 候选名，
+  上限 8 条）；说明文字里给一个具体例子（`0xADDR: name1 / name2 / …`）。
+- 分析里这些函数**依旧不给名字**（`named=false`、`name` 为空），来源不变。
+- `ANALYSIS_FORMAT_VERSION` 4→5（JSON 形状变化）。
+- 验收：`scripts/m8-signature-acceptance.ps1` 仍 **PASS：63 个命名、错名 0**；
+  `m8_signatures.rs` 新增一条——两条字节相同名字不同的签名命中同一函数时，函数
+  **不被命名**、`ambiguous ≥ 1`、候选样例同时含两个名字、说明含具体例子。
+
 ### 新增 — 代码签名 CDHash（签名结构指纹）
 
 在代码签名摘要里补一项 **CDHash**：对整段 CodeDirectory blob 按它自己的 `hashType`

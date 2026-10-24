@@ -317,3 +317,78 @@ fn a_library_for_another_arch_is_reported_and_names_nothing() {
         "根本没跑签名比对时不该有账目（否则界面会显示「用了 0 个」）"
     );
 }
+
+#[test]
+fn ambiguous_signatures_report_candidates_without_naming() {
+    let Some((exe, truth)) = sample() else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("临时目录");
+
+    // 挑一个目标自己说足够大的函数，用它的字节造**两条字节完全相同、名字不同**的签名。
+    let bare = analyze(&exe, None);
+    let bare_analysis = bare.analysis(&bare.detached_job()).expect("分析");
+    let sizes: std::collections::BTreeMap<u64, u64> = bare_analysis
+        .functions()
+        .iter()
+        .filter_map(|f| Some((bitflip_core::parse_address(&f.start)?, f.size?)))
+        .collect();
+    let (addr, name, size) = truth
+        .iter()
+        .filter_map(|(addr, name)| {
+            let size = sizes.get(addr).copied()?;
+            (size >= 16).then(|| (*addr, name.clone(), u32::try_from(size).expect("大小")))
+        })
+        .next()
+        .expect("真值里该有一个足够大的函数");
+
+    // 两条签名：字节一致（都取自同一段目标字节），名字一个是真值、一个是杜撰的"另一名"。
+    let first = signature_from(&bare, addr, &name, size);
+    let mut second = first.clone();
+    second.name = format!("{name}_ambiguous_alias");
+    let library = write_library(dir.path(), vec![first, second]);
+
+    let session = analyze(&exe, Some(library));
+    // 这个函数**绝不能**被命名（两种可能，挑一个就是把 50% 错率伪装成成功）。
+    let found = function_at(&session, addr).expect("函数结论");
+    assert!(
+        found.0.is_empty() && !found.3,
+        "同形无法区分时不许命名：{addr:#x} → {found:?}"
+    );
+
+    // 账目：有一处 ambiguous；候选样例里有这个地址，且**两个名字都在**。
+    let analysis = session.analysis(&session.detached_job()).expect("分析");
+    let report = analysis.signatures().expect("用了签名库就该有账目");
+    assert!(
+        report.ambiguous >= 1,
+        "两条同形签名命中同一函数 → 至少一处无法区分，实际 {}",
+        report.ambiguous
+    );
+    let addr_hex = bitflip_core::hex16(addr);
+    let sample = report
+        .ambiguous_samples
+        .iter()
+        .find(|item| item.addr == addr_hex)
+        .unwrap_or_else(|| {
+            panic!(
+                "候选样例里应有 {addr_hex}，实际 {:?}",
+                report.ambiguous_samples
+            )
+        });
+    assert!(
+        sample.names.contains(&name) && sample.names.iter().any(|n| n.contains("alias")),
+        "候选里应同时给出两个名字：{sample:?}"
+    );
+
+    // 说明文字要把"是哪几个名字在打架"讲出来（不是只报个数字）。
+    // 注意：可能有多个函数都同形，note 里的例子未必是**我们**这个地址，所以这里只验
+    // "有同形说明且带了一个具体候选名"，我们这条的具体候选由上面的 sample 断言管。
+    assert!(
+        analysis
+            .notes()
+            .iter()
+            .any(|note| note.contains("同形无法区分") && note.contains('/')),
+        "说明里应给一个具体候选例子（含 '/' 分隔的候选名）：{:?}",
+        analysis.notes()
+    );
+}

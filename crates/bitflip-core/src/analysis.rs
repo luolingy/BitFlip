@@ -43,7 +43,11 @@ use crate::timing::Stages;
 /// 4（间接调用前驱恢复这一片）：[`CallEdgeWire`] 新增 `recovered_indirect`。
 /// 同样是"每条边多一个字段"，而且这次多出来的是一位**可信度信息**——
 /// 消费方必须能分辨"目标是编码里写的"还是"我们推理出来的"。
-pub const ANALYSIS_FORMAT_VERSION: u32 = 4;
+///
+/// 5（同形签名报候选这一片）：[`SignatureUseWire`] 新增 `ambiguous_samples`
+/// （同形无法区分的候选名字样例）。JSON 形状变了 ⇒ +1。**错名仍为 0**：这些
+/// 函数依旧不给名字，只是把"是哪几个名字在打架"如实列出来，让人自己判断。
+pub const ANALYSIS_FORMAT_VERSION: u32 = 5;
 
 /// 签名库这一遍的账目（M8）。
 ///
@@ -63,6 +67,25 @@ pub struct SignatureUseWire {
     pub skipped_short: u64,
     /// 因为签名比目标函数更长而被排除的条数。
     pub rejected_by_size: u64,
+    /// 同形无法区分时的候选名字样例（地址 + 候选名，最多 [`Self::AMBIGUOUS_SAMPLE_LIMIT`] 条）。
+    ///
+    /// `ambiguous` 只是**个数**；这里给出"是哪几个名字在打架"，让用户能自己判断。
+    /// **绝不替用户挑一个名字** —— 这些函数仍然没有名字（§7）。
+    pub ambiguous_samples: Vec<AmbiguousMatchWire>,
+}
+
+/// 一处"同形无法区分"的候选（地址 + 同时命中的库函数名）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbiguousMatchWire {
+    /// 目标地址（定长 16 位小写十六进制，与地址 wire 口径一致）。
+    pub addr: String,
+    /// 同时命中、无法区分的库函数名（升序去重）。
+    pub names: Vec<String>,
+}
+
+impl SignatureUseWire {
+    /// `ambiguous_samples` 的样例上限（与其它样例字段一致：展示前几条 + 计数）。
+    pub const AMBIGUOUS_SAMPLE_LIMIT: usize = 8;
 }
 
 /// 调试信息这一遍的账目（M8 交付物 1/2）。
@@ -1399,6 +1422,15 @@ impl TargetAnalysis {
                 checked: report.checked,
                 skipped_short: report.skipped_short,
                 rejected_by_size: report.rejected_by_size,
+                ambiguous_samples: report
+                    .ambiguous
+                    .iter()
+                    .take(SignatureUseWire::AMBIGUOUS_SAMPLE_LIMIT)
+                    .map(|item| AmbiguousMatchWire {
+                        addr: hex16(item.addr),
+                        names: item.names.clone(),
+                    })
+                    .collect(),
             });
             if !report.matches.is_empty() {
                 notes.push(format!(
@@ -1410,9 +1442,18 @@ impl TargetAnalysis {
             // 这三条都是"没给出结论"的原因，必须说出来：否则用户看到"签名库认不出"
             // 会以为是库不够全，而实际可能是目标函数太短、或目标大小信息缺失。
             if report.ambiguous_count() > 0 {
+                // 给一个具体例子，让"是哪几个名字在打架"看得见 —— 但**不替用户挑**。
+                let example = report
+                    .ambiguous
+                    .first()
+                    .map(|item| {
+                        format!("，例如 0x{}: {}", hex16(item.addr), item.names.join(" / "))
+                    })
+                    .unwrap_or_default();
                 notes.push(format!(
-                    "签名库里有 {} 个候选函数的字节同时匹配多个库函数名（同形无法区分），未命名",
-                    report.ambiguous_count()
+                    "签名库里有 {} 个候选函数的字节同时匹配多个库函数名（同形无法区分），未命名{}",
+                    report.ambiguous_count(),
+                    example
                 ));
             }
             if report.skipped_short > 0 {
