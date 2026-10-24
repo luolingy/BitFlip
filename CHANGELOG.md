@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### 新增 — Mach-O 重签（A 阶段：纯函数，不写盘）
+
+按 `docs/MACHO-RESIGN-DESIGN.md` §8 第 1-2 步，先只做"算得对"的纯函数，不写盘、不接证书、
+不产生 CMS（ad-hoc 路径）。设计稿承诺的"先钉死正确性，再碰写盘"。
+
+- `codesign::build_code_directory(content, &ResignParams)`：给定内容 + 旧参数
+  (hashType/pageSizeLog/codeLimit/identifier/可选 entitlements blob)，逐页按 hashType 重算
+  code slot 哈希写入，entitlements 按其哈希写进 special slot 5（nSpecial=5），其余字段沿用。
+  布局与解析对称：`[44 头][identifier\0][special slots][code slots]`。
+- `codesign::build_superblob(cd, requirements, entitlements)`：把各 blob 按 4 字节对齐拼回
+  SuperBlob（ad-hoc，不含 CMS 槽）。
+- 坏输入如实报错不猜：未知 hashType / pageSizeLog=0 / 内容比 codeLimit 短 / 空内容 →
+  `ResignError`（带人话原因）。
+- 自校验闭环单测：重签后的(内容+签名)喂回现有 `parse` 必须 `Intact`；SHA-256/SHA-1 各一条；
+  构造 Mismatch→重签→Intact 闭环；含 entitlements（nSpecial=5）仍 Intact 且解得键值。
+  loader lib 314 测试全过（含新增 6 条）。**本片不写盘、不加 CLI、不改现有解析行为。**
+
 ### 新增 — `.app` 资源封印 CodeResources 只读展示（M12）
 
 `.app` 目录里的 `_CodeSignature/CodeResources` 是一份 plist，列出被"封印"的文件与哈希。

@@ -546,6 +546,227 @@ fn code_directory_hash(algorithm: HashAlgorithm, cd_blob: &[u8]) -> Option<Strin
     Some(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+// ───────────────────────── 重签（A 阶段：纯函数，不写盘） ─────────────────────────
+//
+// 只做"算对"：给定内容与旧 CodeDirectory 参数，产出新的 CodeDirectory 字节，并把各 blob
+// 拼回 SuperBlob。**不写盘、不接证书、不产生 CMS**（ad-hoc 路径）。设计见
+// `docs/MACHO-RESIGN-DESIGN.md` §8 第 1-2 步。
+//
+// 边界（§7）：算不出（未知 hashType / pageSizeLog=0 / 内容比 codeLimit 短 / 空内容）就返回
+// 明确的错误，绝不猜一个"看起来能过"的东西。
+
+/// 重签参数：从旧 CodeDirectory 抄来的、决定新签名的那些值（沿用旧值最稳）。
+#[derive(Debug, Clone)]
+pub struct ResignParams {
+    /// `hashType`：1=SHA-1、2=SHA-256、3=SHA-256 截断（本模块支持这三种）。
+    pub hash_type: u8,
+    /// `pageSizeLog`（如 12 表示 4096 字节一页）。
+    pub page_size_log: u8,
+    /// `codeLimit`：被签名内容的字节数（签名区从这之后开始）。
+    pub code_limit: u32,
+    /// `identifier`（如 `com.example.app`）。
+    pub identifier: String,
+    /// 可选：要一并写入 `CSSLOT_ENTITLEMENTS` 槽的 entitlements **blob 原始字节**
+    /// （`fade7171`+len+XML）。给了就把它整块嵌入，并把它按 hashType 的哈希放进 special slot 5。
+    pub entitlements_blob: Option<Vec<u8>>,
+}
+
+/// 重签构造过程中的错误（都带人话原因，调用方直接转成 notes 即可）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResignError {
+    /// 未知 / 不支持的 `hashType`。
+    UnsupportedHashType(u8),
+    /// 不支持的 `hashType`（内部用；`from_hash_type` 判不出时）。
+    ZeroPageSizeLog,
+    /// 空内容（`codeLimit == 0` 或内容为空）。
+    EmptyContent,
+    /// 内容比 `codeLimit` 短（不能对不存在的字节签名）。
+    ContentShorterThanLimit { have: usize, need: u32 },
+}
+
+impl std::fmt::Display for ResignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedHashType(t) => write!(
+                f,
+                "不支持的 hashType={t}（本模块只算 SHA-1=1 / SHA-256=2 / SHA-256 截断=3）"
+            ),
+            Self::ZeroPageSizeLog => write!(f, "pageSizeLog=0（无分页 / 整文件一个哈希），不支持"),
+            Self::EmptyContent => write!(f, "内容为空（codeLimit=0 或没有字节），无法重签"),
+            Self::ContentShorterThanLimit { have, need } => write!(
+                f,
+                "内容只有 {have} 字节，比 codeLimit={need} 短，不能对不存在的字节签名"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResignError {}
+
+/// 由 `hashType` 得到 `(hash_size, 是否截断)`；不可算返回 `None`。
+fn hash_size_for(hash_type: u8) -> Option<usize> {
+    match hash_type {
+        1 => Some(20), // SHA-1
+        2 => Some(32), // SHA-256
+        3 => Some(20), // SHA-256 truncated to 20
+        _ => None,
+    }
+}
+
+/// 按 `hash_type` 对一段数据哈希；截断态取 SHA-256 前 20 字节。
+fn digest_for(hash_type: u8, data: &[u8]) -> Option<Vec<u8>> {
+    match hash_type {
+        1 => sha1_digest(data),
+        2 => sha256_digest(data),
+        3 => Some(sha256_digest(data)?[..20].to_vec()),
+        _ => None,
+    }
+}
+
+/// 构造一份新的 CodeDirectory 字节（含逐页 code slot 哈希 + entitlements special slot）。
+///
+/// 布局与 [`parse`] 对称：`[44 字节头][identifier\0][special slots][code slots]`，
+/// `hashOffset` 指向 code slot 数组起点；special slot `j`（1..=nSpecial）位于
+/// `hashOffset - j*hash_size`。ad-hoc：不含 CMS。**纯函数，不改动 `content`。**
+pub fn build_code_directory(content: &[u8], params: &ResignParams) -> Result<Vec<u8>, ResignError> {
+    let hash_size = hash_size_for(params.hash_type)
+        .ok_or(ResignError::UnsupportedHashType(params.hash_type))?;
+    if params.page_size_log == 0 {
+        return Err(ResignError::ZeroPageSizeLog);
+    }
+    let page_size = 1usize << params.page_size_log;
+    let limit = params.code_limit as usize;
+    if limit == 0 || content.is_empty() {
+        return Err(ResignError::EmptyContent);
+    }
+    if content.len() < limit {
+        return Err(ResignError::ContentShorterThanLimit {
+            have: content.len(),
+            need: params.code_limit,
+        });
+    }
+
+    // 逐页 code slot 哈希（页数 = ceil(limit / page_size)）。
+    let n_code = limit.div_ceil(page_size);
+    let mut code_slots: Vec<Vec<u8>> = Vec::with_capacity(n_code);
+    for slot in 0..n_code {
+        let start = slot * page_size;
+        let end = (start + page_size).min(limit);
+        let digest = digest_for(params.hash_type, &content[start..end])
+            .ok_or(ResignError::UnsupportedHashType(params.hash_type))?;
+        debug_assert_eq!(digest.len(), hash_size);
+        code_slots.push(digest);
+    }
+
+    // special slots：目前只填 entitlements（CSSLOT_ENTITLEMENTS=5）。给了就 nSpecial=5，
+    // 槽 1..4 留空哈希（全 0）；没给就 nSpecial=0。
+    let n_special: usize = if params.entitlements_blob.is_some() {
+        5
+    } else {
+        0
+    };
+    let mut special_slots: Vec<Vec<u8>> = vec![vec![0u8; hash_size]; n_special];
+    if let Some(blob) = &params.entitlements_blob {
+        // special slot 5 = 从末尾数第 5 个，即 index n_special-5。
+        let idx = n_special - (CSSLOT_ENTITLEMENTS as usize);
+        let digest = digest_for(params.hash_type, blob)
+            .ok_or(ResignError::UnsupportedHashType(params.hash_type))?;
+        special_slots[idx] = digest;
+    }
+
+    // 头部固定 44 字节 + identifier 串 + special slots + code slots。
+    let ident_bytes = {
+        let mut v = params.identifier.clone().into_bytes();
+        v.push(0);
+        v
+    };
+    let ident_offset = CD_FIXED_LEN as u32;
+    // 布局（与 Apple 一致）：[44 头][identifier\0][special slots][code slots]。
+    // hashOffset 指向 **code slot 数组起点**，即 special slots 之后；special slot j（1..=nSpecial）
+    // 位于 hashOffset - j*hash_size（j 从 1 数，包含 special slots 紧贴 identifier 之后）。
+    let hash_region_start = CD_FIXED_LEN + ident_bytes.len(); // special slots 起点
+    let hash_offset = (hash_region_start + n_special * hash_size) as u32;
+    let cd_len = hash_region_start + n_special * hash_size + n_code * hash_size;
+
+    let mut cd = vec![0u8; cd_len];
+    cd[0..4].copy_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+    cd[4..8].copy_from_slice(&(cd_len as u32).to_be_bytes());
+    // version：沿用现代版本号 0x20400（与实测样本同一族）。
+    cd[8..12].copy_from_slice(&0x0002_0400u32.to_be_bytes());
+    cd[12..16].copy_from_slice(&0u32.to_be_bytes()); // flags
+    cd[16..20].copy_from_slice(&hash_offset.to_be_bytes());
+    cd[20..24].copy_from_slice(&ident_offset.to_be_bytes());
+    cd[24..28].copy_from_slice(&(n_special as u32).to_be_bytes());
+    cd[28..32].copy_from_slice(&(n_code as u32).to_be_bytes());
+    cd[32..36].copy_from_slice(&params.code_limit.to_be_bytes());
+    cd[36] = hash_size as u8;
+    cd[37] = params.hash_type;
+    cd[38] = 0; // platform
+    cd[39] = params.page_size_log;
+    cd[40..44].copy_from_slice(&0u32.to_be_bytes()); // spare2
+
+    cd[CD_FIXED_LEN..CD_FIXED_LEN + ident_bytes.len()].copy_from_slice(&ident_bytes);
+
+    // special slots：index j（0-based）位于 hash_region_start + j*hash_size。
+    for (j, slot) in special_slots.iter().enumerate() {
+        let at = hash_region_start + j * hash_size;
+        cd[at..at + hash_size].copy_from_slice(slot);
+    }
+    // code slots：从 hashOffset 起。
+    for (i, slot) in code_slots.iter().enumerate() {
+        let at = hash_offset as usize + i * hash_size;
+        cd[at..at + hash_size].copy_from_slice(slot);
+    }
+
+    Ok(cd)
+}
+
+/// 把各 blob 拼回一个 SuperBlob（ad-hoc：不含 CMS 槽）。
+///
+/// 顺序与惯例一致：CodeDirectory（type 0）→ requirements（type 2，可选）→
+/// entitlements（type 5，可选）。各 blob 在其偏移处按 4 字节对齐。**纯函数**。
+#[must_use]
+pub fn build_superblob(
+    code_directory: &[u8],
+    requirements: Option<&[u8]>,
+    entitlements: Option<&[u8]>,
+) -> Vec<u8> {
+    // 组装 (type, bytes) 列表。
+    let mut blobs: Vec<(u32, &[u8])> = vec![(CSSLOT_CODEDIRECTORY, code_directory)];
+    if let Some(req) = requirements {
+        blobs.push((CSSLOT_REQUIREMENTS, req));
+    }
+    if let Some(ent) = entitlements {
+        blobs.push((CSSLOT_ENTITLEMENTS, ent));
+    }
+
+    let count = blobs.len();
+    let index_len = 12 + count * 8;
+
+    // 先算每个 blob 的偏移（按 4 字节对齐累加）。
+    let mut offsets: Vec<u32> = Vec::with_capacity(count);
+    let mut cursor = index_len;
+    for (_, bytes) in &blobs {
+        offsets.push(cursor as u32);
+        cursor += bytes.len();
+        cursor = (cursor + 3) & !3; // 4 字节对齐
+    }
+    let total_len = cursor;
+
+    let mut sb = vec![0u8; total_len];
+    sb[0..4].copy_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
+    sb[4..8].copy_from_slice(&(total_len as u32).to_be_bytes());
+    sb[8..12].copy_from_slice(&(count as u32).to_be_bytes());
+    for (i, ((blob_type, bytes), off)) in blobs.iter().zip(offsets.iter()).enumerate() {
+        let entry = 12 + i * 8;
+        sb[entry..entry + 4].copy_from_slice(&blob_type.to_be_bytes());
+        sb[entry + 4..entry + 8].copy_from_slice(&off.to_be_bytes());
+        let at = *off as usize;
+        sb[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    sb
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,5 +986,195 @@ mod tests {
         let ent = parse_entitlements(&blob, 0).expect("返回 Some");
         assert!(ent.list.is_empty());
         assert!(ent.has_der_form);
+    }
+
+    // ── 重签（A 阶段）自校验闭环 ──
+
+    /// 造一段确定内容：`limit` 字节，值 i%251，便于篡改。
+    fn resign_content(limit: usize) -> Vec<u8> {
+        (0..limit).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// 把内容 + SuperBlob 拼成一个"文件"，签名区在 codeLimit 之后。
+    fn assemble(content: &[u8], code_limit: u32, superblob: &[u8]) -> (Vec<u8>, u64, u64) {
+        let mut file = content[..code_limit as usize].to_vec();
+        file.extend_from_slice(superblob);
+        (file, code_limit as u64, superblob.len() as u64)
+    }
+
+    fn resign_and_parse(
+        content: &[u8],
+        params: &ResignParams,
+        entries: Option<&[u8]>,
+    ) -> crate::object::CodeSignature {
+        let cd = build_code_directory(content, params).expect("构造 CodeDirectory");
+        let sb = build_superblob(&cd, None, entries);
+        let (file, dataoff, datasize) = assemble(content, params.code_limit, &sb);
+        parse(&file, LinkeditRange { dataoff, datasize }, Endian::Little)
+    }
+
+    #[test]
+    fn resign_roundtrip_is_intact_sha256() {
+        let limit = 2 * 4096u32;
+        let content = resign_content(limit as usize);
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit: limit,
+            identifier: "com.example.resigned".to_string(),
+            entitlements_blob: None,
+        };
+        let sig = resign_and_parse(&content, &params, None);
+        assert_eq!(sig.verified_slots, 2, "两页全过");
+        assert!(sig.first_mismatch.is_none());
+        assert!(
+            matches!(sig.verdict, CodeSignVerdict::AdHoc),
+            "ad-hoc（无 CMS）且完整性通过，实际 {:?}",
+            sig.verdict
+        );
+        assert_eq!(sig.identifier, "com.example.resigned");
+        assert_eq!(sig.code_limit, u64::from(limit));
+        assert!(!sig.has_cms_signature);
+    }
+
+    #[test]
+    fn resign_roundtrip_is_intact_sha1() {
+        let limit = 4096u32;
+        let content = resign_content(limit as usize);
+        let params = ResignParams {
+            hash_type: 1,
+            page_size_log: 12,
+            code_limit: limit,
+            identifier: "com.example.sha1".to_string(),
+            entitlements_blob: None,
+        };
+        let sig = resign_and_parse(&content, &params, None);
+        assert_eq!(sig.verified_slots, 1);
+        assert!(matches!(sig.verdict, CodeSignVerdict::AdHoc));
+        assert_eq!(sig.algorithm, HashAlgorithm::Sha1);
+    }
+
+    #[test]
+    fn resign_fixes_a_tampered_mismatch() {
+        // 先签原始内容，再篡改内容 → parse 报 Mismatch；对篡改后的内容重签 → Intact。
+        let limit = 2 * 4096u32;
+        let mut content = resign_content(limit as usize);
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit: limit,
+            identifier: "com.example.fix".to_string(),
+            entitlements_blob: None,
+        };
+        // 用原始内容签一份文件。
+        let cd = build_code_directory(&content, &params).expect("cd");
+        let sb = build_superblob(&cd, None, None);
+        let (file, dataoff, datasize) = assemble(&content, limit, &sb);
+        // 篡改第二页 → Mismatch。
+        content[4096 + 100] ^= 0xff;
+        let mut tampered_file = file.clone();
+        tampered_file[4096 + 100] ^= 0xff;
+        let sig_before = parse(
+            &tampered_file,
+            LinkeditRange { dataoff, datasize },
+            Endian::Little,
+        );
+        assert!(
+            matches!(sig_before.verdict, CodeSignVerdict::Mismatch),
+            "篡改后应报 Mismatch，实际 {:?}",
+            sig_before.verdict
+        );
+        assert_eq!(sig_before.first_mismatch, Some(1));
+
+        // 对篡改后的内容重签 → 重新组装 → Intact。
+        let sig_after = resign_and_parse(&content, &params, None);
+        assert!(
+            matches!(sig_after.verdict, CodeSignVerdict::AdHoc),
+            "重签后应完整性通过（ad-hoc），实际 {:?}",
+            sig_after.verdict
+        );
+        assert_eq!(sig_after.verified_slots, 2);
+        assert!(sig_after.first_mismatch.is_none());
+    }
+
+    #[test]
+    fn resign_with_entitlements_sets_special_slot_and_stays_intact() {
+        // 造 entitlements blob（fade7171+len+XML）。
+        let xml = r#"<?xml version="1.0"?><plist version="1.0"><dict><key>get-task-allow</key><true/></dict></plist>"#;
+        let xml_bytes = xml.as_bytes();
+        let bloc_len = 8 + xml_bytes.len();
+        let mut ent = vec![0u8; bloc_len];
+        ent[0..4].copy_from_slice(&CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes());
+        ent[4..8].copy_from_slice(&(bloc_len as u32).to_be_bytes());
+        ent[8..8 + xml_bytes.len()].copy_from_slice(xml_bytes);
+
+        let limit = 4096u32;
+        let content = resign_content(limit as usize);
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit: limit,
+            identifier: "com.example.ent".to_string(),
+            entitlements_blob: Some(ent.clone()),
+        };
+        let sig = resign_and_parse(&content, &params, Some(&ent));
+
+        // CD 里应写入了 entitlements special slot：nSpecial=5。
+        let cd = build_code_directory(&content, &params).expect("cd");
+        assert_eq!(be_u32(&cd, 24), Some(5), "nSpecialSlots 应为 5");
+        // 解析仍 Intact，且解出了 entitlements。
+        assert!(matches!(sig.verdict, CodeSignVerdict::AdHoc));
+        assert_eq!(sig.verified_slots, 1);
+        let parsed_ent = sig.entitlements.as_ref().expect("应解出 entitlements");
+        assert_eq!(
+            parsed_ent.get("get-task-allow"),
+            Some(&EntitlementValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn resign_rejects_unknown_hash_type() {
+        let content = resign_content(4096);
+        let params = ResignParams {
+            hash_type: 9,
+            page_size_log: 12,
+            code_limit: 4096,
+            identifier: "x".to_string(),
+            entitlements_blob: None,
+        };
+        assert_eq!(
+            build_code_directory(&content, &params),
+            Err(ResignError::UnsupportedHashType(9))
+        );
+    }
+
+    #[test]
+    fn resign_rejects_zero_page_size_and_short_content() {
+        let content = resign_content(4096);
+        let zero_page = ResignParams {
+            hash_type: 2,
+            page_size_log: 0,
+            code_limit: 4096,
+            identifier: "x".to_string(),
+            entitlements_blob: None,
+        };
+        assert_eq!(
+            build_code_directory(&content, &zero_page),
+            Err(ResignError::ZeroPageSizeLog)
+        );
+        let short = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit: 8192,
+            identifier: "x".to_string(),
+            entitlements_blob: None,
+        };
+        assert_eq!(
+            build_code_directory(&content, &short),
+            Err(ResignError::ContentShorterThanLimit {
+                have: 4096,
+                need: 8192
+            })
+        );
     }
 }
