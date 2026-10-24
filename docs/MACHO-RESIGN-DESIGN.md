@@ -118,7 +118,8 @@ ad-hoc 重签（`codesign -s -` 的等价物）**不需要证书**，步骤是�
 5. ✅ 追加/变大写盘（D 阶段）：新签名比旧 `datasize` 大或签名区不紧贴时，追加到文件末尾并更新
    `LC_CODE_SIGNATURE` 与 `__LINKEDIT` 的 `filesize/vmsize`；第 0 页（含 load command）先定稿再
    算哈希。真实样本强制 SHA-256 触发追加，CAltKit 14/14、Alderis 469/469、MetalANGLE 2840/2840 全过。
-6. ⬜ fat 多切片 / `.app` 多二进制：需逐 slice 重签并重建 fat 头，风险高，未做。
+6. ✅ fat 多切片 / 通用二进制（E 阶段）：`resign_macho_file` 按头分派，`resign_fat` 逐 slice 重签
+   并重排 offset、重建 fat 头；合成 2-slice 全过。`.app` 内多二进制可逐个调用（本命令按文件）。
 7. ⬜ 正式重签（带 CMS / 开发者身份 / 私钥）——按 §5/§7 **不做**，需单独立项与密钥隔离。
 
 —— 以上为设计。**是否批准、以及批准到哪一步（只到 1-2 的纯函数？还是含 3-4 的写盘？），

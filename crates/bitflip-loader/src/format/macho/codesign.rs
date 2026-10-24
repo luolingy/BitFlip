@@ -793,6 +793,8 @@ pub enum ResignWriteError {
     NoLinkeditSegment,
     /// 文件/偏移超过 u32 能表示的范围（超出 `linkedit_data_command` 字段能力）。
     FileTooLarge,
+    /// fat / 通用二进制容器解析失败（切片表越界等）。
+    FatContainer(String),
 }
 
 impl std::fmt::Display for ResignWriteError {
@@ -822,6 +824,7 @@ impl std::fmt::Display for ResignWriteError {
                 f,
                 "文件或偏移超过 u32 能表示的范围（linkedit_data_command 字段放不下）"
             ),
+            Self::FatContainer(detail) => write!(f, "fat/通用 Mach-O 容器解析失败：{detail}"),
         }
     }
 }
@@ -990,14 +993,26 @@ fn raw_entitlements_blob(sb: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// **端到端重签一个薄 Mach-O 文件字节**（自带参数推断，保留 entitlements 原始字节）。
+/// **端到端重签一个 Mach-O 文件字节**（自带参数推断，保留 entitlements 原始字节）。
 ///
 /// 与 [`resign_in_place`] 的区别：这里**自己从旧签名里推断参数**（hashType / pageSizeLog /
 /// codeLimit / identifier），不需要调用方手填；并把旧签名里的 entitlements blob **原样**
 /// 重新嵌入（ad-hoc 保留 get-task-allow 之类）。若原签名没有 entitlements，就按没有处理。
 ///
-/// 这是 CLI `resign` 子命令的实现入口；仍是**纯函数**（返回新字节，不落盘）。
+/// **按文件头自动分派**：fat/通用二进制 → [`resign_fat`]（逐 slice 重签并重排 offset）；
+/// 薄 Mach-O → 原地容纳或追加。这是 CLI `resign` 子命令的实现入口；仍是**纯函数**（不落盘）。
 pub fn resign_macho_file(file: &[u8]) -> Result<Vec<u8>, ResignWriteError> {
+    // fat 头恒为大端：0xcafebabe（32）/ 0xcafebabf（64）。
+    let first = read_u32_endian(file, 0, Endian::Big);
+    if matches!(first, Some(m) if m == crate::format::macho::fat::FAT_MAGIC || m == crate::format::macho::fat::FAT_MAGIC_64)
+    {
+        return resign_fat(file);
+    }
+    resign_thin(file)
+}
+
+/// 薄 Mach-O 重签主体（原 `resign_macho_file` 的逻辑，已拆分出来供 fat 逐 slice 调用）。
+fn resign_thin(file: &[u8]) -> Result<Vec<u8>, ResignWriteError> {
     let anchor = find_signature_anchor(file)?;
     // 从旧签名解析出推断参数所需的字段。
     let sig = parse(
@@ -1246,6 +1261,95 @@ fn align_up(value: u64, align: u64) -> u64 {
         return value;
     }
     value.div_ceil(align) * align
+}
+
+/// 对齐移位（`align` 是 2 的底）：返回实际字节对齐值。`align` 荒谬大时钳到 1<<20 挡住坏输入。
+fn align_bytes(align_log: u32) -> u64 {
+    let shift = align_log.min(20); // 上限 1 MiB 对齐，真实 far_arch 远小于此
+    1u64 << shift
+}
+
+/// 端到端重签一个 **fat / 通用 Mach-O**：逐 slice 重签，重排 offset，重建 fat 头。
+///
+/// 每个 slice 用 [`resign_thin`]（内部原地/追加），切片可能变长，所以要按各 slice 的 `align`
+/// 重新排布到新位置，并更新 fat 架构表里每一项的 `offset/size`（cputype/cpusubtype/align/
+/// reserved 保持不变）。绝不原地改输入、不写坏：任何 slice 重签失败、fat 头解析失败、对齐
+/// 非法 → 明确错误。
+pub fn resign_fat(file: &[u8]) -> Result<Vec<u8>, ResignWriteError> {
+    use crate::format::macho::fat;
+
+    let fat = fat::read(file).map_err(|e| ResignWriteError::FatContainer(e.to_string()))?;
+    let is_64 = fat.is_64;
+
+    // 1) 逐 slice 取出字节并重签。
+    let mut resigned_slices: Vec<Vec<u8>> = Vec::with_capacity(fat.slices.len());
+    for s in &fat.slices {
+        let start =
+            usize::try_from(s.offset).map_err(|_| ResignWriteError::MalformedSignatureRange)?;
+        let end = usize::try_from(s.offset + s.size)
+            .map_err(|_| ResignWriteError::MalformedSignatureRange)?;
+        let slice = file
+            .get(start..end)
+            .ok_or(ResignWriteError::MalformedSignatureRange)?;
+        let out = resign_thin(slice)?;
+        resigned_slices.push(out);
+    }
+
+    // 2) 重排布局：slice 依次放到"按各自 align 对齐后的位置"，紧跟 fat 头之后。
+    let arch_size: u64 = if is_64 {
+        fat::FAT_ARCH64_SIZE
+    } else {
+        fat::FAT_ARCH_SIZE
+    };
+    let header_end = fat::FAT_HEADER_SIZE + fat.slices.len() as u64 * arch_size;
+
+    let mut new_offsets: Vec<u64> = Vec::with_capacity(fat.slices.len());
+    let mut cursor = header_end;
+    for (s, bytes) in fat.slices.iter().zip(resigned_slices.iter()) {
+        let align = align_bytes(s.align);
+        let off = align_up(cursor, align);
+        new_offsets.push(off);
+        cursor = off + bytes.len() as u64;
+    }
+    let total_len = cursor;
+
+    // 3) 组装输出：先占位 total_len（清零），再写 fat 头 + 各 slice。
+    let mut out =
+        vec![0u8; usize::try_from(total_len).map_err(|_| ResignWriteError::FileTooLarge)?];
+    // fat 头（大端）。
+    let magic = if is_64 {
+        fat::FAT_MAGIC_64
+    } else {
+        fat::FAT_MAGIC
+    };
+    out[0..4].copy_from_slice(&magic.to_be_bytes());
+    out[4..8].copy_from_slice(&(fat.slices.len() as u32).to_be_bytes());
+
+    for (i, (s, bytes)) in fat.slices.iter().zip(resigned_slices.iter()).enumerate() {
+        let base = (fat::FAT_HEADER_SIZE + i as u64 * arch_size) as usize;
+        let new_off = new_offsets[i];
+        let new_size = bytes.len() as u64;
+        // cputype / cpusubtype 原样。
+        out[base..base + 4].copy_from_slice(&s.cputype.to_be_bytes());
+        out[base + 4..base + 8].copy_from_slice(&s.cpusubtype.to_be_bytes());
+        if is_64 {
+            out[base + 8..base + 16].copy_from_slice(&new_off.to_be_bytes());
+            out[base + 16..base + 24].copy_from_slice(&new_size.to_be_bytes());
+            out[base + 24..base + 28].copy_from_slice(&s.align.to_be_bytes());
+            out[base + 28..base + 32].copy_from_slice(&s.reserved.unwrap_or(0).to_be_bytes());
+        } else {
+            let off32 = u32::try_from(new_off).map_err(|_| ResignWriteError::FileTooLarge)?;
+            let size32 = u32::try_from(new_size).map_err(|_| ResignWriteError::FileTooLarge)?;
+            out[base + 8..base + 12].copy_from_slice(&off32.to_be_bytes());
+            out[base + 12..base + 16].copy_from_slice(&size32.to_be_bytes());
+            out[base + 16..base + 20].copy_from_slice(&s.align.to_be_bytes());
+        }
+        // 写入 slice 字节。
+        let at = new_off as usize;
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1960,6 +2064,98 @@ mod tests {
             resign_append(&full, &params, None),
             Err(ResignWriteError::NoLinkeditSegment)
         ));
+    }
+
+    // ── 重签 E 阶段：fat / 通用 Mach-O 多切片 ──
+
+    /// 把若干薄 Mach-O slice 拼成 32 位 fat 文件（大端头）。每个 slice 用 align=12（4KiB）。
+    fn wrap_fat(slices: &[Vec<u8>]) -> Vec<u8> {
+        use crate::format::macho::fat;
+        let n = slices.len();
+        let arch_size = fat::FAT_ARCH_SIZE; // 20
+        let header_end = fat::FAT_HEADER_SIZE + n as u64 * arch_size;
+        let mut offsets = Vec::with_capacity(n);
+        let mut cursor = header_end;
+        for s in slices {
+            let off = align_up(cursor, 0x1000);
+            offsets.push(off);
+            cursor = off + s.len() as u64;
+        }
+        let mut out = vec![0u8; cursor as usize];
+        out[0..4].copy_from_slice(&fat::FAT_MAGIC.to_be_bytes());
+        out[4..8].copy_from_slice(&(n as u32).to_be_bytes());
+        for (i, s) in slices.iter().enumerate() {
+            let base = (fat::FAT_HEADER_SIZE + i as u64 * arch_size) as usize;
+            // 给不同 cputype 好区分；测试不依赖具体值。
+            let cputype: u32 = if i == 0 { 0x0100_0007 } else { 0x0100_000c }; // x86_64 / arm64
+            out[base..base + 4].copy_from_slice(&cputype.to_be_bytes());
+            out[base + 4..base + 8].copy_from_slice(&3u32.to_be_bytes());
+            out[base + 8..base + 12].copy_from_slice(&(offsets[i] as u32).to_be_bytes());
+            out[base + 12..base + 16].copy_from_slice(&(s.len() as u32).to_be_bytes());
+            out[base + 16..base + 20].copy_from_slice(&12u32.to_be_bytes()); // align log2 = 12
+            let at = offsets[i] as usize;
+            out[at..at + s.len()].copy_from_slice(s);
+        }
+        out
+    }
+
+    #[test]
+    fn resign_fat_resigns_every_slice_and_realigns() {
+        use crate::format::macho::fat;
+        // 两个独立薄 Mach-O（各自自洽 Intact）。
+        let (s0, _) = build_thin_macho(true);
+        let (s1, _) = build_thin_macho(true);
+        let fat_bytes = wrap_fat(&[s0.clone(), s1.clone()]);
+
+        // 先确认 fat 头可解析、偏移正确。
+        let before = fat::read(&fat_bytes).expect("fat 可读");
+        assert_eq!(before.slices.len(), 2, "应有 2 个切片");
+
+        // 重签整个 fat。
+        let resigned = resign_fat(&fat_bytes).expect("fat 重签成功");
+        // 输入不受影响。
+        let still = fat::read(&fat_bytes).unwrap();
+        assert_eq!(still.slices.len(), 2);
+
+        // 重新解析输出 fat：切片数、对齐、每个 slice 完整性。
+        let after = fat::read(&resigned).expect("重签后 fat 可读");
+        assert_eq!(after.slices.len(), 2);
+        for (i, s) in after.slices.iter().enumerate() {
+            // 对齐：offset 必须是 2^align 的倍数（align=12 → 4096）。
+            let a = align_bytes(s.align);
+            assert_eq!(s.offset % a, 0, "slice {i} offset 未按 align 对齐");
+            // 切片字节能独立解析为 Intact 薄 Mach-O。
+            let start = s.offset as usize;
+            let end = (s.offset + s.size) as usize;
+            let slice = &resigned[start..end];
+            assert_eq!(slice.len(), s.size as usize, "slice {i} size 与表项不符");
+            let sig = parse_thin(slice);
+            assert!(
+                matches!(sig.verdict, CodeSignVerdict::AdHoc),
+                "slice {i} 应完整性通过，实际 {:?}",
+                sig.verdict
+            );
+            assert_eq!(
+                sig.verified_slots, sig.code_slots,
+                "slice {i} 所有 slot 通过"
+            );
+        }
+        // 两个切片不重叠（后一个起点 ≥ 前一个末尾）。
+        let s0r = &after.slices[0];
+        let s1r = &after.slices[1];
+        assert!(s1r.offset >= s0r.offset + s0r.size, "切片不应重叠");
+    }
+
+    #[test]
+    fn resign_macho_file_dispatches_fat() {
+        let (s0, _) = build_thin_macho(true);
+        let (s1, _) = build_thin_macho(true);
+        let fat_bytes = wrap_fat(&[s0, s1]);
+        // 入口应自动识别 fat 并走 resign_fat。
+        let resigned = resign_macho_file(&fat_bytes).expect("入口应分派 fat 并成功");
+        assert!(resigned.len() >= fat_bytes.len());
+        let after = crate::format::macho::fat::read(&resigned).expect("重签后仍可读");
+        assert_eq!(after.slices.len(), 2);
     }
 
     /// 真实样本：设 `BITFLIP_RESIGN_SAMPLE=<薄 Mach-O 路径>` 后 `--ignored`。

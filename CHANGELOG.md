@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### 新增 — 重签 E 阶段：fat / 通用 Mach-O 多切片
+
+`resign_macho_file` 现在**按文件头自动分派**：`FAT_MAGIC`(0xcafebabe) / `FAT_MAGIC_64`(0xcafebabf)
+→ `resign_fat`；否则薄 Mach-O → `resign_thin`（原逻辑）。
+
+- `resign_fat`：解析 fat 架构表，逐 slice 用 `resign_thin` 重签（切片可能变长），按各 slice 的
+  `align`（2 的底，钳到 ≤1 MiB）重排 offset，重建大端 fat 头并更新每项 `offset/size`
+  （cputype/cpusubtype/align/reserved 保持不变）。绝不原地改输入、不写坏；fat 头解析失败 →
+  明确 `FatContainer`，切片重签失败透传。
+- `bitflip-cli resign` 自动支持通用二进制（无需新参数）。
+- 合成样本单测：2 slice fat 重签后每个 offset 按 align 对齐、不重叠、size 正确，且**每个 slice
+  独立解析为 Intact/AdHoc 且所有 code slot 通过**；入口对 fat 正确分派。loader 323 全过（+2）。
+- （真实 ipa 内框架为薄切片，无现成 fat 样本；fat 路径由合成 2-slice + 已证实的真实薄重签链路覆盖。）
+
 ### 新增 — 重签 D 阶段：追加式写盘（签名变大 / 不紧贴时）
 
 `resign_in_place` 只支持"签名区原地容纳"。新增 `resign_append`：新 SuperBlob 比旧 `datasize`
