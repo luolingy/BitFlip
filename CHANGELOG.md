@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+### 变更 — 阶段 2 第二片：结构体推断接入 `export --format json-structs`
+
+- 新导出格式 `json-structs`：把结构体推断输出成稳定 JSON（`totals` / `candidates` / `notes` /
+  `disclaimer`），CLI `export` 与 HTTP `/export?format=json-structs` 同一实现，GUI 与脚本都能消费。
+  HTTP 侧无需改动——服务端按 `ExportFormat::all()` 动态枚举，新格式自动可用。
+- 抽出统一的会话级入口 `Session::structs_report()`（core 新模块 `structs`）：反汇编 → 廉价函数发现
+  → 推断，供 CLI `structs` 子命令与 `export` 共用，消灭两处各写一份函数边界逻辑的漂移风险。
+  CLI `structs` 相应改为调用它（输出增加"函数区间 N 个"与 `sub_<addr>` 归属）。
+- `export json-structs` 支持地址范围过滤（按候选归属函数入口落点），越界候选丢弃并在 `notes`
+  里说明差了多少；与其他机器码视图的"入口落点"语义一致。
+- 真实核对：CAltKit（arm64）导出 26738 字节、23 个候选，全部带函数归属；range 过滤正常运行。
+- core 71 / cli 40 全过；fmt/clippy 干净。
+
 ### 新增 — 阶段 2 第一片：疑似结构体字段布局推断（`structs` 子命令）
 
 `bitflip-analyze` 新模块 `structs`：把指令流里形如 `[base + disp]` 的内存访问按 **(函数, 基址)**

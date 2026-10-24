@@ -33,6 +33,7 @@ use crate::analysis::{FunctionWire, TargetAnalysis, XrefWire, ANALYSIS_FORMAT_VE
 use crate::disasm::{hex16, DISASM_FORMAT_VERSION};
 use crate::error::BitflipError;
 use crate::session::{ObjectInfo, Session, INFO_FORMAT_VERSION};
+use bitflip_analyze::StructCandidate;
 
 /// 导出格式版本号。
 ///
@@ -62,6 +63,8 @@ pub enum ExportFormat {
     JsonSymbols,
     /// 交叉引用全表（JSON）。
     JsonXrefs,
+    /// 疑似结构体字段布局（JSON）。**启发式、非真实 C 类型**：见 `bitflip_analyze::structs`。
+    JsonStructs,
     /// 控制流图（Graphviz DOT）。
     DotCfg,
     /// C 风格伪代码（**有界子集**：单基本块表达式视图，不做控制流结构化）。
@@ -87,6 +90,7 @@ impl ExportFormat {
             Self::JsonFunctions => "json-functions",
             Self::JsonSymbols => "json-symbols",
             Self::JsonXrefs => "json-xrefs",
+            Self::JsonStructs => "json-structs",
             Self::DotCfg => "dot-cfg",
             Self::PseudoC => "pseudo-c",
             Self::DexJson => "dex-json",
@@ -104,6 +108,7 @@ impl ExportFormat {
             Self::JsonFunctions,
             Self::JsonSymbols,
             Self::JsonXrefs,
+            Self::JsonStructs,
             Self::DotCfg,
             Self::PseudoC,
             Self::DexJson,
@@ -484,6 +489,9 @@ fn export_with_disasm_prebuilt(
         ExportFormat::JsonXrefs => {
             let analysis = session.analysis(&job)?;
             write_json_xrefs(&mut writer, &analysis, options, &meta, &mut notes)?
+        }
+        ExportFormat::JsonStructs => {
+            write_json_structs(&mut writer, session, options, &meta, &mut notes)?
         }
         ExportFormat::DotCfg => {
             let analysis = session.analysis(&job)?;
@@ -1948,6 +1956,81 @@ fn write_json_xrefs(
             "地址范围过滤掉了 {} 条交叉引用（全表 {} 条，导出 {} 条）",
             all.len() - selected.len(),
             all.len(),
+            selected.len()
+        ));
+    }
+    Ok(selected.len() as u64)
+}
+
+/// 导出疑似结构体字段布局（JSON）。
+///
+/// **启发式、非真实 C 类型**：调用 [`Session::structs_report`]，把候选按访问次数排序后输出。
+/// 支持地址范围过滤（按归属函数入口落点）、以及 `--class`/`--method` 等 DEX 选项越界检查由
+/// 上层统一处理（此处只用 range / function 选择器，与其他机器码视图一致）。
+fn write_json_structs(
+    writer: &mut ExportWriter,
+    session: &Session,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let outcome = session.structs_report()?;
+    let report = &outcome.report;
+
+    // 地址范围过滤：候选归属函数的入口落在范围内才保留（与 json-functions 的"入口落点"语义一致）。
+    let selected: Vec<&StructCandidate> = report
+        .candidates
+        .iter()
+        .filter(|c| match (options.range, c.function) {
+            (None, _) => true,
+            (Some((from, to)), Some(func)) => func >= from && func < to,
+            // 有 range 但候选无函数归属：保守起见丢弃（无法判定落点）。
+            (Some(_), None) => false,
+        })
+        .collect();
+
+    let candidates_json: Vec<_> = selected
+        .iter()
+        .map(|c| {
+            json!({
+                "base_reg": c.base.0,
+                "function": c.function.map(hex16),
+                "size": c.size,
+                "field_count": c.fields.len(),
+                "access_count": c.access_count(),
+                "fields": c.fields.iter().map(|f| json!({
+                    "offset": f.offset,
+                    "widths": f.widths,
+                    "reads": f.reads,
+                    "writes": f.writes,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let document = json!({
+        "format_version": EXPORT_FORMAT_VERSION,
+        "producer": meta.producer,
+        "meta": meta,
+        "totals": {
+            "candidates": selected.len(),
+            "all_candidates": report.candidates.len(),
+            "instructions": outcome.instructions,
+            "function_ranges": outcome.function_ranges,
+        },
+        "candidates": candidates_json,
+        "notes": report.notes,
+        "disclaimer": "疑似结构体：启发式证据，非真实 C 类型（无类型/数据流/跨块指针跟踪）",
+    });
+
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|error| BitflipError::Internal(format!("序列化结构体推断失败：{error}")))?;
+    write_document(writer, &text, options, "结构体推断表")?;
+    if selected.len() != report.candidates.len() {
+        notes.push(format!(
+            "地址范围过滤掉了 {} 个结构体候选（全量 {} 个，导出 {} 个）",
+            report.candidates.len() - selected.len(),
+            report.candidates.len(),
             selected.len()
         ));
     }

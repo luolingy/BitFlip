@@ -19,6 +19,7 @@ mod error;
 mod export;
 mod import_edges;
 mod session;
+mod structs;
 mod timing;
 
 pub use analysis::{
@@ -103,6 +104,7 @@ pub use bitflip_analyze::{infer_struct_fields, StructCandidate, StructField, Str
 pub use bitflip_analyze::derive_function_start_bounds;
 /// 结构体推断要用到的解码指令类型与廉价函数起点推导。
 pub use bitflip_arch::{DecodedInsn, Flow};
+pub use structs::StructsOutcome;
 
 /// 重新导出架构规格（嵌入方做架构相关判断时使用，不需要直接依赖 `bitflip-arch`）。
 pub use bitflip_arch::{Arch, ArchSpec, Endian, Mode};
