@@ -115,8 +115,11 @@ ad-hoc 重签（`codesign -s -` 的等价物）**不需要证书**，步骤是�
 4. ✅ CLI 落盘 + 交叉核对：`bitflip-cli resign [--apply]` 产出 `xxx.resigned`；
    `scripts/resign-acceptance.ps1`（`codesign -v`，缺工具 SKIP）+ 真实样本
    （PojavLauncher 内 5 个 ad-hoc 二进制全过，CAltKit 14/14）。（C 阶段）
-5. ⬜ 签名区**移动** / 尾部追加（签名变大时）与 fat/`.app` 多二进制——风险最高，未做。
-6. ⬜ 正式重签（带 CMS / 开发者身份 / 私钥）——按 §5/§7 **不做**，需单独立项与密钥隔离。
+5. ✅ 追加/变大写盘（D 阶段）：新签名比旧 `datasize` 大或签名区不紧贴时，追加到文件末尾并更新
+   `LC_CODE_SIGNATURE` 与 `__LINKEDIT` 的 `filesize/vmsize`；第 0 页（含 load command）先定稿再
+   算哈希。真实样本强制 SHA-256 触发追加，CAltKit 14/14、Alderis 469/469、MetalANGLE 2840/2840 全过。
+6. ⬜ fat 多切片 / `.app` 多二进制：需逐 slice 重签并重建 fat 头，风险高，未做。
+7. ⬜ 正式重签（带 CMS / 开发者身份 / 私钥）——按 §5/§7 **不做**，需单独立项与密钥隔离。
 
 —— 以上为设计。**是否批准、以及批准到哪一步（只到 1-2 的纯函数？还是含 3-4 的写盘？），
 请你定。** 未获批准前不写任何重签实现代码。

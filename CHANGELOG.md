@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 新增 — 重签 D 阶段：追加式写盘（签名变大 / 不紧贴时）
+
+`resign_in_place` 只支持"签名区原地容纳"。新增 `resign_append`：新 SuperBlob 比旧 `datasize`
+大（换更宽算法/页数变多）或签名区不紧贴被签内容时，**追加到文件末尾（16 字节对齐）**，并更新
+`LC_CODE_SIGNATURE.dataoff/datasize` 与 `__LINKEDIT` 段命令的 `filesize/vmsize`。
+
+- `resign_macho_file` 现在**自动回退**：先试原地容纳，放不下/不紧贴就转追加；找不到 `__LINKEDIT`
+  或偏移超 u32 → 明确 `NoLinkeditSegment`/`FileTooLarge`，不写坏。
+- **关键顺序**：第 0 页包含头与 load command（它们也被签），所以必须**先用最终数值改好命令、
+  再对最终字节算逐页哈希**；先算哈希后改命令会让第 0 页失效（初版正是此 bug，已修）。
+- 32/64 位、大小端均处理；`__LINKEDIT.vmsize` 按旧粒度或 0x1000 对齐，不小于旧值。
+- 合成样本单测：追加后重新 `parse` 必须 `Intact`/`AdHoc` 且所有 code slot 通过、`filesize` 变大；
+  缺 `__LINKEDIT` 明确报错。**真实样本核对**（`#[ignore]`，强制 SHA-256 撑大签名触发追加）：
+  CAltKit 14/14、Alderis 469/469、MetalANGLE 2840/2840，`dataoff` 后移、文件变长、重新解析 Intact。
+- 不加 CLI 参数（`bitflip-cli resign` 自动受益）。loader 321 全过（+3）；fmt/clippy 干净。
+
 ### 新增 — `bitflip-cli resign` 子命令（重签 C 阶段：CLI 落盘）
 
 把 A+B 的重签能力接到 CLI：`bitflip-cli resign <TARGET> [--apply] [--output PATH] [--json]`。

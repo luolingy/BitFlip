@@ -789,6 +789,10 @@ pub enum ResignWriteError {
     DoesNotFit { need: usize, have: usize },
     /// 签名区不紧贴被签名内容（`dataoff != codeLimit`）——需要移动签名区，本阶段不做。
     SignatureNotAdjacent { dataoff: u64, code_limit: u64 },
+    /// 追加路径里找不到 `__LINKEDIT` 段命令（无法安全更新 filesize/vmsize）。
+    NoLinkeditSegment,
+    /// 文件/偏移超过 u32 能表示的范围（超出 `linkedit_data_command` 字段能力）。
+    FileTooLarge,
 }
 
 impl std::fmt::Display for ResignWriteError {
@@ -810,6 +814,13 @@ impl std::fmt::Display for ResignWriteError {
             Self::SignatureNotAdjacent { dataoff, code_limit } => write!(
                 f,
                 "签名区 dataoff={dataoff} 与被签内容 codeLimit={code_limit} 不紧贴，需要移动签名区，本阶段不做"
+            ),
+            Self::NoLinkeditSegment => {
+                write!(f, "找不到 __LINKEDIT 段命令，无法安全追加签名（不写坏）")
+            }
+            Self::FileTooLarge => write!(
+                f,
+                "文件或偏移超过 u32 能表示的范围（linkedit_data_command 字段放不下）"
             ),
         }
     }
@@ -1025,7 +1036,216 @@ pub fn resign_macho_file(file: &[u8]) -> Result<Vec<u8>, ResignWriteError> {
         identifier: sig.identifier.clone(),
         entitlements_blob: ent_blob.clone(),
     };
-    resign_in_place(file, &params, ent_blob.as_deref())
+    // 首选原地容纳；放不下 / 签名区不紧贴 → 回退到"尾部追加并更新 load command"。
+    match resign_in_place(file, &params, ent_blob.as_deref()) {
+        Ok(out) => Ok(out),
+        Err(
+            ResignWriteError::DoesNotFit { .. } | ResignWriteError::SignatureNotAdjacent { .. },
+        ) => resign_append(file, &params, ent_blob.as_deref()),
+        Err(e) => Err(e),
+    }
+}
+
+/// 判定薄 Mach-O 的 `(is_64, endian)`；认不出返回 `NotMachO`。
+fn macho_is64_endian(file: &[u8]) -> Result<(bool, Endian), ResignWriteError> {
+    let magic = read_u32_endian(file, 0, Endian::Little).ok_or(ResignWriteError::NotMachO)?;
+    match magic {
+        0xfeed_facf => Ok((true, Endian::Little)),
+        0xfeed_face => Ok((false, Endian::Little)),
+        0xcffa_edfe => Ok((true, Endian::Big)),
+        0xcefa_edfe => Ok((false, Endian::Big)),
+        _ => Err(ResignWriteError::NotMachO),
+    }
+}
+
+/// `__LINKEDIT` 段命令里各字段在文件中的偏移。
+struct LinkeditAnchor {
+    /// `vmsize` 字段偏移。
+    vmsize_at: usize,
+    /// `fileoff` 字段偏移。
+    fileoff_at: usize,
+    /// `filesize` 字段偏移。
+    filesize_at: usize,
+    /// 当前 `fileoff`。
+    fileoff: u64,
+    /// 当前 `vmsize`。
+    vmsize: u64,
+}
+
+fn read_u64_endian(bytes: &[u8], at: usize, endian: Endian) -> Option<u64> {
+    let s = bytes.get(at..at + 8)?;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(s);
+    Some(match endian {
+        Endian::Little => u64::from_le_bytes(arr),
+        Endian::Big => u64::from_be_bytes(arr),
+    })
+}
+
+fn write_u32_endian(out: &mut [u8], at: usize, value: u32, endian: Endian) {
+    let bytes = match endian {
+        Endian::Little => value.to_le_bytes(),
+        Endian::Big => value.to_be_bytes(),
+    };
+    out[at..at + 4].copy_from_slice(&bytes);
+}
+
+fn write_u64_endian(out: &mut [u8], at: usize, value: u64, endian: Endian) {
+    let bytes = match endian {
+        Endian::Little => value.to_le_bytes(),
+        Endian::Big => value.to_be_bytes(),
+    };
+    out[at..at + 8].copy_from_slice(&bytes);
+}
+
+/// 扫 load commands 找 `__LINKEDIT` 段命令，返回其字段偏移与当前值。
+fn find_linkedit_segment(
+    file: &[u8],
+    is_64: bool,
+    endian: Endian,
+) -> Result<LinkeditAnchor, ResignWriteError> {
+    let header_size = if is_64 { 32 } else { 28 };
+    let ncmds = read_u32_endian(file, 16, endian).ok_or(ResignWriteError::NotMachO)? as usize;
+    let want = if is_64 {
+        crate::format::macho::LC_SEGMENT_64
+    } else {
+        crate::format::macho::LC_SEGMENT
+    };
+    let mut cursor = header_size;
+    for _ in 0..ncmds {
+        let cmd = read_u32_endian(file, cursor, endian).ok_or(ResignWriteError::NotMachO)?;
+        let cmdsize =
+            read_u32_endian(file, cursor + 4, endian).ok_or(ResignWriteError::NotMachO)? as usize;
+        if cmdsize < 8 || cursor + cmdsize > file.len() {
+            return Err(ResignWriteError::NotMachO);
+        }
+        if cmd == want {
+            // segname 在 cursor+8..cursor+24（16 字节，含尾部 \0）。
+            let segname = file
+                .get(cursor + 8..cursor + 24)
+                .ok_or(ResignWriteError::NotMachO)?;
+            let name = segname.split(|&b| b == 0).next().unwrap_or(&[]);
+            if name == b"__LINKEDIT" {
+                let (vmsize_at, fileoff_at, filesize_at) = if is_64 {
+                    (cursor + 32, cursor + 40, cursor + 48)
+                } else {
+                    (cursor + 28, cursor + 32, cursor + 36)
+                };
+                let (vmsize, fileoff) = if is_64 {
+                    (
+                        read_u64_endian(file, vmsize_at, endian),
+                        read_u64_endian(file, fileoff_at, endian),
+                    )
+                } else {
+                    (
+                        read_u32_endian(file, vmsize_at, endian).map(u64::from),
+                        read_u32_endian(file, fileoff_at, endian).map(u64::from),
+                    )
+                };
+                let (Some(vmsize), Some(fileoff)) = (vmsize, fileoff) else {
+                    return Err(ResignWriteError::MalformedSignatureRange);
+                };
+                return Ok(LinkeditAnchor {
+                    vmsize_at,
+                    fileoff_at,
+                    filesize_at,
+                    fileoff,
+                    vmsize,
+                });
+            }
+        }
+        cursor += cmdsize;
+    }
+    Err(ResignWriteError::NoLinkeditSegment)
+}
+
+/// 追加式重签：新 SuperBlob 比旧 `datasize` 大时，**追加到文件末尾**，更新
+/// `LC_CODE_SIGNATURE.dataoff/datasize` 与 `__LINKEDIT` 的 `filesize/vmsize`。
+///
+/// 被签内容始终是 `[0..codeLimit)`（追加后 `dataoff` 变大，但 `codeLimit` 不变、
+/// 哈希只对内容算）。绝不原地改输入、不写坏：找不到 `__LINKEDIT` / 字段放不下 → 明确错误。
+pub fn resign_append(
+    file: &[u8],
+    params: &ResignParams,
+    entitlements_for_superblob: Option<&[u8]>,
+) -> Result<Vec<u8>, ResignWriteError> {
+    let (is_64, endian) = macho_is64_endian(file)?;
+    let anchor = find_signature_anchor(file)?; // 复用同一端序判定与签名命令定位
+    let linkedit = find_linkedit_segment(file, is_64, endian)?;
+
+    // 被签内容 [0..codeLimit) 会在**改完 load command 之后**才定型（Apple 里第 0 页就包含
+    // 头与命令本身，所以 dataoff/datasize/__LINKEDIT 这些字段也是被签的）。因此顺序必须是：
+    //   先算出新签名长度 → 用最终数值改写命令 → 再对最终字节算逐页哈希。
+    let code_limit = params.code_limit as usize;
+    // codeLimit 必须落在文件内、且是"当前实际内容"的界（改命令不会改变文件这些前缀字节的长度）。
+    if code_limit > file.len() {
+        return Err(ResignWriteError::MalformedSignatureRange);
+    }
+
+    // (a) 预算新签名长度：CD 长度只由 params 决定（与具体数值无关），用它拼一份同长 SuperBlob。
+    let probe_content = vec![0u8; code_limit];
+    let probe_cd = build_code_directory(&probe_content, params)?;
+    let probe_sb = build_superblob(&probe_cd, None, entitlements_for_superblob);
+    let predicted_len = probe_sb.len();
+
+    // 追加位置：文件末尾按 16 字节对齐（Apple 惯例）。
+    let append_at = (file.len() + 15) & !15;
+    let new_dataoff = append_at;
+    let new_datasize = predicted_len;
+    let new_end = new_dataoff + new_datasize;
+
+    // (b) 先拷一份并把命令改成最终数值（此刻前缀不再变）。
+    let mut out = file.to_vec();
+    out.resize(append_at.max(out.len()), 0); // 对齐间隙补零（append_at ≥ len）
+
+    // 更新 LC_CODE_SIGNATURE 的 dataoff/datasize（u32 字段）。
+    let new_dataoff_u32 = u32::try_from(new_dataoff).map_err(|_| ResignWriteError::FileTooLarge)?;
+    let new_datasize_u32 =
+        u32::try_from(new_datasize).map_err(|_| ResignWriteError::FileTooLarge)?;
+    write_u32_endian(&mut out, anchor.dataoff_field_at, new_dataoff_u32, endian);
+    write_u32_endian(&mut out, anchor.datasize_field_at, new_datasize_u32, endian);
+
+    // 更新 __LINKEDIT：filesize 覆盖到新签名末尾；vmsize ≥ filesize（按旧粒度或 0x1000 对齐，
+    // 不小于旧 vmsize）。fileoff 不变。
+    let new_filesize = new_end.saturating_sub(linkedit.fileoff as usize) as u64;
+    let align = if linkedit.vmsize >= 0x4000 && linkedit.vmsize % 0x4000 == 0 {
+        0x4000u64
+    } else {
+        0x1000u64
+    };
+    let aligned = align_up(new_filesize, align);
+    let new_vmsize = linkedit.vmsize.max(aligned);
+    if is_64 {
+        write_u64_endian(&mut out, linkedit.filesize_at, new_filesize, endian);
+        write_u64_endian(&mut out, linkedit.vmsize_at, new_vmsize, endian);
+    } else {
+        let fs = u32::try_from(new_filesize).map_err(|_| ResignWriteError::FileTooLarge)?;
+        let vm = u32::try_from(new_vmsize).map_err(|_| ResignWriteError::FileTooLarge)?;
+        write_u32_endian(&mut out, linkedit.filesize_at, fs, endian);
+        write_u32_endian(&mut out, linkedit.vmsize_at, vm, endian);
+    }
+    let _ = linkedit.fileoff_at;
+
+    // (c) 现在对**最终字节** [0..codeLimit) 算哈希、拼 SuperBlob（长度必须与预测一致）。
+    let final_content = out
+        .get(0..code_limit)
+        .ok_or(ResignWriteError::MalformedSignatureRange)?;
+    let cd = build_code_directory(final_content, params)?;
+    let sb = build_superblob(&cd, None, entitlements_for_superblob);
+    if sb.len() != predicted_len {
+        // 长度不一致意味着前缀里还有别的被签字段影响了 CD 长度（不该发生）——保守拒绝，不写坏。
+        return Err(ResignWriteError::FileTooLarge);
+    }
+
+    out.extend_from_slice(&sb);
+    Ok(out)
+}
+
+fn align_up(value: u64, align: u64) -> u64 {
+    if align == 0 {
+        return value;
+    }
+    value.div_ceil(align) * align
 }
 
 #[cfg(test)]
@@ -1441,32 +1661,29 @@ mod tests {
 
     // ── 重签 B 阶段：写盘层（薄 Mach-O 64 位小端） ──
 
-    /// 造一个最小的薄 Mach-O 64 位小端文件：头 + 一条 `LC_CODE_SIGNATURE` + 被签内容 +
-    /// 旧签名区。关键：**`codeLimit` == 签名区 `dataoff`**（Apple 的真实布局——分页覆盖
-    /// 从文件 0 开始，签名紧跟最后一个被签页）。返回 (文件字节, 旧 CD 的 codeLimit)。
+    /// 造一个最小的薄 Mach-O 64 位小端文件：头、`LC_CODE_SIGNATURE`、`__LINKEDIT` 段命令、
+    /// 被签内容、旧签名区。关键：**`codeLimit` == 签名区 `dataoff`**（Apple 的真实布局）。
+    /// 返回 (文件字节, 旧 CD 的 codeLimit)。
     ///
     /// `sign_correctly` 为真时旧签名与内容自洽（Intact）；否则签的是别的字节（Mismatch）。
     fn build_thin_macho(sign_correctly: bool) -> (Vec<u8>, u32) {
-        // 先定布局：头 32 + 命令 16 = 48 字节固定前置；内容若干页；签名区紧随其后。
+        // 布局：头 32 + LC_CODE_SIGNATURE(16) + LC_SEGMENT_64 __LINKEDIT(72) = 120 固定前置。
         let header_size = 32usize;
-        let sizeofcmds = 16u32;
-        let fixed = header_size + sizeofcmds as usize; // 48
-                                                       // 让 codeLimit 覆盖"头+命令+2 页内容"（对齐到页边界，简单起见取 48+8192 向上取整）。
-                                                       // 为让分页整除，取内容使其后总长恰为页的整数倍：48 + 8144? 不整除。
-                                                       // 简化：codeLimit = fixed + 8192 = 8240；分页 4096 → 3 页（最后一页 48 字节）。
-                                                       // 这仍合法：最后一页是 [8192, 8240)。
+        let codesig_cmd_size = 16usize;
+        let linkedit_cmd_size = 72usize; // segment_command_64
+        let sizeofcmds = (codesig_cmd_size + linkedit_cmd_size) as u32;
+        let fixed = header_size + sizeofcmds as usize; // 120
         let content_len = 8192usize;
-        let code_limit = (fixed + content_len) as u32; // 8240
+        let code_limit = (fixed + content_len) as u32; // 8312
 
-        // 构造整个"被签区域" [0..code_limit)：头 + 命令占位 + 内容。
+        // 被签区域 [0..code_limit)：头 + 命令占位 + 内容。
         let mut prefix = vec![0u8; fixed];
         prefix[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
         prefix[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
         prefix[8..12].copy_from_slice(&3u32.to_le_bytes());
         prefix[12..16].copy_from_slice(&2u32.to_le_bytes());
-        prefix[16..20].copy_from_slice(&1u32.to_le_bytes()); // ncmds
+        prefix[16..20].copy_from_slice(&2u32.to_le_bytes()); // ncmds = 2
         prefix[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
-        // 内容：确定值。
         let content: Vec<u8> = (0..content_len).map(|i| (i % 251) as u8).collect();
         let mut signed_region = prefix;
         signed_region.extend_from_slice(&content);
@@ -1493,8 +1710,9 @@ mod tests {
         let dataoff = file.len() as u64; // == code_limit
         file.extend_from_slice(&old_sb);
         let datasize = old_sb.len() as u64;
+        let new_end = dataoff + datasize; // 文件末端
 
-        // 回填 LC_CODE_SIGNATURE（在 header_size=32 处）。
+        // 回填 LC_CODE_SIGNATURE（header_size=32 处）。
         let cmd_at = header_size;
         file[cmd_at..cmd_at + 4]
             .copy_from_slice(&crate::format::macho::LC_CODE_SIGNATURE.to_le_bytes());
@@ -1502,6 +1720,20 @@ mod tests {
         file[cmd_at + 8..cmd_at + 12].copy_from_slice(&(dataoff as u32).to_le_bytes());
         file[cmd_at + 12..cmd_at + 16].copy_from_slice(&(datasize as u32).to_le_bytes());
 
+        // 回填 __LINKEDIT 段命令（紧随 LC_CODE_SIGNATURE 之后）。fileoff = dataoff，
+        // filesize = datasize，vmsize = 页对齐(datasize)（且至少 0x4000 便于校验对齐粒度）。
+        let seg_at = cmd_at + codesig_cmd_size;
+        file[seg_at..seg_at + 4]
+            .copy_from_slice(&crate::format::macho::LC_SEGMENT_64.to_le_bytes());
+        file[seg_at + 4..seg_at + 8].copy_from_slice(&(linkedit_cmd_size as u32).to_le_bytes());
+        file[seg_at + 8..seg_at + 24].copy_from_slice(b"__LINKEDIT\0\0\0\0\0\0");
+        let vmsize = align_up(datasize.max(0x4000), 0x4000);
+        file[seg_at + 32..seg_at + 40].copy_from_slice(&vmsize.to_le_bytes()); // vmsize
+        file[seg_at + 40..seg_at + 48].copy_from_slice(&(dataoff as u64).to_le_bytes()); // fileoff
+        file[seg_at + 48..seg_at + 56].copy_from_slice(&datasize.to_le_bytes()); // filesize
+                                                                                 // nsects(64..68) 由 0 填充即可（无节）。
+
+        let _ = new_end;
         (file, code_limit)
     }
 
@@ -1616,6 +1848,120 @@ mod tests {
         ));
     }
 
+    // ── 重签 D 阶段：追加式写盘（签名变大 / 不紧贴时） ──
+
+    #[test]
+    fn resign_append_updates_commands_and_reverifies_intact() {
+        // 造一份自洽文件，然后把 datasize 改小到 8 逼出"放不下"→ 走追加路径。
+        let (mut file, code_limit) = build_thin_macho(true);
+        let old_dataoff = u32::from_le_bytes([file[40], file[41], file[42], file[43]]) as u64; // dataoff@40
+        assert_eq!(old_dataoff, code_limit as u64, "旧 dataoff 应 == codeLimit");
+        let old_linkedit_filesize_at = {
+            // __LINKEDIT 命令在 32+16=48；filesize 字段在 +48。
+            let seg_at = 32 + 16;
+            seg_at + 48
+        };
+        let old_filesize = u64::from_le_bytes(
+            file[old_linkedit_filesize_at..old_linkedit_filesize_at + 8]
+                .try_into()
+                .unwrap(),
+        );
+        // 逼出放不下：把 datasize 改小（cmd_at+12=44）。
+        file[44..48].copy_from_slice(&8u32.to_le_bytes());
+
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit,
+            identifier: "com.example.thin".to_string(),
+            entitlements_blob: None,
+        };
+        let resigned = resign_append(&file, &params, None).expect("追加重签成功");
+
+        // 文件变长（追加了），原始输入不受影响。
+        assert!(resigned.len() > file.len());
+
+        // 重新解析：新 dataoff 是页对齐后的旧文件长度，签名完整。
+        let after = parse_thin(&resigned);
+        assert!(
+            matches!(after.verdict, CodeSignVerdict::AdHoc),
+            "追加后应完整性通过，实际 {:?}（notes {:?}）",
+            after.verdict,
+            after.notes
+        );
+        assert_eq!(
+            after.verified_slots, after.code_slots,
+            "所有 code slot 通过"
+        );
+
+        // __LINKEDIT.filesize 变大了（覆盖到新签名末尾）。
+        let new_filesize = u64::from_le_bytes(
+            resigned[old_linkedit_filesize_at..old_linkedit_filesize_at + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(
+            new_filesize > old_filesize,
+            "filesize 应增大：{old_filesize} -> {new_filesize}"
+        );
+    }
+
+    #[test]
+    fn resign_macho_file_falls_back_to_append_when_too_small() {
+        // resign_macho_file 端到端：datasize 改小逼出回退，结果应仍 Intact。
+        let (mut file, _code_limit) = build_thin_macho(true);
+        file[44..48].copy_from_slice(&8u32.to_le_bytes()); // datasize=8
+        let resigned = resign_macho_file(&file).expect("应回退到追加并成功");
+        let after = parse_thin(&resigned);
+        assert!(
+            matches!(after.verdict, CodeSignVerdict::AdHoc),
+            "端到端追加后应通过，实际 {:?}",
+            after.verdict
+        );
+    }
+
+    #[test]
+    fn resign_append_without_linkedit_reports_error() {
+        // 造一个只有 LC_CODE_SIGNATURE、没有 __LINKEDIT 的 Mach-O → 追加应明确报错。
+        let (core_file, _code_limit) = build_thin_macho(true);
+        // 重建一个 ncmds=1（仅 LC_CODE_SIGNATURE）、sizeofcmds=16 的假头，去掉 __LINKEDIT。
+        // 简单做法：把 ncmds 改成 1 并收缩——但内容布局已固定，这里直接构造最小文件。
+        let mut file = vec![0u8; 48];
+        file[0..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        file[16..20].copy_from_slice(&1u32.to_le_bytes()); // ncmds=1
+        file[20..24].copy_from_slice(&16u32.to_le_bytes()); // sizeofcmds=16
+        file[32..36].copy_from_slice(&crate::format::macho::LC_CODE_SIGNATURE.to_le_bytes());
+        file[36..40].copy_from_slice(&16u32.to_le_bytes());
+        // 造一份小内容 + 签名区（dataoff=48）。
+        let limit = 4096u32;
+        let content = resign_content(limit as usize);
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: 12,
+            code_limit: limit,
+            identifier: "x".to_string(),
+            entitlements_blob: None,
+        };
+        let cd = build_code_directory(&content, &params).unwrap();
+        let sb = build_superblob(&cd, None, None);
+        // 把内容放到 48..（注意 codeLimit 只截取前 4096 字节，但文件头 48 + 4096 内容）。
+        // 为让 find_signature_anchor 通过，dataoff 指向签名真实位置。
+        let mut full = file;
+        full.resize(48, 0);
+        full.extend_from_slice(&content); // 内容 4096
+        let dataoff = full.len() as u32; // 4144
+        full.extend_from_slice(&sb);
+        full[40..44].copy_from_slice(&dataoff.to_le_bytes());
+        full[44..48].copy_from_slice(&(sb.len() as u32).to_le_bytes());
+        // 但 codeLimit 参数是 4096，而真实被签内容应是 [0..4096) —— 头也在里面，没关系。
+        let _ = core_file;
+        // 触发追加：由于没有 __LINKEDIT，resign_append 必须报 NoLinkeditSegment。
+        assert!(matches!(
+            resign_append(&full, &params, None),
+            Err(ResignWriteError::NoLinkeditSegment)
+        ));
+    }
+
     /// 真实样本：设 `BITFLIP_RESIGN_SAMPLE=<薄 Mach-O 路径>` 后 `--ignored`。
     /// 读它的 LC_CODE_SIGNATURE 与 codeLimit，原地重签，重新解析必须 Intact。
     /// 若样本签名区放不下新签名（换算法/页数变多），本阶段会返回 DoesNotFit —— 那是
@@ -1674,13 +2020,16 @@ mod tests {
             identifier: before.identifier.clone(),
             entitlements_blob: None,
         };
-        match resign_in_place(&file, &params, None) {
+        // 走完整路径：先原地容纳；放不下/不紧贴自动回退到追加。
+        match resign_macho_file(&file) {
             Ok(resigned) => {
+                // 追加后 dataoff 会变，重新用当前命令里的范围来解析。
+                let a2 = find_signature_anchor(&resigned).expect("重签后仍有签名锚点");
                 let after = parse(
                     &resigned,
                     LinkeditRange {
-                        dataoff: anchor.dataoff,
-                        datasize: anchor.datasize,
+                        dataoff: a2.dataoff,
+                        datasize: a2.datasize,
                     },
                     Endian::Little,
                 );
@@ -1698,22 +2047,88 @@ mod tests {
                     "所有 code slot 都应校验通过"
                 );
                 eprintln!(
-                    "重签成功：verdict={:?} verified={}/{}",
-                    after.verdict, after.verified_slots, after.code_slots
+                    "重签成功：verdict={:?} verified={}/{} dataoff={}->{} len={}->{}",
+                    after.verdict,
+                    after.verified_slots,
+                    after.code_slots,
+                    anchor.dataoff,
+                    a2.dataoff,
+                    file.len(),
+                    resigned.len()
                 );
-            }
-            Err(ResignWriteError::DoesNotFit { need, have }) => {
-                eprintln!("跳过：新签名 {need} > 旧 datasize {have}，本阶段只做原地容纳");
-            }
-            Err(ResignWriteError::SignatureNotAdjacent {
-                dataoff,
-                code_limit,
-            }) => {
-                eprintln!(
-                    "跳过：dataoff={dataoff} != codeLimit={code_limit}（需移动，本阶段不做）"
-                );
+                let _ = &params;
             }
             Err(e) => panic!("重签意外失败：{e}"),
         }
+    }
+
+    /// 真实样本 + 强制追加：对样本用 SHA-256（若它是 SHA-1，slot 变大 → 放不下 → 触发追加）。
+    /// 设 `BITFLIP_RESIGN_SAMPLE` 后 `--ignored`。追加后必须重新解析 Intact。
+    #[test]
+    #[ignore = "需要真实 Mach-O 样本：设 BITFLIP_RESIGN_SAMPLE 后加 --ignored"]
+    fn real_sample_append_is_intact() {
+        let Ok(path) = std::env::var("BITFLIP_RESIGN_SAMPLE") else {
+            eprintln!("跳过：未设 BITFLIP_RESIGN_SAMPLE");
+            return;
+        };
+        let file = std::fs::read(&path).expect("读样本");
+        let anchor = match find_signature_anchor(&file) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("跳过：没有签名锚点（{e}）");
+                return;
+            }
+        };
+        let before = parse(
+            &file,
+            LinkeditRange {
+                dataoff: anchor.dataoff,
+                datasize: anchor.datasize,
+            },
+            Endian::Little,
+        );
+        if before.code_limit == 0 || before.page_size == 0 {
+            eprintln!("跳过：样本签名不可解析");
+            return;
+        }
+        // 强制用 SHA-256（更宽的 slot）：若原样本是 SHA-1，签名一定变大 → 放不下 → 追加。
+        let params = ResignParams {
+            hash_type: 2,
+            page_size_log: before.page_size.trailing_zeros() as u8,
+            code_limit: before.code_limit as u32,
+            identifier: before.identifier.clone(),
+            entitlements_blob: None,
+        };
+        let resigned = resign_append(&file, &params, None).expect("追加重签应成功");
+        assert!(resigned.len() > file.len(), "追加后文件应变长");
+        let a2 = find_signature_anchor(&resigned).expect("重签后仍有锚点");
+        let after = parse(
+            &resigned,
+            LinkeditRange {
+                dataoff: a2.dataoff,
+                datasize: a2.datasize,
+            },
+            Endian::Little,
+        );
+        assert!(
+            matches!(
+                after.verdict,
+                CodeSignVerdict::AdHoc | CodeSignVerdict::Intact
+            ),
+            "追加后应通过，实际 {:?}（notes {:?}）",
+            after.verdict,
+            after.notes
+        );
+        assert_eq!(after.verified_slots, after.code_slots);
+        eprintln!(
+            "追加成功：alg={:?} verified={}/{} dataoff={}->{} len={}->{}",
+            after.algorithm,
+            after.verified_slots,
+            after.code_slots,
+            anchor.dataoff,
+            a2.dataoff,
+            file.len(),
+            resigned.len()
+        );
     }
 }
