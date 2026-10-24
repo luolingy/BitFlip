@@ -130,7 +130,7 @@ pub fn infer_struct_fields(
                 .or_default()
                 .entry(offset)
                 .or_default();
-            // `size == 0` = 解码层没给出访问宽度（如 AArch64 路径目前不填 size）。
+            // `size == 0` = 解码层没给出访问宽度（某些架构的路径目前不填 size）。
             if m.size == 0 {
                 width_unknown_sites += 1;
             } else if !acc.widths.contains(&m.size) {
@@ -195,7 +195,7 @@ pub fn infer_struct_fields(
             candidates.len()
         ));
         notes.push(
-            "未排除栈帧/参数寄存器：`[rbp-..]`、`[rsp+..]`、AArch64 `[x29/.. sp]` 一类可能把局部\
+            "未排除栈帧/参数寄存器：形如「[帧基址-..]」「[栈指针+..]」的访问可能把局部\
              变量误当结构体字段，请结合反汇编判断"
                 .to_string(),
         );
@@ -222,7 +222,7 @@ pub fn infer_struct_fields(
     }
     if width_unknown_sites > 0 {
         notes.push(format!(
-            "{width_unknown_sites} 处访问未给出宽度（解码层未提供，如 AArch64 路径）：\
+            "{width_unknown_sites} 处访问未给出宽度（当前解码后端未提供，某些架构如此）：\
              这些字段的\"宽度\"与\"推断大小\"偏保守，别当成真实字段尺寸"
         ));
     }
