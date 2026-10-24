@@ -33,7 +33,7 @@
 | 归档 | ar 长名表 `//`、符号索引 `/` | M5 | 与 `.lib` 同一抽象 |
 | Raw / 固件 | 任意二进制 + 手工基址/段定义 | M2 | 等价 IDA 的 "Binary file" 加载，实用且便宜 |
 | .NET 程序集 | PE + CLI header | 仅识别（M3） | 识别并提示，不做 CIL 反编译 |
-| Mach-O / fat | 可执行 / `.dylib` | **M12**（结构层 + 符号表 + 函数起点已落地） | 已做头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`（含 32 位 12 字节表项）/`LC_FUNCTION_STARTS`（ULEB128 增量）；dyld 绑定、objc/swift、代码签名校验在下一片 |
+| Mach-O / fat | 可执行 / `.dylib` | **M12**（结构层 + 符号表 + 函数起点 + ObjC/Swift + 代码签名有界校验已落地） | 已做头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`（含 32 位 12 字节表项）/`LC_FUNCTION_STARTS`（ULEB128 增量）/链式修复导入/ObjC 选择器·方法表·消息桩·类与类别/Swift 元数据/代码签名的**有界完整性校验** + entitlements·requirements 事实（**只校完整性、不校信任链**，见"代码签名片"） |
 | `.app` bundle / `.ipa` | 目录容器 / ZIP 容器 | **M12**（依赖 Mach-O） | 本项目第一次把"目录"当成可打开的目标 |
 | APK / DEX | ZIP 容器 + Dalvik 字节码 | **M11** | 与 M12 无依赖关系，可并行 |
 | APK 内的 `lib/*.so` | 就是 ELF | **M11（复用既有路径）** | 几乎零成本，先做 |
@@ -2023,8 +2023,48 @@ CFG 构建真正要的也正是这四列；缺的只是 `Cfg::build` 目前收 `
   （走 `Disasm::build` + `TargetAnalysis::build` 的完整流水线，含冲突 notes 与未映射起点）；
   真实样本 `tests/macho_real_analysis.rs` 1 条（`#[ignore]`，样本缺失 **panic 不跳过**）。
 
+**进展 · M12 · 代码签名片：有界完整性 + entitlements 事实 + 面板（据实记录）**：
 
----
+* **做了什么（三块，分三个提交）**：
+  1. **有界完整性校验**（`format::macho::codesign`）：从 `LC_CODE_SIGNATURE` →
+     SuperBlob（`0xfade0cc0`）→ `CSSLOT_CODEDIRECTORY`（`0xfade0c02`）解出
+     identifier / `hashType` / `hashSize` / `codeLimit` / `nCodeSlots` / `pageSize`；
+     用标准 `sha1`/`sha2`（workspace 已有依赖、许可闸门覆盖）**逐页重算文件哈希、与
+     CodeDirectory 里存的 code slot 比对**。改一个字节即判失效。结论
+     `CodeSignVerdict`：`NotSigned` / `AdHoc`（无 CMS 槽）/ `UnsupportedAlgorithm`
+     （SHA-384/截断/未知 hashType，如实标不支持，不猜）/ `Malformed` / `Intact` / `Mismatch`。
+     `Object.signature: Option<CodeSignature>`（`None`=非 Mach-O，`Some{NotSigned}`=Mach-O 但未签名，两者分开）。
+  2. **entitlements / requirements 明文事实**：`CSSLOT_ENTITLEMENTS`（type 5，blob 头
+     `fade7171` + XML plist）用**轻量解析（不引 plist 依赖）**抽成键值（布尔/字符串/
+     字符串数组解真值，嵌套 dict/data/integer 标 `Other`）；DER 形态（`fade7172`）只探测
+     存在不解。`CSSLOT_REQUIREMENTS`（type 2）**只报存在与字节数，不实现需求表达式求值**。
+  3. **Web 信息面板**：新增"代码签名"分区，渲染上面这些 wire 字段；结论徽标按严重度配色
+     （Intact 绿 / AdHoc 中性 / Mismatch 红 / Malformed 黄 / NotSigned 灰），entitlements
+     逐条 `key = value` 展示。非 Mach-O 不显示。
+* **边界（写进 notes 与面板措辞，§7）**：**只校验完整性**（内容是否自签名以来被改过）。
+  **不校**信任链（CMS/X.509）、**不校**资源封印（`CodeResources`）、**不校**需求
+  （Requirement）、不比对系统策略。面板明说"仅校验完整性；未校信任链…"，绝不暗示
+  "已验签/可信/安全"。
+* **实测核对（`temp/*.ipa`，`temp/` 永不入库；`--ignored` 真实样本测试）**：
+
+  | 样本 | 结论 | 算法 | 逐页校验 | CMS | identifiers | entitlements |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | LiveContainer | AdHoc | SHA-256 | 33/33 | 无 | com.kdt.livecontainer | 10 键，get-task-allow=true |
+  | Stapxs QQ `App.app` | AdHoc | SHA-256 | 5/5 | 无 | cn.stapxs.webqq | 0 键（无该 blob） |
+  | SideStore | Intact | SHA-1 | 4728/4728 | 有 | SideStore | 6 键，get-task-allow=true |
+  | PojavLauncher | Intact | SHA-1 | 284/284 | 有 | PojavLauncher | 10 键，get-task-allow=true |
+
+  另用手工改过的 SideStore 副本交叉验证过 `Mismatch`：**第 90 页起**哈希对不上，与逐页
+  实现一致（检测篡改这条路径真的跑通了，不是只测顺利路径）。
+* **API 版本**：`ObjectInfo` 加 `signature` 字段（v9），`SignatureInfoWire` 再加
+  entitlements/requirements 字段（v10）⇒ `CORE_API_VERSION` 8→10、`SERVER_API_VERSION`
+  同步 10（cli version 测试更新）。
+* **测试**：codesign 6 条单测（合成 CodeDirectory：一致→AdHoc、篡改→Mismatch、坏魔数→
+  Malformed；plist 解析标量/数组/Other；entitlements blob + DER 探测；非 entitlements
+  魔数→空列表）；loader 真实样本测试补齐签名/entitlements 断言；core 投影 2 条。
+* **下一片候选**：重签（re-sign，对 patch 过的副本重算 CodeDirectory/哈希并更新签名区，
+  比解析重、要单独设计并严格限范围）；CDHash（CodeDirectory 自身哈希做"签名结构指纹"）。
+
 
 ## 5. 横向轨道
 

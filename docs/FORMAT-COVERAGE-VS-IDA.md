@@ -33,7 +33,7 @@ IDA 官方文档明确说这个列表**不完整**（"The list contains some, bu
 | Linear Executable (LE) | ✗ |
 | **Portable Executable (PE)** (x86, x64, ARM, etc) | **✓ 已解析** |
 | Windows CE PE (ARM, SH-3, SH-4, MIPS) | ✗ |
-| **Mach-O for OS X and iOS** (x86, x64, ARM, PPC) | **△ 结构层 + 符号表 + 函数起点 + dyld 绑定 + ObjC 名字与归属已解析**（M12：头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`/`LC_FUNCTION_STARTS`/链式修复导入/ObjC 选择器·方法表·消息桩·类与类别归属；swift 元数据、代码签名校验**未做**；ppc/ppc64 能解析也能解码） |
+| **Mach-O for OS X and iOS** (x86, x64, ARM, PPC) | **△ 结构层 + 符号表 + 函数起点 + dyld 绑定 + ObjC/Swift 元数据 + 代码签名（有界完整性）已解析**（M12：头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`/`LC_FUNCTION_STARTS`/链式修复导入/ObjC 选择器·方法表·消息桩·类与类别归属/Swift 元数据/代码签名的**有界完整性校验** + entitlements·requirements 事实（**只校完整性、不校信任链**）；ppc/ppc64 能解析也能解码） |
 | Apple Dyld Shared Cache (DSC) | ✗ |
 | **Dalvik Executable (DEX)** | **△ 结构层已解析**（M11：清单/调用图/`dex-smali`/`dex-dot-cfg`；**不**接机器码反汇编流水线） |
 | EPOC (Symbian OS executable) | ✗ |
@@ -70,8 +70,8 @@ IDA 官方文档明确说这个列表**不完整**（"The list contains some, bu
 | Fat/universal Mach-O（选架构切片） | **✓ 切片可枚举且已接进会话**（`format::macho::fat`；按 `SELECTION_RULE_ZH` 选片或 `--arch` 指定，整份 fat 文件本身仍不是一个对象） |
 
 **格式层面的结论**：现代主流三件套（PE / ELF / COFF）+ 归档已经齐了。
-差的是 Mach-O 的**深度**（结构层与符号表/函数起点已落地，dyld 绑定、
-objc/swift 元数据、代码签名校验还在后面）、
+差的是 Mach-O 的**深度**（结构层、符号表/函数起点、dyld 绑定、objc/swift 元数据、
+代码签名的有界完整性校验都已落地；代码签名只校完整性、不校信任链，重签未做）、
 DEX 接进分析流水线（结构层已有），以及一大片历史/嵌入式格式。
 
 ## 3. 处理器架构：这是数量级的差距
@@ -145,7 +145,7 @@ x86/x64、ARM/ARM64、MIPS/MIPS64、PowerPC/PPC64、RISC-V/RV64。
 
 | 优先级 | 事项 | 状态 | 理由 |
 | --- | --- | --- | --- |
-| P0 | **Mach-O 解析落地** | M12 进行中（结构层 + 符号表 + 函数起点已完成；dyld 绑定/objc/swift/代码签名在后） | iOS/macOS 目标的前提；`.app`/IPA 都压在它上面 |
+| P0 | **Mach-O 解析落地** | M12 进行中（结构层 + 符号表 + 函数起点 + dyld 绑定 + objc/swift + 代码签名有界完整性已完成；重签/信任链未做） | iOS/macOS 目标的前提；`.app`/IPA 都压在它上面 |
 | P0 | **DEX/Dalvik** | M11 已排期 | Android 主线；且 DEX 是**字节码**，不需要"反汇编到指令"这一步 |
 | P1 | **反编译器的有界子集** | 本轮评估 | 见 `docs/DECOMPILER-SCOPE.md` |
 | P2 | APK/IPA 容器解包 | M11/M12 从属 | 本质是 ZIP + 清单，成本远低于上面的分析工作 |
