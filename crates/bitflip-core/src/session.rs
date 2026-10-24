@@ -336,6 +336,8 @@ pub struct SignatureInfoWire {
     pub first_mismatch: Option<u64>,
     /// 是否带 CMS 签名槽（非 ad-hoc）。
     pub has_cms_signature: bool,
+    /// CodeDirectory 的 CDHash（签名结构指纹，小写十六进制）；算不出为 `None`。
+    pub cd_hash: Option<String>,
     /// 从 XML entitlements blob 解出的键值（按 plist 顺序）；没有就是空列表。
     pub entitlements: Vec<EntitlementWire>,
     /// 是否还存在 DER 形态的 entitlements（存在但不解内容）。
@@ -415,6 +417,7 @@ impl SignatureInfoWire {
             verified_slots: sig.verified_slots,
             first_mismatch: sig.first_mismatch,
             has_cms_signature: sig.has_cms_signature,
+            cd_hash: sig.cd_hash.clone(),
             entitlements: sig
                 .entitlements
                 .as_ref()
@@ -2529,6 +2532,7 @@ mod tests {
             verified_slots: 2,
             first_mismatch: None,
             has_cms_signature: false,
+            cd_hash: Some("deadbeef".into()),
             entitlements: Some(bitflip_loader::object::Entitlements {
                 list: vec![
                     bitflip_loader::object::Entitlement {
@@ -2565,6 +2569,7 @@ mod tests {
         assert!(wire.entitlements_has_der_form);
         assert!(wire.has_requirements);
         assert_eq!(wire.requirements_size, 96);
+        assert_eq!(wire.cd_hash.as_deref(), Some("deadbeef"));
 
         // 篡改：verdict=Mismatch，first_mismatch 透传。
         let tampered = CodeSignature {

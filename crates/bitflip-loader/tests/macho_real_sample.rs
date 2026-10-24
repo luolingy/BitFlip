@@ -1699,6 +1699,8 @@ struct SignCounts {
     app_id: Option<String>,
     /// 是否有 requirements blob。
     has_requirements: bool,
+    /// CDHash（签名结构指纹）；None 表示算不出。
+    cd_hash: Option<String>,
 }
 
 #[test]
@@ -1728,6 +1730,7 @@ fn real_ios_binaries_report_code_signature_verdicts() {
                 get_task_allow: None,
                 app_id: None,
                 has_requirements: false,
+                cd_hash: None,
             },
             Some(sig) => {
                 let ent = sig.entitlements.as_ref();
@@ -1757,11 +1760,12 @@ fn real_ios_binaries_report_code_signature_verdicts() {
                     get_task_allow,
                     app_id,
                     has_requirements: sig.requirements.present,
+                    cd_hash: sig.cd_hash.clone(),
                 }
             }
         };
         eprintln!(
-            "{:<44} verdict={:<8} alg={:<8} slots={}(verify {}) cms={} mismatch={:?} ent={} gta={:?} appid={:?} req={} id={}",
+            "{:<44} verdict={:<8} alg={:<8} slots={}(verify {}) cms={} mismatch={:?} ent={} gta={:?} appid={:?} req={} cdhash={} id={}",
             row.name,
             row.verdict,
             row.algorithm,
@@ -1773,6 +1777,7 @@ fn real_ios_binaries_report_code_signature_verdicts() {
             row.get_task_allow,
             row.app_id,
             row.has_requirements,
+            row.cd_hash.as_deref().unwrap_or("none"),
             row.identifier
         );
         rows.push(row);
@@ -1809,6 +1814,18 @@ fn real_ios_binaries_report_code_signature_verdicts() {
         "LiveContainer 实测 application-identifier"
     );
     assert!(lc.has_requirements, "LiveContainer 应带 requirements blob");
+    // LiveContainer 是 SHA-256 → CDHash 64 位小写十六进制。
+    let lc_hash = lc
+        .cd_hash
+        .as_deref()
+        .expect("LiveContainer SHA-256 应算出 CDHash");
+    assert_eq!(lc_hash.len(), 64, "SHA-256 CDHash 应 64 个字符");
+    assert!(
+        lc_hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "CDHash 应小写十六进制：{lc_hash}"
+    );
 
     // SideStore 是 SHA-1、带 CMS；完整性结论要么 Intact 要么 Mismatch（样本可能被动过），
     // 但一定要读出结构、算法与 slot 数，且 verified ≤ slots。
@@ -1839,6 +1856,12 @@ fn real_ios_binaries_report_code_signature_verdicts() {
         "SideStore 实测 application-identifier"
     );
     assert!(ss.has_requirements, "SideStore 应带 requirements blob");
+    // SideStore 是 SHA-1 → CDHash 40 位小写十六进制。
+    let ss_hash = ss
+        .cd_hash
+        .as_deref()
+        .expect("SideStore SHA-1 应算出 CDHash");
+    assert_eq!(ss_hash.len(), 40, "SHA-1 CDHash 应 40 个字符");
     // 全部样本（无论有没有签名）都不该 panic，verdict 是枚举之一。
     for row in &rows {
         if row.present {

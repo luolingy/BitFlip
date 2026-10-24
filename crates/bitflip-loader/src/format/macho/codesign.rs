@@ -101,6 +101,7 @@ pub(super) fn parse(bytes: &[u8], range: LinkeditRange, endian: Endian) -> CodeS
         first_mismatch: None,
         has_cms_signature: false,
         entitlements: None,
+        cd_hash: None,
         requirements: Requirements::default(),
         verdict: CodeSignVerdict::Malformed,
         notes: Vec::new(),
@@ -249,6 +250,16 @@ pub(super) fn parse(bytes: &[u8], range: LinkeditRange, endian: Endian) -> CodeS
         return signature;
     };
     signature.algorithm = algorithm;
+
+    // CDHash：CodeDirectory 整个 blob（从魔数到它自己的 length）按同一 hashType 再哈希，
+    // 是这份签名结构的"指纹"（与 CodeDirectory 是否覆盖文件内容是两回事）。
+    // 只对本文能算的算法（SHA-1 / SHA-256）给出；截断态按规范截断；SHA-384 不算（不猜）。
+    if let Some(cd_length) = be_u32(cd, 4) {
+        let cd_length = cd_length as usize;
+        if let Some(cd_blob) = cd.get(0..cd_length) {
+            signature.cd_hash = code_directory_hash(algorithm, cd_blob);
+        }
+    }
 
     if page_size_log == 0 || signature.page_size == 0 {
         signature
@@ -518,6 +529,23 @@ fn sha256_digest(data: &[u8]) -> Option<Vec<u8>> {
     Some(Sha256::digest(data).to_vec())
 }
 
+/// CodeDirectory 的 CDHash：对整段 CodeDirectory blob 按 `algorithm` 再哈希，转小写十六进制。
+///
+/// 这是签名结构的"指纹"（常见于 `codesign -d` 输出）。与"内容是否被改"是两回事：
+/// CDHash 只标识"这份 CodeDirectory 长什么样"。SHA-1 / SHA-256 / SHA-256 截断可算；
+/// SHA-384 本模块没接哈希实现，返回 `None`（不猜）。
+fn code_directory_hash(algorithm: HashAlgorithm, cd_blob: &[u8]) -> Option<String> {
+    let digest = match algorithm {
+        HashAlgorithm::Sha1 => sha1_digest(cd_blob)?,
+        HashAlgorithm::Sha256 => sha256_digest(cd_blob)?,
+        // 截断态 = SHA-256 前 20 字节（规范如此）。
+        HashAlgorithm::Sha256Truncated => sha256_digest(cd_blob)?[..20].to_vec(),
+        // SHA-384 本模块没有哈希实现，不编造。
+        HashAlgorithm::Sha384 => return None,
+    };
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +640,24 @@ mod tests {
         assert_eq!(sig.code_slots, 2);
         assert_eq!(sig.verified_slots, 2, "两页都应一致");
         assert!(sig.first_mismatch.is_none());
+        // CDHash（SHA-256）应是 64 位小写十六进制，且可复现（同一 CD 反复算一致）。
+        let cd_hash = sig.cd_hash.as_deref().expect("SHA-256 CD 应能算 CDHash");
+        assert_eq!(cd_hash.len(), 64, "SHA-256 CDHash 应 64 个十六进制字符");
+        assert!(
+            cd_hash
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "CDHash 应是小写十六进制：{cd_hash}"
+        );
+        let again = parse(
+            &file,
+            LinkeditRange {
+                dataoff: 2 * 4096,
+                datasize: sb_len,
+            },
+            Endian::Little,
+        );
+        assert_eq!(again.cd_hash.as_deref(), Some(cd_hash), "CDHash 应可复现");
     }
 
     #[test]

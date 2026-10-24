@@ -193,6 +193,8 @@ export interface SignatureInfoWire {
   verified_slots: number;
   first_mismatch: number | null;
   has_cms_signature: boolean;
+  /** CodeDirectory 的 CDHash（签名结构指纹，小写十六进制）；算不出为 null。 */
+  cd_hash: string | null;
   /** 从 XML entitlements blob 解出的键值（展示用）。 */
   entitlements: EntitlementWire[];
   /** 是否还存在 DER 形态的 entitlements（存在但不解内容）。 */

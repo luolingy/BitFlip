@@ -760,6 +760,9 @@ function CodeSignatureSection({ signature }: { signature: SignatureInfoWire }) {
             value={`${signature.verified_slots} / ${signature.code_slots} 页一致`}
           />
           <Fact label="CMS 证书槽" value={signature.has_cms_signature ? "有" : "无（ad-hoc）"} />
+          {signature.cd_hash && (
+            <Fact label="CDHash" value={signature.cd_hash} />
+          )}
           <Fact label="需求 (requirements)" value={signature.has_requirements ? `有 · ${formatSize(signature.requirements_size)}` : "无"} />
         </dl>
       )}

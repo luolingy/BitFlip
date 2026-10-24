@@ -127,7 +127,11 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// v10（entitlements/requirements 事实这一片）：[`crate::session::SignatureInfoWire`]
 /// 新增 `entitlements` / `entitlements_has_der_form` / `has_requirements` /
 /// `requirements_size`。公开结构体形状变化 ⇒ +1；`SERVER_API_VERSION` 同步 +1。
-pub const CORE_API_VERSION: u32 = 10;
+///
+/// v11（CDHash 这一片）：[`crate::session::SignatureInfoWire`] 新增 `cd_hash`
+/// （CodeDirectory 自身哈希，签名结构指纹）。公开结构体形状变化 ⇒ +1；
+/// `SERVER_API_VERSION` 同步 +1。
+pub const CORE_API_VERSION: u32 = 11;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

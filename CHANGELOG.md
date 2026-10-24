@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 新增 — 代码签名 CDHash（签名结构指纹）
+
+在代码签名摘要里补一项 **CDHash**：对整段 CodeDirectory blob 按它自己的 `hashType`
+再哈希，是"签名结构的指纹"（`codesign -d` 里那个 `CDHash`）。它与"内容是否被改"
+无关，只标识"这份 CodeDirectory 长什么样"。
+
+- loader `CodeSignature.cd_hash: Option<String>`：SHA-1 / SHA-256 / SHA-256 截断可算
+  （截断态取 SHA-256 前 20 字节，按规范），SHA-384 本模块没哈希实现 → `None`（不猜）。
+- core `SignatureInfoWire.cd_hash: Option<String>`；形状变化 ⇒ `CORE_API_VERSION`
+  10→11、`SERVER_API_VERSION` 同步 11（cli version 测试已更新）。Web `api.ts` 补字段，
+  信息面板 facts 区加一行 `CDHash`。
+- 实测（`--ignored`）：LiveContainer SHA-256 `cdhash=63a2521f…82df7c6`（64 位）、
+  SideStore SHA-1 `cdhash=b0629f4e…f052592`（40 位）；合成 CD 单测断言 64 位小写十六
+  进制且可复现。
+
 ### 新增 — Web 信息面板展示代码签名摘要（M12）
 
 把前两片的成果落地成可见的一块：信息面板新增"代码签名"分区，渲染

@@ -1003,6 +1003,11 @@ pub struct CodeSignature {
     pub has_cms_signature: bool,
     /// 从 XML entitlements blob 解出的键值（没有就是 `None`，不编造）。
     pub entitlements: Option<Entitlements>,
+    /// CodeDirectory 的 CDHash（对整段 CodeDirectory 按 `hashType` 再哈希，小写十六进制）。
+    ///
+    /// 这是**签名结构的指纹**（`codesign -d` 里那个 `CDHash`），与"内容是否被改"无关。
+    /// 算不出（SHA-384 未接 / 结构缺失）为 `None`，不猜。
+    pub cd_hash: Option<String>,
     /// 需求（type 2）blob 的存在性事实（不实现求值）。
     pub requirements: Requirements,
     /// 结论。
@@ -1037,6 +1042,7 @@ impl CodeSignature {
             first_mismatch: None,
             has_cms_signature: false,
             entitlements: None,
+            cd_hash: None,
             requirements: Requirements::default(),
             verdict: CodeSignVerdict::NotSigned,
             notes: vec!["没有 LC_CODE_SIGNATURE：这个 Mach-O 未签名".to_string()],
