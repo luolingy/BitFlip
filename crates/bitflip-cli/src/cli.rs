@@ -98,6 +98,8 @@ pub enum Command {
     Resign(ResignArgs),
     /// 批量重签一个 .app 里所有 Mach-O 副本，并让 CodeResources 清单自洽（需 --apply）
     ResignApp(ResignAppArgs),
+    /// 推断"疑似结构体字段布局"（启发式，非真实 C 类型）
+    Structs(StructsArgs),
     /// 打印版本与 API 版本
     Version,
 }
@@ -645,6 +647,23 @@ pub struct ResignAppArgs {
     /// 输出 JSON（稳定的 wire 契约，供脚本消费）
     #[arg(long)]
     pub json: bool,
+}
+
+/// `structs` 参数：推断"疑似结构体字段布局"（启发式，非真实 C 类型）。
+#[derive(Debug, Args)]
+pub struct StructsArgs {
+    /// 目标文件（可执行/动态库；归档请先取出成员）
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+    /// 人类可读时最多显示多少个结构体（0 = 全部）
+    #[arg(long, default_value_t = 20, value_name = "N")]
+    pub limit: usize,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
 }
 
 #[cfg(test)]

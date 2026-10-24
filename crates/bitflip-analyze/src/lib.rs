@@ -19,6 +19,7 @@ mod jumptable;
 mod pseudo;
 mod scan;
 mod strings;
+mod structs;
 mod xref;
 
 pub use addrspace::{
@@ -69,6 +70,7 @@ pub use scan::{
     ScanOptions, ScanStats,
 };
 pub use strings::{extract_strings, StringEncoding, StringEntry, StringOptions};
+pub use structs::{infer_struct_fields, StructCandidate, StructField, StructReport};
 pub use xref::{xrefs_of, xrefs_of_all, Xref, XrefKind};
 
 /// 本 crate 的公共 API 版本。

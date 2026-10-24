@@ -13,6 +13,7 @@ mod resign;
 mod resign_app;
 mod serve;
 mod signature;
+mod structs;
 mod tracing_setup;
 
 use std::process::ExitCode;
@@ -22,7 +23,7 @@ use clap::Parser;
 pub use cli::{
     Cli, Command, DexArgs, DiffArgs, ExportArgs, FunctionsArgs, InfoArgs, MembersArgs, OpenCli,
     PatchArgs, RawOverrideArgs, ResignAppArgs, ResignArgs, ServeArgs, SignatureArgs,
-    SignatureBuildArgs, SignatureCommand, SignatureInfoArgs, SymbolArgs,
+    SignatureBuildArgs, SignatureCommand, SignatureInfoArgs, StructsArgs, SymbolArgs,
 };
 pub use dex::{build_json as build_dex_json, build_text as build_dex_text, run_dex};
 pub use diff::run_diff;
@@ -35,6 +36,7 @@ pub use resign::run_resign;
 pub use resign_app::run_resign_app;
 pub use serve::{serve_blocking, ServeRequest};
 pub use signature::run_signature;
+pub use structs::run_structs;
 
 /// `bitflip <target>` 的入口。
 #[must_use]
@@ -75,6 +77,7 @@ pub fn cli_main() -> ExitCode {
         Command::Patch(args) => report(run_patch(&args)),
         Command::Resign(args) => report(run_resign(&args)),
         Command::ResignApp(args) => report(run_resign_app(&args)),
+        Command::Structs(args) => report(run_structs(&args)),
         Command::Serve(args) => {
             let open_options = match args.raw.to_open_options() {
                 Ok(o) => o,
