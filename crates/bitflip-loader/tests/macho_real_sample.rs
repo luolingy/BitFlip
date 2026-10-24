@@ -1679,3 +1679,124 @@ fn real_ios_binaries_report_swift_metadata() {
         );
     }
 }
+
+/// 一个样本的代码签名摘要（打印与断言共用）。
+struct SignCounts {
+    name: String,
+    present: bool,
+    verdict: String,
+    algorithm: String,
+    identifier: String,
+    slots: u64,
+    verified: u64,
+    first_mismatch: Option<u64>,
+    has_cms: bool,
+}
+
+#[test]
+#[ignore = "需要真实 IPA（temp/*.ipa 或 BITFLIP_TEST_MACHO_IPA）；用 --ignored 手动跑"]
+fn real_ios_binaries_report_code_signature_verdicts() {
+    use bitflip_loader::object::CodeSignVerdict;
+
+    let paths = all_sample_paths();
+    let mut rows = Vec::new();
+    for path in &paths {
+        let ipa = std::fs::read(path).expect("读 IPA");
+        let listing = zip::list_members(&ipa).expect("列成员");
+        let (_index, member_name, binary) = pick_main_binary(&ipa, &listing);
+        let (_how, _facts, object) = parse_one_image(&binary);
+        let row = match &object.signature {
+            None => SignCounts {
+                name: member_name.clone(),
+                present: false,
+                verdict: "None".to_string(),
+                algorithm: "-".to_string(),
+                identifier: String::new(),
+                slots: 0,
+                verified: 0,
+                first_mismatch: None,
+                has_cms: false,
+            },
+            Some(sig) => SignCounts {
+                name: member_name.clone(),
+                present: true,
+                verdict: format!("{:?}", sig.verdict),
+                algorithm: sig.algorithm.name().to_string(),
+                identifier: sig.identifier.clone(),
+                slots: sig.code_slots,
+                verified: sig.verified_slots,
+                first_mismatch: sig.first_mismatch,
+                has_cms: sig.has_cms_signature,
+            },
+        };
+        eprintln!(
+            "{:<44} present={} verdict={:<10} alg={:<10} slots={}(verify {}) cms={} mismatch={:?} id={}",
+            row.name,
+            row.present,
+            row.verdict,
+            row.algorithm,
+            row.slots,
+            row.verified,
+            row.has_cms,
+            row.first_mismatch,
+            row.identifier
+        );
+        rows.push(row);
+    }
+
+    // LiveContainer 是 ad-hoc（无 CMS）、SHA-256、全部页一致 → AdHoc。
+    let lc = rows
+        .iter()
+        .find(|row| row.name.contains("LiveContainer"))
+        .expect("样本里应有 LiveContainer");
+    assert!(lc.present, "LiveContainer 应有签名结构");
+    assert_eq!(
+        lc.verdict, "AdHoc",
+        "LiveContainer 是 ad-hoc 且逐页一致，应为 AdHoc，实际 {}",
+        lc.verdict
+    );
+    assert_eq!(lc.algorithm, "SHA-256");
+    assert!(!lc.has_cms, "ad-hoc 没有 CMS 槽");
+    assert_eq!(
+        lc.verified, lc.slots,
+        "LiveContainer 所有 code page 都应一致"
+    );
+    assert_eq!(lc.slots, 33, "实测 LiveContainer 33 个 code slot");
+
+    // SideStore 是 SHA-1、带 CMS；完整性结论要么 Intact 要么 Mismatch（样本可能被动过），
+    // 但一定要读出结构、算法与 slot 数，且 verified ≤ slots。
+    let ss = rows
+        .iter()
+        .find(|row| row.name.contains("SideStore"))
+        .expect("样本里应有 SideStore");
+    assert!(ss.present, "SideStore 应有签名结构");
+    assert_eq!(ss.algorithm, "SHA-1");
+    assert!(ss.has_cms, "SideStore 应带 CMS 签名槽");
+    assert_eq!(ss.slots, 4728, "实测 SideStore 4728 个 code slot");
+    assert!(ss.verified <= ss.slots);
+    assert!(
+        matches!(ss.verdict.as_str(), "Intact" | "Mismatch"),
+        "SideStore verdict 应为 Intact 或 Mismatch，实际 {}",
+        ss.verdict
+    );
+    // 全部样本（无论有没有签名）都不该 panic，verdict 是枚举之一。
+    for row in &rows {
+        if row.present {
+            assert!(
+                [
+                    "NotSigned",
+                    "AdHoc",
+                    "UnsupportedAlgorithm",
+                    "Malformed",
+                    "Intact",
+                    "Mismatch"
+                ]
+                .contains(&row.verdict.as_str()),
+                "{}：未知 verdict {}",
+                row.name,
+                row.verdict
+            );
+        }
+    }
+    let _ = CodeSignVerdict::NotSigned; // 引用一下，避免 import 未用告警（文档用途）
+}

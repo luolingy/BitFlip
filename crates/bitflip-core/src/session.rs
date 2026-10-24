@@ -306,6 +306,78 @@ impl SwiftInfoWire {
     }
 }
 
+/// 代码签名摘要的 wire 表示（只有 Mach-O 有）。
+///
+/// **只表达完整性结论，不表达可信度**：`verdict` 说"内容是否自签名以来被改过 / 是不是
+/// ad-hoc"，**不**代表签名者是否被信任（信任链校验没做，`notes` 写明）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct SignatureInfoWire {
+    /// 这个格式有没有"代码签名"这个概念（非 Mach-O 为 false，其余字段无意义）。
+    pub applicable: bool,
+    /// 是否有 `LC_CODE_SIGNATURE`（Mach-O 未签名时为 false，但 `applicable` 仍是 true）。
+    pub present: bool,
+    /// 结论：`NotSigned` / `AdHoc` / `UnsupportedAlgorithm` / `Malformed` / `Intact` / `Mismatch`。
+    pub verdict: String,
+    /// 是否"已签名"（ad-hoc 及以上；未签名/读坏为 false）。等价于 loader 的 `is_signed`。
+    pub signed: bool,
+    /// 哈希算法名（`SHA-1` / `SHA-256` / …）；未读到时为空串。
+    pub algorithm: String,
+    /// CodeDirectory identifier（如 `com.kdt.livecontainer`）。
+    pub identifier: String,
+    /// 被哈希覆盖的文件字节上限（`codeLimit`）。
+    pub code_limit: u64,
+    /// 分页大小（字节）。
+    pub page_size: u64,
+    /// CodeDirectory 声明的 code slot 数。
+    pub code_slots: u64,
+    /// 逐页校验通过的 slot 数。
+    pub verified_slots: u64,
+    /// 第一个不一致的 slot 下标（`Mismatch` 时有值）。
+    pub first_mismatch: Option<u64>,
+    /// 是否带 CMS 签名槽（非 ad-hoc）。
+    pub has_cms_signature: bool,
+    /// 解析与校验说明（降级、未做项，§7）。
+    pub notes: Vec<String>,
+}
+
+impl SignatureInfoWire {
+    /// 由 loader 的 `Option<CodeSignature>` 构造。
+    ///
+    /// `None`（非 Mach-O）→ `applicable=false` 的空 wire；`Some`（Mach-O）→ `applicable=true`，
+    /// 其中 `verdict=NotSigned` 表示"是 Mach-O 但没签名"（§7：与"没有这个概念"分开）。
+    #[must_use]
+    pub fn from_loader(signature: Option<&bitflip_loader::object::CodeSignature>) -> Self {
+        use bitflip_loader::object::CodeSignVerdict;
+
+        let Some(sig) = signature else {
+            return Self::default(); // applicable=false
+        };
+        let verdict = match sig.verdict {
+            CodeSignVerdict::NotSigned => "NotSigned",
+            CodeSignVerdict::AdHoc => "AdHoc",
+            CodeSignVerdict::UnsupportedAlgorithm => "UnsupportedAlgorithm",
+            CodeSignVerdict::Malformed => "Malformed",
+            CodeSignVerdict::Intact => "Intact",
+            CodeSignVerdict::Mismatch => "Mismatch",
+        };
+        Self {
+            applicable: true,
+            present: sig.verdict != CodeSignVerdict::NotSigned,
+            verdict: verdict.to_string(),
+            signed: sig.is_signed(),
+            algorithm: sig.algorithm.name().to_string(),
+            identifier: sig.identifier.clone(),
+            code_limit: sig.code_limit,
+            page_size: sig.page_size,
+            code_slots: sig.code_slots,
+            verified_slots: sig.verified_slots,
+            first_mismatch: sig.first_mismatch,
+            has_cms_signature: sig.has_cms_signature,
+            notes: sig.notes.clone(),
+        }
+    }
+}
+
 /// 节的 wire 表示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SectionInfo {
@@ -453,6 +525,11 @@ pub struct ObjectInfo {
     /// **只给能低风险读出的东西**：类型/协议名；字段布局等更深的语义没有做，
     /// loader 的 swift notes 会逐节说明哪些没解析（§7）。
     pub swift: SwiftInfoWire,
+    /// 代码签名摘要：**有界完整性校验**结论（只有 Mach-O 有）。
+    ///
+    /// 只表达"内容是否自签名以来被改过 / 是不是 ad-hoc"，**不表达可信度**——
+    /// 信任链（CMS/X.509）、资源封印、需求校验都没做（loader 的 signature notes 写明）。
+    pub signature: SignatureInfoWire,
     /// 段（内存视角）。
     pub segments: Vec<SegmentInfo>,
     /// 节（文件视角）。
@@ -492,6 +569,7 @@ impl ObjectInfo {
                 .collect(),
             objc: ObjcInfoWire::from_loader(&object.objc),
             swift: SwiftInfoWire::from_loader(&object.swift),
+            signature: SignatureInfoWire::from_loader(object.signature.as_ref()),
             segments: object
                 .segments
                 .iter()
@@ -2369,6 +2447,58 @@ mod tests {
         assert_eq!(wire.protocol_samples, vec!["Baz".to_string()]);
         assert!(wire.has_entry);
         assert!(!wire.is_empty());
+    }
+
+    #[test]
+    fn signature_info_wire_none_means_not_applicable() {
+        let wire = SignatureInfoWire::from_loader(None);
+        assert!(!wire.applicable, "非 Mach-O：没有代码签名这个概念");
+        assert!(!wire.present);
+        assert!(!wire.signed);
+        assert_eq!(wire.verdict, "");
+    }
+
+    #[test]
+    fn signature_info_wire_not_signed_vs_ad_hoc_vs_intact() {
+        use bitflip_loader::object::{CodeSignVerdict, CodeSignature, HashAlgorithm};
+
+        // Mach-O 但没签名：applicable=true, present=false, verdict=NotSigned。
+        let not_signed = CodeSignature::not_signed();
+        let wire = SignatureInfoWire::from_loader(Some(&not_signed));
+        assert!(wire.applicable);
+        assert!(!wire.present);
+        assert_eq!(wire.verdict, "NotSigned");
+
+        // ad-hoc：present=true, signed=true, verdict=AdHoc。
+        let ad_hoc = CodeSignature {
+            algorithm: HashAlgorithm::Sha256,
+            identifier: "com.example".into(),
+            code_limit: 8192,
+            page_size: 4096,
+            code_slots: 2,
+            verified_slots: 2,
+            first_mismatch: None,
+            has_cms_signature: false,
+            verdict: CodeSignVerdict::AdHoc,
+            notes: vec![],
+        };
+        let wire = SignatureInfoWire::from_loader(Some(&ad_hoc));
+        assert!(wire.present && wire.signed);
+        assert_eq!(wire.verdict, "AdHoc");
+        assert_eq!(wire.algorithm, "SHA-256");
+        assert_eq!(wire.code_slots, 2);
+        assert_eq!(wire.verified_slots, 2);
+
+        // 篡改：verdict=Mismatch，first_mismatch 透传。
+        let tampered = CodeSignature {
+            first_mismatch: Some(5),
+            verified_slots: 4,
+            verdict: CodeSignVerdict::Mismatch,
+            ..ad_hoc.clone()
+        };
+        let wire = SignatureInfoWire::from_loader(Some(&tampered));
+        assert_eq!(wire.verdict, "Mismatch");
+        assert_eq!(wire.first_mismatch, Some(5));
     }
 
     /// 构造一个最小的 64 位 x86_64 ELF 头（与 loader 的测试保持一致）。

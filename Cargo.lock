@@ -284,6 +284,7 @@ dependencies = [
  "bitflip-arch",
  "droidsaw-dex",
  "sha1",
+ "sha2",
  "tempfile",
  "thiserror",
  "zip",

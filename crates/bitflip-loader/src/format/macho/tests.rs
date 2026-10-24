@@ -686,8 +686,15 @@ fn unimplemented_capabilities_are_stated_in_notes() {
         joined.contains("没有 LC_FUNCTION_STARTS"),
         "缺哪张表就说哪张表，而不是让空表冒充\"没有函数\"：{joined}"
     );
-    // 样本里没有 LC_CODE_SIGNATURE，所以那条不该出现。
-    assert!(!joined.contains("LC_CODE_SIGNATURE"), "{joined}");
+    // 样本里没有 LC_CODE_SIGNATURE：现在会如实说明"未签名"（不是沉默，也不是谎称有）。
+    assert!(
+        joined.contains("没有 LC_CODE_SIGNATURE") && joined.contains("未签名"),
+        "没有代码签名要说清楚，而不是让「没签名」冒充没有：{joined}"
+    );
+    assert!(
+        !object.signature.as_ref().is_some_and(|sig| sig.is_signed()),
+        "没有 LC_CODE_SIGNATURE 的样本不该被判成已签名"
+    );
     // 样本里**有**一条空的 LC_DYLD_INFO_ONLY：那是"命令在、流是空的"，必须与
     // "没有这条命令"说得不一样 —— 它的导入表为空是文件里的事实。
     assert!(

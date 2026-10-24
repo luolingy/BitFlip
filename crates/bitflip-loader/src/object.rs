@@ -848,6 +848,129 @@ impl SwiftMetadata {
     }
 }
 
+/// 代码签名里 CodeDirectory 声明的哈希算法（Swift/Mach-O 规范里的 `hashType`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashAlgorithm {
+    /// `hashType == 1`：SHA-1，20 字节。
+    Sha1,
+    /// `hashType == 2`：SHA-256，32 字节。
+    Sha256,
+    /// `hashType == 3`：SHA-256 截断（20 字节）。
+    Sha256Truncated,
+    /// `hashType == 4`：SHA-384，48 字节。
+    Sha384,
+}
+
+impl HashAlgorithm {
+    /// 规范里的 `hashType` 字节 → 算法；未知值返回 `None`（不猜）。
+    #[must_use]
+    pub fn from_hash_type(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Sha1),
+            2 => Some(Self::Sha256),
+            3 => Some(Self::Sha256Truncated),
+            4 => Some(Self::Sha384),
+            _ => None,
+        }
+    }
+
+    /// 规范名（`SHA-1` / `SHA-256` / …）。
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sha1 => "SHA-1",
+            Self::Sha256 => "SHA-256",
+            Self::Sha256Truncated => "SHA-256(截断)",
+            Self::Sha384 => "SHA-384",
+        }
+    }
+
+    /// 本模块**是否真能校验**它。只接 SHA-1 / SHA-256；截断与 SHA-384 没接（如实标"不支持"）。
+    #[must_use]
+    pub fn is_verifiable(self) -> bool {
+        matches!(self, Self::Sha1 | Self::Sha256)
+    }
+}
+
+/// 代码签名的有界校验结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeSignVerdict {
+    /// 没有 `LC_CODE_SIGNATURE`（未签名）。
+    NotSigned,
+    /// 有签名，但**没有 CMS 签名槽**（`CSSLOT_SIGNATURESLOT`）——ad-hoc 签名。
+    AdHoc,
+    /// 读了 CodeDirectory，但算法本模块不校验（SHA-384 / 截断 / 未知 hashType）。
+    UnsupportedAlgorithm,
+    /// 签名区结构读不出来（SuperBlob / CodeDirectory magic 或长度不对）。
+    Malformed,
+    /// 所有 code page 的哈希都与 CodeDirectory 里存的槽一致（**完整性**通过）。
+    Intact,
+    /// 有 code page 的哈希对不上（从 `first_mismatch` 起出现不一致）。
+    Mismatch,
+}
+
+/// 一个 Mach-O 的代码签名摘要 + 有界完整性校验结果。
+///
+/// **只校验完整性**：逐页重算文件哈希、与 CodeDirectory 里存的 code slot 比对。
+/// **不校验**信任链（CMS / X.509）、不校资源封印（`CodeResources`）、不校需求
+/// （Requirement）。这些都超出"离线、可复现、有界"的范围，`notes` 里逐条写明。
+///
+/// 只有 Mach-O 有这套概念；其它格式 `Object::signature` 为 `None`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeSignature {
+    /// CodeDirectory 声明的哈希算法。
+    pub algorithm: HashAlgorithm,
+    /// CodeDirectory 的 identifier（如 `com.kdt.livecontainer` / `SideStore`）。
+    pub identifier: String,
+    /// 被哈希覆盖的文件字节上限（`codeLimit`）：签名数据本身在它之外。
+    pub code_limit: u64,
+    /// 分页大小（字节）。
+    pub page_size: u64,
+    /// CodeDirectory 声明的 code slot 总数。
+    pub code_slots: u64,
+    /// 实际逐页**校验通过**的 slot 数（≤ `code_slots`；不支持算法时为 0）。
+    pub verified_slots: u64,
+    /// 第一个不一致的 slot 下标（`Mismatch` 时有值）。
+    pub first_mismatch: Option<u64>,
+    /// SuperBlob 里是否带 CMS 签名槽（`CSSLOT_SIGNATURESLOT`，type 0x1000）。
+    pub has_cms_signature: bool,
+    /// 结论。
+    pub verdict: CodeSignVerdict,
+    /// 解析与校验说明（降级、未做项，§7）。
+    pub notes: Vec<String>,
+}
+
+impl CodeSignature {
+    /// 有没有"读出了签名结构"（ad-hoc 及以上；未签名/读坏了没有）。
+    #[must_use]
+    pub fn is_signed(&self) -> bool {
+        !matches!(
+            self.verdict,
+            CodeSignVerdict::NotSigned | CodeSignVerdict::Malformed
+        )
+    }
+
+    /// 一个"未签名"的结果：Mach-O 里没有 `LC_CODE_SIGNATURE` 时用它。
+    ///
+    /// 注意与 `Object::signature == None` 的区别：`None` 是"这个格式没有代码签名
+    /// 这个概念"（非 Mach-O）；`not_signed()` 是"这是 Mach-O，但它没签名"（§7）。
+    #[must_use]
+    pub fn not_signed() -> Self {
+        Self {
+            algorithm: HashAlgorithm::Sha256,
+            identifier: String::new(),
+            code_limit: 0,
+            page_size: 0,
+            code_slots: 0,
+            verified_slots: 0,
+            first_mismatch: None,
+            has_cms_signature: false,
+            verdict: CodeSignVerdict::NotSigned,
+            notes: vec!["没有 LC_CODE_SIGNATURE：这个 Mach-O 未签名".to_string()],
+        }
+    }
+}
+
 /// 解析结果：一个可分析的对象。
 #[derive(Debug, Clone)]
 pub struct Object {
@@ -919,6 +1042,12 @@ pub struct Object {
     /// 只有 Mach-O 有这套节。**其他格式是空表** —— 与 `objc` 一样，是"这个格式没有
     /// 这个概念"，不是"这个二进制里没有 Swift 代码"的否定结论（§7）。
     pub swift: SwiftMetadata,
+    /// 代码签名摘要 + 有界完整性校验（只有 Mach-O 有；其它格式是 `None`）。
+    ///
+    /// `None` = "这个对象没有代码签名这个概念"（非 Mach-O），或"没读到签名区"；
+    /// Mach-O 里"没有 `LC_CODE_SIGNATURE`"会给出 `verdict = NotSigned` 的 `Some` 值，
+    /// 两者在语义上要分开（§7）。
+    pub signature: Option<CodeSignature>,
     /// 解析过程中的说明（降级、跳过、未支持项）。
     ///
     /// 这是"诚实"的载体：任何没解析出来的东西都要在这里留下痕迹，
@@ -1004,6 +1133,7 @@ impl Object {
             header_flags: None,
             objc: ObjcMetadata::default(),
             swift: SwiftMetadata::default(),
+            signature: None,
             notes: Vec::new(),
         }
     }

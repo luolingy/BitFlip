@@ -119,7 +119,11 @@ pub use bitflip_project::{Annotation, AnnotationKind, ProjectStore};
 /// v8（Swift 元数据这一片）：[`crate::session::ObjectInfo`] 新增 `swift:
 /// SwiftInfoWire`（`__swift5_*` 的类型/协议名与计数）。公开结构体的形状变了
 /// （字面量构造会编译失败）⇒ +1；`SERVER_API_VERSION` 同步 +1。
-pub const CORE_API_VERSION: u32 = 8;
+///
+/// v9（代码签名有界校验这一片）：[`crate::session::ObjectInfo`] 新增 `signature:
+/// SignatureInfoWire`（完整性结论/算法/identifier/slot 计数）。同样是公开结构体的
+/// 形状变化 ⇒ +1；`SERVER_API_VERSION` 同步 +1。
+pub const CORE_API_VERSION: u32 = 9;
 
 /// BitFlip 引擎版本（来自 Cargo 包版本）。
 #[must_use]

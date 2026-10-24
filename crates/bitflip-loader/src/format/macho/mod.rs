@@ -37,7 +37,9 @@
 //!   与 rebase 信息，本片不解；遇到时记 `notes` 并停止那条流。
 //! - **objc / swift 元数据**（`__objc_classname`、`__swift5_*` 等）：按普通节列出，
 //!   不解析内容。
-//! - **代码签名**（`LC_CODE_SIGNATURE`）：只记录存在性，**不做校验**。
+//! - **代码签名**（`LC_CODE_SIGNATURE`）：解析 SuperBlob/CodeDirectory 并做**有界的
+//!   完整性校验**（逐页重算哈希比对 code slot；见 [`codesign`]）。**不校信任链**
+//!   （CMS/X.509）、不校资源封印与需求校验。
 //! - **`.app` bundle / IPA 容器语义**：目录容器由 [`crate::sniff_file`] 识别
 //!   （`looks_like_app_directory`），主二进制由 [`crate::bundle::find_main_binary`]
 //!   定位 —— 那是打包约定层面的判断，不是 Mach-O 格式的一部分；`LoaderError::IsDirectory`
@@ -116,6 +118,7 @@ use crate::ObjectKind;
 
 pub mod bind;
 pub mod chained;
+pub mod codesign;
 pub mod export_trie;
 pub mod fat;
 pub mod objc;
@@ -683,6 +686,20 @@ pub fn parse(bytes: &[u8], base: u64, id: ObjectId) -> Result<Object, ParseError
         &file.segments,
     );
     for note in object.swift.notes.clone() {
+        object.note(note);
+    }
+    // 代码签名：解析 SuperBlob/CodeDirectory 并做**有界完整性校验**（只校逐页哈希，
+    // 不校信任链）。有 `LC_CODE_SIGNATURE` 才解析；没有则如实给 `NotSigned`。
+    let signature = Some(match file.code_signature {
+        Some(range) => codesign::parse(bytes, range, file.endian),
+        None => crate::object::CodeSignature::not_signed(),
+    });
+    let signature_notes = signature
+        .as_ref()
+        .map(|sig| sig.notes.clone())
+        .unwrap_or_default();
+    object.signature = signature;
+    for note in signature_notes {
         object.note(note);
     }
     Ok(object)

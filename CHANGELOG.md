@@ -5,6 +5,38 @@
 
 ## [Unreleased]
 
+### 新增 — 代码签名的**有界完整性校验**（M12）
+
+此前 `LC_CODE_SIGNATURE` 只记"存在、不校验"。这一片把它变成一件可离线复现、
+结论确定的事：**逐页重算文件哈希，与 CodeDirectory 里存的 code slot 比对**，
+判断"文件内容是否自签名以来被改过"。改一个字节 → 判定签名失效。
+
+- **loader 新增 `format::macho::codesign`**：解析 `LC_CODE_SIGNATURE` → SuperBlob
+  （magic `0xfade0cc0`）→ 找 `CSSLOT_CODEDIRECTORY`（`0xfade0c02`）→ 读 CodeDirectory
+  字段（identifier / hashType / hashSize / codeLimit / nCodeSlots / pageSize）。
+  标准 `sha1` / `sha2` 重算 SHA-1 / SHA-256（workspace 已有依赖，许可闸门覆盖）。
+- **`Object.signature: Option<CodeSignature>`**：`None` = 非 Mach-O（没有这个概念）；
+  `Some{ verdict: NotSigned }` = Mach-O 但未签名（§7，两者分开）。
+  结论 `CodeSignVerdict`：`NotSigned` / `AdHoc`（无 CMS 槽）/ `UnsupportedAlgorithm`
+  （SHA-384 / 截断 / 未知 hashType，如实标不支持，不猜）/ `Malformed` / `Intact` / `Mismatch`。
+- **明确只做完整性**：CMS/X.509 信任链、资源封印、需求校验**都不做**，写进 notes。
+- **core**：`ObjectInfo` 新增 `signature: SignatureInfoWire`；形状变化 ⇒
+  `CORE_API_VERSION` 8→9、`SERVER_API_VERSION` 同步 9（cli version 测试已更新）。
+- **Web**：`api.ts` 补 `SignatureInfoWire` / `SwiftInfoWire` 与 `ObjectInfo` 字段镜像。
+- **真实样本交叉核对**（`--ignored`）：
+
+  | 样本 | 结论 | 算法 | 校验 | CMS | identifier |
+  | --- | --- | --- | --- | --- | --- |
+  | LiveContainer | AdHoc | SHA-256 | 33/33 | 否 | com.kdt.livecontainer |
+  | Stapxs QQ App.app | AdHoc | SHA-256 | 5/5 | 否 | cn.stapxs.webqq |
+  | SideStore | Intact | SHA-1 | 4728/4728 | 是 | SideStore |
+  | PojavLauncher | Intact | SHA-1 | 284/284 | 是 | PojavLauncher |
+
+  （另用手工改过的 SideStore 副本交叉验证过 `Mismatch`：第 90 页起哈希对不上，
+  与逐页实现一致。）
+- **测试**：codesign 模块 3 条单测（合成 CodeDirectory：一致→AdHoc、篡改→Mismatch、
+  坏魔数→Malformed）；loader 真实样本 1 条；core 投影 2 条。
+
 ### 改进 — 打补丁的守卫与标签细化到**节级**（`__TEXT,__text`）
 
 之前 `bitflip-patch` 只到**段**这一层：改一处 `__TEXT` 里的指令，diff 上只写"段

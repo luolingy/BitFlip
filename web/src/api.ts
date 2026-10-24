@@ -164,6 +164,38 @@ export interface ObjcInfo {
 }
 
 /** 完整解析结果。对应 `bitflip-core::ObjectInfo`。 */
+/** Swift 元数据摘要（`__swift5_*`）。对应 `bitflip-core::SwiftInfoWire`。 */
+export interface SwiftInfoWire {
+  type_count: number;
+  types_named: number;
+  type_samples: string[];
+  protocol_count: number;
+  protocols_named: number;
+  protocol_samples: string[];
+  has_entry: boolean;
+  unparsed_sections: [string, number][];
+  skipped: number;
+  notes: string[];
+}
+
+/** 代码签名有界完整性校验摘要。对应 `bitflip-core::SignatureInfoWire`。 */
+export interface SignatureInfoWire {
+  applicable: boolean;
+  present: boolean;
+  /** NotSigned / AdHoc / UnsupportedAlgorithm / Malformed / Intact / Mismatch。 */
+  verdict: string;
+  signed: boolean;
+  algorithm: string;
+  identifier: string;
+  code_limit: number;
+  page_size: number;
+  code_slots: number;
+  verified_slots: number;
+  first_mismatch: number | null;
+  has_cms_signature: boolean;
+  notes: string[];
+}
+
 export interface ObjectInfo {
   id: string;
   format_type: string | null;
@@ -181,6 +213,10 @@ export interface ObjectInfo {
   function_starts: string[];
   /** ObjC 元数据摘要（选择器/方法/消息桩）。非 Mach-O 是空表。 */
   objc: ObjcInfo;
+  /** Swift 元数据摘要（`__swift5_*`）。对应 `bitflip-core::SwiftInfoWire`。 */
+  swift: SwiftInfoWire;
+  /** 代码签名有界完整性校验摘要。对应 `bitflip-core::SignatureInfoWire`。 */
+  signature: SignatureInfoWire;
   segments: SegmentInfo[];
   sections: SectionInfo[];
   imports: ImportInfo[];

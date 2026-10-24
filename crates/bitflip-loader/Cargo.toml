@@ -20,12 +20,13 @@ apk-info-xml = { workspace = true }
 droidsaw-dex = { workspace = true }
 thiserror = { workspace = true }
 zip = { workspace = true }
+# 代码签名完整性校验要按 CodeDirectory 的 hashType 重算 SHA-1 / SHA-256。
+# 两个 crate 都已在 workspace 依赖清单里、许可闸门早已覆盖；**刻意与 droidsaw-dex /
+# 其它实现用同一套**（sha1 0.11 / sha2 0.11），免得"另一个哈希实现"引入难查的假失败。
+sha1 = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
-# DEX 合成样本要按规范自己算 `header.signature`（SHA-1）。**刻意用同一个 crate**：
-# `droidsaw-dex` 用的就是 `sha1` 0.11，两个"另一个实现"之间的差异会变成
-# 一条难查的假失败。它不是新增依赖 —— 已经在传递依赖里，许可闸门早已覆盖。
-sha1 = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
