@@ -5,6 +5,25 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第三片：x86 分支条件可读（`if`/`while` 条件从"条件未知"变具体）
+
+- `bitflip-arch` 的 `convert_condition` 为 **x86 / x86_64** 补上条件码：capstone 0.14 的 x86
+  detail 没有对通用 `jcc` 暴露 cc（只有 SSE/AVX/XOP），因此按 x86 条件跳转**各自独立的助记符**
+  如实映射到 [`ConditionCode`]（`je`/`jz`→Equal、`jl`→SignedLessThan、`jb`/`jc`→CarryClear、
+  `ja`→UnsignedHigher…）。奇偶条件（`jp`/`jnp` 等）无对应项，返回 `None`（不猜）。
+- 渲染层据此**只在"条件不在助记符里"的架构**追加 `.cc` 后缀（AArch64 的 `b`+`.lt`）；x86 助记符
+  本身已带条件，`condition` 只用于**语义**（伪代码 if 条件），不再追加后缀（否则会渲染成 `je.eq`）。
+- 效果：`pseudo-c-structured` 在 x86 上 `if (/* 条件未知 */)` 归零，变为 `if (/* CarryClear */ flags)`
+  等具体条件；kernel32.dll 同一 120KB 段 121 个 `if`、7 个 `while` 全部可读。伪代码仍是**标志位**
+  语义（不假装成 `a < b` 比较——那需要数据流，仍是后续工作）。
+- 同步修正一处**陈旧的服务端契约测试**（`m6_api::unresolved_indirect_calls_are_kept_and_counted`）：
+  未解析条目字段集应从旧的两键 `["caller","insn"]` 更新为含 `via_slot`（前端 `api.ts` 早已声明
+  `via_slot`）；调用边字段集更新为 `CallEdgeWire` 的 8 键（external/import_name/import_module/
+  objc_selector/recovered_indirect）。该测试在本次改动前即已失败，属"断言落后于 wire 契约"，
+  与功能无关。
+- arch 101（+1 x86 条件映射单测）/ analyze 212 / core 73 / server m6 17 / cli 40 全过；
+  `cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第二片：完整自然循环识别（`while` / `do-while`）
 
 - `structurize` 新增**自然循环**识别（`compute_natural_loops`）：对每条回边 `b→h`（`h` 支配 `b`）

@@ -81,8 +81,20 @@ pub fn format_insn_with(decoder: &CapstoneDecoder, insn: &DecodedInsn, style: Te
         // `b.lt` 与 `b` 的 `InsnId` 相同，差别只在 cc 字段；不追加后缀就会
         // 把条件跳转显示成无条件跳转 —— 读者会以为执行流一定跳走，
         // 而实际上是"条件为假就往下走"。
+        //
+        // **只对"条件不在助记符里"的架构追加后缀**：x86 的条件跳转助记符本身
+        // 就带了条件（`je`/`jl`…），再追加 `.eq` 会渲染成 `je.eq` —— 错的。
+        // 所以 x86 上 `condition` 只用于**语义**（伪代码的 if 条件），不参与文本后缀。
         let base = match insn.condition {
-            Some(cc) if cc.is_meaningful() => format!("{base}.{cc}"),
+            Some(cc)
+                if cc.is_meaningful()
+                    && !matches!(
+                        insn.arch,
+                        crate::types::Arch::X86 | crate::types::Arch::X86_64
+                    ) =>
+            {
+                format!("{base}.{cc}")
+            }
             _ => base,
         };
 

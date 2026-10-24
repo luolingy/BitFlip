@@ -297,14 +297,34 @@ async fn unresolved_indirect_calls_are_kept_and_counted() {
 
     // 每条未解析记录要能定位到调用点
     for u in unresolved {
-        assert_keys(u, &["caller", "insn"], "unresolved 条目");
+        // `via_slot` 是 wire 契约的一部分（前端 api.ts 的 UnresolvedCall 声明了它：
+        // 有值时说明目标从哪个内存槽读，null 表示连槽都没恢复出来）。字段集合必须与
+        // 前端一致——曾是 ["caller","insn"] 两字段的旧契约，加了 via_slot 后要同步更新，
+        // 否则这条断言本身就成了"阻止契约前进"的陈旧约束。
+        assert_keys(u, &["caller", "insn", "via_slot"], "unresolved 条目");
         let insn = u["insn"].as_str().unwrap();
         assert_eq!(insn.len(), 16, "地址必须是定长 16 位：{insn}");
     }
 
-    // 已解析的边必须都有非空 callee —— 空字符串会让前端画出悬空节点
+    // 已解析的边必须都有非空 callee —— 空字符串会让前端画出悬空节点。
+    // 字段集合以 core 的 `CallEdgeWire` 为准（8 个）：多几片功能后边带了
+    // external/import_name/import_module/objc_selector/recovered_indirect，
+    // 这里必须同步，否则断言本身成为阻止契约前进的陈旧约束。
     for e in body["edges"].as_array().expect("edges 是数组") {
-        assert_keys(e, &["caller", "callee", "tail"], "edges 条目");
+        assert_keys(
+            e,
+            &[
+                "caller",
+                "callee",
+                "tail",
+                "external",
+                "import_name",
+                "import_module",
+                "objc_selector",
+                "recovered_indirect",
+            ],
+            "edges 条目",
+        );
         assert_eq!(e["callee"].as_str().unwrap().len(), 16);
         assert_eq!(e["caller"].as_str().unwrap().len(), 16);
     }

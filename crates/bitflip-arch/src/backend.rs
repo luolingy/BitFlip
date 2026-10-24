@@ -636,7 +636,7 @@ fn convert(
 
     // 条件码。**必须**单独取：它不在 `InsnId` 里，`b.lt` 与 `b` 的 id 相同。
     // 不取的话渲染层只能拿到裸 `b`，把条件跳转显示成无条件跳转。
-    let condition = convert_condition(detail, arch);
+    let condition = convert_condition(detail, arch, mnemonic_str);
 
     DecodedInsn {
         addr,
@@ -658,7 +658,11 @@ fn convert(
 /// x86 不从这里取：x86 的条件分支有**各自独立的助记符**（`je`/`jne`/`jl`…），
 /// 名字里已经带了条件，`InsnId` 就能区分。AArch64/AArch32 则是同一个 `b`
 /// 配一个 cc 字段，名字里看不出来。所以只有 ARM 系需要这条路径。
-fn convert_condition(detail: &InsnDetail<'_>, arch: Arch) -> Option<crate::insn::ConditionCode> {
+fn convert_condition(
+    detail: &InsnDetail<'_>,
+    arch: Arch,
+    mnemonic_str: &str,
+) -> Option<crate::insn::ConditionCode> {
     use crate::insn::ConditionCode;
 
     match arch {
@@ -686,12 +690,46 @@ fn convert_condition(detail: &InsnDetail<'_>, arch: Arch) -> Option<crate::insn:
                 _ => return None,
             })
         }
+        // x86 不靠 detail 取条件码：capstone 0.14 的 x86 detail 没有对通用 `jcc` 暴露条件码
+        // （只有 SSE/AVX/XOP 的 cc 访问器）。x86 的条件跳转有**各自独立的助记符**
+        // （`je`/`jne`/`jl`…），名字本身已经带了条件 —— 从助记符如实映射，不猜。
+        // 奇偶条件（`jp`/`jnp` 等）在 [`ConditionCode`] 里没有对应项，返回 `None`（如实保守）。
+        Arch::X86 | Arch::X86_64 => x86_condition_from_mnemonic(mnemonic_str),
         // AArch32 的条件码在指令编码的高 4 位里，capstone 目前没有通过
         // 统一接口暴露。**如实返回 `None`**（不猜），CFG 仍然是对的
         // （靠 `Flow::Branch { conditional }`），只是文本上会显示成裸 `b`。
         // 这一条写在这里是为了让它可被找到，而不是悄悄漏掉。
         _ => None,
     }
+}
+
+/// 从 x86 条件跳转助记符映射到 [`ConditionCode`]。
+///
+/// 只认标准 `jcc` 助记符；同义写法（`jz`/`jne`/`jnz`…）归一到同一条件。
+/// 奇偶类（`jp`/`jpe`/`jnp`/`jpo`）在 [`ConditionCode`] 里没有对应项 —— 返回 `None`，
+/// 由上层如实显示"条件未知"，而不是硬凑一个近似条件（§7：不猜）。
+fn x86_condition_from_mnemonic(mnemonic: &str) -> Option<crate::insn::ConditionCode> {
+    use crate::insn::ConditionCode;
+    Some(match mnemonic {
+        "je" | "jz" => ConditionCode::Equal,
+        "jne" | "jnz" => ConditionCode::NotEqual,
+        // CF=1：无符号"低于"（比借位/进位清除）。
+        "jb" | "jnae" | "jc" => ConditionCode::CarryClear,
+        // CF=0：无符号"不低于"（高于或相等）。
+        "jae" | "jnb" | "jnc" => ConditionCode::CarrySet,
+        "jbe" | "jna" => ConditionCode::UnsignedLowerOrSame,
+        "ja" | "jnbe" => ConditionCode::UnsignedHigher,
+        "jl" | "jnge" => ConditionCode::SignedLessThan,
+        "jge" | "jnl" => ConditionCode::SignedGreaterEqual,
+        "jle" | "jng" => ConditionCode::SignedLessOrEqual,
+        "jg" | "jnle" => ConditionCode::SignedGreaterThan,
+        "js" => ConditionCode::Minus,
+        "jns" => ConditionCode::Plus,
+        "jo" => ConditionCode::Overflow,
+        "jno" => ConditionCode::NoOverflow,
+        // 奇偶条件：无对应 ConditionCode → 不猜。
+        _ => return None,
+    })
 }
 
 /// 把 capstone 的寄存器 id 转成本项目的 [`RegId`]；无效哨兵值转成 `None`。
@@ -1582,6 +1620,36 @@ mod tests {
             !text.contains("jmp."),
             "不该给 x86 助记符加 ARM 风格的 `.cc` 后缀：{text:?}"
         );
+    }
+
+    #[test]
+    fn x86_conditional_jump_carries_semantic_condition() {
+        // x86 的条件码不在 detail 里，从助记符如实映射到语义 ConditionCode，
+        // 供伪代码的 if 条件使用（文本后缀仍不加，见上一条测试）。
+        let dec = decoder();
+        let cases: &[(u8, crate::insn::ConditionCode)] = &[
+            (0x74, crate::insn::ConditionCode::Equal),          // je
+            (0x75, crate::insn::ConditionCode::NotEqual),       // jne
+            (0x7C, crate::insn::ConditionCode::SignedLessThan), // jl
+            (0x7D, crate::insn::ConditionCode::SignedGreaterEqual), // jge
+            (0x72, crate::insn::ConditionCode::CarryClear),     // jb
+            (0x73, crate::insn::ConditionCode::CarrySet),       // jae
+            (0x77, crate::insn::ConditionCode::UnsignedHigher), // ja
+            (0x78, crate::insn::ConditionCode::Minus),          // js
+        ];
+        for &(opcode, expect) in cases {
+            let insn = dec
+                .decode_one(&[opcode, 0x05], 0x1000)
+                .expect("conditional jump");
+            assert_eq!(
+                insn.condition,
+                Some(expect),
+                "opcode {opcode:#x} 的条件码应为 {expect:?}"
+            );
+        }
+        // 奇偶条件没有对应 ConditionCode → 如实 None（不猜）。
+        let jp = dec.decode_one(&[0x7A, 0x05], 0x1000).expect("jp");
+        assert_eq!(jp.condition, None);
     }
 
     #[test]
