@@ -105,14 +105,18 @@ ad-hoc 重签（`codesign -s -` 的等价物）**不需要证书**，步骤是�
 | 被当成"绕过版权/许可"的工具 | 法律 / 合规风险 | 默认不给、需显式请求；文档与 UI 注明"仅限自有产物" |
 | 正式（带证书）重签涉及私钥 | 高风险，泄密 | **本方案不做**；如要做，单独立项、隔离密钥处理 |
 
-## 8. 建议的落地顺序（若你批 ad-hoc 路径）
+## 8. 落地顺序与进度
 
-1. 纯函数：给定内容 + 旧 CodeDirectory 参数，产出**新的 CodeDirectory 字节**（含逐页哈希 +
-   special slot），只读、可单测（用现有 `codesign::parse` 反向校验 `Intact`）。
-2. 纯函数：给定各 blob，**拼回 SuperBlob**，单测对照结构。
-3. 写盘层：只做"签名区能原地容纳就原地，否则尾部追加"的最稳路径，产出 `xxx.resigned`。
-4. 交叉核对脚本（`codesign -v`，缺工具 SKIP）+ 真实样本（LiveContainer ad-hoc 最容易）。
-5. 再考虑签名区**移动**与 fat/`.app` 多二进制——风险最高，最后做。
+1. ✅ 纯函数：给定内容 + 旧 CodeDirectory 参数，产出**新的 CodeDirectory 字节**（含逐页哈希 +
+   special slot），只读、可单测（用现有 `codesign::parse` 反向校验 `Intact`）。（A 阶段，`25740a1`）
+2. ✅ 纯函数：给定各 blob，**拼回 SuperBlob**，单测对照结构。（A 阶段）
+3. ✅ 写盘层（最稳子集）：签名区能原地容纳就原地、尾部补零、`datasize` 不变；放不下/需移动
+   明确报错。`codesign::resign_in_place`。（B 阶段，`bc1a91d`）
+4. ✅ CLI 落盘 + 交叉核对：`bitflip-cli resign [--apply]` 产出 `xxx.resigned`；
+   `scripts/resign-acceptance.ps1`（`codesign -v`，缺工具 SKIP）+ 真实样本
+   （PojavLauncher 内 5 个 ad-hoc 二进制全过，CAltKit 14/14）。（C 阶段）
+5. ⬜ 签名区**移动** / 尾部追加（签名变大时）与 fat/`.app` 多二进制——风险最高，未做。
+6. ⬜ 正式重签（带 CMS / 开发者身份 / 私钥）——按 §5/§7 **不做**，需单独立项与密钥隔离。
 
 —— 以上为设计。**是否批准、以及批准到哪一步（只到 1-2 的纯函数？还是含 3-4 的写盘？），
 请你定。** 未获批准前不写任何重签实现代码。

@@ -956,6 +956,78 @@ pub fn resign_in_place(
     Ok(out)
 }
 
+/// 从 SuperBlob（`sb` 是签名区字节）里取 `CSSLOT_ENTITLEMENTS`（type 5）的**原始 blob 字节**
+/// （`magic+length+payload`，大端结构，与 Mach-O 端序无关）。没有就 `None`。
+fn raw_entitlements_blob(sb: &[u8]) -> Option<Vec<u8>> {
+    let magic = be_u32(sb, 0)?;
+    if magic != CSMAGIC_EMBEDDED_SIGNATURE {
+        return None;
+    }
+    let count = be_u32(sb, 8)? as usize;
+    for i in 0..count {
+        let entry = 12 + i * 8;
+        let (Some(blob_type), Some(off)) = (be_u32(sb, entry), be_u32(sb, entry + 4)) else {
+            continue;
+        };
+        if blob_type == CSSLOT_ENTITLEMENTS {
+            let off = off as usize;
+            let len = be_u32(sb, off + 4)? as usize; // blob 头是 magic+length
+            let bytes = sb.get(off..off + len)?;
+            return Some(bytes.to_vec());
+        }
+    }
+    None
+}
+
+/// **端到端重签一个薄 Mach-O 文件字节**（自带参数推断，保留 entitlements 原始字节）。
+///
+/// 与 [`resign_in_place`] 的区别：这里**自己从旧签名里推断参数**（hashType / pageSizeLog /
+/// codeLimit / identifier），不需要调用方手填；并把旧签名里的 entitlements blob **原样**
+/// 重新嵌入（ad-hoc 保留 get-task-allow 之类）。若原签名没有 entitlements，就按没有处理。
+///
+/// 这是 CLI `resign` 子命令的实现入口；仍是**纯函数**（返回新字节，不落盘）。
+pub fn resign_macho_file(file: &[u8]) -> Result<Vec<u8>, ResignWriteError> {
+    let anchor = find_signature_anchor(file)?;
+    // 从旧签名解析出推断参数所需的字段。
+    let sig = parse(
+        file,
+        LinkeditRange {
+            dataoff: anchor.dataoff,
+            datasize: anchor.datasize,
+        },
+        anchor.endian,
+    );
+    let hash_type = match sig.algorithm {
+        HashAlgorithm::Sha1 => 1u8,
+        HashAlgorithm::Sha256 => 2u8,
+        HashAlgorithm::Sha256Truncated => 3u8,
+        HashAlgorithm::Sha384 => {
+            return Err(ResignWriteError::Build(ResignError::UnsupportedHashType(4)));
+        }
+    };
+    if sig.page_size == 0 || sig.code_limit == 0 {
+        return Err(ResignWriteError::Build(ResignError::ZeroPageSizeLog));
+    }
+    let page_size_log = sig.page_size.trailing_zeros() as u8;
+    let code_limit =
+        u32::try_from(sig.code_limit).map_err(|_| ResignWriteError::MalformedSignatureRange)?;
+
+    // 取旧签名里的 entitlements 原始 blob（保留）。签名区在文件 [dataoff..dataoff+datasize)。
+    let sb = file
+        .get(anchor.dataoff as usize..(anchor.dataoff + anchor.datasize) as usize)
+        .ok_or(ResignWriteError::MalformedSignatureRange)?;
+    let ent_blob = raw_entitlements_blob(sb);
+
+    let params = ResignParams {
+        hash_type,
+        page_size_log,
+        code_limit,
+        identifier: sig.identifier.clone(),
+        entitlements_blob: ent_blob.clone(),
+    };
+    resign_in_place(file, &params, ent_blob.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

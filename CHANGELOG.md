@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 新增 — `bitflip-cli resign` 子命令（重签 C 阶段：CLI 落盘）
+
+把 A+B 的重签能力接到 CLI：`bitflip-cli resign <TARGET> [--apply] [--output PATH] [--json]`。
+默认**只读预览**（能不能重签、报结果，不写盘）；`--apply` 才写出 `xxx.resigned` 副本，原文件
+永不原地覆写。只走"原地容纳"路径，不接证书、不产 CMS（ad-hoc）。
+
+- `bitflip_core::resign_macho_file(file) -> ResultVec<u8>, ResignWriteError>`：从旧签名**自动推断**
+  hashType/pageSizeLog/codeLimit/identifier，并把旧签名里的 entitlements blob **原样**重新嵌入
+  （ad-hoc 保留 get-task-allow 之类）。放不下/需移动/非 Mach-O/无签名 → 明确错误不写坏。
+- CLI 输出路径若与目标相同直接拒绝（绝不原地覆写）；`--json` 给稳定契约。
+- `scripts/resign-acceptance.ps1`：对真实薄 Mach-O 跑 `resign --apply` 到临时副本，用 `info`
+  复核必须"完整性通过"且 ad-hoc（`verified == code slots`）；有 `codesign` 就 `-v` 交叉核对，
+  缺则如实 SKIP；本阶段不支持的样本（放不下）如实 SKIP 不判失败。**实测**：CAltKit（真实
+  ad-hoc 框架）→ PASS，14/14 页全过，`codesign -v` SKIP。
+- 库函数+单测：cli 38、loader 318 全过；fmt/clippy 干净。不改现有解析行为。
+
 ### 新增 — Mach-O 重签（B 阶段：写盘层，最稳子集）
 
 在 A 阶段纯函数之上加写盘层 `codesign::resign_in_place`：**只做"原地容纳"**这一条最稳路径，

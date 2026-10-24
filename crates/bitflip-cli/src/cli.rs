@@ -94,6 +94,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// 打补丁：预览计划（只读）或写出 `.patched` 副本（需显式 --apply）
     Patch(PatchArgs),
+    /// 重签一个 Mach-O 的副本（ad-hoc，需显式 --apply；绝不原地改）
+    Resign(ResignArgs),
     /// 打印版本与 API 版本
     Version,
 }
@@ -598,6 +600,27 @@ pub struct PatchArgs {
     /// 架构 / 基址覆盖（原始二进制需要）
     #[command(flatten)]
     pub raw: RawOverrideArgs,
+}
+
+/// `resign` 参数：给自己拥有/改造过的 Mach-O 副本重签（ad-hoc）。
+///
+/// 默认**只读预览**：只判断能不能重签、报结果（不写盘）。`--apply` 才写出 `xxx.resigned`
+/// 副本 —— 原文件永不原地覆写。当前只支持"原地容纳"路径（新签名 ≤ 旧 datasize）；
+/// 需移动签名区/放不下时明确报错，不写坏、不接证书、不产 CMS。边界见设计稿。
+#[derive(Debug, Args)]
+pub struct ResignArgs {
+    /// 目标：一个薄 Mach-O 文件（fat / 容器暂不支持）
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 写出副本 `xxx.resigned`。不给就只读预览，不写盘。
+    #[arg(long)]
+    pub apply: bool,
+    /// 输出文件路径（与 `--apply` 搭配；默认在目标旁加 `.resigned`）
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+    /// 只读：解释为什么不能重签（不做任何写入），等价于默认行为
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[cfg(test)]

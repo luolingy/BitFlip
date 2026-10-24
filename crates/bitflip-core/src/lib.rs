@@ -69,6 +69,11 @@ pub fn parse_code_resources(bytes: &[u8]) -> CodeResourcesSummary {
     bitflip_loader::format::macho::code_resources::parse(bytes)
 }
 
+/// 重签一个薄 Mach-O 文件字节（ad-hoc，原地容纳路径），返回新字节。边界见设计稿
+/// `docs/MACHO-RESIGN-DESIGN.md`。**不落盘、不接证书、不产 CMS**；放不下/需移动/形态不符
+/// 时返回 [`ResignWriteError`]，不写坏、不猜。
+pub use bitflip_loader::format::macho::codesign::{resign_macho_file, ResignWriteError};
+
 pub use session::{
     AnalysisSummary, ExportInfo, ImportInfo, ObjectInfo, OpenOptions, RelocInfo, SectionInfo,
     SegmentInfo, Session, SymbolInfo, TargetInfo, INFO_FORMAT_VERSION, MAX_FULL_PARSE_BYTES,
