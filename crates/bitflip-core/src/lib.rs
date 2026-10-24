@@ -43,6 +43,9 @@ pub use export::{
     EXPORT_FORMAT_VERSION,
 };
 
+/// 重新导出 `_CodeSignature/CodeResources` 的只读摘要：`info` 展示要用，嵌入方也不必
+/// 直接依赖 `bitflip-loader`。
+pub use bitflip_loader::object::CodeResourcesSummary;
 /// 一并重新导出 APK 成员角色：它由**成员名**判定（纯字符串，不读字节），
 /// 嵌入方要在成员列表里标出 `classes*.dex` / `lib/<abi>/*.so` 就得用它。
 ///
@@ -58,6 +61,14 @@ pub use bitflip_loader::ArchiveMember;
 /// 不导出的话，消费方只能被迫去依赖 `bitflip-loader` —— 那正是上面那条
 /// 重新导出想避免的事（核心层的公开 API 是对外契约，载体在这里）。
 pub use bitflip_loader::MemberStorage;
+
+/// 解析 `CodeResources` 字节得到只读摘要（**只读事实、不校封印、不校信任链**，
+/// 边界见 [`CodeResourcesSummary`]）。
+#[must_use]
+pub fn parse_code_resources(bytes: &[u8]) -> CodeResourcesSummary {
+    bitflip_loader::format::macho::code_resources::parse(bytes)
+}
+
 pub use session::{
     AnalysisSummary, ExportInfo, ImportInfo, ObjectInfo, OpenOptions, RelocInfo, SectionInfo,
     SegmentInfo, Session, SymbolInfo, TargetInfo, INFO_FORMAT_VERSION, MAX_FULL_PARSE_BYTES,

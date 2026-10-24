@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### 新增 — `.app` 资源封印 CodeResources 只读展示（M12）
+
+`.app` 目录里的 `_CodeSignature/CodeResources` 是一份 plist，列出被"封印"的文件与哈希。
+新增**只读事实**展示——**不校封印、不校信任链**（判断权留给用户）。
+
+- loader 新模块 `format::macho::code_resources::parse`：解析 XML plist 的 `files` /
+  `files2` 段（条目数 + 文件名样例 + 是否有 `rules`/`rules2`）；二进制 plist 只标形态、
+  不解内容；其它形态如实标 `unknown`（不猜，§7）。
+- `bitflip-cli info` 在目标为 `.app` 目录时打印"资源封印"一节（形态/files/files2/rules/
+  样例）；没有该文件则静默（正常缺失不是错误）。
+- 实测：LiveContainer `_CodeSignature/CodeResources` files=76/files2=74/rules=有；
+  PojavLauncher files=303/files2=302/rules=有（`#[ignore]` 真实样本测试核对）。
+- 无 wire/API 版本变化（仅 CLI 展示；`CodeResourcesSummary` 经 core 重新导出）。
+
 ### 新增 — 签名库同形命中时如实报"N 个候选之一"（M8）
 
 此前同一段字节同时命中多个库函数名（同形无法区分）时，只在账目里记一个**数字**

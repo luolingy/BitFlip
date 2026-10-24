@@ -118,6 +118,7 @@ use crate::ObjectKind;
 
 pub mod bind;
 pub mod chained;
+pub mod code_resources;
 pub mod codesign;
 pub mod export_trie;
 pub mod fat;

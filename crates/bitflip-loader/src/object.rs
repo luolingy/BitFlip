@@ -964,6 +964,27 @@ impl Entitlements {
     }
 }
 
+/// `_CodeSignature/CodeResources` 的**只读摘要**（包内文件封印清单的"事实"，非"判断"）。
+///
+/// **只读事实**：列出封印清单覆盖多少文件、样例名字、有没有 rules，以及形态是 XML/二进制
+/// plist。**不校验**这些哈希、**不校封印**（不说"包完整/被改"）、**不校信任链**——判断
+/// 权留给用户。解析见 [`crate::format::macho::code_resources::parse`]。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CodeResourcesSummary {
+    /// 形态：`xml-plist` / `binary-plist` / `unknown`。
+    pub format: String,
+    /// `files` 段的条目数（SHA-1 封印清单）。
+    pub files: usize,
+    /// `files2` 段的条目数（含 `hash`/`hash2` 的更完整清单）。
+    pub files2: usize,
+    /// 是否带 `rules`/`rules2`（决定哪些文件参与封印的正则集合）。
+    pub has_rules: bool,
+    /// `(段名, 文件名)` 样例（各段前几条，便于展示）。
+    pub name_samples: Vec<(String, String)>,
+    /// 降级 / 边界说明（中文）。
+    pub notes: Vec<String>,
+}
+
 /// 需求（`CSSLOT_REQUIREMENTS`，type 2）blob 的存在性事实。
 ///
 /// **只报存在与字节数，不实现需求表达式求值**——那是一个独立的表达式语言（opcode 流 +

@@ -32,6 +32,13 @@ pub fn run_info(
 
     print_human(session.info(), &session);
 
+    // 代码签名支线：`.app` 目录里的 `_CodeSignature/CodeResources` —— 只读事实摘要。
+    // 只对 bundle 目录读这一份小文件，不碰热路径；读了就打印，读不到/没有就什么都不说
+    // （没有封印文件不是错误）。
+    if session.info().container == "app-bundle" {
+        print_code_resources(target);
+    }
+
     // 原始二进制：只有**还不知道**架构时才提示要手工指定。
     // 已经给了 `--arch` 还提示"需要指定"会让用户以为自己没生效。
     if session.info().object == "raw" && session.info().arch.is_none() {
@@ -452,6 +459,39 @@ fn print_parsed(parsed: &ObjectInfo) {
     }
 }
 
+/// 代码签名支线：把 `.app` 目录里的 `_CodeSignature/CodeResources` 读成只读摘要打印出来。
+///
+/// 只读事实：封印清单覆盖多少文件、样例名字、有没有 rules。**不校封印、不校信任链**。
+/// 没有这份文件 / 读不出来 / 形态不认识，都不当成错误 —— 只是不打印，或如实说明。
+fn print_code_resources(app_dir: &Path) {
+    let path = app_dir.join("_CodeSignature").join("CodeResources");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return; // 没有封印文件是正常的，不打扰。
+    };
+    let summary = bitflip_core::parse_code_resources(&bytes);
+
+    println!();
+    println!("资源封印（CodeResources，只读事实 · 不校封印 · 不校信任链）");
+    println!("  形态      {}", summary.format);
+    if summary.format == "xml-plist" {
+        println!("  files     {} 条（SHA-1 清单）", summary.files);
+        println!("  files2    {} 条（含 hash/hash2）", summary.files2);
+        println!(
+            "  rules     {}",
+            if summary.has_rules { "有" } else { "无" }
+        );
+        if !summary.name_samples.is_empty() {
+            println!("  样例文件（前 {} 条）", summary.name_samples.len());
+            for (section, name) in &summary.name_samples {
+                println!("    [{section}] {name}");
+            }
+        }
+    }
+    for note in &summary.notes {
+        println!("  · {note}");
+    }
+}
+
 /// 按显示宽度截断（非 ASCII 按 2 宽度估算，避免中英混排时表格错位）。
 fn truncate(text: &str, max: usize) -> String {
     let mut width = 0;
@@ -507,5 +547,27 @@ mod tests {
         )
         .expect_err("应失败");
         assert!(error.to_string().contains("读取目标失败"));
+    }
+
+    #[test]
+    fn code_resources_absent_is_silent() {
+        // 没有 _CodeSignature/CodeResources 的目录：不 panic、不打印（正常缺失）。
+        let dir = tempfile::tempdir().expect("tempdir");
+        print_code_resources(dir.path());
+    }
+
+    #[test]
+    fn code_resources_reads_small_plist() {
+        // 造一个最小 CodeResources：files 一条、无 files2、有 rules。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sig = dir.path().join("_CodeSignature");
+        std::fs::create_dir_all(&sig).expect("mkdir");
+        let plist = "<plist><dict>\
+            <key>files</key><dict><key>Info.plist</key><data>AAAA</data></dict>\
+            <key>rules</key><dict><key>^.*</key><true/></dict>\
+            </dict></plist>";
+        std::fs::write(sig.join("CodeResources"), plist).expect("write");
+        // 只要能跑通不 panic 即达意（人类可读输出走 stdout）。
+        print_code_resources(dir.path());
     }
 }
