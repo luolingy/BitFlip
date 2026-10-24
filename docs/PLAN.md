@@ -913,7 +913,9 @@ M8 新增的两处界面（函数表的源位置列、"另有 N 个候选"标记
     （`8a67143c-d173-1ace-4c4c-44205044422e` / age 1）。"不匹配不许认"这半边没法用真产物造
     （fixture 脚本只产一份 PDB），用构造数据钉住；GUID 文本的字段端序也单测，对照
     `llvm-readobj` 在真样本上打出的字节（`3C 14 67 8A …` ↔ `8a67143c-…`）。
-签名库本身待改进的两处：同形报"N 个候选之一"、按目标切换签名库（`Session` 已按目标持有，接口不缺）。
+签名库本身待改进：同形报"N 个候选之一"——**已落地**（`SignatureUseWire.ambiguous_samples`
+列出候选名，函数仍不命名，错名仍 0，`ANALYSIS_FORMAT_VERSION` 4→5）；按目标切换签名库
+（`Session` 已按目标持有，接口不缺）仍未做。
 交付物 1 的收尾：读 PE 调试目录里的 CodeView 记录（现在按同名约定找，别名 PDB 找不到）、
 MSVC 修饰名反修饰、静态库 PDB。
 
@@ -2062,8 +2064,12 @@ CFG 构建真正要的也正是这四列；缺的只是 `Cfg::build` 目前收 `
 * **测试**：codesign 6 条单测（合成 CodeDirectory：一致→AdHoc、篡改→Mismatch、坏魔数→
   Malformed；plist 解析标量/数组/Other；entitlements blob + DER 探测；非 entitlements
   魔数→空列表）；loader 真实样本测试补齐签名/entitlements 断言；core 投影 2 条。
-* **下一片候选**：重签（re-sign，对 patch 过的副本重算 CodeDirectory/哈希并更新签名区，
-  比解析重、要单独设计并严格限范围）；CDHash（CodeDirectory 自身哈希做"签名结构指纹"）。
+* **已追加的小片（据实记录）**：CDHash（CodeDirectory 自身哈希做"签名结构指纹"，已落地
+  CORE/SERVER API v11）；`.app` 资源封印 `_CodeSignature/CodeResources` 只读展示（`info` 里
+  打印 files/files2/rules 与样例，**不校封印、不校信任链**）。
+* **下一片候选：重签（re-sign）**——比解析重、涉及写签名区与密钥，按重大决策处理：
+  设计方案见 [`docs/MACHO-RESIGN-DESIGN.md`](MACHO-RESIGN-DESIGN.md)（ad-hoc 路径 + 红线 +
+  风险清单 + 落地顺序），**待用户拍板后再实现**。
 
 
 ## 5. 横向轨道
