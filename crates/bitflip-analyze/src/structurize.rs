@@ -19,12 +19,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bitflip_arch::{DecodedInsn, Flow};
+use bitflip_arch::{DecodedInsn, Flow, Operand};
 
 use crate::cfg::Cfg;
 use crate::pseudo::{
     branch_condition_text, decompile_function, translate, PseudocodeFunction, PseudocodeNote,
-    RegisterNamer,
+    RegisterNamer, TableReader,
 };
 
 /// 结构化渲染的一行。
@@ -43,6 +43,19 @@ struct Built {
     structured_blocks: usize,
 }
 
+/// 解析出的跳表形状（见 [`Builder::parse_switch_shape`]）。
+struct SwitchShape {
+    /// 索引寄存器。
+    idx_reg: bitflip_arch::RegId,
+    /// 读表项的虚拟地址。
+    table_addr: u64,
+    /// 每项字节数（偏移表恒 4；指针表 4 或 8）。
+    entry_size: usize,
+    /// 偏移表基址：`Some(基址)` 时表项是相对基址的偏移，目标 = 基址 + 偏移；
+    /// 指针表为 `None`（表项即目标）。
+    base: Option<u64>,
+}
+
 /// 生成一个函数的**结构化**伪代码。
 ///
 /// 结构失败或只能部分结构化时，`structured` 为 `false`，但仍会在 `structured_body` 里给出
@@ -55,6 +68,7 @@ pub fn decompile_structured(
     insns: &[DecodedInsn],
     cfg: &Cfg,
     namer: RegisterNamer<'_>,
+    table_reader: Option<TableReader<'_>>,
 ) -> PseudocodeFunction {
     // 先拿扁平版本：它已经算好了每块的语句、未翻译计数、截断、基础 notes。
     let mut flat = decompile_function(entry, name, insns, cfg, namer);
@@ -82,6 +96,7 @@ pub fn decompile_structured(
         ipdom: &ipdom,
         natural_loops: &natural_loops,
         namer,
+        table_reader,
         visited: BTreeSet::new(),
         lines: Vec::new(),
         residual_gotos: 0,
@@ -135,6 +150,8 @@ struct Builder<'a> {
     /// 自然循环：回边头 → 循环体块集合（含头）。由 `compute_natural_loops` 预算。
     natural_loops: &'a BTreeMap<u64, BTreeSet<u64>>,
     namer: RegisterNamer<'a>,
+    /// 只读数据读取器（读 switch 跳表）；`None` 时不做 switch 还原。
+    table_reader: Option<TableReader<'a>>,
     visited: BTreeSet<u64>,
     lines: Vec<Line>,
     residual_gotos: usize,
@@ -189,6 +206,229 @@ impl Builder<'_> {
             .map(|(_, insn)| *insn)
     }
 
+    /// 跳表形状：解析出的读表参数。
+    ///
+    /// `base == Some(基址)` 表示**偏移表**（表项是相对基址的 32 位偏移，目标 = 基址 + 偏移）；
+    /// `base == None` 表示**指针表**（表项就是目标地址）。
+    fn parse_switch_shape(&self, switch_block: u64, jmp: &DecodedInsn) -> Option<SwitchShape> {
+        // 形状 A：`jmp [idx*scale + TABLE]` —— 单个 Mem 操作数，指针表。
+        if let [Operand::Mem(m)] = jmp.operands.as_slice() {
+            let idx = m.index?;
+            if m.scale >= 2 && m.disp != 0 {
+                let entry_size = match m.size {
+                    4 => 4usize,
+                    8 => 8usize,
+                    _ => return None,
+                };
+                return Some(SwitchShape {
+                    idx_reg: idx,
+                    table_addr: m.disp as u64,
+                    entry_size,
+                    base: None,
+                });
+            }
+        }
+
+        // 形状 B：MSVC x64 偏移跳表 idiom —— `jmp REG`，其前三条指令依次为：
+        //   lea BASE, [rip+off]                 ; BASE = 表基址（绝对）
+        //   mov DREG, [BASE + IDX*scale + disp] ; DREG = 32 位偏移（项大小 4）
+        //   add JREG, BASE                      ; JREG (= REG) = BASE + offset
+        // 从块内、jmp 之前反向扫描三条指令，逐一核对寄存器连线。
+        let [Operand::Reg(jreg)] = jmp.operands.as_slice() else {
+            return None;
+        };
+        let block = self.blocks.get(&switch_block).copied()?;
+        // jmp 之前的指令（按地址升序）。
+        let before: Vec<&DecodedInsn> = self
+            .by_addr
+            .range(block.start..jmp.addr)
+            .map(|(_, i)| *i)
+            .collect();
+        // add JREG, BASE
+        let add = before.last()?;
+        let [Operand::Reg(areg), Operand::Reg(base_reg)] = add.operands.as_slice() else {
+            return None;
+        };
+        if areg.0 != jreg.0 {
+            return None;
+        }
+        // mov DREG, [BASE + IDX*scale + disp]
+        let mov = before.get(before.len().checked_sub(2)?)?;
+        let [Operand::Reg(_dreg), Operand::Mem(m)] = mov.operands.as_slice() else {
+            return None;
+        };
+        if m.base.map(|b| b.0) != Some(base_reg.0) || m.size != 4 {
+            return None;
+        }
+        let idx = m.index?;
+        // lea BASE, [rip+off]（PcRelative 操作数）
+        let lea = before.get(before.len().checked_sub(3)?)?;
+        let [Operand::Reg(lreg), Operand::PcRelative(rel)] = lea.operands.as_slice() else {
+            return None;
+        };
+        if lreg.0 != base_reg.0 {
+            return None;
+        }
+        // 基址绝对值：lea 指令地址 + 指令长度 + 相对位移。
+        let base_abs = lea
+            .addr
+            .wrapping_add(u64::from(lea.len))
+            .wrapping_add(*rel as u64);
+        // 表读地址 = 基址 + mov 的常量位移；项大小固定 4（32 位偏移）。
+        let table_addr = base_abs.wrapping_add(m.disp as u64);
+        Some(SwitchShape {
+            idx_reg: idx,
+            table_addr,
+            entry_size: 4,
+            base: Some(base_abs),
+        })
+    }
+
+    /// 尝试把"`cmp idx,N` + 条件跳转 → 间接跳转块"这一**跳表分发**还原成 `switch`。
+    ///
+    /// 入参是**谓词块**（条件跳转所在块）；它的两个后继里，一个是**间接跳转块**（switch 主体）、
+    /// 另一个是**缺省**（`ja default` 这类越界走 default）。只认**窄而可证**的形状，任何一环
+    /// 不满足就返回 `false`，交回上层走 `if / goto` 兜底 —— 不猜：
+    /// - 谓词块内有 `cmp X, Imm(n)`（越界判断），映射到 switch 的 `case 0..=n`；
+    /// - switch 块末是跳表分发：指针表 `jmp [idx*scale+TABLE]`，或 MSVC 省 x64 偏移表 idiom
+    ///   （`lea` + `mov [base+idx*4+disp]` + `add` + `jmp reg`，见 [`Self::parse_switch_shape`]）；
+    /// - 从表读得到 `n+1` 个项（上限 `MAX_SWITCH_CASES`）。
+    ///
+    /// 产出 `if (<越界条件>的反) { switch (idx) { case i: goto Ti; ... default: goto D; } } else {
+    /// goto D; }`：披露分发表是本片目标；各 case 体仍是 `goto`（后续工作）。
+    fn emit_switch_from_pred(
+        &mut self,
+        pred_cur: u64,
+        plast: &DecodedInsn,
+        succs: &[u64],
+        indent: usize,
+    ) -> bool {
+        const MAX_SWITCH_CASES: usize = 512;
+        let Some(reader) = self.table_reader else {
+            return false;
+        };
+        // 谓词块：条件跳转所在块。
+        let Some(pred_block) = self.blocks.get(&pred_cur).copied() else {
+            return false;
+        };
+        // switch 主体 = **谓词块的顺序后继**（fallthrough，即分支后下一条指令所在块）。
+        // 直接按块边界定位，比"从 succs 里挑间接跳转块"更稳：CFG 对间接跳转会丢掉目标未知
+        // 的那条边，导致 succs 里常常只剩 default 一侧。fallthrough 块才是顺序落到的分发块。
+        let switch_block = pred_block.end;
+        let Some(sb) = self.blocks.get(&switch_block).copied() else {
+            return false;
+        };
+        let s_last = self
+            .last_insn_addr(sb)
+            .and_then(|a| self.by_addr.get(&a).copied());
+        let Some(jmp) = s_last else {
+            return false;
+        };
+        if !(matches!(jmp.flow, Flow::Branch { conditional: false }) && jmp.target.is_none()) {
+            return false;
+        }
+        // 缺省目标 = 谓词块后继里、除 switch 块外的那个（若有）。可能因为间接边丢失而只剩一个，
+        // 也可能两个都在；取不等于 switch_block 的那一个，且必须唯一。
+        let mut default_iter = succs.iter().copied().filter(|&s| s != switch_block);
+        let Some(default_target) = default_iter.next() else {
+            return false;
+        };
+        if default_iter.next().is_some() {
+            return false;
+        }
+
+        // 解析 switch 块的跳转形状，得到：索引寄存器、表读地址、项大小、以及（偏移表时的）基址。
+        let Some(shape) = self.parse_switch_shape(switch_block, jmp) else {
+            return false;
+        };
+        let idx_reg = shape.idx_reg;
+
+        // 谓词块内 `cmp X, Imm(n)` 上界 —— 越界守卫（`ja default`）的界即 case 上界。
+        // 注意：守卫比较的寄存器**未必等于**索引寄存器（编译器常把选择子拷一份再比较），
+        // 所以这里取谓词块内任意 `cmp reg, imm` 的最大立即数，而不是只认 idx_reg。
+        let mut bound: Option<i64> = None;
+        for (&_a, insn) in self.by_addr.range(pred_block.start..pred_block.end) {
+            if let [Operand::Reg(_), Operand::Imm(n)] = insn.operands.as_slice() {
+                // 只接受小的、看起来像 case 数的上界（排除非分支相关的常量）。
+                if *n >= 0 {
+                    bound = Some(bound.map_or(*n, |b| b.max(*n)));
+                }
+            }
+        }
+        let Some(n) = bound else {
+            return false;
+        };
+        let count = n.saturating_add(1);
+        if count <= 0 || count as usize > MAX_SWITCH_CASES {
+            return false;
+        }
+        let count = count as usize;
+
+        // 读表并解出各 case 目标：
+        // - 指针表（shape A）：表项即目标地址；
+        // - 偏移表（shape B）：表项是**相对基址的 32 位偏移**，目标 = 基址 + 偏移。
+        let entry_size = shape.entry_size;
+        let need = count * entry_size;
+        let Some(bytes) = (*reader)(shape.table_addr, need) else {
+            return false;
+        };
+        if bytes.len() < need {
+            return false;
+        }
+        let mut targets = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = i * entry_size;
+            let chunk = &bytes[off..off + entry_size];
+            let raw = if entry_size == 8 {
+                u64::from_le_bytes(chunk.try_into().expect("8 字节"))
+            } else {
+                u64::from(u32::from_le_bytes(chunk.try_into().expect("4 字节")))
+            };
+            let target = match shape.base {
+                // 偏移表：目标 = 基址 + 偏移（32 位无符号，`mov ecx` 零扩展到 64 位）。
+                Some(base) => base.wrapping_add(raw),
+                // 指针表：表项就是目标。
+                None => raw,
+            };
+            targets.push(target);
+        }
+
+        // 发射：谓词块语句（跳过它的分支），再 if 守卫 + switch。
+        self.emit_block_stmts(pred_cur, indent, true);
+        self.visited.insert(pred_cur);
+        self.structured_blocks += 1;
+
+        // 守卫条件：分支条件（越界→default）取反即"在表内"。
+        let prev = self.prev_insn(pred_cur, plast.addr);
+        let cond = branch_condition_text(plast, prev, self.namer);
+        let idx_text = (self.namer)(idx_reg.0).unwrap_or_else(|| "idx".to_string());
+        self.push(indent, format!("if (!({cond})) {{"));
+        self.push(
+            indent + 1,
+            format!("switch ({idx_text}) {{ /* 跳表 @{:#x} */", shape.table_addr),
+        );
+        for (i, &t) in targets.iter().enumerate() {
+            if t == 0 {
+                self.push(
+                    indent + 2,
+                    format!("case {i}: goto /* 表项 0，无法作目标 */ ;"),
+                );
+            } else {
+                self.push(indent + 2, format!("case {i}: goto {t:#x};"));
+            }
+        }
+        self.push(indent + 2, format!("default: goto {default_target:#x};"));
+        self.push(indent + 1, "}".to_string());
+        self.push(indent, "} else {".to_string());
+        self.push(indent + 1, format!("goto {default_target:#x};"));
+        self.push(indent, "}".to_string());
+
+        // switch 块本身也已"解释"掉（其分发被 case 表披露）。
+        self.visited.insert(switch_block);
+        self.structured_blocks += 1;
+        true
+    }
+
     /// 从 `cur` 开始发射到 `stop`（不含）为止。
     ///
     /// `bound` 为 `Some` 时表示只在给定块集合内展开（用于循环体）：遇到集合外的块就当作
@@ -231,6 +471,16 @@ impl Builder<'_> {
             let last_insn = self
                 .last_insn_addr(b)
                 .and_then(|a| self.by_addr.get(&a).copied());
+
+            // 跳表分发：条件块 + 一个间接跳转后继 = switch。先尝试还原，成功则整块消化掉。
+            // 放在 `if` 结构化之前，因为间接跳转块没有已知后继，`emit_if` 会因取不到 join 而放弃。
+            if let Some(insn) = last_insn {
+                if matches!(insn.flow, Flow::Branch { conditional: true })
+                    && self.emit_switch_from_pred(cur, insn, succs, indent)
+                {
+                    return;
+                }
+            }
 
             // 终结块（ret/trap）或没有已知后继：整块发射后停。
             if b.terminal || succs.is_empty() {
@@ -757,7 +1007,187 @@ mod tests {
 
     fn build(insns: Vec<DecodedInsn>) -> PseudocodeFunction {
         let cfg = Cfg::build(&insns);
-        decompile_structured(insns[0].addr, Some("f"), &insns, &cfg, &namer)
+        decompile_structured(insns[0].addr, Some("f"), &insns, &cfg, &namer, None)
+    }
+
+    /// 造一条 x86 `cmp reg, imm`（顺序流、只写标志——writes 放一个非操作数寄存器模拟标志）。
+    fn cmp_reg_imm(addr: u64, reg: u16, imm: i64) -> DecodedInsn {
+        let mut i = nop(addr);
+        i.operands = vec![Operand::Reg(RegId(reg)), Operand::Imm(imm)];
+        // 模拟标志寄存器写（不在操作数里的寄存器）。
+        i.writes.insert(RegId(999));
+        i.reads.insert(RegId(reg));
+        i
+    }
+
+    /// 造一条间接跳转 `jmp [idx*8 + table]`（目标未知 = switch 形态）。
+    fn jmp_table(addr: u64, idx_reg: u16, table: i64) -> DecodedInsn {
+        let mut i = jmp(addr, 0);
+        i.target = None;
+        i.operands = vec![Operand::Mem(bitflip_arch::MemRef {
+            base: None,
+            index: Some(RegId(idx_reg)),
+            scale: 8,
+            index_extend: None,
+            disp: table,
+            size: 8,
+            write: false,
+        })];
+        i
+    }
+
+    #[test]
+    fn switch_table_is_recovered_into_case_dispatch() {
+        // 布局：
+        //   0x1000 cmp r0(idx),2
+        //   0x1004 ja 0x3000 (default)      —— 本块两后继：0x1010(switch) 与 0x3000
+        //   0x1010 jmp [r0*8 + 0x8000]        —— switch 块，间接
+        //   0x3000 ret  (default)
+        //   表 @0x8000: [0x2000, 0x2010, 0x2020]
+        let insns = vec![
+            cmp_reg_imm(0x1000, 0, 2),
+            // ja：flow 条件跳转、target=default；但 CFG 会用 successors 判定。
+            DecodedInsn {
+                flow: Flow::Branch { conditional: true },
+                target: Some(0x3000),
+                condition: Some(ConditionCode::UnsignedHigher),
+                ..jmp(0x1004, 0x3000)
+            },
+            jmp_table(0x1008, 0, 0x8000),
+            ret(0x3000),
+        ];
+        let targets = [0x2000u64, 0x2010, 0x2020];
+        let reader = move |addr: u64, len: usize| -> Option<Vec<u8>> {
+            if addr != 0x8000 {
+                return None;
+            }
+            let mut out = Vec::new();
+            for t in targets.iter() {
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+            Some(out[..len.min(out.len())].to_vec())
+        };
+        let cfg = Cfg::build(&insns);
+        let f = decompile_structured(
+            insns[0].addr,
+            Some("f"),
+            &insns,
+            &cfg,
+            &namer,
+            Some(&reader),
+        );
+        let body = f
+            .structured_body
+            .as_ref()
+            .expect("应有结构化正文")
+            .join("\n");
+        assert!(body.contains("switch (r0)"), "应还原出 switch：\n{body}");
+        assert!(body.contains("case 0: goto 0x2000;"), "\n{body}");
+        assert!(body.contains("case 2: goto 0x2020;"), "\n{body}");
+        assert!(body.contains("default: goto 0x3000;"), "\n{body}");
+    }
+
+    #[test]
+    fn switch_offset_idiom_is_recovered() {
+        // MSVC x64 偏移跳表 idiom：
+        //   0x1000 cmp eax,1
+        //   0x1004 ja 0x4000 (default)
+        //   0x1008 lea r5, [rip + rel]        ; base = 0x1008 + 7 + rel
+        //   0x100f mov ecx, [r5 + r0*4 + 0]   ; 32 位偏移，项大小 4
+        //   0x1015 add r9, r5                 ; r9 = base + offset
+        //   0x1018 jmp r9
+        //   0x4000 ret
+        // 表 @base: 两个 u32 偏移 [0x40, 0x50] → 目标 base+0x40 / base+0x50。
+        let lea_addr = 0x1008u64;
+        let rel = 0x2000i64; // base = (0x1008 + 7) + 0x2000 = 0x300f
+        let mut lea = nop(lea_addr);
+        lea.len = 7;
+        lea.operands = vec![Operand::Reg(RegId(5)), Operand::PcRelative(rel)];
+        let mut mov = nop(0x100f);
+        mov.len = 6;
+        mov.operands = vec![
+            Operand::Reg(RegId(9)),
+            Operand::Mem(bitflip_arch::MemRef {
+                base: Some(RegId(5)),
+                index: Some(RegId(0)),
+                scale: 4,
+                index_extend: None,
+                disp: 0,
+                size: 4,
+                write: false,
+            }),
+        ];
+        let mut add = nop(0x1015);
+        add.operands = vec![Operand::Reg(RegId(9)), Operand::Reg(RegId(5))];
+        let mut jmp_reg = jmp(0x1019, 0);
+        jmp_reg.target = None;
+        jmp_reg.operands = vec![Operand::Reg(RegId(9))];
+        let insns = vec![
+            cmp_reg_imm(0x1000, 0, 1),
+            DecodedInsn {
+                flow: Flow::Branch { conditional: true },
+                target: Some(0x4000),
+                condition: Some(ConditionCode::UnsignedHigher),
+                ..jmp(0x1004, 0x4000)
+            },
+            lea,
+            mov,
+            add,
+            jmp_reg,
+            ret(0x4000),
+        ];
+        let base = lea_addr + 7 + rel as u64; // 0x300f
+        let reader = move |addr: u64, len: usize| -> Option<Vec<u8>> {
+            if addr != base {
+                return None;
+            }
+            let mut out = Vec::new();
+            out.extend_from_slice(&0x40u32.to_le_bytes());
+            out.extend_from_slice(&0x50u32.to_le_bytes());
+            Some(out[..len.min(out.len())].to_vec())
+        };
+        let cfg = Cfg::build(&insns);
+        let f = decompile_structured(
+            insns[0].addr,
+            Some("f"),
+            &insns,
+            &cfg,
+            &namer,
+            Some(&reader),
+        );
+        let body = f.structured_body.as_ref().expect("正文").join("\n");
+        assert!(body.contains("switch (r0)"), "应还原 switch：\n{body}");
+        assert!(
+            body.contains(&format!("case 0: goto {:#x};", base + 0x40)),
+            "偏移应加到基址：\n{body}"
+        );
+        assert!(
+            body.contains(&format!("case 1: goto {:#x};", base + 0x50)),
+            "\n{body}"
+        );
+    }
+
+    #[test]
+    fn switch_without_reader_stays_goto() {
+        // 没有 table_reader：间接跳转无法还原，应保持 goto 兜底（不猜）。
+        let insns = vec![
+            cmp_reg_imm(0x1000, 0, 2),
+            DecodedInsn {
+                flow: Flow::Branch { conditional: true },
+                target: Some(0x3000),
+                condition: Some(ConditionCode::UnsignedHigher),
+                ..jmp(0x1004, 0x3000)
+            },
+            jmp_table(0x1008, 0, 0x8000),
+            ret(0x3000),
+        ];
+        let cfg = Cfg::build(&insns);
+        let f = decompile_structured(insns[0].addr, Some("f"), &insns, &cfg, &namer, None);
+        let body = f.structured_body.as_ref().expect("应有正文").join("\n");
+        assert!(
+            !body.contains("switch"),
+            "无读取器时不应还原 switch：\n{body}"
+        );
     }
 
     #[test]

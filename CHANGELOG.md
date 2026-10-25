@@ -5,6 +5,28 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第五片：switch 跳表识别（基础版 + 诚实边界说明）
+
+- `structurize` 新增 `emit_switch_from_pred` / `parse_switch_shape`：把"`cmp X,N` + 条件跳转
+  （越界守卫）→ 间接跳转块"这一**跳表分发**还原成 `switch`，支持两种形状：
+  - **指针表** `jmp [idx*scale + TABLE]`（表项即目标地址，项大小 4/8）；
+  - **MSVC x64 偏移表 idiom** `lea BASE,[rip+off]` + `mov ecx,[BASE+idx*4+disp]` +
+    `add JREG,BASE` + `jmp JREG`（表项是**相对基址的 32 位偏移**，目标 = 基址 + 偏移）。
+- 产出 `if (<越界条件>的反) { switch (idx) { case i: goto Ti; ... default: goto D; } } else {
+  goto D; }`：披露分发表；case 体仍是 goto（后续工作）。判据纯结构化、不硬编码架构词，任何
+  一环不满足即回落 `if/goto` 兜底（§7）。
+- 注入 `TableReader`（`&dyn Fn(u64,usize)->OptionVec<u8>>`，core 由已构建的 `AddrSpace`
+  `read_window` 提供，不补零冒充）。`decompile_structured` 签名新增 `table_reader: Option`.
+- 单测：指针表 / 偏移表 idiom / 无读取器保持 goto，三例覆盖。
+- **诚实边界（重要）**：在参考目标 kernel32.dll(x86_64) 上实测**尚不能端到端产出** switch。
+  经排查，分发谓词块（如 `0x1800019cc cmp eax,0xc; ja`）与间接跳转块（`0x1800019d5 lea/mov/
+  add/jmp rcx`）在 CFG 里确实各自成块，但**当前结构化遍历路径尚未走到该谓词块**（函数靠前的
+  早退/尾跳分支使线性行走跳过它）——这属**上游 CFG 可达性/遍历覆盖**问题，非本片判定逻辑缺陷。
+  因此本片交付的是**已单测通过的基础实现**，真实收益待"CFG 覆盖/遍历"后续片补上后释放；不谎称
+  已在真实二进制上生效。
+- arch 102 / analyze 221(+3) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第四片：标志位条件升级为真实比较（`if (a < b)` 而非 `flags`）
 
 - 新增 `pseudo::branch_condition_text`：条件跳转的 C 表达式现在能结合**紧邻其前**的

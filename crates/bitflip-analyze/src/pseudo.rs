@@ -758,6 +758,15 @@ fn mem_text(m: &bitflip_arch::MemRef, namer: RegisterNamer<'_>) -> String {
 /// 返回 `None` 时调用方必须如实报告，**不得**编一个 `reg#44` 这样的假名（§7）。
 pub type RegisterNamer<'a> = &'a dyn Fn(u16) -> Option<String>;
 
+/// 只读数据读取器：按虚拟地址读 `len` 字节（用于读 switch 跳表）。
+///
+/// 返回 `Some(bytes)` 表示读到了（可能短于 `len`，到段尾），`None` 表示该地址
+/// 不在任何已映射区间。**不补零冒充**（§7）：读不到就是读不到，调用方据此放弃还原。
+///
+/// 与 [`RegisterNamer`] 同样的注入方式：本 crate 不持有"目标内存"，由调用方
+/// （core 的 `Session::read_virtual`）提供。
+pub type TableReader<'a> = &'a dyn Fn(u64, usize) -> Option<Vec<u8>>;
+
 /// 不做命名的解析器：所有寄存器都报"未知"。
 ///
 /// 这是**诚实的默认值**：宁可在输出里写明"寄存器名未覆盖"，

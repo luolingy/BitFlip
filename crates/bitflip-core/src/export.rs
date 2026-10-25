@@ -948,6 +948,12 @@ fn write_pseudo_c(
             .as_ref()
             .and_then(|r| r.register_name(bitflip_arch::RegId(id)))
     };
+    // 跳表读取器：用已构建的地址空间，按虚拟地址读只读数据（switch 跳表用）。
+    // 不补零冒充：`read_window` 只返回真实读到的字节（可能到段尾截断）。
+    let space = &disasm.space;
+    let table_reader = |addr: u64, len: usize| -> Option<Vec<u8>> {
+        space.read_window(addr, len).map(|(bytes, _span)| bytes)
+    };
 
     writer.push_raw(&pseudo_header(meta, options));
     if structured {
@@ -1022,7 +1028,14 @@ fn write_pseudo_c(
         let insns = disasm.decode_range(from, to);
         let inner = bitflip_analyze::Cfg::build(&insns);
         let code = if structured {
-            bitflip_analyze::decompile_structured(entry, name.as_deref(), &insns, &inner, &namer)
+            bitflip_analyze::decompile_structured(
+                entry,
+                name.as_deref(),
+                &insns,
+                &inner,
+                &namer,
+                Some(&table_reader),
+            )
         } else {
             bitflip_analyze::decompile_function(entry, name.as_deref(), &insns, &inner, &namer)
         };
