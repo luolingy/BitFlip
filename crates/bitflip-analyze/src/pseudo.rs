@@ -507,6 +507,127 @@ pub(crate) fn condition_text(c: ConditionCode) -> String {
     format!("/* {c:?} */ flags")
 }
 
+/// 条件分支的 C 表达式：能从前一条 `cmp`/`test` 还原成**真实比较**时就还，
+/// 否则退回标志位形式 `/* Cond */ flags`。
+///
+/// # 依据（为什么这不是猜）
+///
+/// x86 的条件跳转（`jl`/`jae`…）本身只读标志位；要给出 `a < b` 这样的比较，
+/// 必须结合**紧邻其前**那条设置标志的指令。这里的做法是结构化的、限定严格的：
+/// - 只认**同一条基本块内、紧挨在分支之前**的那条指令（`prev`）；
+/// - 它必须**不写任何通用寄存器**（`writes` 空）却读寄存器 —— 这正是 `cmp`/`test`
+///   这类"只设标志"指令的形状（普通算术会写目标寄存器，因此被排除）；
+/// - 两个操作数都是**同一寄存器**（`test a,a` 的自测形状）→ 还原成与 0 比较；
+///   否则按 `cmp a,b` 还原成有序比较。
+///
+/// 关系符按条件码的无/有符号语义选择（`jb` 是无符号"低于"→ `(unsigned)a < b`）。
+/// 拿不准的条件（`js`/`jo` 之类在 `cmp` 后很罕见）**退回标志位**，不硬套比较 —— §7 不猜。
+pub(crate) fn branch_condition_text(
+    branch: &DecodedInsn,
+    prev: Option<&DecodedInsn>,
+    namer: RegisterNamer<'_>,
+) -> String {
+    let Some(cc) = branch.condition else {
+        return "/* 条件未知 */ flags".to_string();
+    };
+    if let Some(text) = try_comparison(cc, prev, namer) {
+        return text;
+    }
+    condition_text(cc)
+}
+
+/// 收集一条指令所有操作数里出现的寄存器编号（基址/索引/移位寄存器都算）。
+///
+/// 用于判断"被写的寄存器是否就是某个操作数"——这是区分 `cmp/test`（只写标志）与
+/// `mov/add`（写目标操作数）的**与架构无关**的结构判据。
+fn operand_reg_ids(ops: &[Operand]) -> std::collections::BTreeSet<u16> {
+    let mut set = std::collections::BTreeSet::new();
+    for op in ops {
+        match op {
+            Operand::Reg(r) => {
+                set.insert(r.0);
+            }
+            Operand::Mem(m) => {
+                if let Some(b) = m.base {
+                    set.insert(b.0);
+                }
+                if let Some(i) = m.index {
+                    set.insert(i.0);
+                }
+            }
+            Operand::Shifted { reg, .. } => {
+                set.insert(reg.0);
+            }
+            _ => {}
+        }
+    }
+    set
+}
+
+/// 尝试把 `prev`(cmp/test) + `cc` 还原成比较表达式；不成立返回 `None`。
+fn try_comparison(
+    cc: ConditionCode,
+    prev: Option<&DecodedInsn>,
+    namer: RegisterNamer<'_>,
+) -> Option<String> {
+    let p = prev?;
+    // 形状门槛：只设标志、有两个操作数、顺序流、读寄存器。
+    //
+    // "只设标志"的判据**纯结构化、不硬编码架构寄存器名/编号**（硬编码会破坏分层，
+    // 按名字（"rflags"/"nzcv"）匹配同样会引入架构词汇）。用的是这样一条与架构无关的事实：
+    // `cmp`/`test` 的写集合是**标志寄存器**，它**不是**这条指令的操作数之一；
+    // 而 `mov`/`add`/`sub` 等会写**目标操作数**（写集合里含某个操作数寄存器）。
+    // 于是判据是："被写的寄存器**都不在操作数寄存器集合里**"。
+    if p.reads.is_empty() || p.operands.len() < 2 {
+        return None;
+    }
+    if !matches!(p.flow, Flow::Fallthrough) {
+        return None;
+    }
+    let operand_regs = operand_reg_ids(&p.operands);
+    let writes_only_flags = p.writes.iter().all(|r| !operand_regs.contains(&r.0));
+    if !writes_only_flags {
+        return None;
+    }
+    let lhs = expr_one(&p.operands[0], p.addr, namer).ok()?;
+    let rhs = expr_one(&p.operands[1], p.addr, namer).ok()?;
+
+    // `test a, a` 的自测形状：两操作数是同一寄存器 → 与 0 比较。
+    let same_reg = match (&p.operands[0], &p.operands[1]) {
+        (Operand::Reg(a), Operand::Reg(b)) => a.0 == b.0,
+        _ => false,
+    };
+    if same_reg {
+        return Some(match cc {
+            ConditionCode::Equal => format!("{lhs} == 0"),
+            ConditionCode::NotEqual => format!("{lhs} != 0"),
+            ConditionCode::Minus => format!("(int64_t){lhs} < 0"),
+            ConditionCode::Plus => format!("(int64_t){lhs} >= 0"),
+            // 其它条件对"自测"没有简洁语义 → 不猜。
+            _ => return None,
+        });
+    }
+
+    // 有序比较：按 cc 的语义选运算符。
+    let op = match cc {
+        ConditionCode::Equal => format!("{lhs} == {rhs}"),
+        ConditionCode::NotEqual => format!("{lhs} != {rhs}"),
+        // 有符号关系。
+        ConditionCode::SignedLessThan => format!("{lhs} < {rhs}"),
+        ConditionCode::SignedGreaterEqual => format!("{lhs} >= {rhs}"),
+        ConditionCode::SignedGreaterThan => format!("{lhs} > {rhs}"),
+        ConditionCode::SignedLessOrEqual => format!("{lhs} <= {rhs}"),
+        // 无符号关系（cast 出来才诚实：同一标志位在有/无符号下含义不同）。
+        ConditionCode::CarryClear => format!("(uint64_t){lhs} < (uint64_t){rhs}"),
+        ConditionCode::CarrySet => format!("(uint64_t){lhs} >= (uint64_t){rhs}"),
+        ConditionCode::UnsignedHigher => format!("(uint64_t){lhs} > (uint64_t){rhs}"),
+        ConditionCode::UnsignedLowerOrSame => format!("(uint64_t){lhs} <= (uint64_t){rhs}"),
+        // Minus/Plus/Overflow/NoOverflow/Always/Never 在 cmp 之后没有简洁比较语义 → 不猜。
+        _ => return None,
+    };
+    Some(op)
+}
+
 /// 生成左值（可赋值目标）。
 fn lvalue(op: &Operand, namer: RegisterNamer<'_>) -> Result<String, String> {
     match op {
@@ -649,7 +770,7 @@ pub fn no_register_names(id: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitflip_arch::{Arch, MnemonicId, RegId, RegSet};
+    use bitflip_arch::{Arch, ConditionCode, MnemonicId, RegId, RegSet};
 
     /// 一个**确定知道答案**的寄存器名解析器。
     ///
@@ -858,5 +979,108 @@ mod tests {
                 assert!(s.addr >= b.start && s.addr < b.end, "语句地址应在块内");
             }
         }
+    }
+
+    /// 造一条"只设标志"的 `cmp`/`test`：reads 有、writes 空、顺序流、两操作数。
+    fn cmp(addr: u64, a: Operand, b: Operand) -> DecodedInsn {
+        let mut i = insn(addr, 7, Flow::Fallthrough, None, vec![a, b]);
+        // 读到寄存器（capstone 对 cmp 的常见表现），但不写通用寄存器。
+        if let Operand::Reg(r) = &i.operands[0] {
+            i.reads.insert(*r);
+        }
+        i
+    }
+
+    /// 造一条条件跳转（设置 condition）。
+    fn jcc(addr: u64, cc: ConditionCode) -> DecodedInsn {
+        let mut i = insn(
+            addr,
+            7,
+            Flow::Branch { conditional: true },
+            Some(0x2000),
+            vec![],
+        );
+        i.condition = Some(cc);
+        i
+    }
+
+    #[test]
+    fn cmp_plus_jcc_becomes_real_comparison() {
+        // cmp rax, 0x7 ; jl → if (rax < 0x7)
+        let c = cmp(0x1000, Operand::Reg(RegId(19)), Operand::Imm(7));
+        let j = jcc(0x1003, ConditionCode::SignedLessThan);
+        assert_eq!(
+            branch_condition_text(&j, Some(&c), &test_namer),
+            "rax < 0x7"
+        );
+    }
+
+    #[test]
+    fn cmp_equality_uses_double_equals() {
+        let c = cmp(0x1000, Operand::Reg(RegId(19)), Operand::Reg(RegId(26)));
+        let j = jcc(0x1003, ConditionCode::Equal);
+        assert_eq!(
+            branch_condition_text(&j, Some(&c), &test_namer),
+            "rax == rcx"
+        );
+    }
+
+    #[test]
+    fn unsigned_condition_casts_both_sides() {
+        // jb（无符号低于）→ (uint64_t)rax < (uint64_t)rdx
+        let c = cmp(0x1000, Operand::Reg(RegId(19)), Operand::Reg(RegId(27)));
+        let j = jcc(0x1003, ConditionCode::CarryClear);
+        assert_eq!(
+            branch_condition_text(&j, Some(&c), &test_namer),
+            "(uint64_t)rax < (uint64_t)rdx"
+        );
+    }
+
+    #[test]
+    fn test_self_shape_becomes_zero_compare() {
+        // test rax, rax ; jz → rax == 0
+        let c = cmp(0x1000, Operand::Reg(RegId(19)), Operand::Reg(RegId(19)));
+        let j = jcc(0x1003, ConditionCode::Equal);
+        assert_eq!(branch_condition_text(&j, Some(&c), &test_namer), "rax == 0");
+        let jnz = jcc(0x1003, ConditionCode::NotEqual);
+        assert_eq!(
+            branch_condition_text(&jnz, Some(&c), &test_namer),
+            "rax != 0"
+        );
+    }
+
+    #[test]
+    fn no_prev_or_non_flags_insn_falls_back_to_flags() {
+        // 没有前驱 → 标志位占位。
+        let j = jcc(0x1000, ConditionCode::SignedLessThan);
+        assert_eq!(
+            branch_condition_text(&j, None, &test_namer),
+            "/* SignedLessThan */ flags"
+        );
+        // 前驱会写通用寄存器（不是 cmp/test 形状）→ 不还原比较，退回标志位。
+        let mut arith = insn(
+            0x1000,
+            7,
+            Flow::Fallthrough,
+            None,
+            vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(26))],
+        );
+        arith.writes.insert(RegId(19)); // 写了目标 → 不是纯标志设置
+        let j2 = jcc(0x1003, ConditionCode::Equal);
+        assert_eq!(
+            branch_condition_text(&j2, Some(&arith), &test_namer),
+            "/* Equal */ flags"
+        );
+    }
+
+    #[test]
+    fn relational_after_self_test_is_not_forced() {
+        // test rax,rax + jl（有符号小于）在自测形状里无简洁语义 → 退回标志位，不猜。
+        let c = cmp(0x1000, Operand::Reg(RegId(19)), Operand::Reg(RegId(19)));
+        let j = jcc(0x1003, ConditionCode::SignedLessThan);
+        assert_eq!(
+            branch_condition_text(&j, Some(&c), &test_namer),
+            "/* SignedLessThan */ flags"
+        );
     }
 }

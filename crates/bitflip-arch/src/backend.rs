@@ -1653,6 +1653,43 @@ mod tests {
     }
 
     #[test]
+    fn x86_cmp_write_register_is_not_an_operand() {
+        // 结构化把 `cmp`/`test` + 条件跳转还原成真实比较，靠的是"只设标志"的形状判据：
+        // "被写的寄存器不在操作数寄存器里"（标志寄存器不是操作数；mov/add 会写目标操作数）。
+        // 这条测试钉死前提：capstone 对 cmp 报告的写寄存器**不是**它的操作数。
+        // 若将来变了，判据会失效、结构化退回 flags —— 这里先失败提醒。
+        let dec = decoder();
+        let operand_regs = |insn: &crate::insn::DecodedInsn| -> Vec<u16> {
+            insn.operands
+                .iter()
+                .filter_map(|op| match op {
+                    crate::insn::Operand::Reg(r) => Some(r.0),
+                    _ => None,
+                })
+                .collect()
+        };
+        // 83 f8 00 = cmp eax, 0
+        let cmp = dec.decode_one(&[0x83, 0xF8, 0x00], 0x1000).expect("cmp");
+        assert!(!cmp.reads.is_empty(), "cmp 应读操作数");
+        let regs = operand_regs(&cmp);
+        for r in cmp.writes.iter() {
+            assert!(
+                !regs.contains(&r.0),
+                "cmp 的写寄存器 {r:?} 竟然出现在操作数里，判据会失效"
+            );
+        }
+        // 85 c0 = test eax, eax
+        let test = dec.decode_one(&[0x85, 0xC0], 0x1000).expect("test");
+        let regs = operand_regs(&test);
+        for r in test.writes.iter() {
+            assert!(
+                !regs.contains(&r.0),
+                "test 的写寄存器 {r:?} 竟然出现在操作数里，判据会失效"
+            );
+        }
+    }
+
+    #[test]
     fn relative_targets_are_resolved_to_absolute() {
         // 固化"capstone 给的是绝对目标"这一事实：如果将来换了后端
         // （D3 决策），这里会立刻失败，提醒适配层做转换。

@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第四片：标志位条件升级为真实比较（`if (a < b)` 而非 `flags`）
+
+- 新增 `pseudo::branch_condition_text`：条件跳转的 C 表达式现在能结合**紧邻其前**的
+  `cmp`/`test` 还原成**真实比较**——`cmp rax,0x7` + `jl` → `if (rax < 0x7)`，
+  `test rax,rax` + `jz` → `if (rax == 0)`；关系符按条件码无/有符号语义选
+  （`jb` → `(uint64_t)a < (uint64_t)b`，`jl` → `a < b`）。`pseudo-c-structured` 已接入。
+- **判据纯结构化、不硬编码架构词**（守住分层）：只认**同一基本块内、紧挨在分支之前**、
+  有 ≥2 操作数、顺序流、且"被写寄存器**不在操作数寄存器集合里**"的指令（`cmp`/`test`
+  只写标志寄存器，标志不是操作数；`mov`/`add` 会写目标操作数 → 被排除，不误判为比较）。
+  两操作数是同一寄存器（`test a,a` 自测形状）→ 还原成与 0 比较。
+- **拿不准就退回标志位**：无前驱、前驱会写通用寄存器、或 `js`/`jo` 等在 `cmp` 后无简洁
+  比较语义的条件、以及自测形状配关系条件——一律退回 `/* Cond */ flags`，不硬套比较（§7）。
+- `arch` 增补回归测试钉死前提：capstone 对 `cmp`/`test` 报告的写寄存器不是其操作数（判据依赖）；
+  若将来变了测试先失败提醒。新增 `pseudo::branch_condition_text` 6 项单测（有符号/无符号/
+  相等/自测零比较/无前驱退回/非标志前驱退回/自测+关系退回）。
+- 真实效果：kernel32.dll(x86_64) 同一 120KB 段，`flags` 风格 `if` 由 126 → 15，
+  出现 `!(eax == 0)`、`(uint64_t)...`、内存比较等真实条件。
+- arch 102(+1) / analyze 218(+6) / core 73 / server m6 17 / cli 40，`cargo test --workspace`
+  全绿；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第三片：x86 分支条件可读（`if`/`while` 条件从"条件未知"变具体）
 
 - `bitflip-arch` 的 `convert_condition` 为 **x86 / x86_64** 补上条件码：capstone 0.14 的 x86

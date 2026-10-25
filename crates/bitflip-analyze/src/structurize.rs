@@ -23,7 +23,7 @@ use bitflip_arch::{DecodedInsn, Flow};
 
 use crate::cfg::Cfg;
 use crate::pseudo::{
-    condition_text, decompile_function, translate, PseudocodeFunction, PseudocodeNote,
+    branch_condition_text, decompile_function, translate, PseudocodeFunction, PseudocodeNote,
     RegisterNamer,
 };
 
@@ -179,6 +179,16 @@ impl Builder<'_> {
             .map(|(&a, _)| a)
     }
 
+    /// 取块内紧挨在 `branch_addr` **之前**的那条指令（用于把 `cmp`/`test` + 条件跳转
+    /// 还原成真实比较）。只在同一基本块范围内找，不跨块 —— 跨块的标志设置已不在
+    /// "紧邻"范围内，跨块猜比较不可靠。
+    fn prev_insn(&self, block_start: u64, branch_addr: u64) -> Option<&DecodedInsn> {
+        self.by_addr
+            .range(block_start..branch_addr)
+            .next_back()
+            .map(|(_, insn)| *insn)
+    }
+
     /// 从 `cur` 开始发射到 `stop`（不含）为止。
     ///
     /// `bound` 为 `Some` 时表示只在给定块集合内展开（用于循环体）：遇到集合外的块就当作
@@ -305,13 +315,12 @@ impl Builder<'_> {
             return false;
         };
 
-        // 条件文本（与扁平模式同一套占位，不假装是比较）。
+        // 条件文本：能从前一条 cmp/test 还原成真实比较时就还，否则退回标志位占位。
         let Some(insn) = last_insn else {
             return false;
         };
-        let cond = insn
-            .condition
-            .map_or_else(|| "/* 条件未知 */".to_string(), condition_text);
+        let prev = self.prev_insn(cur, insn.addr);
+        let cond = branch_condition_text(insn, prev, self.namer);
 
         // 判定形态。
         if join == taken {
@@ -403,9 +412,8 @@ impl Builder<'_> {
         else {
             return false;
         };
-        let cond = hlast
-            .condition
-            .map_or_else(|| "/* 条件未知 */".to_string(), condition_text);
+        let prev = self.prev_insn(header, hlast.addr);
+        let cond = branch_condition_text(hlast, prev, self.namer);
 
         // 循环出口：体集合中、后继落在体外的目标（必须唯一，否则不猜）。
         let mut exits: BTreeSet<u64> = BTreeSet::new();
