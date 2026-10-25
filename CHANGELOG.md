@@ -5,6 +5,25 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第八片：间接调用/跳板解析成导入名（`ReadFile()` 而非裸槽地址）
+
+- 上一片把间接调用/跳板的槽地址如实写出了，但仍是裸的 `0x180084580`。本片把**槽 → 导入名**
+  接进渲染：新增注入 `ImportNamer`（`&dyn Fn(u64) -> Option<String>`），由 core 用
+  `ImportEdges::from_parts` 建「槽 → 导入」表提供，解出 `模块!函数名`。
+- 渲染规则（语义不含糊，§7）：
+  - **间接调用**（call 通过槽）→ 直接用名字：`/* call */ api-ms-win-core-file-l1-1-0.dll!ReadFile /* *(void **)0x180084580 */()`；
+  - **间接跳转**（goto 通过槽）→ 目标必须是"槽里的值"，所以保留解引用、把名字放注释：
+    `goto *(void **)0x180085430 /* = api-ms-win-core-rtlsupport-l1-1-0.dll!RtlVirtualUnwind */`；
+  - 按序号导入无名字 → 写 `模块!#序号`，**不编**像名字的字符串；解析不出来 → 退回裸槽地址。
+- 用 `from_parts`（不是 `build`）：只建「槽 → 导入」查询，不触碰被验收冻结的 PE/ELF 调用图边
+  行为（`build` 仍只对 Mach-O 建表）。
+- 效果（kernel32.dll x86_64 全量）：**672 处**间接调用写出真实导入名（`ReadFile`/`SetFilePointerEx`/
+  `SetLastError`/`RtlVirtualUnwind` 等），**90 处**跳板 goto 带 `/* = 模块!函数 */`；仅 14 处因
+  导入表未列出而保留裸槽地址（如实，不猜）。
+- 新增 3 项单测：已知槽的 call 用名字 / 已知槽的 goto 保解引用加名字注释 / 未知槽退回裸地址。
+- arch 102 / analyze 230(+3) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第七片：间接跳转/调用写出真实目标（去掉误导性的 `0`）
 
 - 伪代码里 `goto /* 目标未知（间接） */ 0` 与 `/* call */ …0()` 里那个 **`0` 是误导**：它占着

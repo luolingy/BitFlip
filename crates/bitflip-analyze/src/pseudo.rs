@@ -307,6 +307,7 @@ pub fn decompile_function(
     insns: &[DecodedInsn],
     cfg: &Cfg,
     namer: RegisterNamer<'_>,
+    import_namer: Option<ImportNamer<'_>>,
 ) -> PseudocodeFunction {
     let mut notes = vec![PseudocodeNote::FlatGoto];
     if name.is_none() {
@@ -335,7 +336,7 @@ pub fn decompile_function(
                 truncated += 1;
                 continue;
             }
-            match translate(insn, namer) {
+            match translate(insn, namer, import_namer) {
                 Ok(Some(text)) => {
                     statements.push(PseudocodeStatement { addr, text });
                     statement_count += 1;
@@ -417,6 +418,7 @@ pub fn decompile_function(
 pub(crate) fn translate(
     insn: &DecodedInsn,
     namer: RegisterNamer<'_>,
+    import_namer: Option<ImportNamer<'_>>,
 ) -> Result<Option<String>, String> {
     let m = insn.mnemonic;
     let ops = &insn.operands;
@@ -430,7 +432,7 @@ pub(crate) fn translate(
             // 只有确实无法表达才说未知 —— 用一个裸 `0` 冒充目标地址是误导（§7）。
             let target = match insn.target {
                 Some(t) => format!("{t:#x}"),
-                None => indirect_goto_target(insn, namer)
+                None => indirect_goto_target(insn, namer, import_namer, false)
                     .unwrap_or_else(|| "/* 目标未知（间接） */ 0".to_string()),
             };
             if conditional {
@@ -446,7 +448,8 @@ pub(crate) fn translate(
             // 所以这里**不编造参数**，只给被调者地址。
             let callee = match insn.target {
                 Some(t) => format!("{t:#x}"),
-                None => indirect_goto_target(insn, namer)
+                // call 通过槽间接调用时，若有导入名就直接用名字（可读性最高）。
+                None => indirect_goto_target(insn, namer, import_namer, true)
                     .unwrap_or_else(|| "/* 目标未知（间接） */ 0".to_string()),
             };
             // AArch64/AArch32 的 bl 带返回地址寄存器，但那是链接细节不是 C 参数。
@@ -715,14 +718,29 @@ fn expr_one(op: &Operand, addr: u64, namer: RegisterNamer<'_>) -> Result<String,
 /// - `Operand::Reg(r)`：`jmp reg` → 直接是寄存器里的地址，写成寄存器名。
 ///
 /// 这些都不是"编出来的常量"，而是指令本身表达的事实；比一个裸 `0` 诚实得多。
-fn indirect_goto_target(insn: &DecodedInsn, namer: RegisterNamer<'_>) -> Option<String> {
+fn indirect_goto_target(
+    insn: &DecodedInsn,
+    namer: RegisterNamer<'_>,
+    import_namer: Option<ImportNamer<'_>>,
+    is_call: bool,
+) -> Option<String> {
     match insn.operands.as_slice() {
-        // `jmp [rip+rel]` / `call [rip+rel]` —— 导入跳板与 IAT 槽调用。
+        // `jmp/call [rip+rel]` —— 导入跳板与 IAT 槽调用。
         [Operand::PcRelative(rel)] => {
             let slot = insn
                 .addr
                 .wrapping_add(u64::from(insn.len))
                 .wrapping_add(*rel as u64);
+            // 能解析出导入名时：call 直接用名字（最好读），goto 用解引用+名字注释
+            // （因为 goto 的目标必须是"槽里的值"，把名字放在注释里，语义不含糊）。
+            let import = import_namer.and_then(|f| f(slot));
+            if let Some(name) = import {
+                if is_call {
+                    // 形如 `KERNEL32.dll!RtlAllocateHeap /* *(void **)0xSLOT */`
+                    return Some(format!("{name} /* *(void **){slot:#x} */"));
+                }
+                return Some(format!("*(void **){slot:#x} /* = {name} */"));
+            }
             Some(format!("*(void **){slot:#x}"))
         }
         // `jmp [base+idx*scale+disp]` —— 跳表或槽表寻址。
@@ -797,6 +815,14 @@ pub type RegisterNamer<'a> = &'a dyn Fn(u16) -> Option<String>;
 /// 与 [`RegisterNamer`] 同样的注入方式：本 crate 不持有"目标内存"，由调用方
 /// （core 的 `Session::read_virtual`）提供。
 pub type TableReader<'a> = &'a dyn Fn(u64, usize) -> Option<Vec<u8>>;
+
+/// 导入名解析器：给一个**槽地址/IAT 地址**，返回该导入的可读名（例如
+/// `KERNEL32.dll!RtlAllocateHeap`），解不出来就 `None`。
+///
+/// 与 [`RegisterNamer`]/[`TableReader`] 同一种注入方式：本 crate 不持有导入表，
+/// 由 core 用 `ImportEdges` 提供。**解不出来就返回 None**，渲染层据此退回显示槽地址，
+/// 绝不编一个像模像样的函数名（§7）。
+pub type ImportNamer<'a> = &'a dyn Fn(u64) -> Option<String>;
 
 /// 不做命名的解析器：所有寄存器都报"未知"。
 ///
@@ -885,7 +911,7 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(9999)), Operand::Imm(1)],
         );
-        let e = translate(&i, &test_namer).unwrap_err();
+        let e = translate(&i, &test_namer, None).unwrap_err();
         assert!(e.contains("9999"), "应报出编号：{e}");
         assert!(e.contains("无名字"), "应说明是没有名字：{e}");
     }
@@ -908,7 +934,7 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(19)), Operand::Imm(7)],
         );
-        let text = translate(&i, &test_namer).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None).unwrap().unwrap();
         assert!(text.contains("rax = 0x7"), "{text}");
     }
 
@@ -924,7 +950,7 @@ mod tests {
             vec![],
         );
         i.condition = Some(ConditionCode::Equal);
-        let text = translate(&i, &test_namer).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None).unwrap().unwrap();
         assert!(text.contains("goto 0x1100"), "应含 goto：{text}");
         assert!(text.starts_with("if ("), "应保留条件：{text}");
         // 不得出现 C 的语句块花括号 —— 那会让人以为是结构化输出。
@@ -935,7 +961,7 @@ mod tests {
     fn indirect_branch_says_unknown_instead_of_guessing() {
         // 间接跳转没有目标：必须写明"未知"，不能编一个地址。
         let i = insn(0x2000, 2, Flow::Branch { conditional: false }, None, vec![]);
-        let text = translate(&i, &test_namer).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None).unwrap().unwrap();
         assert!(text.contains("目标未知"), "应说明目标未知：{text}");
         assert!(text.contains("goto"), "仍需给出 goto：{text}");
     }
@@ -943,9 +969,9 @@ mod tests {
     #[test]
     fn return_and_trap_are_rendered() {
         let r = insn(0, 3, Flow::Return, None, vec![]);
-        assert_eq!(translate(&r, &test_namer).unwrap().unwrap(), "return");
+        assert_eq!(translate(&r, &test_namer, None).unwrap().unwrap(), "return");
         let t = insn(0, 4, Flow::Trap, None, vec![]);
-        assert!(translate(&t, &test_namer)
+        assert!(translate(&t, &test_namer, None)
             .unwrap()
             .unwrap()
             .contains("trap"));
@@ -988,7 +1014,7 @@ mod tests {
     #[test]
     fn unnamed_function_gets_a_note_not_a_fabricated_name() {
         let cfg = Cfg::build(&[]);
-        let f = decompile_function(0x1000, None, &[], &cfg, &test_namer);
+        let f = decompile_function(0x1000, None, &[], &cfg, &test_namer, None);
         assert!(f.name.is_none(), "不得编造名字");
         assert!(f.notes.contains(&PseudocodeNote::Unnamed));
         // 渲染时用入口地址，不是 func_xxx。
@@ -1001,7 +1027,7 @@ mod tests {
     fn flat_goto_note_is_always_present() {
         // 这条说明决定了用户怎么读输出，漏掉它等于让用户误判。
         let cfg = Cfg::build(&[]);
-        let f = decompile_function(0, Some("f"), &[], &cfg, &test_namer);
+        let f = decompile_function(0, Some("f"), &[], &cfg, &test_namer, None);
         assert!(f.notes.contains(&PseudocodeNote::FlatGoto));
         assert!(!f.structured, "本模块恒不结构化");
     }
@@ -1012,7 +1038,7 @@ mod tests {
         let ops = vec![Operand::Reg(RegId(19)), Operand::Imm(7)];
         let insns = vec![insn(0x1000, 10, Flow::Fallthrough, None, ops)];
         let cfg = Cfg::build(&insns);
-        let f = decompile_function(0x1000, Some("f"), &insns, &cfg, &test_namer);
+        let f = decompile_function(0x1000, Some("f"), &insns, &cfg, &test_namer, None);
         assert_eq!(f.untranslated, 0, "这条应当能翻译");
         for b in &f.blocks {
             for s in &b.statements {
@@ -1131,7 +1157,7 @@ mod tests {
         let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
-        let text = translate(&i, &test_namer).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None).unwrap().unwrap();
         // 槽 = 0x1000 + 6 + 0x1234 = 0x223a
         assert_eq!(text, "goto *(void **)0x223a");
         assert!(!text.contains("目标未知"), "不该再退回未知占位：{text}");
@@ -1142,7 +1168,7 @@ mod tests {
         // `jmp rax`（35 是 capstone 的 rsp；这里用 19 = rax）→ 目标就是寄存器里的地址。
         let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
         i.operands = vec![Operand::Reg(RegId(19))];
-        let text = translate(&i, &test_namer).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None).unwrap().unwrap();
         assert_eq!(text, "goto rax");
     }
 
@@ -1159,7 +1185,7 @@ mod tests {
             size: 8,
             write: false,
         })];
-        let text = translate(&i, &test_namer).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None).unwrap().unwrap();
         assert!(
             text.starts_with("goto *(void **)("),
             "应解引用表寻址：{text}"
@@ -1172,7 +1198,45 @@ mod tests {
     fn indirect_jump_without_usable_operand_still_says_unknown() {
         // 操作数里没有任何可用线索时，仍如实说未知（不退化成假地址，也不编目标）。
         let i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
-        let text = translate(&i, &test_namer).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None).unwrap().unwrap();
         assert_eq!(text, "goto /* 目标未知（间接） */ 0");
+    }
+
+    #[test]
+    fn indirect_call_through_a_known_import_slot_uses_the_import_name() {
+        // call [rip+rel]，槽 0x223a；导入名解析器认得这个槽 → 直接用名字，槽地址退到注释。
+        let mut i = insn(0x1000, 7, Flow::Call, None, vec![]);
+        i.len = 6;
+        i.operands = vec![Operand::PcRelative(0x1234)];
+        let imp = |slot: u64| -> Option<String> {
+            (slot == 0x223a).then(|| "KERNEL32.dll!RtlAllocateHeap".to_string())
+        };
+        let text = translate(&i, &test_namer, Some(&imp)).unwrap().unwrap();
+        assert_eq!(
+            text,
+            "/* call */ KERNEL32.dll!RtlAllocateHeap /* *(void **)0x223a */()"
+        );
+    }
+
+    #[test]
+    fn indirect_jump_through_a_known_import_slot_keeps_deref_and_notes_the_name() {
+        // goto 的目标必须是"槽里的值"，所以保留解引用，把导入名放注释里，语义不含糊。
+        let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
+        i.len = 6;
+        i.operands = vec![Operand::PcRelative(0x1234)];
+        let imp = |slot: u64| -> Option<String> { (slot == 0x223a).then(|| "K!Func".to_string()) };
+        let text = translate(&i, &test_namer, Some(&imp)).unwrap().unwrap();
+        assert_eq!(text, "goto *(void **)0x223a /* = K!Func */");
+    }
+
+    #[test]
+    fn unknown_slot_falls_back_to_the_plain_slot_address() {
+        // 解析器不认识这个槽 → 不编名字，只写槽地址（与无解析器时一致）。
+        let mut i = insn(0x1000, 7, Flow::Call, None, vec![]);
+        i.len = 6;
+        i.operands = vec![Operand::PcRelative(0x1234)];
+        let imp = |_slot: u64| -> Option<String> { None };
+        let text = translate(&i, &test_namer, Some(&imp)).unwrap().unwrap();
+        assert_eq!(text, "/* call */ *(void **)0x223a()");
     }
 }

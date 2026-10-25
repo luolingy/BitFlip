@@ -23,8 +23,8 @@ use bitflip_arch::{DecodedInsn, Flow, Operand};
 
 use crate::cfg::Cfg;
 use crate::pseudo::{
-    branch_condition_text, decompile_function, translate, PseudocodeFunction, PseudocodeNote,
-    RegisterNamer, TableReader,
+    branch_condition_text, decompile_function, translate, ImportNamer, PseudocodeFunction,
+    PseudocodeNote, RegisterNamer, TableReader,
 };
 
 /// 结构化渲染的一行。
@@ -69,9 +69,10 @@ pub fn decompile_structured(
     cfg: &Cfg,
     namer: RegisterNamer<'_>,
     table_reader: Option<TableReader<'_>>,
+    import_namer: Option<ImportNamer<'_>>,
 ) -> PseudocodeFunction {
     // 先拿扁平版本：它已经算好了每块的语句、未翻译计数、截断、基础 notes。
-    let mut flat = decompile_function(entry, name, insns, cfg, namer);
+    let mut flat = decompile_function(entry, name, insns, cfg, namer, import_namer);
 
     if cfg.is_empty() {
         return flat;
@@ -97,6 +98,7 @@ pub fn decompile_structured(
         natural_loops: &natural_loops,
         namer,
         table_reader,
+        import_namer,
         visited: BTreeSet::new(),
         lines: Vec::new(),
         residual_gotos: 0,
@@ -193,6 +195,8 @@ struct Builder<'a> {
     namer: RegisterNamer<'a>,
     /// 只读数据读取器（读 switch 跳表）；`None` 时不做 switch 还原。
     table_reader: Option<TableReader<'a>>,
+    /// 导入名解析器（间接调用/跳板的槽 → 导入名）；`None` 时只写槽地址。
+    import_namer: Option<ImportNamer<'a>>,
     visited: BTreeSet<u64>,
     lines: Vec<Line>,
     residual_gotos: usize,
@@ -219,7 +223,7 @@ impl Builder<'_> {
             if skip_last_branch && Some(addr) == last_addr {
                 continue;
             }
-            match translate(insn, self.namer) {
+            match translate(insn, self.namer, self.import_namer) {
                 Ok(Some(text)) => self.push(indent, format!("{text}; /* @{addr:#x} */")),
                 Ok(None) => {}
                 Err(reason) => {
@@ -1086,7 +1090,7 @@ mod tests {
 
     fn build(insns: Vec<DecodedInsn>) -> PseudocodeFunction {
         let cfg = Cfg::build(&insns);
-        decompile_structured(insns[0].addr, Some("f"), &insns, &cfg, &namer, None)
+        decompile_structured(insns[0].addr, Some("f"), &insns, &cfg, &namer, None, None)
     }
 
     /// 造一条 x86 `cmp reg, imm`（顺序流、只写标志——writes 放一个非操作数寄存器模拟标志）。
@@ -1154,6 +1158,7 @@ mod tests {
             &cfg,
             &namer,
             Some(&reader),
+            None,
         );
         let body = f
             .structured_body
@@ -1233,6 +1238,7 @@ mod tests {
             &cfg,
             &namer,
             Some(&reader),
+            None,
         );
         let body = f.structured_body.as_ref().expect("正文").join("\n");
         assert!(body.contains("switch (r0)"), "应还原 switch：\n{body}");
@@ -1261,7 +1267,7 @@ mod tests {
             ret(0x3000),
         ];
         let cfg = Cfg::build(&insns);
-        let f = decompile_structured(insns[0].addr, Some("f"), &insns, &cfg, &namer, None);
+        let f = decompile_structured(insns[0].addr, Some("f"), &insns, &cfg, &namer, None, None);
         let body = f.structured_body.as_ref().expect("应有正文").join("\n");
         assert!(
             !body.contains("switch"),

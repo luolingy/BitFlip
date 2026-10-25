@@ -954,6 +954,35 @@ fn write_pseudo_c(
     let table_reader = |addr: u64, len: usize| -> Option<Vec<u8>> {
         space.read_window(addr, len).map(|(bytes, _span)| bytes)
     };
+    // 读字节闭包（供导入边建表用），独立于 `table_reader` 以便有独立的生命周期，
+    // 让 `ImportEdges` 能借用它。
+    let read_bytes = |addr: u64, len: usize| space.read(addr, len);
+
+    // 导入名解析：把间接调用/跳板里那个 IAT 槽地址翻成可读的 `模块!函数名`。
+    //
+    // 这里直接用 `ImportEdges::from_parts`（而不是 `build`）——`build` 只对 Mach-O 建表
+    // （PE/ELF 的**调用图边**行为被验收冻结，见 import_edges 模块文档），但本处只需
+    // "槽地址 → 导入条目" 这条查询，对所有带 `iat_slot` 的格式都成立，且不改动任何
+    // 冻结的调用图行为。桩节范围传空：本处只走规则 1（目标本身就是槽），不需要桩识别。
+    let import_edges = session.object().map(|object| {
+        crate::import_edges::ImportEdges::from_parts(
+            &object.imports,
+            object.arch,
+            Vec::new(),
+            &read_bytes,
+        )
+    });
+    let import_namer = |slot: u64| -> Option<String> {
+        let edges = import_edges.as_ref()?;
+        let index = edges.lookup_index(slot)?;
+        let import = edges.import_at(index)?;
+        Some(match (&import.name, import.ordinal) {
+            (Some(name), _) => format!("{}!{name}", import.module),
+            // 按序号导入：没有名字就如实写序号，**不编**一个像名字的字符串（§7）。
+            (None, Some(ordinal)) => format!("{}!#{ordinal}", import.module),
+            (None, None) => return None,
+        })
+    };
 
     writer.push_raw(&pseudo_header(meta, options));
     if structured {
@@ -1035,9 +1064,17 @@ fn write_pseudo_c(
                 &inner,
                 &namer,
                 Some(&table_reader),
+                Some(&import_namer),
             )
         } else {
-            bitflip_analyze::decompile_function(entry, name.as_deref(), &insns, &inner, &namer)
+            bitflip_analyze::decompile_function(
+                entry,
+                name.as_deref(),
+                &insns,
+                &inner,
+                &namer,
+                Some(&import_namer),
+            )
         };
 
         statements += code.statement_count as u64;
