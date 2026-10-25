@@ -984,6 +984,48 @@ fn write_pseudo_c(
         })
     };
 
+    // 字符串解析：地址落在**可读、非写、非执行**的段（.rdata / __const 之类）里、且是一段
+    // 以 NUL 结尾的干净可打印字节时返回它。保守判定：段权限来自 loader（事实），字节可打印性
+    // 直接判（事实），不假设 UTF-8/UTF-16 编码（只收 ASCII 可打印 + 常见空白），给错会误导。
+    let string_reader = |addr: u64| -> Option<String> {
+        let in_rodata = disasm.space.segments().iter().any(|seg| {
+            let end = seg.vaddr.saturating_add(seg.vsize);
+            addr >= seg.vaddr
+                && addr < end
+                && seg.perms.read
+                && !seg.perms.write
+                && !seg.perms.execute
+        });
+        if !in_rodata {
+            return None;
+        }
+        // 用 `read_window`（读可用字节，段尾会截断）而不是 `read`（读不满就整段 None）：
+        // 段尾附近的字符串也能读到，不会因为"后面 512 字节不满"就整条放弃。
+        let (bytes, _span) = disasm.space.read_window(addr, 512)?;
+        let mut out = String::new();
+        let mut terminated = false;
+        for &byte in &bytes {
+            if byte == 0 {
+                terminated = true;
+                break;
+            }
+            let printable = (0x20..=0x7e).contains(&byte) || matches!(byte, b'\t' | b'\r' | b'\n');
+            if !printable {
+                return None;
+            }
+            out.push(byte as char);
+            if out.len() >= 400 {
+                return None;
+            }
+        }
+        // 至少几个字符、且确实以 NUL 结尾，才认为是一段字符串（避免把短数据片段当串）。
+        if terminated && out.len() >= 4 {
+            Some(out)
+        } else {
+            None
+        }
+    };
+
     writer.push_raw(&pseudo_header(meta, options));
     if structured {
         writer.push_raw(
@@ -1063,8 +1105,11 @@ fn write_pseudo_c(
                 &insns,
                 &inner,
                 &namer,
-                Some(&table_reader),
-                Some(&import_namer),
+                bitflip_analyze::Resolvers {
+                    table: Some(&table_reader),
+                    import: Some(&import_namer),
+                    string: Some(&string_reader),
+                },
             )
         } else {
             bitflip_analyze::decompile_function(
@@ -1074,6 +1119,7 @@ fn write_pseudo_c(
                 &inner,
                 &namer,
                 Some(&import_namer),
+                Some(&string_reader),
             )
         };
 

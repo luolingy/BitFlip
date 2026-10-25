@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第九片：只读数据字符串注释 + PC 相对地址修正
+
+- 伪代码里 `r9 = 0x180089e50 /* PC 相对 0x79cf1 */` 这种常量，若地址落在**只读数据段**里且是
+  一段以 NUL 结尾的干净 ASCII 可打印串，就附注出来：`r9 = 0x180089e50 /* PC 相对 0x79cf1 */
+  /* "Exception encountered [%x]" */` —— 逆向核对时一眼能认出错误串/格式串，价值极大。
+- **诚实边界（§7）**：只收**窄 ASCII**（0x20–0x7e + 制表/换行）、必须以 NUL 结尾、至少 4 字节；
+  UTF-16/宽字符**不猜编码**（拒绝，不产生错误注释）；串来自注入的 `StringReader`（core 用段权限
+  `read && !write && !execute` + `read_window` 判定），解不出就不加注释、绝不把碰巧可打印的数据
+  谎称字符串；注释内容转义引号/控制字符，>64 字符截断加 `…`。
+- **修正一处既有 bug**：`PC 相对` 的绝对地址早先按 `指令首 + disp` 算，会整体偏一个指令长度；改为
+  `指令末 + disp`（`addr + len + rel`），单测锁定。这同时让字符串注释落在正确地址上。
+- 架构收敛：把 `table_reader/import_namer/string_reader` 三个注入打包成 `Resolvers` 结构，`decompile_
+  structured` 参数回到 6 个（clippy 限 7），调用点更清爽。
+- 效果（kernel32.dll x86_64 全量）：41 处常量附注出真实字符串（`"Flags:%d; DatabasePath:%ws"`
+  `"Can't find LIBRARY tag in main db"` 等 SDB 错误串），零编造；数量偏低是因为该库大量字符串是
+  UTF-16（不猜）与跳表/指针表（非字符串），如实。
+- 新增 4 项单测：立即数串注释 / 转义 / 无解析器不编串 / PC 相对按指令末算。
+- arch 102 / analyze 234(+4) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第八片：间接调用/跳板解析成导入名（`ReadFile()` 而非裸槽地址）
 
 - 上一片把间接调用/跳板的槽地址如实写出了，但仍是裸的 `0x180084580`。本片把**槽 → 导入名**

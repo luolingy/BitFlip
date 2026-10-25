@@ -308,6 +308,7 @@ pub fn decompile_function(
     cfg: &Cfg,
     namer: RegisterNamer<'_>,
     import_namer: Option<ImportNamer<'_>>,
+    string_reader: Option<StringReader<'_>>,
 ) -> PseudocodeFunction {
     let mut notes = vec![PseudocodeNote::FlatGoto];
     if name.is_none() {
@@ -336,7 +337,7 @@ pub fn decompile_function(
                 truncated += 1;
                 continue;
             }
-            match translate(insn, namer, import_namer) {
+            match translate(insn, namer, import_namer, string_reader) {
                 Ok(Some(text)) => {
                     statements.push(PseudocodeStatement { addr, text });
                     statement_count += 1;
@@ -419,6 +420,7 @@ pub(crate) fn translate(
     insn: &DecodedInsn,
     namer: RegisterNamer<'_>,
     import_namer: Option<ImportNamer<'_>>,
+    string_reader: Option<StringReader<'_>>,
 ) -> Result<Option<String>, String> {
     let m = insn.mnemonic;
     let ops = &insn.operands;
@@ -476,7 +478,7 @@ pub(crate) fn translate(
 
     let dst = &ops[0];
     let rhs = if ops.len() >= 2 {
-        expr(&ops[1..], insn.addr, namer)?
+        expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?
     } else {
         // 一元指令（inc / neg / push / pop 的单操作数形式…）无法用"目标 ← 源"表达。
         // 不猜它的语义，写成 noreturn 的调用形式会误导，所以明确标出来。
@@ -595,8 +597,8 @@ fn try_comparison(
     if !writes_only_flags {
         return None;
     }
-    let lhs = expr_one(&p.operands[0], p.addr, namer).ok()?;
-    let rhs = expr_one(&p.operands[1], p.addr, namer).ok()?;
+    let lhs = expr_one(&p.operands[0], p.addr, p.len, namer, None).ok()?;
+    let rhs = expr_one(&p.operands[1], p.addr, p.len, namer, None).ok()?;
 
     // `test a, a` 的自测形状：两操作数是同一寄存器 → 与 0 比较。
     let same_reg = match (&p.operands[0], &p.operands[1]) {
@@ -657,25 +659,80 @@ fn lvalue(op: &Operand, namer: RegisterNamer<'_>) -> Result<String, String> {
 }
 
 /// 生成表达式。
-fn expr(ops: &[Operand], addr: u64, namer: RegisterNamer<'_>) -> Result<String, String> {
+/// 若 `value` 对应的绝对地址指向一段可打印 C 字符串，就在值后面加 ` /* "..." */`。
+///
+/// 字符串来自注入的 [`StringReader`]；它为 `None` 或那里不是干净字符串时不加任何注释
+/// —— 绝不把碰巧可打印的字节谎称字符串（§7）。注释里对内容做转义，避免截断/串行。
+fn annotate_string(value: String, abs: u64, string_reader: Option<StringReader<'_>>) -> String {
+    let Some(text) = string_reader.and_then(|f| f(abs)) else {
+        return value;
+    };
+    format!("{value} /* {} */", escape_comment_string(&text))
+}
+
+/// 把字符串转义成能安全放进 `/* ... */` 注释的形式：不可打印字节转 `\xNN`，
+/// 引号转义，过长截断（保留可读前缀并注明截断）。
+fn escape_comment_string(text: &str) -> String {
+    const MAX: usize = 64;
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    let mut truncated = false;
+    for (index, ch) in text.chars().enumerate() {
+        if index >= MAX {
+            truncated = true;
+            break;
+        }
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    if truncated {
+        out.push('…');
+    }
+    out
+}
+
+fn expr(
+    ops: &[Operand],
+    addr: u64,
+    len: u8,
+    namer: RegisterNamer<'_>,
+    string_reader: Option<StringReader<'_>>,
+) -> Result<String, String> {
     let mut parts = Vec::new();
     for op in ops {
-        parts.push(expr_one(op, addr, namer)?);
+        parts.push(expr_one(op, addr, len, namer, string_reader)?);
     }
     Ok(parts.join(" + "))
 }
 
 /// 生成单个操作数的表达式。
-fn expr_one(op: &Operand, addr: u64, namer: RegisterNamer<'_>) -> Result<String, String> {
+fn expr_one(
+    op: &Operand,
+    addr: u64,
+    len: u8,
+    namer: RegisterNamer<'_>,
+    string_reader: Option<StringReader<'_>>,
+) -> Result<String, String> {
     match op {
         Operand::Reg(r) => namer(r.0).ok_or_else(|| format!("寄存器编号 {} 无名字", r.0)),
         // 立即数写成十六进制：反汇编语境下十六进制比十进制好核对。
-        Operand::Imm(v) => Ok(format!("{v:#x}")),
+        // 若这个立即数其实是个指向只读数据的字符串地址，附注出来（对逆向核对极有用）。
+        Operand::Imm(v) => Ok(annotate_string(format!("{v:#x}"), *v as u64, string_reader)),
         Operand::Mem(m) => Ok(mem_text(m, namer)),
         Operand::PcRelative(d) => {
-            // 转成绝对地址，这样用户能直接跳过去看。溢出按饱和处理并如实呈现。
-            let abs = addr.wrapping_add(*d as u64);
-            Ok(format!("{abs:#x} /* PC 相对 {d:#x} */"))
+            // 转成绝对地址，这样用户能直接跳过去看。PC 相对是从**指令末**算起的，
+            // 所以要加 `len`（不是只加 `addr`，否则每条都偏一个指令长度）。
+            let abs = addr.wrapping_add(u64::from(len)).wrapping_add(*d as u64);
+            let value = format!("{abs:#x} /* PC 相对 {d:#x} */");
+            Ok(annotate_string(value, abs, string_reader))
         }
         Operand::Shifted { reg, kind, amount } => {
             let r = namer(reg.0).ok_or_else(|| format!("寄存器编号 {} 无名字", reg.0))?;
@@ -824,6 +881,41 @@ pub type TableReader<'a> = &'a dyn Fn(u64, usize) -> Option<Vec<u8>>;
 /// 绝不编一个像模像样的函数名（§7）。
 pub type ImportNamer<'a> = &'a dyn Fn(u64) -> Option<String>;
 
+/// 字符串解析器：给一个**绝对虚拟地址**，若那里是一段可打印的 C 字符串（只读数据），
+/// 返回它（不含结尾 NUL）；否则 `None`。
+///
+/// 与 [`RegisterNamer`]/[`TableReader`]/[`ImportNamer`] 同一种注入：本 crate 不做
+/// "哪段是可读只读数据、这段字节算不算字符串" 的判定（那是 loader/地址空间的活），
+/// 由 core 提供。返回 `None` 时渲染层**不加**任何注释 —— 绝不把碰巧可打印的数据谎称字符串。
+pub type StringReader<'a> = &'a dyn Fn(u64) -> Option<String>;
+
+/// 可选的外部事实解析器集合（跳表 / 导入名 / 字符串）。
+///
+/// 打包成一个结构而不是三个独立参数：它们都是"本 crate 不持有、由 core 注入"的查询，
+/// 一起传既避免参数列表膨胀，也让调用点一眼看清"这个渲染拿到了哪些外部事实"。
+/// 全部为 `None` 时渲染层只写自己确知的东西（不猜）。
+#[derive(Clone, Copy, Default)]
+pub struct Resolvers<'a> {
+    /// switch 跳表读取器。
+    pub table: Option<TableReader<'a>>,
+    /// 导入名解析器（槽 → `模块!函数`）。
+    pub import: Option<ImportNamer<'a>>,
+    /// 只读数据里的 C 字符串解析器。
+    pub string: Option<StringReader<'a>>,
+}
+
+impl<'a> Resolvers<'a> {
+    /// 全都没有：只做纯指令级翻译。
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            table: None,
+            import: None,
+            string: None,
+        }
+    }
+}
+
 /// 不做命名的解析器：所有寄存器都报"未知"。
 ///
 /// 这是**诚实的默认值**：宁可在输出里写明"寄存器名未覆盖"，
@@ -911,7 +1003,7 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(9999)), Operand::Imm(1)],
         );
-        let e = translate(&i, &test_namer, None).unwrap_err();
+        let e = translate(&i, &test_namer, None, None).unwrap_err();
         assert!(e.contains("9999"), "应报出编号：{e}");
         assert!(e.contains("无名字"), "应说明是没有名字：{e}");
     }
@@ -934,7 +1026,7 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(19)), Operand::Imm(7)],
         );
-        let text = translate(&i, &test_namer, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
         assert!(text.contains("rax = 0x7"), "{text}");
     }
 
@@ -950,7 +1042,7 @@ mod tests {
             vec![],
         );
         i.condition = Some(ConditionCode::Equal);
-        let text = translate(&i, &test_namer, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
         assert!(text.contains("goto 0x1100"), "应含 goto：{text}");
         assert!(text.starts_with("if ("), "应保留条件：{text}");
         // 不得出现 C 的语句块花括号 —— 那会让人以为是结构化输出。
@@ -961,7 +1053,7 @@ mod tests {
     fn indirect_branch_says_unknown_instead_of_guessing() {
         // 间接跳转没有目标：必须写明"未知"，不能编一个地址。
         let i = insn(0x2000, 2, Flow::Branch { conditional: false }, None, vec![]);
-        let text = translate(&i, &test_namer, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
         assert!(text.contains("目标未知"), "应说明目标未知：{text}");
         assert!(text.contains("goto"), "仍需给出 goto：{text}");
     }
@@ -969,9 +1061,12 @@ mod tests {
     #[test]
     fn return_and_trap_are_rendered() {
         let r = insn(0, 3, Flow::Return, None, vec![]);
-        assert_eq!(translate(&r, &test_namer, None).unwrap().unwrap(), "return");
+        assert_eq!(
+            translate(&r, &test_namer, None, None).unwrap().unwrap(),
+            "return"
+        );
         let t = insn(0, 4, Flow::Trap, None, vec![]);
-        assert!(translate(&t, &test_namer, None)
+        assert!(translate(&t, &test_namer, None, None)
             .unwrap()
             .unwrap()
             .contains("trap"));
@@ -1014,7 +1109,7 @@ mod tests {
     #[test]
     fn unnamed_function_gets_a_note_not_a_fabricated_name() {
         let cfg = Cfg::build(&[]);
-        let f = decompile_function(0x1000, None, &[], &cfg, &test_namer, None);
+        let f = decompile_function(0x1000, None, &[], &cfg, &test_namer, None, None);
         assert!(f.name.is_none(), "不得编造名字");
         assert!(f.notes.contains(&PseudocodeNote::Unnamed));
         // 渲染时用入口地址，不是 func_xxx。
@@ -1027,7 +1122,7 @@ mod tests {
     fn flat_goto_note_is_always_present() {
         // 这条说明决定了用户怎么读输出，漏掉它等于让用户误判。
         let cfg = Cfg::build(&[]);
-        let f = decompile_function(0, Some("f"), &[], &cfg, &test_namer, None);
+        let f = decompile_function(0, Some("f"), &[], &cfg, &test_namer, None, None);
         assert!(f.notes.contains(&PseudocodeNote::FlatGoto));
         assert!(!f.structured, "本模块恒不结构化");
     }
@@ -1038,7 +1133,7 @@ mod tests {
         let ops = vec![Operand::Reg(RegId(19)), Operand::Imm(7)];
         let insns = vec![insn(0x1000, 10, Flow::Fallthrough, None, ops)];
         let cfg = Cfg::build(&insns);
-        let f = decompile_function(0x1000, Some("f"), &insns, &cfg, &test_namer, None);
+        let f = decompile_function(0x1000, Some("f"), &insns, &cfg, &test_namer, None, None);
         assert_eq!(f.untranslated, 0, "这条应当能翻译");
         for b in &f.blocks {
             for s in &b.statements {
@@ -1157,7 +1252,7 @@ mod tests {
         let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
-        let text = translate(&i, &test_namer, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
         // 槽 = 0x1000 + 6 + 0x1234 = 0x223a
         assert_eq!(text, "goto *(void **)0x223a");
         assert!(!text.contains("目标未知"), "不该再退回未知占位：{text}");
@@ -1168,7 +1263,7 @@ mod tests {
         // `jmp rax`（35 是 capstone 的 rsp；这里用 19 = rax）→ 目标就是寄存器里的地址。
         let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
         i.operands = vec![Operand::Reg(RegId(19))];
-        let text = translate(&i, &test_namer, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
         assert_eq!(text, "goto rax");
     }
 
@@ -1185,7 +1280,7 @@ mod tests {
             size: 8,
             write: false,
         })];
-        let text = translate(&i, &test_namer, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
         assert!(
             text.starts_with("goto *(void **)("),
             "应解引用表寻址：{text}"
@@ -1198,7 +1293,7 @@ mod tests {
     fn indirect_jump_without_usable_operand_still_says_unknown() {
         // 操作数里没有任何可用线索时，仍如实说未知（不退化成假地址，也不编目标）。
         let i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
-        let text = translate(&i, &test_namer, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
         assert_eq!(text, "goto /* 目标未知（间接） */ 0");
     }
 
@@ -1211,7 +1306,9 @@ mod tests {
         let imp = |slot: u64| -> Option<String> {
             (slot == 0x223a).then(|| "KERNEL32.dll!RtlAllocateHeap".to_string())
         };
-        let text = translate(&i, &test_namer, Some(&imp)).unwrap().unwrap();
+        let text = translate(&i, &test_namer, Some(&imp), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             text,
             "/* call */ KERNEL32.dll!RtlAllocateHeap /* *(void **)0x223a */()"
@@ -1225,7 +1322,9 @@ mod tests {
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
         let imp = |slot: u64| -> Option<String> { (slot == 0x223a).then(|| "K!Func".to_string()) };
-        let text = translate(&i, &test_namer, Some(&imp)).unwrap().unwrap();
+        let text = translate(&i, &test_namer, Some(&imp), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(text, "goto *(void **)0x223a /* = K!Func */");
     }
 
@@ -1236,7 +1335,80 @@ mod tests {
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
         let imp = |_slot: u64| -> Option<String> { None };
-        let text = translate(&i, &test_namer, Some(&imp)).unwrap().unwrap();
+        let text = translate(&i, &test_namer, Some(&imp), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(text, "/* call */ *(void **)0x223a()");
+    }
+
+    #[test]
+    fn immediate_string_pointer_is_annotated_with_the_text() {
+        // mov rax, 0x401000 —— 该地址是一段字符串时，值后面附注出来。
+        let i = insn(
+            0x1000,
+            10,
+            Flow::Fallthrough,
+            None,
+            vec![Operand::Reg(RegId(19)), Operand::Imm(0x401000)],
+        );
+        let sr = |addr: u64| -> Option<String> {
+            (addr == 0x401000).then(|| "Hello, world".to_string())
+        };
+        let text = translate(&i, &test_namer, None, Some(&sr))
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "rax = 0x401000 /* \"Hello, world\" */");
+    }
+
+    #[test]
+    fn string_annotation_escapes_control_and_quotes() {
+        // 字符串里的引号/换行要转义，且过长要在 64 字符处截断加省略号。
+        let i = insn(
+            0x1000,
+            10,
+            Flow::Fallthrough,
+            None,
+            vec![Operand::Reg(RegId(19)), Operand::Imm(0x401000)],
+        );
+        let sr = |_a: u64| -> Option<String> { Some("a\"b\nc".to_string()) };
+        let text = translate(&i, &test_namer, None, Some(&sr))
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("\\\""), "引号应转义：{text}");
+        assert!(text.contains("\\n"), "换行应转义：{text}");
+    }
+
+    #[test]
+    fn no_string_reader_never_fabricates_a_string() {
+        // 没有字符串解析器：立即数就是立即数，不加任何注释（不猜）。
+        let i = insn(
+            0x1000,
+            10,
+            Flow::Fallthrough,
+            None,
+            vec![Operand::Reg(RegId(19)), Operand::Imm(0x401000)],
+        );
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        assert_eq!(text, "rax = 0x401000");
+    }
+
+    #[test]
+    fn pc_relative_absolute_uses_instruction_end_not_start() {
+        // PC 相对从**指令末**算起：lea rax,[rip+0x10] 在 0x1000、长 7 字节 → 绝对 0x1017。
+        // 早先按 addr+disp 算会偏一个指令长度（错）；此处锁定正确行为。
+        let mut i = insn(
+            0x1000,
+            7,
+            Flow::Fallthrough,
+            None,
+            vec![Operand::Reg(RegId(19)), Operand::PcRelative(0x10)],
+        );
+        i.len = 7;
+        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        assert!(
+            text.contains("0x1017"),
+            "PC 相对绝对地址应为指令末+disp：{text}"
+        );
+        assert!(!text.contains("0x1010"), "不得用指令首算：{text}");
     }
 }

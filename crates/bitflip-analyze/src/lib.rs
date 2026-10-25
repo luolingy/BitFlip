@@ -61,9 +61,9 @@ pub use jumptable::{
     LOOKBACK_WINDOW, MAX_ENTRIES,
 };
 pub use pseudo::{
-    decompile_function, no_register_names, render_function_text, Pseudocode, PseudocodeBlock,
-    PseudocodeFunction, PseudocodeNote, PseudocodeStatement, RegisterNamer, MAX_STATEMENTS,
-    PSEUDO_FORMAT_VERSION,
+    decompile_function, no_register_names, render_function_text, ImportNamer, Pseudocode,
+    PseudocodeBlock, PseudocodeFunction, PseudocodeNote, PseudocodeStatement, RegisterNamer,
+    Resolvers, StringReader, TableReader, MAX_STATEMENTS, PSEUDO_FORMAT_VERSION,
 };
 pub use scan::{
     combine, control_flow_targets, scan_linear, scan_linear_with_ledger, scan_recursive,
