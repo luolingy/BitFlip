@@ -105,6 +105,47 @@ pub fn decompile_structured(
     };
     builder.emit_from(start, None, 0, None);
 
+    // 覆盖补遍：主路径没走到的块（典型是被函数前部的早退/尾跳分支遮住、只能经间接跳转
+    // 或异常到达的分发/辅助块）。**不静默丢弃**：按地址顺序，对每个尚未访问、且没有
+    // "已覆盖前驱"的块，起一段新的结构化区域并标注来源。这样 switch/if/while 在分离区域里
+    // 也能被还原，而不是永远看不见。
+    //
+    // 只在确实存在未覆盖块时插入分隔注释，避免污染完全结构化的输出。
+    let unreached: Vec<u64> = block_map
+        .keys()
+        .copied()
+        .filter(|a| !builder.visited.contains(a))
+        // 只把"入口块"当作新区域起点：它的所有前驱都还没被覆盖（否则会经主路径已连上）。
+        .filter(|a| {
+            block_map
+                .get(a)
+                .is_none_or(|b| b.predecessors.iter().all(|p| !builder.visited.contains(p)))
+        })
+        .collect();
+    if !unreached.is_empty() {
+        // 过滤掉**纯填充/陷阱块**（`int3`/`nop` 之类）：它们不可执行、不是真正的"分离代码"，
+        // 若一并输出就是成百上千行 `__builtin_trap` 噪声，毫无价值。只有当分离区域里**含有
+        // 可执行指令**时才起段。
+        let real: Vec<u64> = unreached
+            .into_iter()
+            .filter(|&a| !builder.is_padding_region(a))
+            .collect();
+        if !real.is_empty() {
+            builder.push(
+                0,
+                "/* --- 以下区域未被主路径连入（可能经间接跳转/异常到达），单独起段 --- */"
+                    .to_string(),
+            );
+            for a in real {
+                if builder.visited.contains(&a) || builder.lines.len() >= builder.budget {
+                    continue;
+                }
+                builder.push(0, format!("// @{a:#x}（分离区域起点）"));
+                builder.emit_from(a, None, 0, None);
+            }
+        }
+    }
+
     let built = Built {
         lines: builder.lines,
         residual_gotos: builder.residual_gotos,
@@ -199,6 +240,28 @@ impl Builder<'_> {
     /// 取块内紧挨在 `branch_addr` **之前**的那条指令（用于把 `cmp`/`test` + 条件跳转
     /// 还原成真实比较）。只在同一基本块范围内找，不跨块 —— 跨块的标志设置已不在
     /// "紧邻"范围内，跨块猜比较不可靠。
+    /// 判断一个（未覆盖）块是否是**纯填充/陷阱**：块内指令全部是 `trap`（`int3` 等）
+    /// 或单字节无法翻译的填充。这类块不值得作为"分离区域"输出（成百上千行噪声）。
+    fn is_padding_region(&self, block_start: u64) -> bool {
+        let Some(b) = self.blocks.get(&block_start) else {
+            return true;
+        };
+        for (&_a, insn) in self.by_addr.range(b.start..b.end) {
+            match insn.flow {
+                Flow::Trap => {}
+                // `nop`/填充常见为 len==1 且无操作数的 fallthrough。
+                Flow::Fallthrough => {
+                    if insn.len > 1 || !insn.operands.is_empty() {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        // 空块或全 trap/填充 → 视为填充。
+        true
+    }
+
     fn prev_insn(&self, block_start: u64, branch_addr: u64) -> Option<&DecodedInsn> {
         self.by_addr
             .range(block_start..branch_addr)
@@ -985,6 +1048,22 @@ mod tests {
             privileged: false,
         }
     }
+    /// 一条 `int3` 式的陷阱填充指令（单字节）。
+    fn trap(addr: u64) -> DecodedInsn {
+        DecodedInsn {
+            addr,
+            len: 1,
+            arch: Arch::X86_64,
+            mnemonic: MnemonicId::UNKNOWN,
+            flow: Flow::Trap,
+            target: None,
+            condition: None,
+            operands: vec![],
+            reads: Default::default(),
+            writes: Default::default(),
+            privileged: false,
+        }
+    }
     fn nop(addr: u64) -> DecodedInsn {
         DecodedInsn {
             addr,
@@ -1187,6 +1266,33 @@ mod tests {
         assert!(
             !body.contains("switch"),
             "无读取器时不应还原 switch：\n{body}"
+        );
+    }
+
+    #[test]
+    fn unreached_code_region_is_emitted_not_dropped() {
+        // 主路径：0x1000 jmp 0x1010（跳过 0x1004 一段不可达代码）；0x1004 有一段不可达
+        // 但**可执行**的代码（nop + ret）。覆盖补遍应把它作为分离区域输出，而不是丢弃。
+        let insns = vec![jmp(0x1000, 0x1010), nop(0x1004), ret(0x1008), ret(0x1010)];
+        let f = build(insns);
+        let body = f.structured_body.as_ref().unwrap().join("\n");
+        assert!(
+            body.contains("分离区域起点"),
+            "不可达代码块应作为分离区域输出：\n{body}"
+        );
+        assert!(body.contains("@0x1004"), "\n{body}");
+    }
+
+    #[test]
+    fn padding_only_unreached_region_is_not_dumped() {
+        // 0x1000 jmp 0x1008；0x1004 是一个纯 trap（int3）填充块。覆盖补遍**不应**把它
+        // 当分离区域输出（否则真实二进制里成百上千个 int3 会刷屏）。
+        let insns = vec![jmp(0x1000, 0x1008), trap(0x1004), ret(0x1008)];
+        let f = build(insns);
+        let body = f.structured_body.as_ref().unwrap().join("\n");
+        assert!(
+            !body.contains("分离区域起点"),
+            "纯填充块不应作为分离区域输出：\n{body}"
         );
     }
 

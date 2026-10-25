@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第六片：CFG 覆盖补遍（分离区域不再丢失，switch 端到端生效）
+
+- `decompile_structured` 在主路径 `emit_from` 之后新增**覆盖补遍**：主路径没走到的块（典型是
+  被函数前部早退/尾跳分支遮住、只能经间接跳转/异常/冷路径到达的块）不再被静默丢弃——按地址
+  顺序对每个尚未访问、且无已覆盖前驱的"分离区域入口块"另起一段结构化，并加注释标注来源。
+- 过滤**纯填充/陷阱块**（`int3`/`nop` 之类，`is_padding_region`）：真实二进制里成百上千个
+  一字节 `int3` 对齐填充不再作为分离区域刷屏（实测 kernel32 陷阱输出由数千降到 **0**）。
+- 效果（kernel32.dll x86_64 全量）：**switch 由 0 → 2 处端到端还原**，例如 MSVC 偏移表 idiom
+  `lea/mov/add/jmp rcx` 被正确解成 `if (!((uint64_t)eax > (uint64_t)0xc)) { switch (rax) {
+  case 0..12: goto <真实目标>; } }`（目标地址经基址+偏移正确解析）；分离区域里露出大量原本
+  不可见的错误路径/冷代码（真实指令，非填充）。
+- 新增单测：不可达可执行块作为分离区域输出 / 纯填充块不输出 / （连带）switch 两种形状。
+- arch 102 / analyze 223(+2) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第五片：switch 跳表识别（基础版 + 诚实边界说明）
 
 - `structurize` 新增 `emit_switch_from_pred` / `parse_switch_shape`：把"`cmp X,N` + 条件跳转
