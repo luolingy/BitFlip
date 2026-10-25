@@ -426,10 +426,12 @@ pub(crate) fn translate(
         Flow::Return => return Ok(Some("return".to_string())),
         Flow::Trap => return Ok(Some(format!("__builtin_trap() /* {} */", insn_name(m)))),
         Flow::Branch { conditional } => {
+            // 目标表达式：常量地址直接写；间接时把**真实来源**（槽地址/寄存器/表寻址）写出来，
+            // 只有确实无法表达才说未知 —— 用一个裸 `0` 冒充目标地址是误导（§7）。
             let target = match insn.target {
                 Some(t) => format!("{t:#x}"),
-                // 间接跳转：目标未知。**不猜**，写明未知。
-                None => "/* 目标未知（间接） */ 0".to_string(),
+                None => indirect_goto_target(insn, namer)
+                    .unwrap_or_else(|| "/* 目标未知（间接） */ 0".to_string()),
             };
             if conditional {
                 let cond = insn
@@ -444,7 +446,8 @@ pub(crate) fn translate(
             // 所以这里**不编造参数**，只给被调者地址。
             let callee = match insn.target {
                 Some(t) => format!("{t:#x}"),
-                None => "/* 目标未知（间接） */ 0".to_string(),
+                None => indirect_goto_target(insn, namer)
+                    .unwrap_or_else(|| "/* 目标未知（间接） */ 0".to_string()),
             };
             // AArch64/AArch32 的 bl 带返回地址寄存器，但那是链接细节不是 C 参数。
             return Ok(Some(format!("/* call */ {callee}()")));
@@ -699,6 +702,34 @@ fn expr_one(op: &Operand, addr: u64, namer: RegisterNamer<'_>) -> Result<String,
         Operand::FpImm(bits) => Ok(format!("{:?}", f64::from_bits(*bits))),
         Operand::Svcr(mode) => Ok(format!("__svcr({})", mode.as_str())),
         Operand::SmeIndex => Ok("__sme_index".to_string()),
+    }
+}
+
+/// 间接跳转/调用的**目标表达式**（`goto ` / `call ` 后面那一段）。
+///
+/// 不是"猜目标"，而是把**真实来源**写出来（§7）：`target` 为 `None` 的间接转移，其目标
+/// 必然是上一步算出来的，而操作数里通常留着线索：
+/// - `Operand::PcRelative(rel)`：`jmp [rip+rel]`（典型**导入跳板**）→ 槽地址 = 本指令末 + rel，
+///   目标是**槽里存的那个地址**，所以写成 `*(void **)0xSLOT`（解引用槽）。
+/// - `Operand::Mem(m)`：`jmp [base+idx*scale+disp]` → `*(void **)(<寻址>)`（解引用算出地址）。
+/// - `Operand::Reg(r)`：`jmp reg` → 直接是寄存器里的地址，写成寄存器名。
+///
+/// 这些都不是"编出来的常量"，而是指令本身表达的事实；比一个裸 `0` 诚实得多。
+fn indirect_goto_target(insn: &DecodedInsn, namer: RegisterNamer<'_>) -> Option<String> {
+    match insn.operands.as_slice() {
+        // `jmp [rip+rel]` / `call [rip+rel]` —— 导入跳板与 IAT 槽调用。
+        [Operand::PcRelative(rel)] => {
+            let slot = insn
+                .addr
+                .wrapping_add(u64::from(insn.len))
+                .wrapping_add(*rel as u64);
+            Some(format!("*(void **){slot:#x}"))
+        }
+        // `jmp [base+idx*scale+disp]` —— 跳表或槽表寻址。
+        [Operand::Mem(m)] => Some(format!("*(void **)({})", mem_text(m, namer))),
+        // `jmp reg` —— 地址在寄存器里。
+        [Operand::Reg(r)] => Some(namer(r.0).unwrap_or_else(|| format!("reg#{}", r.0))),
+        _ => None,
     }
 }
 
@@ -1091,5 +1122,57 @@ mod tests {
             branch_condition_text(&j, Some(&c), &test_namer),
             "/* SignedLessThan */ flags"
         );
+    }
+
+    #[test]
+    fn indirect_jump_through_a_slot_shows_the_slot_not_a_fake_zero() {
+        // `jmp [rip+rel]`（导入跳板）解码成 PcRelative；目标表达式应**解引用槽地址**，
+        // 而不是那个会让人误以为是真地址的裸 `0`。
+        let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
+        i.len = 6;
+        i.operands = vec![Operand::PcRelative(0x1234)];
+        let text = translate(&i, &test_namer).unwrap().unwrap();
+        // 槽 = 0x1000 + 6 + 0x1234 = 0x223a
+        assert_eq!(text, "goto *(void **)0x223a");
+        assert!(!text.contains("目标未知"), "不该再退回未知占位：{text}");
+    }
+
+    #[test]
+    fn indirect_jump_through_a_register_shows_the_register() {
+        // `jmp rax`（35 是 capstone 的 rsp；这里用 19 = rax）→ 目标就是寄存器里的地址。
+        let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
+        i.operands = vec![Operand::Reg(RegId(19))];
+        let text = translate(&i, &test_namer).unwrap().unwrap();
+        assert_eq!(text, "goto rax");
+    }
+
+    #[test]
+    fn indirect_jump_through_a_table_shows_the_addressing() {
+        // `jmp [rdx*8 + disp]` → 解引用算出来的地址。
+        let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
+        i.operands = vec![Operand::Mem(bitflip_arch::MemRef {
+            base: None,
+            index: Some(RegId(27)), // rdx
+            scale: 8,
+            index_extend: None,
+            disp: 0x401000,
+            size: 8,
+            write: false,
+        })];
+        let text = translate(&i, &test_namer).unwrap().unwrap();
+        assert!(
+            text.starts_with("goto *(void **)("),
+            "应解引用表寻址：{text}"
+        );
+        assert!(text.contains("rdx"), "应保留索引寄存器名：{text}");
+        assert!(text.contains("0x401000"), "应保留表基址：{text}");
+    }
+
+    #[test]
+    fn indirect_jump_without_usable_operand_still_says_unknown() {
+        // 操作数里没有任何可用线索时，仍如实说未知（不退化成假地址，也不编目标）。
+        let i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
+        let text = translate(&i, &test_namer).unwrap().unwrap();
+        assert_eq!(text, "goto /* 目标未知（间接） */ 0");
     }
 }
