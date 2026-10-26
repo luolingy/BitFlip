@@ -948,6 +948,11 @@ fn write_pseudo_c(
             .as_ref()
             .and_then(|r| r.register_name(bitflip_arch::RegId(id)))
     };
+    // 助记符解析器：把 MnemonicId 翻成可读文本，让算术/逻辑指令按真实运算符还原
+    // （否则 `add`/`xor r,r` 会被错写成赋值）。后端提供，与寄存器名同源。
+    let mnemonic = |m: bitflip_arch::MnemonicId| -> Option<String> {
+        renderer.as_ref().and_then(|r| r.mnemonic_name_by_id(m))
+    };
     // 跳表读取器：用已构建的地址空间，按虚拟地址读只读数据（switch 跳表用）。
     // 不补零冒充：`read_window` 只返回真实读到的字节（可能到段尾截断）。
     let space = &disasm.space;
@@ -1109,6 +1114,7 @@ fn write_pseudo_c(
                     table: Some(&table_reader),
                     import: Some(&import_namer),
                     string: Some(&string_reader),
+                    mnemonic: Some(&mnemonic),
                 },
             )
         } else {
@@ -1118,8 +1124,12 @@ fn write_pseudo_c(
                 &insns,
                 &inner,
                 &namer,
-                Some(&import_namer),
-                Some(&string_reader),
+                bitflip_analyze::Resolvers {
+                    table: None,
+                    import: Some(&import_namer),
+                    string: Some(&string_reader),
+                    mnemonic: Some(&mnemonic),
+                },
             )
         };
 

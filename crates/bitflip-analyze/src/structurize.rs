@@ -71,15 +71,7 @@ pub fn decompile_structured(
     resolvers: crate::pseudo::Resolvers<'_>,
 ) -> PseudocodeFunction {
     // 先拿扁平版本：它已经算好了每块的语句、未翻译计数、截断、基础 notes。
-    let mut flat = decompile_function(
-        entry,
-        name,
-        insns,
-        cfg,
-        namer,
-        resolvers.import,
-        resolvers.string,
-    );
+    let mut flat = decompile_function(entry, name, insns, cfg, namer, resolvers);
 
     if cfg.is_empty() {
         return flat;
@@ -107,6 +99,7 @@ pub fn decompile_structured(
         table_reader: resolvers.table,
         import_namer: resolvers.import,
         string_reader: resolvers.string,
+        mnemonic: resolvers.mnemonic,
         visited: BTreeSet::new(),
         lines: Vec::new(),
         residual_gotos: 0,
@@ -207,6 +200,8 @@ struct Builder<'a> {
     import_namer: Option<ImportNamer<'a>>,
     /// 字符串解析器（地址 → 只读数据里的 C 字符串）；`None` 时不附注字符串。
     string_reader: Option<StringReader<'a>>,
+    /// 助记符解析器（编号 → 文本），用于还原算术/逻辑指令的真实语义。
+    mnemonic: Option<crate::pseudo::MnemonicResolver<'a>>,
     visited: BTreeSet<u64>,
     lines: Vec<Line>,
     residual_gotos: usize,
@@ -233,7 +228,13 @@ impl Builder<'_> {
             if skip_last_branch && Some(addr) == last_addr {
                 continue;
             }
-            match translate(insn, self.namer, self.import_namer, self.string_reader) {
+            match translate(
+                insn,
+                self.namer,
+                self.import_namer,
+                self.string_reader,
+                self.mnemonic,
+            ) {
                 Ok(Some(text)) => self.push(indent, format!("{text}; /* @{addr:#x} */")),
                 Ok(None) => {}
                 Err(reason) => {

@@ -409,6 +409,15 @@ impl CapstoneDecoder {
         self.with_engine(|cs| cs.insn_name(capstone::InsnId(insn.mnemonic.0)))
     }
 
+    /// 取一个 `MnemonicId` 的**助记符文本**（`"mov"`/`"xor"`…）。
+    ///
+    /// 与 [`Self::mnemonic_name`] 相同，但只需要编号而不需要整条指令 —— 供渲染层按助记符
+    /// 还原算术/逻辑语义时使用。查不到返回 `None`，调用方退回保守处理（不猜语义）。
+    #[must_use]
+    pub fn mnemonic_name_by_id(&self, mnemonic: crate::MnemonicId) -> Option<String> {
+        self.with_engine(|cs| cs.insn_name(capstone::InsnId(mnemonic.0)))
+    }
+
     /// 取一个寄存器编号的**名字**（`RegId(37)` → `"rbx"`）。
     ///
     /// # 为什么不能只靠 ABI 表

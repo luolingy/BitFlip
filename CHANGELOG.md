@@ -5,6 +5,30 @@
 
 ## [Unreleased]
 
+### 修正 — 阶段 1 第十片：算术/逻辑指令按真实语义还原（`add`/`xor` 不再错写成赋值）
+
+- **这是一处正确性 bug，不是美化**：`translate` 的"一般形状"原来把**任何**两操作数指令都渲染成
+  `目标 = 源`，于是 `add rax, rcx` 被写成 `rax = rcx`（加法变赋值！）、`xor r8d, r8d`（清零 idiom）
+  被写成 `r8d = r8d`（无意义的自赋值）。真实二进制里这类错误遍布（kernel32 曾达 ~2474 处自赋值假象）。
+- 新增注入 `MnemonicResolver`（`MnemonicId → 文本`，core 由后端 `mnemonic_name_by_id` 提供），
+  `translate` 依据**真实助记符**分类拼装（`classify_mnemonic`）：
+  - `mov` 家族 → `dst = src`；
+  - `lea` → `dst = <地址表达式>`（**算地址、不解引用**，此前错写成 `*(T*)(...)` 解引用）；
+  - `add/sub/and/or/xor/imul/shl/shr/sar` → `dst = dst <op> src`；`xor r,r`/`sub r,r` 同寄存器
+    → `dst = 0`（XOR/SUB 清零 idiom）；
+  - `inc/dec/neg/not` 一元；`test/cmp` 只设标志、**有意不产生语句**（否则会被误读成赋值）；
+  - 助记符未知/未注入 → 退回保守 `dst = src`（对 mov 正确，不引入新回归）。
+- 架构收敛：`decompile_function` 的可选注参也打包成 `Resolvers`（连同 table/import/string/mnemonic），
+  参数回到 6–7 个，clippy 通过。
+- 效果（kernel32.dll x86_64 全量）：自赋值假象 **2474 → 55**；`= 0`（清零）正确冒出 **808** 处；
+  加法 `dst = dst + …` **2482** 处（此前全被错写）；`lea` 地址计算正确；`cmp/test` 不再产出伪赋值。
+- 新增 6 项单测：xor 同寄存器清零 / xor 异寄存器真异或 / add 真加法 / cmp·test 无语句 /
+  lea 不解引用 / 未知助记符保守赋值。
+- arch 102 / analyze 240(+6) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+- 注：期间一次误用 `Set-Content -NoNewline` 曾给 `pseudo.rs` 引入 BOM 并压平行尾（与早先
+  `backend.rs` 同型事故），已 `git checkout` 还原并用 `edit` 工具重放全部改动，最终 diff 干净无 BOM。
+
 ### 新增 — 阶段 1 第九片：只读数据字符串注释 + PC 相对地址修正
 
 - 伪代码里 `r9 = 0x180089e50 /* PC 相对 0x79cf1 */` 这种常量，若地址落在**只读数据段**里且是

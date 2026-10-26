@@ -307,8 +307,7 @@ pub fn decompile_function(
     insns: &[DecodedInsn],
     cfg: &Cfg,
     namer: RegisterNamer<'_>,
-    import_namer: Option<ImportNamer<'_>>,
-    string_reader: Option<StringReader<'_>>,
+    resolvers: Resolvers<'_>,
 ) -> PseudocodeFunction {
     let mut notes = vec![PseudocodeNote::FlatGoto];
     if name.is_none() {
@@ -337,7 +336,13 @@ pub fn decompile_function(
                 truncated += 1;
                 continue;
             }
-            match translate(insn, namer, import_namer, string_reader) {
+            match translate(
+                insn,
+                namer,
+                resolvers.import,
+                resolvers.string,
+                resolvers.mnemonic,
+            ) {
                 Ok(Some(text)) => {
                     statements.push(PseudocodeStatement { addr, text });
                     statement_count += 1;
@@ -421,6 +426,7 @@ pub(crate) fn translate(
     namer: RegisterNamer<'_>,
     import_namer: Option<ImportNamer<'_>>,
     string_reader: Option<StringReader<'_>>,
+    mnemonic: Option<MnemonicResolver<'_>>,
 ) -> Result<Option<String>, String> {
     let m = insn.mnemonic;
     let ops = &insn.operands;
@@ -470,23 +476,62 @@ pub(crate) fn translate(
         return Ok(None);
     }
 
-    // 一般形状：目标 ← 表达式。x86 的 mov 是 dst, src；多数 RISC 的 mov 也是。
+    // 一般形状：目标 ← 表达式。但**不是所有两操作数指令都是 mov** —— `add`/`xor`/`shl`
+    // 等必须按真实运算符还原，否则会把加法写成赋值、把 `xor r,r`（清零）写成无意义的自赋值。
+    // 助记符文本来自注入的 `MnemonicResolver`（本 crate 无编号→文本表）。
     let name = insn_name(m);
     if ops.is_empty() {
         return Ok(Some(format!("/* {name} */")));
     }
+    let mn = mnemonic.and_then(|f| f(m)).map(|s| s.to_ascii_lowercase());
 
-    let dst = &ops[0];
-    let rhs = if ops.len() >= 2 {
-        expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?
-    } else {
-        // 一元指令（inc / neg / push / pop 的单操作数形式…）无法用"目标 ← 源"表达。
-        // 不猜它的语义，写成 noreturn 的调用形式会误导，所以明确标出来。
-        return Err(format!("{name} 为单操作数指令，无法用赋值形式表达"));
-    };
-
-    let lhs = lvalue(dst, namer)?;
-    Ok(Some(format!("{lhs} = {rhs}")))
+    let dst = lvalue(&ops[0], namer)?;
+    match classify_mnemonic(mn.as_deref()) {
+        // 只设标志、没有可赋值的"目标 ← "形态：`test`/`cmp` 的结果由紧随的分支消费，
+        // 输出成一行 `a = b` 是错误的（会误导成赋值）。这里**有意不产生语句**。
+        MnemonicClass::FlagsOnly => Ok(None),
+        MnemonicClass::Lea => {
+            // lea 计算地址，**不解引用**。`lea r, [mem]` = `r = &mem`（表达式即地址）。
+            if let Some(Operand::Mem(mem)) = ops.get(1) {
+                Ok(Some(format!("{dst} = {}", mem_addr(mem, namer))))
+            } else {
+                // 非常规 lea（第二操作数不是内存）→ 落回保守赋值。
+                let rhs = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
+                Ok(Some(format!("{dst} = {rhs}")))
+            }
+        }
+        MnemonicClass::Binary { op, self_zero } => {
+            let src = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
+            // `xor r,r` / `sub r,r` 的同寄存器形状 = 清零（x64 常见零寄存器 idiom）。
+            if self_zero && same_register(&ops[0], ops.get(1)) {
+                Ok(Some(format!("{dst} = 0")))
+            } else {
+                Ok(Some(format!("{dst} = {dst} {op} {src}")))
+            }
+        }
+        MnemonicClass::Unary { op, post } => Ok(Some(match post {
+            Some(one) => format!("{dst} = {dst} {one}"),
+            None => format!("{dst} = {op}{dst}"),
+        })),
+        MnemonicClass::Move => {
+            if ops.len() >= 2 {
+                let rhs = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
+                Ok(Some(format!("{dst} = {rhs}")))
+            } else {
+                Err(format!("{name} 为单操作数指令，无法用赋值形式表达"))
+            }
+        }
+        MnemonicClass::Unknown => {
+            // 助记符不认识（或没提供）：退回最保守的"目标 ← 源"。对 mov 正确；对别的指令
+            // 可能不准确，但至少在没 mnemonic 解析器时保持既有行为，不引入新回归。
+            if ops.len() >= 2 {
+                let rhs = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
+                Ok(Some(format!("{dst} = {rhs}")))
+            } else {
+                Err(format!("{name} 为单操作数指令，无法用赋值形式表达"))
+            }
+        }
+    }
 }
 
 /// 指令助记符的可读名。
@@ -813,6 +858,98 @@ fn indirect_goto_target(
 /// **宽度是事实**（`MemRef::size` 从指令读出来），所以 `T` 不是猜的；
 /// 但如果 size 不是 1/2/4/8，说明是向量访问或我们理解错了 ——
 /// 那种情况如实标注字节数，不硬塞一个 C 类型。
+/// 两个操作数是否是同一个寄存器（用于识别 `xor r,r` / `sub r,r` 清零 idiom）。
+fn same_register(a: &Operand, b: Option<&Operand>) -> bool {
+    matches!((a, b), (Operand::Reg(x), Some(Operand::Reg(y))) if x.0 == y.0)
+}
+
+/// 指令按语义分成的形状类别（决定 `translate` 怎么拼语句）。
+enum MnemonicClass {
+    /// 只设标志、无可赋值结果（`test`/`cmp`）。
+    FlagsOnly,
+    /// `lea`：算地址不解引用。
+    Lea,
+    /// 二元运算：`dst = dst <op> src`；`self_zero` 时同寄存器形状 → `dst = 0`。
+    Binary { op: &'static str, self_zero: bool },
+    /// 一元运算：`dst = <op>dst`（neg/not）或 `dst = dst <one>`（inc/dec）。
+    Unary {
+        op: &'static str,
+        post: Option<&'static str>,
+    },
+    /// `mov` 家族：`dst = src`。
+    Move,
+    /// 不认识：退回保守赋值。
+    Unknown,
+}
+
+/// 把可读助记符文本归类。只处理常见 x86/ARM 算术逻辑；未知返回 `Unknown`（走保守路径）。
+///
+/// 依据是**指令语义**（事实），不是猜：`add` 就是加法、`xor r,r` 就是清零。给出正确运算
+/// 比一句占位更有用，也比把加法错写成赋值诚实得多（§7）。
+fn classify_mnemonic(mn: Option<&str>) -> MnemonicClass {
+    let Some(mn) = mn else {
+        return MnemonicClass::Unknown;
+    };
+    match mn {
+        "mov" | "movabs" | "movzx" | "movsx" | "movsxd" | "movz" | "movs" => MnemonicClass::Move,
+        "lea" | "adr" | "adrp" => MnemonicClass::Lea,
+        "test" | "cmp" | "cmn" | "tst" => MnemonicClass::FlagsOnly,
+        "add" | "adds" => MnemonicClass::Binary {
+            op: "+",
+            self_zero: false,
+        },
+        "sub" | "subs" => MnemonicClass::Binary {
+            op: "-",
+            self_zero: true,
+        },
+        "and" | "ands" => MnemonicClass::Binary {
+            op: "&",
+            self_zero: false,
+        },
+        "or" | "orr" | "orrs" => MnemonicClass::Binary {
+            op: "|",
+            self_zero: false,
+        },
+        "xor" | "eor" | "xors" => MnemonicClass::Binary {
+            op: "^",
+            self_zero: true,
+        },
+        "imul" | "mul" | "madd" => MnemonicClass::Binary {
+            op: "*",
+            self_zero: false,
+        },
+        "shl" | "sal" | "lsl" | "slli" => MnemonicClass::Binary {
+            op: "<<",
+            self_zero: false,
+        },
+        "shr" | "lsr" | "srli" => MnemonicClass::Binary {
+            op: ">>",
+            self_zero: false,
+        },
+        "sar" | "asr" | "srai" => MnemonicClass::Binary {
+            op: ">>",
+            self_zero: false,
+        },
+        "inc" => MnemonicClass::Unary {
+            op: "",
+            post: Some("+ 1"),
+        },
+        "dec" => MnemonicClass::Unary {
+            op: "",
+            post: Some("- 1"),
+        },
+        "neg" => MnemonicClass::Unary {
+            op: "-",
+            post: None,
+        },
+        "not" | "mvn" => MnemonicClass::Unary {
+            op: "~",
+            post: None,
+        },
+        _ => MnemonicClass::Unknown,
+    }
+}
+
 fn mem_text(m: &bitflip_arch::MemRef, namer: RegisterNamer<'_>) -> String {
     let ty = match m.size {
         1 => "uint8_t".to_string(),
@@ -821,6 +958,17 @@ fn mem_text(m: &bitflip_arch::MemRef, namer: RegisterNamer<'_>) -> String {
         8 => "uint64_t".to_string(),
         n => format!("/* {n} 字节 */ uint8_t"),
     };
+    let inner = mem_addr(m, namer);
+    if m.write {
+        format!("*({ty} *)({inner}) /* 写 */")
+    } else {
+        format!("*({ty} *)({inner})")
+    }
+}
+
+/// 内存引用的**地址表达式**（`base + index*scale + disp`），不含解引用/宽度。
+/// `lea` 要的正是这个（它算地址、不加载）。
+fn mem_addr(m: &bitflip_arch::MemRef, namer: RegisterNamer<'_>) -> String {
     let mut parts = Vec::new();
     if let Some(b) = m.base {
         parts.push(namer(b.0).unwrap_or_else(|| format!("reg{}", b.0)));
@@ -840,12 +988,7 @@ fn mem_text(m: &bitflip_arch::MemRef, namer: RegisterNamer<'_>) -> String {
             parts.push(format!("{:#x}", m.disp));
         }
     }
-    let inner = parts.join(" + ");
-    if m.write {
-        format!("*({ty} *)({inner}) /* 写 */")
-    } else {
-        format!("*({ty} *)({inner})")
-    }
+    parts.join(" + ")
 }
 
 /// 寄存器名解析器：把 capstone 的寄存器编号变成名字。
@@ -889,6 +1032,13 @@ pub type ImportNamer<'a> = &'a dyn Fn(u64) -> Option<String>;
 /// 由 core 提供。返回 `None` 时渲染层**不加**任何注释 —— 绝不把碰巧可打印的数据谎称字符串。
 pub type StringReader<'a> = &'a dyn Fn(u64) -> Option<String>;
 
+/// 助记符解析器：`MnemonicId`（capstone 原始编号）→ 可读助记符文本（小写，如 `"mov"`/`"xor"`）。
+///
+/// 本 crate 不持有"编号 → 文本"的表（那张表在 `bitflip-arch` 解码后端里），所以算术/逻辑
+/// 指令的**真实语义**（`add` 是加法不是赋值、`xor r,r` 是清零）必须靠它来判——注入失败时
+/// 只能退回最保守的"目标 ← 源"，那对 `add`/`xor` 是**不准确**的，故 real 运行务必提供。
+pub type MnemonicResolver<'a> = &'a dyn Fn(bitflip_arch::MnemonicId) -> Option<String>;
+
 /// 可选的外部事实解析器集合（跳表 / 导入名 / 字符串）。
 ///
 /// 打包成一个结构而不是三个独立参数：它们都是"本 crate 不持有、由 core 注入"的查询，
@@ -902,6 +1052,8 @@ pub struct Resolvers<'a> {
     pub import: Option<ImportNamer<'a>>,
     /// 只读数据里的 C 字符串解析器。
     pub string: Option<StringReader<'a>>,
+    /// 助记符解析器（编号 → 文本），用于还原算术/逻辑指令的真实语义。
+    pub mnemonic: Option<MnemonicResolver<'a>>,
 }
 
 impl<'a> Resolvers<'a> {
@@ -912,6 +1064,7 @@ impl<'a> Resolvers<'a> {
             table: None,
             import: None,
             string: None,
+            mnemonic: None,
         }
     }
 }
@@ -1003,7 +1156,7 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(9999)), Operand::Imm(1)],
         );
-        let e = translate(&i, &test_namer, None, None).unwrap_err();
+        let e = translate(&i, &test_namer, None, None, None).unwrap_err();
         assert!(e.contains("9999"), "应报出编号：{e}");
         assert!(e.contains("无名字"), "应说明是没有名字：{e}");
     }
@@ -1026,7 +1179,9 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(19)), Operand::Imm(7)],
         );
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         assert!(text.contains("rax = 0x7"), "{text}");
     }
 
@@ -1042,7 +1197,9 @@ mod tests {
             vec![],
         );
         i.condition = Some(ConditionCode::Equal);
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         assert!(text.contains("goto 0x1100"), "应含 goto：{text}");
         assert!(text.starts_with("if ("), "应保留条件：{text}");
         // 不得出现 C 的语句块花括号 —— 那会让人以为是结构化输出。
@@ -1053,7 +1210,9 @@ mod tests {
     fn indirect_branch_says_unknown_instead_of_guessing() {
         // 间接跳转没有目标：必须写明"未知"，不能编一个地址。
         let i = insn(0x2000, 2, Flow::Branch { conditional: false }, None, vec![]);
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         assert!(text.contains("目标未知"), "应说明目标未知：{text}");
         assert!(text.contains("goto"), "仍需给出 goto：{text}");
     }
@@ -1062,11 +1221,13 @@ mod tests {
     fn return_and_trap_are_rendered() {
         let r = insn(0, 3, Flow::Return, None, vec![]);
         assert_eq!(
-            translate(&r, &test_namer, None, None).unwrap().unwrap(),
+            translate(&r, &test_namer, None, None, None)
+                .unwrap()
+                .unwrap(),
             "return"
         );
         let t = insn(0, 4, Flow::Trap, None, vec![]);
-        assert!(translate(&t, &test_namer, None, None)
+        assert!(translate(&t, &test_namer, None, None, None)
             .unwrap()
             .unwrap()
             .contains("trap"));
@@ -1109,7 +1270,7 @@ mod tests {
     #[test]
     fn unnamed_function_gets_a_note_not_a_fabricated_name() {
         let cfg = Cfg::build(&[]);
-        let f = decompile_function(0x1000, None, &[], &cfg, &test_namer, None, None);
+        let f = decompile_function(0x1000, None, &[], &cfg, &test_namer, Resolvers::none());
         assert!(f.name.is_none(), "不得编造名字");
         assert!(f.notes.contains(&PseudocodeNote::Unnamed));
         // 渲染时用入口地址，不是 func_xxx。
@@ -1122,7 +1283,7 @@ mod tests {
     fn flat_goto_note_is_always_present() {
         // 这条说明决定了用户怎么读输出，漏掉它等于让用户误判。
         let cfg = Cfg::build(&[]);
-        let f = decompile_function(0, Some("f"), &[], &cfg, &test_namer, None, None);
+        let f = decompile_function(0, Some("f"), &[], &cfg, &test_namer, Resolvers::none());
         assert!(f.notes.contains(&PseudocodeNote::FlatGoto));
         assert!(!f.structured, "本模块恒不结构化");
     }
@@ -1133,7 +1294,14 @@ mod tests {
         let ops = vec![Operand::Reg(RegId(19)), Operand::Imm(7)];
         let insns = vec![insn(0x1000, 10, Flow::Fallthrough, None, ops)];
         let cfg = Cfg::build(&insns);
-        let f = decompile_function(0x1000, Some("f"), &insns, &cfg, &test_namer, None, None);
+        let f = decompile_function(
+            0x1000,
+            Some("f"),
+            &insns,
+            &cfg,
+            &test_namer,
+            Resolvers::none(),
+        );
         assert_eq!(f.untranslated, 0, "这条应当能翻译");
         for b in &f.blocks {
             for s in &b.statements {
@@ -1252,7 +1420,9 @@ mod tests {
         let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         // 槽 = 0x1000 + 6 + 0x1234 = 0x223a
         assert_eq!(text, "goto *(void **)0x223a");
         assert!(!text.contains("目标未知"), "不该再退回未知占位：{text}");
@@ -1263,7 +1433,9 @@ mod tests {
         // `jmp rax`（35 是 capstone 的 rsp；这里用 19 = rax）→ 目标就是寄存器里的地址。
         let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
         i.operands = vec![Operand::Reg(RegId(19))];
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(text, "goto rax");
     }
 
@@ -1280,7 +1452,9 @@ mod tests {
             size: 8,
             write: false,
         })];
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         assert!(
             text.starts_with("goto *(void **)("),
             "应解引用表寻址：{text}"
@@ -1293,7 +1467,9 @@ mod tests {
     fn indirect_jump_without_usable_operand_still_says_unknown() {
         // 操作数里没有任何可用线索时，仍如实说未知（不退化成假地址，也不编目标）。
         let i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(text, "goto /* 目标未知（间接） */ 0");
     }
 
@@ -1306,7 +1482,7 @@ mod tests {
         let imp = |slot: u64| -> Option<String> {
             (slot == 0x223a).then(|| "KERNEL32.dll!RtlAllocateHeap".to_string())
         };
-        let text = translate(&i, &test_namer, Some(&imp), None)
+        let text = translate(&i, &test_namer, Some(&imp), None, None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1322,7 +1498,7 @@ mod tests {
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
         let imp = |slot: u64| -> Option<String> { (slot == 0x223a).then(|| "K!Func".to_string()) };
-        let text = translate(&i, &test_namer, Some(&imp), None)
+        let text = translate(&i, &test_namer, Some(&imp), None, None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "goto *(void **)0x223a /* = K!Func */");
@@ -1335,7 +1511,7 @@ mod tests {
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
         let imp = |_slot: u64| -> Option<String> { None };
-        let text = translate(&i, &test_namer, Some(&imp), None)
+        let text = translate(&i, &test_namer, Some(&imp), None, None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "/* call */ *(void **)0x223a()");
@@ -1354,7 +1530,7 @@ mod tests {
         let sr = |addr: u64| -> Option<String> {
             (addr == 0x401000).then(|| "Hello, world".to_string())
         };
-        let text = translate(&i, &test_namer, None, Some(&sr))
+        let text = translate(&i, &test_namer, None, Some(&sr), None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "rax = 0x401000 /* \"Hello, world\" */");
@@ -1371,7 +1547,7 @@ mod tests {
             vec![Operand::Reg(RegId(19)), Operand::Imm(0x401000)],
         );
         let sr = |_a: u64| -> Option<String> { Some("a\"b\nc".to_string()) };
-        let text = translate(&i, &test_namer, None, Some(&sr))
+        let text = translate(&i, &test_namer, None, Some(&sr), None)
             .unwrap()
             .unwrap();
         assert!(text.contains("\\\""), "引号应转义：{text}");
@@ -1388,7 +1564,9 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(19)), Operand::Imm(0x401000)],
         );
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(text, "rax = 0x401000");
     }
 
@@ -1404,11 +1582,97 @@ mod tests {
             vec![Operand::Reg(RegId(19)), Operand::PcRelative(0x10)],
         );
         i.len = 7;
-        let text = translate(&i, &test_namer, None, None).unwrap().unwrap();
+        let text = translate(&i, &test_namer, None, None, None)
+            .unwrap()
+            .unwrap();
         assert!(
             text.contains("0x1017"),
             "PC 相对绝对地址应为指令末+disp：{text}"
         );
         assert!(!text.contains("0x1010"), "不得用指令首算：{text}");
+    }
+
+    /// 造一条两操作数指令，附带一个固定的助记符解析器（模拟后端返回 `mn`）。
+    fn translate_with_mnemonic(mn: &'static str, ops: Vec<Operand>) -> Option<String> {
+        let i = insn(0x1000, 7, Flow::Fallthrough, None, ops);
+        let resolver =
+            move |_m: bitflip_arch::MnemonicId| -> Option<String> { Some(mn.to_string()) };
+        translate(&i, &test_namer, None, None, Some(&resolver)).unwrap()
+    }
+
+    #[test]
+    fn xor_same_register_becomes_zero_not_self_assign() {
+        // `xor r8d, r8d`（x64 零寄存器 idiom）必须写成清零，而不是无意义的 `r8d = r8d`。
+        let text = translate_with_mnemonic(
+            "xor",
+            vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(19))],
+        );
+        assert_eq!(text.as_deref(), Some("rax = 0"));
+    }
+
+    #[test]
+    fn xor_different_registers_is_a_real_xor() {
+        let text = translate_with_mnemonic(
+            "xor",
+            vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(26))],
+        );
+        assert_eq!(text.as_deref(), Some("rax = rax ^ rcx"));
+    }
+
+    #[test]
+    fn add_is_rendered_as_addition_not_assignment() {
+        // `add rax, rcx` 是加法，早先会错写成 `rax = rcx`（严重误导）。
+        let text = translate_with_mnemonic(
+            "add",
+            vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(26))],
+        );
+        assert_eq!(text.as_deref(), Some("rax = rax + rcx"));
+    }
+
+    #[test]
+    fn cmp_and_test_produce_no_statement() {
+        // cmp/test 只设标志，被紧随的分支消费；输出成一行赋值是错的 → 有意不产生语句。
+        assert!(
+            translate_with_mnemonic("cmp", vec![Operand::Reg(RegId(19)), Operand::Imm(0)])
+                .is_none()
+        );
+        assert!(translate_with_mnemonic(
+            "test",
+            vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(19))]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn lea_computes_address_and_does_not_dereference() {
+        // `lea rax, [rcx+0x10]` 算地址，不是解引用：绝不能写成 `rax = *(uint64_t*)(...)`。
+        let text = translate_with_mnemonic(
+            "lea",
+            vec![
+                Operand::Reg(RegId(19)),
+                Operand::Mem(bitflip_arch::MemRef {
+                    base: Some(RegId(26)),
+                    index: None,
+                    scale: 1,
+                    index_extend: None,
+                    disp: 0x10,
+                    size: 8,
+                    write: false,
+                }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(text, "rax = rcx + 0x10");
+        assert!(!text.contains("*("), "lea 不得解引用：{text}");
+    }
+
+    #[test]
+    fn unknown_mnemonic_keeps_conservative_move() {
+        // 不认识的助记符（或没解析器）→ 退回保守赋值，不引入新回归。
+        let text = translate_with_mnemonic(
+            "frobnicate",
+            vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(26))],
+        );
+        assert_eq!(text.as_deref(), Some("rax = rcx"));
     }
 }
