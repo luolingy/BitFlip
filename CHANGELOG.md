@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第十一片：多字节 nop / endbr64 / push / pop 正常表达（"无法翻译"从 2444 降到 135）
+
+- 逆向里最扎眼的噪声是成片的 `/* 无法翻译：insn#N 为单操作数指令 */` 注释。查明主因是**多字节
+  `nop`**（如 `nop dword ptr [rax+rax*1]`）与 **`push`/`pop`**：它们要么带内存操作数、要么本就是
+  栈操作，却都掉进"目标 ← 源"的单操作数兜底而报错。
+- 按助记符归类（`classify_mnemonic`，助记符来自已注入的 `MnemonicResolver`）：
+  - `nop`/多字节 `nop`/`endbr64`/`endbr32`/`hint`/`bti` → **不产生语句**（它们语义上就是空操作/
+    对齐填充/控制流保护标记，带操作数也仍是空操作）；
+  - `push x` → `push(x)`、`pop dst` → `pop(dst)`（如实表达栈操作，**不改写 rsp 表达式、不编造
+    栈模型**——那是超出本片范围的数据流，留白不猜）。
+- `lvalue` 改为**按需计算**（原在 match 前 eager 求值，导致 `push imm` 的立即数被当左值而报错）。
+- 效果（kernel32.dll x86_64 全量）：`无法翻译` 注释 **2444 → 135**（−2309）；`push()` 689 处、
+  `pop()` 644 处正常呈现；剩余 135 处是更罕见的单操作数指令（`cdqe`/`leave`/`ret` 等，留待后续）。
+- 新增 4 项单测：多字节 nop 不产生语句 / endbr64 不产生语句 / push·pop 栈操作 / push 立即数。
+- arch 102 / analyze 243(+3) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 修正 — 阶段 1 第十片：算术/逻辑指令按真实语义还原（`add`/`xor` 不再错写成赋值）
 
 - **这是一处正确性 bug，不是美化**：`translate` 的"一般形状"原来把**任何**两操作数指令都渲染成

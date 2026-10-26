@@ -485,12 +485,14 @@ pub(crate) fn translate(
     }
     let mn = mnemonic.and_then(|f| f(m)).map(|s| s.to_ascii_lowercase());
 
-    let dst = lvalue(&ops[0], namer)?;
     match classify_mnemonic(mn.as_deref()) {
+        // 空操作/对齐填充/控制流保护标记 → 有意不产生语句。
+        MnemonicClass::Nop => Ok(None),
         // 只设标志、没有可赋值的"目标 ← "形态：`test`/`cmp` 的结果由紧随的分支消费，
         // 输出成一行 `a = b` 是错误的（会误导成赋值）。这里**有意不产生语句**。
         MnemonicClass::FlagsOnly => Ok(None),
         MnemonicClass::Lea => {
+            let dst = lvalue(&ops[0], namer)?;
             // lea 计算地址，**不解引用**。`lea r, [mem]` = `r = &mem`（表达式即地址）。
             if let Some(Operand::Mem(mem)) = ops.get(1) {
                 Ok(Some(format!("{dst} = {}", mem_addr(mem, namer))))
@@ -501,6 +503,7 @@ pub(crate) fn translate(
             }
         }
         MnemonicClass::Binary { op, self_zero } => {
+            let dst = lvalue(&ops[0], namer)?;
             let src = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
             // `xor r,r` / `sub r,r` 的同寄存器形状 = 清零（x64 常见零寄存器 idiom）。
             if self_zero && same_register(&ops[0], ops.get(1)) {
@@ -509,12 +512,26 @@ pub(crate) fn translate(
                 Ok(Some(format!("{dst} = {dst} {op} {src}")))
             }
         }
-        MnemonicClass::Unary { op, post } => Ok(Some(match post {
-            Some(one) => format!("{dst} = {dst} {one}"),
-            None => format!("{dst} = {op}{dst}"),
-        })),
+        MnemonicClass::Unary { op, post } => {
+            let dst = lvalue(&ops[0], namer)?;
+            Ok(Some(match post {
+                Some(one) => format!("{dst} = {dst} {one}"),
+                None => format!("{dst} = {op}{dst}"),
+            }))
+        }
+        MnemonicClass::Push => {
+            // `push x` 语义即把 x 压栈；用 `push(x)` 表达，不改写 rsp 表达式、不编造栈模型。
+            let arg = expr(ops, insn.addr, insn.len, namer, string_reader)?;
+            Ok(Some(format!("push({arg})")))
+        }
+        MnemonicClass::Pop => {
+            // `pop dst` 语义即从栈弹出到 dst；用 `pop(dst)` 表达。
+            let dst = lvalue(&ops[0], namer)?;
+            Ok(Some(format!("pop({dst})")))
+        }
         MnemonicClass::Move => {
             if ops.len() >= 2 {
+                let dst = lvalue(&ops[0], namer)?;
                 let rhs = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
                 Ok(Some(format!("{dst} = {rhs}")))
             } else {
@@ -525,6 +542,7 @@ pub(crate) fn translate(
             // 助记符不认识（或没提供）：退回最保守的"目标 ← 源"。对 mov 正确；对别的指令
             // 可能不准确，但至少在没 mnemonic 解析器时保持既有行为，不引入新回归。
             if ops.len() >= 2 {
+                let dst = lvalue(&ops[0], namer)?;
                 let rhs = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
                 Ok(Some(format!("{dst} = {rhs}")))
             } else {
@@ -865,6 +883,10 @@ fn same_register(a: &Operand, b: Option<&Operand>) -> bool {
 
 /// 指令按语义分成的形状类别（决定 `translate` 怎么拼语句）。
 enum MnemonicClass {
+    /// 空操作 / 对齐填充 / 控制流保护标记（`nop`、多字节 `nop [mem]`、`endbr64`…）——
+    /// **不产生任何语句**。多字节 `nop` 带一个内存操作数（如 `nop dword ptr [rax+rax*1]`），
+    /// 若走"一般形状"会被误报成"单操作数无法翻译"，其实它语义上就是空操作。
+    Nop,
     /// 只设标志、无可赋值结果（`test`/`cmp`）。
     FlagsOnly,
     /// `lea`：算地址不解引用。
@@ -878,6 +900,10 @@ enum MnemonicClass {
     },
     /// `mov` 家族：`dst = src`。
     Move,
+    /// `push <op>`：压栈（语义即 `push(x)`，不改写 rsp 表达式、不编造栈模型）。
+    Push,
+    /// `pop <dst>`：出栈（语义即 `pop(dst)`）。
+    Pop,
     /// 不认识：退回保守赋值。
     Unknown,
 }
@@ -891,7 +917,11 @@ fn classify_mnemonic(mn: Option<&str>) -> MnemonicClass {
         return MnemonicClass::Unknown;
     };
     match mn {
+        // 空操作/对齐填充/控制流保护标记：无论是否带操作数，都不产生语句。
+        "nop" | "endbr64" | "endbr32" | "hint" | "bti" => MnemonicClass::Nop,
         "mov" | "movabs" | "movzx" | "movsx" | "movsxd" | "movz" | "movs" => MnemonicClass::Move,
+        "push" | "pushf" | "pushfq" => MnemonicClass::Push,
+        "pop" | "popf" | "popfq" => MnemonicClass::Pop,
         "lea" | "adr" | "adrp" => MnemonicClass::Lea,
         "test" | "cmp" | "cmn" | "tst" => MnemonicClass::FlagsOnly,
         "add" | "adds" => MnemonicClass::Binary {
@@ -1674,5 +1704,48 @@ mod tests {
             vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(26))],
         );
         assert_eq!(text.as_deref(), Some("rax = rcx"));
+    }
+
+    #[test]
+    fn multibyte_nop_with_operand_emits_no_statement() {
+        // `nop dword ptr [rax+rax*1]`（多字节 nop）带一个内存操作数，但它语义上是空操作：
+        // 必须不产生语句，而不是被误报成"单操作数无法翻译"。
+        let text = translate_with_mnemonic(
+            "nop",
+            vec![Operand::Mem(bitflip_arch::MemRef {
+                base: Some(RegId(19)),
+                index: Some(RegId(19)),
+                scale: 1,
+                index_extend: None,
+                disp: 0,
+                size: 4,
+                write: false,
+            })],
+        );
+        assert!(text.is_none(), "多字节 nop 不应产生语句，得到 {text:?}");
+    }
+
+    #[test]
+    fn endbr64_emits_no_statement() {
+        // `endbr64`（CET 控制流保护标记）也只是标记，不产生语句。
+        assert!(translate_with_mnemonic("endbr64", vec![]).is_none());
+    }
+
+    #[test]
+    fn push_and_pop_render_as_stack_ops() {
+        // `push rbx` / `pop rbx` 是简单可判的栈操作，应表达出来而不是"无法翻译"。
+        assert_eq!(
+            translate_with_mnemonic("push", vec![Operand::Reg(RegId(28))]).as_deref(),
+            Some("push(rbx)")
+        );
+        assert_eq!(
+            translate_with_mnemonic("pop", vec![Operand::Reg(RegId(28))]).as_deref(),
+            Some("pop(rbx)")
+        );
+        // `push 0x10` 立即数形式。
+        assert_eq!(
+            translate_with_mnemonic("push", vec![Operand::Imm(0x10)]).as_deref(),
+            Some("push(0x10)")
+        );
     }
 }
