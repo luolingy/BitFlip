@@ -43,6 +43,35 @@ struct Built {
     structured_blocks: usize,
 }
 
+/// 给函数序幕的栈帧分配语句加一句尾注：`rsp = rsp - 0xN` → `… /* 栈帧 0xN 字节 */`。
+///
+/// 只认**函数体里第一条** `rsp = rsp - 0xN`（按发射顺序，序幕就在最前），且仅加**注释**、
+/// 不改语义。这条是 `sub rsp, N` 的渲染，N 即本函数在栈上分配的局部空间（含 shadow/对齐），
+/// 逆向时对局部变量布局有直观帮助。
+fn annotate_frame_size(lines: &mut [Line]) {
+    for line in lines.iter_mut() {
+        let Some(rest) = line.text.strip_prefix("rsp = rsp - ") else {
+            continue;
+        };
+        // 只处理纯十六进制立即数（`0x…`）。此时文本已带 `; /* @addr */` 后缀，
+        // 因此只取 `0x` 之后连续十六进制数字即可（遇到 `;`/空格/`/` 停）。
+        let Some(num) = rest.strip_prefix("0x") else {
+            continue;
+        };
+        let hex: String = num.chars().take_while(char::is_ascii_hexdigit).collect();
+        if let Ok(size) = u64::from_str_radix(&hex, 16) {
+            if size > 0 {
+                // 插在 `;` 之前，保持 `…- 0xN /* 栈帧…字节 */; /* @addr */` 的可读顺序。
+                line.text = line
+                    .text
+                    .replacen("; ", &format!(" /* 栈帧 {size:#x} 字节 */; "), 1);
+            }
+        }
+        // 只标注第一条（序幕）；无论成功与否都不再继续。
+        return;
+    }
+}
+
 /// 解析出的跳表形状（见 [`Builder::parse_switch_shape`]）。
 struct SwitchShape {
     /// 索引寄存器。
@@ -149,6 +178,7 @@ pub fn decompile_structured(
         }
     }
 
+    annotate_frame_size(&mut builder.lines);
     let built = Built {
         lines: builder.lines,
         residual_gotos: builder.residual_gotos,
@@ -1033,6 +1063,46 @@ fn compute_immediate_postdominators(
 mod tests {
     use super::*;
     use bitflip_arch::{Arch, ConditionCode, MnemonicId, Operand, RegId};
+
+    #[test]
+    fn frame_size_annotation_marks_first_rsp_sub() {
+        let mut lines = vec![
+            Line {
+                indent: 1,
+                text: "push(rbx); /* @0x1000 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "rsp = rsp - 0xc0; /* @0x1001 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "rsp = rsp - 0x20; /* @0x1004 */".to_string(),
+            },
+        ];
+        annotate_frame_size(&mut lines);
+        // 第一条 `rsp = rsp - 0xN` 被标注（注释插在 `;` 之前）。
+        assert_eq!(
+            lines[1].text,
+            "rsp = rsp - 0xc0 /* 栈帧 0xc0 字节 */; /* @0x1001 */"
+        );
+        // 只有第一条被标注（序幕）；后面的不再动。
+        assert_eq!(lines[2].text, "rsp = rsp - 0x20; /* @0x1004 */");
+        // `push` 行不受影响。
+        assert_eq!(lines[0].text, "push(rbx); /* @0x1000 */");
+    }
+
+    #[test]
+    fn frame_size_annotation_ignores_non_hex_rsp_adjust() {
+        // `rsp = rsp + 0x20`（尾声增向）不是栈帧分配；不标注。
+        let mut lines = vec![Line {
+            indent: 1,
+            text: "rsp = rsp + 0x20; /* @0x1000 */".to_string(),
+        }];
+        annotate_frame_size(&mut lines);
+        assert_eq!(lines[0].text, "rsp = rsp + 0x20; /* @0x1000 */");
+    }
+
     fn jmp(addr: u64, target: u64) -> DecodedInsn {
         DecodedInsn {
             addr,
