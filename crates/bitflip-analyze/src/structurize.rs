@@ -224,6 +224,9 @@ impl Builder<'_> {
             return;
         };
         let last_addr = self.last_insn_addr(b);
+        // 先收集本块的语句（含地址），做返回值归纳后再统一输出 —— 这样 `ret` 前的
+        // `eax/rax = ...` 能融合成 `return <expr>`，与扁平路径口径一致。
+        let mut stmts: Vec<crate::pseudo::PseudocodeStatement> = Vec::new();
         for (&addr, insn) in self.by_addr.range(b.start..b.end) {
             if skip_last_branch && Some(addr) == last_addr {
                 continue;
@@ -235,12 +238,17 @@ impl Builder<'_> {
                 self.string_reader,
                 self.mnemonic,
             ) {
-                Ok(Some(text)) => self.push(indent, format!("{text}; /* @{addr:#x} */")),
+                Ok(Some(text)) => stmts.push(crate::pseudo::PseudocodeStatement { addr, text }),
                 Ok(None) => {}
-                Err(reason) => {
-                    self.push(indent, format!("/* 无法翻译：{reason} */ /* @{addr:#x} */"))
-                }
+                Err(reason) => stmts.push(crate::pseudo::PseudocodeStatement {
+                    addr,
+                    text: format!("/* 无法翻译：{reason} */"),
+                }),
             }
+        }
+        crate::pseudo::fuse_return_value(&mut stmts);
+        for s in stmts {
+            self.push(indent, format!("{}; /* @{:#x} */", s.text, s.addr));
         }
     }
 

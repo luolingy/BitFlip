@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第十四片：返回值归纳（`eax/rax = …; ret` 融合成 `return <expr>;`）
+
+- 让非 void 函数像 C：`ret` 前对返回值寄存器（`eax`/`rax`，SysV/MS x64，事实）的赋值，融合成
+  `return <expr>;`，而不是孤零零的 `return;`。
+- 判据保守但有覆盖：
+  - 从 `return` 回溯，**跳过纯尾声语句**（`pop(...)`、`rsp = …` 栈指针复位、恢复被调用者保存
+    寄存器 `rbx/rsi/rdi/rbp/r12..15` 及其 32 位形式）；
+  - 遇到 `eax/rax = <expr>` 即融合成 `return <expr>`（值就是等号右边，可能正是 `ebx`/`r9d` 等，
+    因为常见形态是 `eax = ebx; ret`）；
+  - **遇到 `call` 或任何未归类语句立即停止、不融合**——`call` 可能改写 rax，绝不猜数据流。
+- 关键点：扁平路径（`decompile_function`）与**结构化路径**（`structurize::emit_block_stmts`）
+  都要做这一步；此前只加在扁平路径，而实际导出走结构化，导致融合 0 命中。本片把融合抽成
+  `fuse_return_value` 并在结构化的**每个基本块**输出前调用，两条路径口径一致。
+- 效果（kernel32.dll x86_64 全量）：`return <expr>;` **0 → 139** 处（共 318 个 return，其余
+  179 个确无局部值可归纳——值来自 call 返回值或无赋值，如实保留 `return;`）。
+- 新增 5 项单测：返回值表达式识别（eax/rax，排除更长前缀）/ 相邻融合 / 跨尾声指令融合 /
+  call 阻隔不融合 / 未知语句阻隔不融合。
+- arch 103 / analyze 252(+5) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第十三片：RIP 相对的全局变量写入还原成 `*(uintN *)(0x..) = reg`
 
 - 真实正确性缺口：`mov [rip+rel], rcx` 这类**写到全局变量**的指令，目标操作数是 RIP 相对的，

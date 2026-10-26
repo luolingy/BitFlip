@@ -366,6 +366,8 @@ pub fn decompile_function(
                 indirect += 1;
             }
         }
+        // 返回值归纳：`ret` 前紧邻一条对 `eax`/`rax` 的赋值时，融合成 `return <expr>;`。
+        fuse_return_value(&mut statements);
         blocks.push(PseudocodeBlock {
             start: b.start,
             end: b.end,
@@ -617,6 +619,87 @@ fn insn_name(m: bitflip_arch::MnemonicId) -> String {
     } else {
         format!("insn#{}", m.get())
     }
+}
+
+/// 若 `text` 是形如 `eax = <expr>` / `rax = <expr>` 的赋值，返回 `<expr>`（返回值表达式）。
+///
+/// 只认 x86 返回寄存器 `eax`（32 位）/`rax`（64 位）。`eaxjunk = ...` 之类不会被误认
+/// （要求前缀后**恰好**是 ` = `）。这两个寄存器是 SysV/MS x64 的返回值寄存器（事实）。
+fn return_value_expr(text: &str) -> Option<&str> {
+    for reg in ["rax", "eax"] {
+        if let Some(rest) = text.strip_prefix(reg) {
+            if let Some(value) = rest.strip_prefix(" = ") {
+                // 排除把 `rax` 用作更长的名字前缀（含 `[`/`(`/字母/数字）的情形。
+                let next = text[reg.len()..].chars().next();
+                if matches!(next, Some(' ')) && !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 返回值归纳：`ret` 前先跳过**纯尾声指令**（`pop`、`rsp` 调整、恢复被调用者保存寄存器），
+/// 再遇到 `eax = <expr>` / `rax = <expr>` 时融合成 `return <expr>;`。
+///
+/// 判据保守但不失覆盖：仅当从 `return` 回溯、沿途全是"**不写返回值寄存器、不调用**"的
+/// 尾声语句时才融合；一旦遇到未知语句或 `call`（可能改写 rax）就**停止、不融合**。这既覆盖
+/// 常见的 `eax = v; rsp += N; pop...; ret` 形态，又绝不误吞可能改写返回值的语句（不猜数据流）。
+pub(crate) fn fuse_return_value(statements: &mut Vec<PseudocodeStatement>) {
+    let n = statements.len();
+    if n < 2 {
+        return;
+    }
+    if statements[n - 1].text.trim() != "return" {
+        return;
+    }
+    // 从 return 前一条开始回溯。
+    let mut i = n - 2;
+    // 收集可跳过的尾声语句（不写 rax/eax、不 call）。
+    while i > 0 && is_epilogue_statement(&statements[i].text) {
+        i -= 1;
+    }
+    let Some(value) = return_value_expr(&statements[i].text) else {
+        return;
+    };
+    // 融合：把 return 之前、从 i 到末尾的尾部语句都删掉（它们是尾声），返回 i 处的值。
+    let value = value.trim().to_string();
+    statements[i].addr = statements[n - 1].addr;
+    statements[i].text = format!("return {value}");
+    statements.truncate(i + 1);
+}
+
+/// 判断一条语句是否是"纯尾声"语句（跳过它去寻找返回值赋值是安全的）。
+///
+/// 安全前提：**不写 `eax`/`rax`、不是 `call`**。只认几类确定形态：
+/// `pop(...)`、`rsp = ...`（栈指针复位/调整）、恢复被调用者保存寄存器（`rbx/rsi/rdi/rbp/r12..15`
+/// 及其 32 位形式）。其余一律视为"停下"（返回 false）。
+fn is_epilogue_statement(text: &str) -> bool {
+    let t = text.trim();
+    if t.starts_with("pop(") {
+        return true;
+    }
+    if t.starts_with("/* call */") {
+        return false; // 调用可能改写 rax —— 必须停。
+    }
+    // `rsp = ...`（栈指针复位）。
+    if t.starts_with("rsp = ") {
+        return true;
+    }
+    // 恢复被调用者保存寄存器：<callee-saved reg> = ...
+    const CALLEE_SAVED: &[&str] = &[
+        "rbx", "ebx", "rsi", "esi", "rdi", "edi", "rbp", "ebp", "r12", "r12d", "r13", "r13d",
+        "r14", "r14d", "r15", "r15d",
+    ];
+    for reg in CALLEE_SAVED {
+        if let Some(rest) = t.strip_prefix(reg) {
+            if rest.starts_with(" = ") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// 条件码 → C 表达式片段。
@@ -1286,6 +1369,14 @@ mod tests {
             _ => return None,
         };
         Some(name.to_string())
+    }
+
+    /// 造一条伪代码语句（用于直接测 `fuse_return_value`）。
+    fn stmt(addr: u64, text: &str) -> PseudocodeStatement {
+        PseudocodeStatement {
+            addr,
+            text: text.to_string(),
+        }
     }
 
     /// 造一条最小指令。**只设测试真正用到的字段**，其余刻意留默认值 ——
@@ -1962,5 +2053,73 @@ mod tests {
             translate_with_mnemonic("push", vec![Operand::Imm(0x10)]).as_deref(),
             Some("push(0x10)")
         );
+    }
+
+    #[test]
+    fn return_value_expr_recognizes_eax_and_rax() {
+        assert_eq!(return_value_expr("eax = 0x1"), Some("0x1"));
+        assert_eq!(return_value_expr("rax = rcx + 0x8"), Some("rcx + 0x8"));
+        // 非返回值寄存器、或被用作更长名字前缀的，都不认。
+        assert_eq!(return_value_expr("ebx = 0x1"), None);
+        assert_eq!(return_value_expr("rax_flag = 0x1"), None);
+        assert_eq!(return_value_expr("*(uint64_t *)(0x0) = rax"), None);
+    }
+
+    #[test]
+    fn return_value_is_fused_when_adjacent_to_return() {
+        // `eax = 0x1; return` → `return 0x1`。
+        let mut stmts = vec![
+            stmt(0x1000, "rsp = rsp - 0x20"),
+            stmt(0x1004, "eax = 0x1"),
+            stmt(0x1008, "return"),
+        ];
+        fuse_return_value(&mut stmts);
+        assert_eq!(
+            stmts.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["rsp = rsp - 0x20", "return 0x1"]
+        );
+    }
+
+    #[test]
+    fn return_value_is_fused_across_epilogue_statements() {
+        // `eax = x; rsp = rsp + N; pop(rbx); return` —— 越过尾声指令仍找到返回值并融合。
+        let mut stmts = vec![
+            stmt(0x1000, "eax = 0x1"),
+            stmt(0x1004, "rsp = rsp + 0x20"),
+            stmt(0x1008, "pop(rbx)"),
+            stmt(0x100c, "return"),
+        ];
+        fuse_return_value(&mut stmts);
+        assert_eq!(
+            stmts.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            vec!["return 0x1"]
+        );
+    }
+
+    #[test]
+    fn return_value_is_not_fused_when_call_intervenes() {
+        // 中间有 call（可能改写 rax）→ 停止、不融合，保留 `eax = x; ...; return`。
+        let mut stmts = vec![
+            stmt(0x1000, "eax = 0x1"),
+            stmt(0x1004, "/* call */ foo()"),
+            stmt(0x1008, "rsp = rsp + 0x20"),
+            stmt(0x100c, "return"),
+        ];
+        fuse_return_value(&mut stmts);
+        assert_eq!(stmts.len(), 4);
+        assert_eq!(stmts[3].text, "return");
+    }
+
+    #[test]
+    fn return_value_is_not_fused_when_unknown_statement_intervenes() {
+        // 中间有无法归类的普通语句 → 停止、不融合（不猜它是否改写返回值）。
+        let mut stmts = vec![
+            stmt(0x1000, "eax = 0x1"),
+            stmt(0x1004, "*(uint64_t *)(0x40) = rcx"),
+            stmt(0x1008, "return"),
+        ];
+        fuse_return_value(&mut stmts);
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[2].text, "return");
     }
 }
