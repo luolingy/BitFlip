@@ -539,26 +539,69 @@ pub(crate) fn translate(
             Ok(Some(format!("{dst} = ({cond}) ? 1 : 0")))
         }
         MnemonicClass::Move => {
-            if ops.len() >= 2 {
+            if ops.len() < 2 {
+                return Err(format!("{name} 为单操作数指令，无法用赋值形式表达"));
+            }
+            // `mov [rip+rel], reg`：写到 RIP 相对的全局地址。宽度从源寄存器名如实推断
+            // （`rcx`→8、`eax`→4…），渲染成 `*(uintN *)(0xABS) = reg`。
+            if let Some(text) = store_to_pc_relative(insn, ops, namer, string_reader)? {
+                Ok(Some(text))
+            } else {
                 let dst = lvalue(&ops[0], namer)?;
                 let rhs = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
                 Ok(Some(format!("{dst} = {rhs}")))
-            } else {
-                Err(format!("{name} 为单操作数指令，无法用赋值形式表达"))
             }
         }
         MnemonicClass::Unknown => {
             // 助记符不认识（或没提供）：退回最保守的"目标 ← 源"。对 mov 正确；对别的指令
             // 可能不准确，但至少在没 mnemonic 解析器时保持既有行为，不引入新回归。
-            if ops.len() >= 2 {
+            if ops.len() < 2 {
+                return Err(format!("{name} 为单操作数指令，无法用赋值形式表达"));
+            }
+            if let Some(text) = store_to_pc_relative(insn, ops, namer, string_reader)? {
+                Ok(Some(text))
+            } else {
                 let dst = lvalue(&ops[0], namer)?;
                 let rhs = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
                 Ok(Some(format!("{dst} = {rhs}")))
-            } else {
-                Err(format!("{name} 为单操作数指令，无法用赋值形式表达"))
             }
         }
     }
+}
+
+/// 若目标是 RIP 相对地址（`[rip+rel]`）且**源是寄存器**，渲染成对全局变量的存储：
+/// `*(uintN *)(0xABS) = src`。宽度由源寄存器名推断（`rcx`→8、`eax`→4…）。
+///
+/// 源不是寄存器（立即数/内存）时返回 `Ok(None)` 而**不猜**宽度 —— 让上层照常处理或如实报错。
+/// 这解决的是"`mov [rip+rel], rcx` 这类全局变量写入渲染不出来"的真实缺口。
+fn store_to_pc_relative(
+    insn: &DecodedInsn,
+    ops: &[Operand],
+    namer: RegisterNamer<'_>,
+    string_reader: Option<StringReader<'_>>,
+) -> Result<Option<String>, String> {
+    let Some(Operand::PcRelative(rel)) = ops.first() else {
+        return Ok(None);
+    };
+    // 源必须是寄存器，才能从名字推宽度。
+    let Some(Operand::Reg(src_reg)) = ops.get(1) else {
+        return Ok(None);
+    };
+    let Some(src_name) = namer(src_reg.0) else {
+        return Ok(None);
+    };
+    let Some(width) = reg_width_from_name(&src_name) else {
+        return Ok(None);
+    };
+    // RIP 相对：绝对地址 = 指令末 + 位移（与 expr 的口径一致）。
+    let abs = insn
+        .addr
+        .wrapping_add(u64::from(insn.len))
+        .wrapping_add(*rel as u64);
+    let ty = int_type(width);
+    let value = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
+    let store = format!("*({ty} *)({abs:#x}) = {value}");
+    Ok(Some(annotate_string(store, abs, string_reader)))
 }
 
 /// 指令助记符的可读名。
@@ -953,6 +996,57 @@ fn x86_cc_suffix(mn: &str) -> bool {
             | "o"
             | "no"
     )
+}
+
+/// 从寄存器名推断**访问宽度**（字节）。名字是 capstone 给的事实，宽度映射是固定表，不是猜。
+///
+/// 只认 x86 通用寄存器命名（`rax`→8 / `eax`→4 / `ax`→2 / `al`→1，`r8`…`r15` 同理，
+/// `r8d`→4，`r8w`→2，`r8b`→1）。推不出（如 `xmm`/`st`/未知名）返回 `None`，调用方据此保守处理。
+fn reg_width_from_name(name: &str) -> Option<u8> {
+    let base = name.trim_start_matches('<').trim_end_matches('>');
+    if let Some(rest) = base.strip_prefix('r') {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return Some(8); // r8..r15
+        }
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            return match rest.trim_start_matches(|c: char| c.is_ascii_digit()) {
+                "" => Some(8),
+                "d" => Some(4),
+                "w" => Some(2),
+                "b" => Some(1),
+                _ => None,
+            };
+        }
+    }
+    const EIGHT: &[&str] = &["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp"];
+    const FOUR: &[&str] = &["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"];
+    const TWO: &[&str] = &["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"];
+    const ONE: &[&str] = &[
+        "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl", "ah", "bh", "ch", "dh",
+    ];
+    if EIGHT.contains(&base) {
+        Some(8)
+    } else if FOUR.contains(&base) {
+        Some(4)
+    } else if TWO.contains(&base) {
+        Some(2)
+    } else if ONE.contains(&base) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// 按宽度给 C 整数类型名（用于 PC 相对存储的解引用类型）。
+fn int_type(width: u8) -> String {
+    match width {
+        1 => "uint8_t".to_string(),
+        2 => "uint16_t".to_string(),
+        4 => "uint32_t".to_string(),
+        8 => "uint64_t".to_string(),
+        n => format!("/* {n} 字节 */ uint8_t"),
+    }
 }
 
 /// 把可读助记符文本归类。只处理常见 x86/ARM 算术逻辑；未知返回 `Unknown`（走保守路径）。
@@ -1801,6 +1895,55 @@ mod tests {
             .unwrap();
         assert_eq!(text, "rax = (/* NotEqual */ flags) ? 1 : 0");
         assert!(!text.contains("无法翻译"));
+    }
+
+    #[test]
+    fn reg_width_from_name_table_is_factual() {
+        assert_eq!(reg_width_from_name("rax"), Some(8));
+        assert_eq!(reg_width_from_name("eax"), Some(4));
+        assert_eq!(reg_width_from_name("ax"), Some(2));
+        assert_eq!(reg_width_from_name("al"), Some(1));
+        assert_eq!(reg_width_from_name("rcx"), Some(8));
+        assert_eq!(reg_width_from_name("r8"), Some(8));
+        assert_eq!(reg_width_from_name("r8d"), Some(4));
+        assert_eq!(reg_width_from_name("r8w"), Some(2));
+        assert_eq!(reg_width_from_name("r8b"), Some(1));
+        // 推不出宽度的一律 None（不猜）。
+        assert_eq!(reg_width_from_name("xmm0"), None);
+        assert_eq!(reg_width_from_name("st"), None);
+    }
+
+    #[test]
+    fn pc_relative_store_renders_as_global_write() {
+        // `mov [rip+0x10], rcx` 在 0x1000、长 7 → 绝对 = 0x1000+7+0x10 = 0x1017。
+        // 源是 64 位寄存器 → 渲染成 `*(uint64_t *)(0x1017) = rcx`，而不是"PC 相对不能作赋值目标"。
+        let mut i = insn(
+            0x1000,
+            7,
+            Flow::Fallthrough,
+            None,
+            vec![Operand::PcRelative(0x10), Operand::Reg(RegId(26))],
+        );
+        i.len = 7;
+        let mn = |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("mov".to_string()) };
+        let text = translate(&i, &test_namer, None, None, Some(&mn)).unwrap();
+        assert_eq!(text.as_deref(), Some("*(uint64_t *)(0x1017) = rcx"));
+    }
+
+    #[test]
+    fn pc_relative_store_imm_source_is_refused_not_guessed() {
+        // 源是立即数时无法推宽度 → 不猜，仍如实报错（不能假装知道 4/8 字节）。
+        let mut i = insn(
+            0x1000,
+            7,
+            Flow::Fallthrough,
+            None,
+            vec![Operand::PcRelative(0x10), Operand::Imm(0)],
+        );
+        i.len = 7;
+        let mn = |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("mov".to_string()) };
+        let r = translate(&i, &test_namer, None, None, Some(&mn));
+        assert!(r.is_err(), "立即数源推不出宽度，应如实报错而不是猜：{r:?}");
     }
 
     #[test]
