@@ -719,7 +719,15 @@ fn convert_condition(
 /// 由上层如实显示"条件未知"，而不是硬凑一个近似条件（§7：不猜）。
 fn x86_condition_from_mnemonic(mnemonic: &str) -> Option<crate::insn::ConditionCode> {
     use crate::insn::ConditionCode;
-    Some(match mnemonic {
+    // `setcc`（`setne`/`setb`…）的条件后缀与 `jcc` 完全同构：剥掉 `set` 前缀后按 `j`+后缀
+    // 映射即可。这样 `setz`/`sete` 等都能还原出语义条件，供渲染层写成 `(cond) ? 1 : 0`。
+    let key = if let Some(rest) = mnemonic.strip_prefix("set") {
+        // 复用一个临时 `j`-助记符再走同一张表（`setne` → `jne`）。
+        format!("j{rest}")
+    } else {
+        mnemonic.to_string()
+    };
+    Some(match key.as_str() {
         "je" | "jz" => ConditionCode::Equal,
         "jne" | "jnz" => ConditionCode::NotEqual,
         // CF=1：无符号"低于"（比借位/进位清除）。
@@ -1659,6 +1667,27 @@ mod tests {
         // 奇偶条件没有对应 ConditionCode → 如实 None（不猜）。
         let jp = dec.decode_one(&[0x7A, 0x05], 0x1000).expect("jp");
         assert_eq!(jp.condition, None);
+    }
+
+    #[test]
+    fn x86_setcc_carries_semantic_condition() {
+        // `setcc`（setne/setb/setns…）按标志置 0/1，条件后缀与 jcc 同构。
+        // 回归：早先只认 `jcc`，`setcc` 的 condition 恒为 None，渲染层只能显示"条件未知"。
+        let dec = decoder();
+        let cases: &[(&[u8], crate::insn::ConditionCode)] = &[
+            (&[0x0F, 0x95, 0xC0], crate::insn::ConditionCode::NotEqual), // setne al
+            (&[0x0F, 0x94, 0xC0], crate::insn::ConditionCode::Equal),    // sete al
+            (&[0x0F, 0x92, 0xC0], crate::insn::ConditionCode::CarryClear), // setb al
+            (&[0x0F, 0x99, 0xC1], crate::insn::ConditionCode::Plus),     // setns cl
+        ];
+        for &(bytes, expect) in cases {
+            let insn = dec.decode_one(bytes, 0x1000).expect("setcc");
+            assert_eq!(
+                insn.condition,
+                Some(expect),
+                "setcc 字节 {bytes:02x?} 的条件应为 {expect:?}"
+            );
+        }
     }
 
     #[test]

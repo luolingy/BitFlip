@@ -529,6 +529,15 @@ pub(crate) fn translate(
             let dst = lvalue(&ops[0], namer)?;
             Ok(Some(format!("pop({dst})")))
         }
+        MnemonicClass::SetCc => {
+            // `setcc dst` 按标志位把 dst 置 0/1。条件来自 `insn.condition`（架构层已按
+            // 助记符映射好）。条件不确定时如实显示 `/* 条件未知 */`，仍给 0/1 的形状。
+            let dst = lvalue(&ops[0], namer)?;
+            let cond = insn
+                .condition
+                .map_or_else(|| "/* 条件未知 */ flags".to_string(), condition_text);
+            Ok(Some(format!("{dst} = ({cond}) ? 1 : 0")))
+        }
         MnemonicClass::Move => {
             if ops.len() >= 2 {
                 let dst = lvalue(&ops[0], namer)?;
@@ -904,8 +913,46 @@ enum MnemonicClass {
     Push,
     /// `pop <dst>`：出栈（语义即 `pop(dst)`）。
     Pop,
+    /// `setcc <dst>`：按标志位把 dst 置 0/1（渲染成 `dst = (cond) ? 1 : 0`）。
+    SetCc,
     /// 不认识：退回保守赋值。
     Unknown,
+}
+
+/// 判断 `set` 之后的后缀是否是合法 x86 条件码（用于把 `setcc` 与 `set...` 其它指令区分开）。
+/// 只认 x86 条件码（与 `x86_condition_from_mnemonic` 对齐），不猜未知后缀。
+fn x86_cc_suffix(mn: &str) -> bool {
+    let Some(rest) = mn.strip_prefix("set") else {
+        return false;
+    };
+    matches!(
+        rest,
+        "e" | "z"
+            | "ne"
+            | "nz"
+            | "b"
+            | "nae"
+            | "c"
+            | "ae"
+            | "nb"
+            | "nc"
+            | "be"
+            | "na"
+            | "a"
+            | "nbe"
+            | "l"
+            | "nge"
+            | "ge"
+            | "nl"
+            | "le"
+            | "ng"
+            | "g"
+            | "nle"
+            | "s"
+            | "ns"
+            | "o"
+            | "no"
+    )
 }
 
 /// 把可读助记符文本归类。只处理常见 x86/ARM 算术逻辑；未知返回 `Unknown`（走保守路径）。
@@ -916,6 +963,10 @@ fn classify_mnemonic(mn: Option<&str>) -> MnemonicClass {
     let Some(mn) = mn else {
         return MnemonicClass::Unknown;
     };
+    // `setcc`（setne/setb/setns…）是一大类条件置位指令：后缀与 jcc 同构。
+    if mn.starts_with("set") && x86_cc_suffix(mn) {
+        return MnemonicClass::SetCc;
+    }
     match mn {
         // 空操作/对齐填充/控制流保护标记：无论是否带操作数，都不产生语句。
         "nop" | "endbr64" | "endbr32" | "hint" | "bti" => MnemonicClass::Nop,
@@ -1729,6 +1780,27 @@ mod tests {
     fn endbr64_emits_no_statement() {
         // `endbr64`（CET 控制流保护标记）也只是标记，不产生语句。
         assert!(translate_with_mnemonic("endbr64", vec![]).is_none());
+    }
+
+    #[test]
+    fn setcc_renders_as_conditional_zero_or_one() {
+        // `setne r8b`：按标志位把 r8b 置 0/1。带语义条件时应写成 `(cond) ? 1 : 0`，
+        // 而不是"单操作数无法翻译"。
+        let mut i = insn(
+            0x1000,
+            7,
+            Flow::Fallthrough,
+            None,
+            vec![Operand::Reg(RegId(19))],
+        );
+        i.condition = Some(ConditionCode::NotEqual);
+        let resolver =
+            |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("setne".to_string()) };
+        let text = translate(&i, &test_namer, None, None, Some(&resolver))
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "rax = (/* NotEqual */ flags) ? 1 : 0");
+        assert!(!text.contains("无法翻译"));
     }
 
     #[test]

@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第十二片：`setcc` 条件置位指令还原成 `(cond) ? 1 : 0`
+
+- 逆向输出里剩余"无法翻译"最常见的一类是 **`setcc`**（`setne`/`setb`/`setns`…，按标志位把
+  目标置 0/1），共约 60 处。它们只带一个寄存器操作数，掉进单操作数兜底而报错。
+- 修在两个层面（各司其职）：
+  - **arch**：`x86_condition_from_mnemonic` 现在也识别 `set` 前缀（剥掉 `set` 后按 `j`+后缀
+    走同一张条件码表），使 `insn.condition` 对 `setcc` 有真实语义条件；此前只认 `jcc`，
+    `setcc` 恒为 `None`。
+  - **analyze**：新增 `MnemonicClass::SetCc`，渲染成 `dst = (/* Cond */ flags) ? 1 : 0`——
+    条件来自 `insn.condition`，不确定时显示 `/* 条件未知 */`，不猜。
+- 效果（kernel32.dll x86_64 全量）：`无法翻译` 注释 **135 → 75**（−60）；`? 1 : 0` 形如
+  `r8b = (/* NotEqual */ flags) ? 1 : 0;` 共 37 处（其余 setcc 落在分离区域/非主路径）。
+- 新增 2 项单测：arch 层 `setcc` 携带语义条件（setne/sete/setb/setns 字节级）；analyze 层
+  `setcc` 渲染成 `(cond) ? 1 : 0`。
+- arch 103(+1) / analyze 244(+1) / core 73 / server m6 17 / cli 40，`cargo test --workspace`
+  全绿；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第十一片：多字节 nop / endbr64 / push / pop 正常表达（"无法翻译"从 2444 降到 135）
 
 - 逆向里最扎眼的噪声是成片的 `/* 无法翻译：insn#N 为单操作数指令 */` 注释。查明主因是**多字节
