@@ -147,6 +147,91 @@ fn annotate_stack_slots(lines: &mut Vec<Line>) {
     lines.insert(0, Line { indent, text: note });
 }
 
+/// 解析一行里所有 `*(uintN_t *)(&v<hex>)` 视图，返回 `(起始字节, 结束字节, 宽度, 偏移)`。
+///
+/// 只认这一固定形状（第十九片产出的符号化形态）；`N` 是位宽（8/16/32/64），宽度 = N/8。
+fn parse_slot_views(text: &str) -> Vec<(usize, usize, u64, u64)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("*(uint") {
+        let start = from + rel;
+        // 从 `*(uint` 之后读位宽数字。
+        let mut i = start + "*(uint".len();
+        let digits_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let bits: u64 = match text[digits_start..i].parse() {
+            Ok(v) => v,
+            Err(_) => {
+                from = start + "*(uint".len();
+                continue;
+            }
+        };
+        // 期望紧跟 `_t *)(&v`。
+        let expected = "_t *)(&v";
+        if !text[i..].starts_with(expected) {
+            from = start + "*(uint".len();
+            continue;
+        }
+        i += expected.len();
+        // 读偏移十六进制。
+        let hex_start = i;
+        while i < bytes.len() && (bytes[i] as char).is_ascii_hexdigit() {
+            i += 1;
+        }
+        if i == hex_start || !text[i..].starts_with(')') {
+            from = start + "*(uint".len();
+            continue;
+        }
+        let off = u64::from_str_radix(&text[hex_start..i], 16).unwrap_or(0);
+        let end = i + 1; // 含右括号
+        out.push((start, end, bits / 8, off));
+        from = end;
+    }
+    out
+}
+
+/// 栈槽化简为变量引用：`*(uint64_t *)(&v88)` → `v88`。
+///
+/// **只在宽度唯一时才化简**：先统计每个槽偏移在整函数里被哪些宽度访问；只被单一宽度访问的槽
+/// 才化简成裸变量（安全，可读性更好）；被多种宽度访问的槽（联合/重解释视图）**保留**
+/// `*(ty *)(&v..)` 原形，避免丢掉"同一槽以不同宽度解释"这一事实（§7 不猜）。
+fn simplify_single_width_slots(lines: &mut [Line]) {
+    use std::collections::{BTreeMap, BTreeSet};
+    // 统计每个偏移出现的宽度集合。
+    let mut widths: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for line in lines.iter() {
+        for (_, _, size, off) in parse_slot_views(&line.text) {
+            widths.entry(off).or_default().insert(size);
+        }
+    }
+    let single: BTreeSet<u64> = widths
+        .iter()
+        .filter(|(_, s)| s.len() == 1)
+        .map(|(&o, _)| o)
+        .collect();
+    if single.is_empty() {
+        return;
+    }
+    // 逐行倒序替换（偏移不变，倒序替换避免字节位移影响后续区间）。
+    for line in lines.iter_mut() {
+        let views = parse_slot_views(&line.text);
+        if views.is_empty() {
+            continue;
+        }
+        let mut text = line.text.clone();
+        for (start, end, size, off) in views.into_iter().rev() {
+            // 宽度唯一、且该唯一宽度就是本视图的宽度 → 化简。
+            if single.contains(&off) && widths[&off].len() == 1 && widths[&off].contains(&size) {
+                text.replace_range(start..end, &format!("v{off:x}"));
+            }
+        }
+        line.text = text;
+    }
+}
+
 /// 在函数序幕（开头到第一条 `rsp = rsp - 0xN` 之间）收集 `push(<被调者保存寄存器>)`，
 /// 在其后插入一行归组注释：`// 序幕保存被调者寄存器: rbx, rbp, r12`。
 ///
@@ -292,6 +377,7 @@ pub fn decompile_structured(
     annotate_frame_size(&mut builder.lines);
     annotate_epilogue_frame(&mut builder.lines);
     annotate_stack_slots(&mut builder.lines);
+    simplify_single_width_slots(&mut builder.lines);
     let built = Built {
         lines: builder.lines,
         residual_gotos: builder.residual_gotos,
@@ -1249,6 +1335,50 @@ mod tests {
         }];
         annotate_stack_slots(&mut lines);
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn single_width_slot_access_becomes_bare_variable() {
+        // 同一槽偏移只用 8 字节访问 → 化简成裸变量 v88。
+        let mut lines = vec![
+            Line {
+                indent: 1,
+                text: "rax = *(uint64_t *)(&v88); /* @0x1000 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "*(uint64_t *)(&v88) = rbx; /* @0x1004 */".to_string(),
+            },
+        ];
+        simplify_single_width_slots(&mut lines);
+        assert_eq!(lines[0].text, "rax = v88; /* @0x1000 */");
+        assert_eq!(lines[1].text, "v88 = rbx; /* @0x1004 */");
+    }
+
+    #[test]
+    fn multi_width_slot_access_keeps_deref_form() {
+        // 同一槽偏移被 4 字节与 8 字节两种宽度访问 → 保留 `*(ty *)(&v..)`，不化简（不丢宽度）。
+        let mut lines = vec![
+            Line {
+                indent: 1,
+                text: "rax = *(uint64_t *)(&v10); /* @0x1000 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "ecx = *(uint32_t *)(&v10); /* @0x1004 */".to_string(),
+            },
+        ];
+        simplify_single_width_slots(&mut lines);
+        assert_eq!(lines[0].text, "rax = *(uint64_t *)(&v10); /* @0x1000 */");
+        assert_eq!(lines[1].text, "ecx = *(uint32_t *)(&v10); /* @0x1004 */");
+    }
+
+    #[test]
+    fn parse_slot_views_extracts_size_and_offset() {
+        let v = parse_slot_views("x = *(uint32_t *)(&v2c) + *(uint64_t *)(&v30);");
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].2, v[0].3), (4, 0x2c));
+        assert_eq!((v[1].2, v[1].3), (8, 0x30));
     }
 
     #[test]
