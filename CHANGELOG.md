@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第二十三片：函数头参数声明注释
+
+- 对识别出的入参（第二十二片），在函数体最顶生成一行 `// 参数: arg1=rcx, arg2=rdx, arg3=r8`，
+  与栈槽汇总声明并列，一眼看清"哪些寄存器是参数、各是第几个"，函数签名侧可读性收尾。
+- 实现：在把 `param_map` 移进包装 namer **之前**先算好声明文本（趁 `namer` 还能反查寄存器名），
+  各 annotate 完成后插入正文最前（签名在栈布局之前）。按 argN 的 N 升序排列；无参数则不加。
+  纯注释、零语义改动。
+- 效果（kernel32.dll x86_64 全量）：326 个函数获得参数声明注释（如 `// 参数: arg1=rcx, arg3=r8`
+  ——如实只列真正被判为参数的寄存器）。
+- 新增 1 项单测：乱序插入的 param_map 按 arg 序号排序输出 / 空映射返回 None。
+- arch 103 / analyze 268(+1) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第二十二片：入参寄存器符号化（`rcx/rdx/r8/r9` → `arg1..arg4`）
 
 - 函数签名可读化：x64 前四整型参数寄存器 `rcx/rdx/r8/r9`（SysV 与 Windows x64 顺序一致）在函数

@@ -232,7 +232,34 @@ fn simplify_single_width_slots(lines: &mut [Line]) {
     }
 }
 
-/// 识别入参寄存器：x64 前四整型参数寄存器 `rcx/rdx/r8/r9`（SysV 与 Windows x64 顺序一致）。
+/// 由参数映射生成函数头声明注释：`// 参数: arg1=rcx, arg2=rdx, arg3=r8`。
+///
+/// 只列**确实被识别为参数**的寄存器（`detect_param_regs` 的产物），按 argN 的 N 升序；
+/// 反查寄存器名用原 `namer`（事实）。无参数返回 `None`。纯注释、零语义改动。
+fn param_declaration(
+    param_map: &BTreeMap<u16, String>,
+    namer: RegisterNamer<'_>,
+) -> Option<String> {
+    if param_map.is_empty() {
+        return None;
+    }
+    // 按 arg 序号排序（arg1..arg4）。
+    let mut entries: Vec<(u32, String)> = param_map
+        .iter()
+        .filter_map(|(&rid, arg)| {
+            let n = arg.strip_prefix("arg")?.parse::<u32>().ok()?;
+            let reg = namer(rid)?;
+            Some((n, format!("{arg}={reg}")))
+        })
+        .collect();
+    entries.sort_by_key(|(n, _)| *n);
+    if entries.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = entries.into_iter().map(|(_, s)| s).collect();
+    Some(format!("// 参数: {}", parts.join(", ")))
+}
+
 ///
 /// 判据：按地址升序扫描，找每个候选寄存器**首次出现**的指令；若那次是"读、且不同时写"
 /// （即入口先读后写，说明它是传入参数），就记为 `argN`（N 按 ABI 槽位：rcx=1/rdx=2/r8=3/r9=4）。
@@ -363,6 +390,9 @@ pub fn decompile_structured(
     // （x64 SysV/Win 前四整型参数寄存器 rcx/rdx/r8/r9 顺序固定）。仅当入口**先读**才改名，
     // 入口先写（局部用途）保持原寄存器名 —— 纯命名、语义等价。
     let param_map = detect_param_regs(&by_addr, namer);
+    // 先据 param_map 生成函数头参数声明注释（`// 参数: arg1=rcx, arg2=rdx`），
+    // 趁 `namer` 还能反查寄存器名、且 `param_map` 未被移进闭包时算好。
+    let param_note = param_declaration(&param_map, namer);
     let base_namer = namer;
     let param_namer =
         move |id: u16| -> Option<String> { param_map.get(&id).cloned().or_else(|| base_namer(id)) };
@@ -430,6 +460,11 @@ pub fn decompile_structured(
     annotate_frame_size(&mut builder.lines);
     annotate_epilogue_frame(&mut builder.lines);
     annotate_stack_slots(&mut builder.lines);
+    // 参数声明注释放最顶（签名在栈布局之前），仅在识别到参数时插入。
+    if let Some(note) = param_note {
+        let indent = builder.lines.first().map_or(1, |l| l.indent);
+        builder.lines.insert(0, Line { indent, text: note });
+    }
     simplify_single_width_slots(&mut builder.lines);
     let built = Built {
         lines: builder.lines,
@@ -1606,6 +1641,34 @@ mod tests {
 
     fn namer(_: u16) -> Option<String> {
         Some("r0".to_string())
+    }
+
+    #[test]
+    fn param_declaration_lists_args_in_order() {
+        use bitflip_arch::RegId;
+        let name_map = |id: u16| -> Option<String> {
+            Some(
+                match id {
+                    26 => "rcx",
+                    27 => "rdx",
+                    66 => "r8",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+        let mut pm: BTreeMap<u16, String> = BTreeMap::new();
+        // 故意乱序插入，验证按 arg 序号排序输出。
+        pm.insert(66, "arg3".to_string()); // r8
+        pm.insert(26, "arg1".to_string()); // rcx
+        pm.insert(27, "arg2".to_string()); // rdx
+        let _ = RegId(0);
+        assert_eq!(
+            param_declaration(&pm, &name_map).as_deref(),
+            Some("// 参数: arg1=rcx, arg2=rdx, arg3=r8")
+        );
+        // 空映射 → None。
+        assert_eq!(param_declaration(&BTreeMap::new(), &name_map), None);
     }
 
     #[test]
