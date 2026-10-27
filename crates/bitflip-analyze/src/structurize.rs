@@ -72,6 +72,37 @@ fn annotate_frame_size(lines: &mut [Line]) {
     }
 }
 
+/// 从一行文本里解析 `rsp = rsp - 0xN` 的 N（十六进制）。仅用于序幕帧大小提取。
+fn parse_rsp_sub_size(text: &str) -> Option<u64> {
+    let rest = text.strip_prefix("rsp = rsp - 0x")?;
+    let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    u64::from_str_radix(&hex, 16).ok()
+}
+
+/// 尾声栈帧释放注释：把与**序幕帧大小 N 精确配对**的尾声 `rsp = rsp + 0xN` 标注成
+/// `… /* 栈帧释放 0xN 字节 */`，与序幕的 `/* 栈帧 0xN 字节 */` 首尾呼应。
+///
+/// 判据：先取序幕 `rsp = rsp - 0xN` 的 N；再从**后往前**找第一条 `rsp = rsp + 0xM` 且 `M == N`
+/// ——同值才配对，避免误标函数中间无关的 rsp 加。仅注释、零语义改动；无序幕或无配对则不标。
+fn annotate_epilogue_frame(lines: &mut [Line]) {
+    let Some(frame_size) = lines.iter().find_map(|l| parse_rsp_sub_size(&l.text)) else {
+        return;
+    };
+    // 从后往前找与序幕等值的 `rsp = rsp + 0xN`（最靠近尾声的那条）。
+    for line in lines.iter_mut().rev() {
+        let Some(rest) = line.text.strip_prefix("rsp = rsp + 0x") else {
+            continue;
+        };
+        let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+        if u64::from_str_radix(&hex, 16).ok() == Some(frame_size) {
+            line.text =
+                line.text
+                    .replacen("; ", &format!(" /* 栈帧释放 {frame_size:#x} 字节 */; "), 1);
+            return;
+        }
+    }
+}
+
 /// 若 `push(<reg>)` 里的 reg 是**跨 ABI 都非易失**的被调者保存寄存器，返回其规范名。
 ///
 /// 只认 `rbx/rbp/r12..r15` —— 这些在 SysV 与 Windows x64 里都要求被调者保存，跨平台可靠。
@@ -225,6 +256,7 @@ pub fn decompile_structured(
 
     annotate_prologue_regs(&mut builder.lines);
     annotate_frame_size(&mut builder.lines);
+    annotate_epilogue_frame(&mut builder.lines);
     let built = Built {
         lines: builder.lines,
         residual_gotos: builder.residual_gotos,
@@ -1147,6 +1179,45 @@ mod tests {
         }];
         annotate_frame_size(&mut lines);
         assert_eq!(lines[0].text, "rsp = rsp + 0x20; /* @0x1000 */");
+    }
+
+    #[test]
+    fn epilogue_frame_release_pairs_with_prologue_size() {
+        // 序幕 `rsp = rsp - 0x48`，尾声 `rsp = rsp + 0x48` → 标注"栈帧释放 0x48 字节"。
+        let mut lines = vec![
+            Line {
+                indent: 1,
+                text: "rsp = rsp - 0x48; /* @0x1000 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "rsp = rsp + 0x48; /* @0x1010 */".to_string(),
+            },
+        ];
+        annotate_epilogue_frame(&mut lines);
+        assert_eq!(
+            lines[1].text,
+            "rsp = rsp + 0x48 /* 栈帧释放 0x48 字节 */; /* @0x1010 */"
+        );
+        // 序幕行不受影响。
+        assert_eq!(lines[0].text, "rsp = rsp - 0x48; /* @0x1000 */");
+    }
+
+    #[test]
+    fn epilogue_frame_release_ignores_nonmatching_add() {
+        // 尾声的增向与序幕不等值 → 不配对、不标注（避免误标中间无关的 rsp 加）。
+        let mut lines = vec![
+            Line {
+                indent: 1,
+                text: "rsp = rsp - 0x48; /* @0x1000 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "rsp = rsp + 0x10; /* @0x1010 */".to_string(),
+            },
+        ];
+        annotate_epilogue_frame(&mut lines);
+        assert_eq!(lines[1].text, "rsp = rsp + 0x10; /* @0x1010 */");
     }
 
     #[test]
