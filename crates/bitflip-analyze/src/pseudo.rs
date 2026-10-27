@@ -1219,12 +1219,37 @@ fn mem_text(m: &bitflip_arch::MemRef, namer: RegisterNamer<'_>) -> String {
         8 => "uint64_t".to_string(),
         n => format!("/* {n} 字节 */ uint8_t"),
     };
-    let inner = mem_addr(m, namer);
+    let inner = frame_slot_ref(m, namer).unwrap_or_else(|| mem_addr(m, namer));
     if m.write {
         format!("*({ty} *)({inner}) /* 写 */")
     } else {
         format!("*({ty} *)({inner})")
     }
+}
+
+/// 若这是一次**固定栈槽**访存（`rsp + 常量`，无 index），返回一个符号化引用 `&v<偏移>`，
+/// 让 `*(uint64_t *)(rsp + 0x88)` 读成 `*(uint64_t *)(&v88)`——一眼看出是同一栈槽。
+///
+/// 只认 `rsp`（栈指针）+ 常量位移 + 无 index 的形状（2017/2566 的帧访问是这一形状）；
+/// `rbp`/带 index/寄存器位移一律不符号化（可能是动态寻址，不是固定槽）。**仅改名、不改语义**：
+/// 外层 `*(ty *)` 的宽度保留，`&v<偏移>` 就是该栈槽地址。`lea` 走 [`mem_addr`]，不受影响
+/// （它要真实地址算术，不能变成符号名）。
+fn frame_slot_ref(m: &bitflip_arch::MemRef, namer: RegisterNamer<'_>) -> Option<String> {
+    if m.index.is_some() || m.disp == 0 {
+        return None;
+    }
+    let base = m.base?;
+    let name = namer(base.0)?;
+    if name != "rsp" {
+        return None;
+    }
+    // 位移按无符号栈偏移命名（`rsp + 0x88` → `v88`）；负位移极少见，用 `m<偏移>` 区分。
+    let slot = if m.disp >= 0 {
+        format!("v{:x}", m.disp as u64)
+    } else {
+        format!("m{:x}", (-m.disp) as u64)
+    };
+    Some(format!("&{slot}"))
 }
 
 /// 内存引用的**地址表达式**（`base + index*scale + disp`），不含解引用/宽度。
@@ -1870,8 +1895,57 @@ mod tests {
     }
 
     #[test]
+    fn frame_slot_access_is_symbolized_on_rsp_base() {
+        // `*(uint64_t *)(rsp + 0x88)` → `*(uint64_t *)(&v88)`（固定栈槽符号化）。
+        let m = bitflip_arch::MemRef {
+            size: 8,
+            base: Some(RegId(35)), // rsp
+            index: None,
+            scale: 1,
+            disp: 0x88,
+            write: false,
+            index_extend: None,
+        };
+        assert_eq!(mem_text(&m, &test_namer), "*(uint64_t *)(&v88)");
+        // 写访问保留 `/* 写 */`。
+        let w = bitflip_arch::MemRef { write: true, ..m };
+        assert_eq!(mem_text(&w, &test_namer), "*(uint64_t *)(&v88) /* 写 */");
+    }
+
+    #[test]
+    fn frame_slot_not_symbolized_for_indexed_or_non_rsp_base() {
+        // 带 index 的动态寻址：不符号化（真实地址算术）。
+        let idx = bitflip_arch::MemRef {
+            size: 8,
+            base: Some(RegId(35)),
+            index: Some(RegId(26)),
+            scale: 4,
+            disp: 0x10,
+            write: false,
+            index_extend: None,
+        };
+        assert!(
+            mem_text(&idx, &test_namer).contains("rsp + "),
+            "带 index 应保留原址"
+        );
+        // 非 rsp 基址（如 rax）不符号化。
+        let rax = bitflip_arch::MemRef {
+            size: 8,
+            base: Some(RegId(19)), // rax
+            index: None,
+            scale: 1,
+            disp: 0x20,
+            write: false,
+            index_extend: None,
+        };
+        assert!(
+            mem_text(&rax, &test_namer).contains("rax + "),
+            "非 rsp 基址应保留原址"
+        );
+    }
+
+    #[test]
     fn branch_uses_previous_cmp_for_real_comparison() {
-        // 结构化/扁平路径把上一条 cmp 传给 translate，条件跳转应还原成真实比较而非裸 flags。
         let c = cmp(0x1000, Operand::Reg(RegId(19)), Operand::Imm(7));
         let j = jcc(0x1004, ConditionCode::Equal);
         let text = translate(&j, &test_namer, None, None, None, Some(&c))
