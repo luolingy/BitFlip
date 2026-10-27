@@ -335,6 +335,7 @@ impl Builder<'_> {
         // 先收集本块的语句（含地址），做返回值归纳后再统一输出 —— 这样 `ret` 前的
         // `eax/rax = ...` 能融合成 `return <expr>`，与扁平路径口径一致。
         let mut stmts: Vec<crate::pseudo::PseudocodeStatement> = Vec::new();
+        let mut prev: Option<&bitflip_arch::DecodedInsn> = None;
         for (&addr, insn) in self.by_addr.range(b.start..b.end) {
             if skip_last_branch && Some(addr) == last_addr {
                 continue;
@@ -345,6 +346,7 @@ impl Builder<'_> {
                 self.import_namer,
                 self.string_reader,
                 self.mnemonic,
+                prev,
             ) {
                 Ok(Some(text)) => stmts.push(crate::pseudo::PseudocodeStatement { addr, text }),
                 Ok(None) => {}
@@ -353,6 +355,7 @@ impl Builder<'_> {
                     text: format!("/* 无法翻译：{reason} */"),
                 }),
             }
+            prev = Some(insn);
         }
         crate::pseudo::fuse_return_value(&mut stmts);
         for s in stmts {

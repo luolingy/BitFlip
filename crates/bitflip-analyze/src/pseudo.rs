@@ -331,6 +331,7 @@ pub fn decompile_function(
             continue;
         }
         let mut statements = Vec::new();
+        let mut prev: Option<&DecodedInsn> = None;
         for (&addr, insn) in by_addr.range(b.start..b.end) {
             if statement_count >= MAX_STATEMENTS {
                 truncated += 1;
@@ -342,6 +343,7 @@ pub fn decompile_function(
                 resolvers.import,
                 resolvers.string,
                 resolvers.mnemonic,
+                prev,
             ) {
                 Ok(Some(text)) => {
                     statements.push(PseudocodeStatement { addr, text });
@@ -365,6 +367,7 @@ pub fn decompile_function(
             if matches!(insn.flow, Flow::Branch { .. } | Flow::Call) && insn.target.is_none() {
                 indirect += 1;
             }
+            prev = Some(insn);
         }
         // 返回值归纳：`ret` 前紧邻一条对 `eax`/`rax` 的赋值时，融合成 `return <expr>;`。
         fuse_return_value(&mut statements);
@@ -429,6 +432,7 @@ pub(crate) fn translate(
     import_namer: Option<ImportNamer<'_>>,
     string_reader: Option<StringReader<'_>>,
     mnemonic: Option<MnemonicResolver<'_>>,
+    prev: Option<&DecodedInsn>,
 ) -> Result<Option<String>, String> {
     let m = insn.mnemonic;
     let ops = &insn.operands;
@@ -446,9 +450,8 @@ pub(crate) fn translate(
                     .unwrap_or_else(|| "/* 目标未知（间接） */ 0".to_string()),
             };
             if conditional {
-                let cond = insn
-                    .condition
-                    .map_or_else(|| "/* 条件未知 */".to_string(), condition_text);
+                // 能从前一条 `cmp`/`test` 还原成真实比较时就还，否则退回标志位占位。
+                let cond = branch_condition_text(insn, prev, namer);
                 return Ok(Some(format!("if ({cond}) goto {target}")));
             }
             return Ok(Some(format!("goto {target}")));
@@ -1422,7 +1425,7 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(9999)), Operand::Imm(1)],
         );
-        let e = translate(&i, &test_namer, None, None, None).unwrap_err();
+        let e = translate(&i, &test_namer, None, None, None, None).unwrap_err();
         assert!(e.contains("9999"), "应报出编号：{e}");
         assert!(e.contains("无名字"), "应说明是没有名字：{e}");
     }
@@ -1445,7 +1448,7 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(19)), Operand::Imm(7)],
         );
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         assert!(text.contains("rax = 0x7"), "{text}");
@@ -1463,7 +1466,7 @@ mod tests {
             vec![],
         );
         i.condition = Some(ConditionCode::Equal);
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         assert!(text.contains("goto 0x1100"), "应含 goto：{text}");
@@ -1476,7 +1479,7 @@ mod tests {
     fn indirect_branch_says_unknown_instead_of_guessing() {
         // 间接跳转没有目标：必须写明"未知"，不能编一个地址。
         let i = insn(0x2000, 2, Flow::Branch { conditional: false }, None, vec![]);
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         assert!(text.contains("目标未知"), "应说明目标未知：{text}");
@@ -1487,13 +1490,13 @@ mod tests {
     fn return_and_trap_are_rendered() {
         let r = insn(0, 3, Flow::Return, None, vec![]);
         assert_eq!(
-            translate(&r, &test_namer, None, None, None)
+            translate(&r, &test_namer, None, None, None, None)
                 .unwrap()
                 .unwrap(),
             "return"
         );
         let t = insn(0, 4, Flow::Trap, None, vec![]);
-        assert!(translate(&t, &test_namer, None, None, None)
+        assert!(translate(&t, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap()
             .contains("trap"));
@@ -1686,7 +1689,7 @@ mod tests {
         let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         // 槽 = 0x1000 + 6 + 0x1234 = 0x223a
@@ -1699,7 +1702,7 @@ mod tests {
         // `jmp rax`（35 是 capstone 的 rsp；这里用 19 = rax）→ 目标就是寄存器里的地址。
         let mut i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
         i.operands = vec![Operand::Reg(RegId(19))];
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "goto rax");
@@ -1718,7 +1721,7 @@ mod tests {
             size: 8,
             write: false,
         })];
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         assert!(
@@ -1733,7 +1736,7 @@ mod tests {
     fn indirect_jump_without_usable_operand_still_says_unknown() {
         // 操作数里没有任何可用线索时，仍如实说未知（不退化成假地址，也不编目标）。
         let i = insn(0x1000, 7, Flow::Branch { conditional: false }, None, vec![]);
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "goto /* 目标未知（间接） */ 0");
@@ -1748,7 +1751,7 @@ mod tests {
         let imp = |slot: u64| -> Option<String> {
             (slot == 0x223a).then(|| "KERNEL32.dll!RtlAllocateHeap".to_string())
         };
-        let text = translate(&i, &test_namer, Some(&imp), None, None)
+        let text = translate(&i, &test_namer, Some(&imp), None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1764,7 +1767,7 @@ mod tests {
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
         let imp = |slot: u64| -> Option<String> { (slot == 0x223a).then(|| "K!Func".to_string()) };
-        let text = translate(&i, &test_namer, Some(&imp), None, None)
+        let text = translate(&i, &test_namer, Some(&imp), None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "goto *(void **)0x223a /* = K!Func */");
@@ -1777,7 +1780,7 @@ mod tests {
         i.len = 6;
         i.operands = vec![Operand::PcRelative(0x1234)];
         let imp = |_slot: u64| -> Option<String> { None };
-        let text = translate(&i, &test_namer, Some(&imp), None, None)
+        let text = translate(&i, &test_namer, Some(&imp), None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "/* call */ *(void **)0x223a()");
@@ -1796,7 +1799,7 @@ mod tests {
         let sr = |addr: u64| -> Option<String> {
             (addr == 0x401000).then(|| "Hello, world".to_string())
         };
-        let text = translate(&i, &test_namer, None, Some(&sr), None)
+        let text = translate(&i, &test_namer, None, Some(&sr), None, None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "rax = 0x401000 /* \"Hello, world\" */");
@@ -1813,7 +1816,7 @@ mod tests {
             vec![Operand::Reg(RegId(19)), Operand::Imm(0x401000)],
         );
         let sr = |_a: u64| -> Option<String> { Some("a\"b\nc".to_string()) };
-        let text = translate(&i, &test_namer, None, Some(&sr), None)
+        let text = translate(&i, &test_namer, None, Some(&sr), None, None)
             .unwrap()
             .unwrap();
         assert!(text.contains("\\\""), "引号应转义：{text}");
@@ -1830,7 +1833,7 @@ mod tests {
             None,
             vec![Operand::Reg(RegId(19)), Operand::Imm(0x401000)],
         );
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "rax = 0x401000");
@@ -1848,7 +1851,7 @@ mod tests {
             vec![Operand::Reg(RegId(19)), Operand::PcRelative(0x10)],
         );
         i.len = 7;
-        let text = translate(&i, &test_namer, None, None, None)
+        let text = translate(&i, &test_namer, None, None, None, None)
             .unwrap()
             .unwrap();
         assert!(
@@ -1863,7 +1866,26 @@ mod tests {
         let i = insn(0x1000, 7, Flow::Fallthrough, None, ops);
         let resolver =
             move |_m: bitflip_arch::MnemonicId| -> Option<String> { Some(mn.to_string()) };
-        translate(&i, &test_namer, None, None, Some(&resolver)).unwrap()
+        translate(&i, &test_namer, None, None, Some(&resolver), None).unwrap()
+    }
+
+    #[test]
+    fn branch_uses_previous_cmp_for_real_comparison() {
+        // 结构化/扁平路径把上一条 cmp 传给 translate，条件跳转应还原成真实比较而非裸 flags。
+        let c = cmp(0x1000, Operand::Reg(RegId(19)), Operand::Imm(7));
+        let j = jcc(0x1004, ConditionCode::Equal);
+        let text = translate(&j, &test_namer, None, None, None, Some(&c))
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "if (rax == 0x7) goto 0x2000");
+        // 不传 prev 时退回标志位形式（保持向后兼容）。
+        let fallback = translate(&j, &test_namer, None, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            fallback.contains("flags"),
+            "无 prev 应退回 flags：{fallback}"
+        );
     }
 
     #[test]
@@ -1981,7 +2003,7 @@ mod tests {
         i.condition = Some(ConditionCode::NotEqual);
         let resolver =
             |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("setne".to_string()) };
-        let text = translate(&i, &test_namer, None, None, Some(&resolver))
+        let text = translate(&i, &test_namer, None, None, Some(&resolver), None)
             .unwrap()
             .unwrap();
         assert_eq!(text, "rax = (/* NotEqual */ flags) ? 1 : 0");
@@ -2017,7 +2039,7 @@ mod tests {
         );
         i.len = 7;
         let mn = |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("mov".to_string()) };
-        let text = translate(&i, &test_namer, None, None, Some(&mn)).unwrap();
+        let text = translate(&i, &test_namer, None, None, Some(&mn), None).unwrap();
         assert_eq!(text.as_deref(), Some("*(uint64_t *)(0x1017) = rcx"));
     }
 
@@ -2033,7 +2055,7 @@ mod tests {
         );
         i.len = 7;
         let mn = |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("mov".to_string()) };
-        let r = translate(&i, &test_namer, None, None, Some(&mn));
+        let r = translate(&i, &test_namer, None, None, Some(&mn), None);
         assert!(r.is_err(), "立即数源推不出宽度，应如实报错而不是猜：{r:?}");
     }
 

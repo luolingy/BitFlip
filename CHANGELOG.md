@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第十八片：条件跳转统一按前一条 `cmp`/`test` 还原成真实比较
+
+- 真实正确性缺口：`translate` 的条件分支只用指令自身携带的语义条件码渲染成
+  `if (/* Equal */ flags) goto …`，拿不到**紧邻其前**那条 `cmp`/`test` 的操作数，于是很多本可
+  还原成 `if (rax == 0x7)` 的地方退化成裸标志位。结构化 `emit_if` 路径此前已用
+  `branch_condition_text` 还原，但**扁平路径与残差/逐字输出块**没有——口径不一致。
+- 修法：给 `translate` 增加 `prev: Option<&DecodedInsn>` 参数，条件分支改用
+  `branch_condition_text(insn, prev, namer)`；扁平路径（`decompile_function` 块循环）与结构化
+  `emit_block_stmts` 都在遍历时把**上一条指令**传进去。两路口径对齐。judge 仍严格：只认**同块内
+  紧邻**前一条"只写标志、不写通用寄存器"的指令（`cmp`/`test` 形状），拿不准照旧退回标志位。
+- 效果（kernel32.dll x86_64 全量）：`if (… flags) goto` 裸标志位回退 **12 → 3**，其余 1828 处
+  均还原成真实比较（`if (cl == 0x1)`、`if (rax != 0)`、`if (edi <= 0xffff…)` 等）。
+- 新增 1 项单测：传 prev（cmp）时 `if (rax == 0x7) goto`、不传 prev 时退回 flags（向后兼容）。
+- 测试/调用点机械补第 6 参 `None`（约 20 处测试直调）。
+- arch 103 / analyze 259(+1) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第十七片：尾声栈帧释放注释（与序幕帧大小首尾呼应）
 
 - 尾声里与**序幕帧大小 N 精确配对**的 `rsp = rsp + 0xN` 现在标注 `/* 栈帧释放 0xN 字节 */`，
