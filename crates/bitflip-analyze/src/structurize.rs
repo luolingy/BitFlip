@@ -113,6 +113,40 @@ fn callee_saved_name(op: &str) -> Option<&str> {
     matches!(name, "rbx" | "rbp" | "r12" | "r13" | "r14" | "r15").then_some(name)
 }
 
+/// 收集函数体内所有被符号化的栈槽引用（`&v<偏移>`），在函数体最前插入一行汇总注释：
+/// `// 本函数栈槽（rsp 偏移，升序）: v10, v28, v88`。
+///
+/// 只是**把已存在于正文的槽名汇总到开头**，纯注释、不改任何语句。按偏移升序排列，一眼看清
+/// 本函数的栈布局全集。无槽则不插入。
+fn annotate_stack_slots(lines: &mut Vec<Line>) {
+    // 抓所有 `&v<hex>` 形式里的偏移（只认我们自己产出的符号名形状）。
+    let mut offsets: Vec<u64> = Vec::new();
+    for line in lines.iter() {
+        let mut rest = line.text.as_str();
+        while let Some(pos) = rest.find("&v") {
+            rest = &rest[pos + 2..];
+            let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+            // 名字后必须紧跟 `)`（`&v88)`），排除偶然的 `&v` 误匹配。
+            let after = rest[hex.len()..].chars().next();
+            if !hex.is_empty() && after == Some(')') {
+                if let Ok(off) = u64::from_str_radix(&hex, 16) {
+                    if !offsets.contains(&off) {
+                        offsets.push(off);
+                    }
+                }
+            }
+        }
+    }
+    if offsets.is_empty() {
+        return;
+    }
+    offsets.sort_unstable();
+    let names: Vec<String> = offsets.iter().map(|&o| format!("v{o:x}")).collect();
+    let indent = lines.first().map_or(1, |l| l.indent);
+    let note = format!("// 本函数栈槽（rsp 偏移，升序）: {}", names.join(", "));
+    lines.insert(0, Line { indent, text: note });
+}
+
 /// 在函数序幕（开头到第一条 `rsp = rsp - 0xN` 之间）收集 `push(<被调者保存寄存器>)`，
 /// 在其后插入一行归组注释：`// 序幕保存被调者寄存器: rbx, rbp, r12`。
 ///
@@ -257,6 +291,7 @@ pub fn decompile_structured(
     annotate_prologue_regs(&mut builder.lines);
     annotate_frame_size(&mut builder.lines);
     annotate_epilogue_frame(&mut builder.lines);
+    annotate_stack_slots(&mut builder.lines);
     let built = Built {
         lines: builder.lines,
         residual_gotos: builder.residual_gotos,
@@ -1182,6 +1217,38 @@ mod tests {
         }];
         annotate_frame_size(&mut lines);
         assert_eq!(lines[0].text, "rsp = rsp + 0x20; /* @0x1000 */");
+    }
+
+    #[test]
+    fn stack_slots_declaration_collects_and_sorts() {
+        let mut lines = vec![
+            Line {
+                indent: 1,
+                text: "rax = *(uint64_t *)(&v88); /* @0x1000 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "*(uint64_t *)(&v10) = rbx; /* @0x1004 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "rcx = *(uint32_t *)(&v10); /* @0x1008 */".to_string(),
+            },
+        ];
+        annotate_stack_slots(&mut lines);
+        // 汇总行插在最前，按偏移升序、去重（v10 只出现一次）。
+        assert_eq!(lines[0].text, "// 本函数栈槽（rsp 偏移，升序）: v10, v88");
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn stack_slots_declaration_absent_when_no_slots() {
+        let mut lines = vec![Line {
+            indent: 1,
+            text: "rax = rcx + rdx; /* @0x1000 */".to_string(),
+        }];
+        annotate_stack_slots(&mut lines);
+        assert_eq!(lines.len(), 1);
     }
 
     #[test]
