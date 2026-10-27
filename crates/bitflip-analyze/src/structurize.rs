@@ -72,6 +72,51 @@ fn annotate_frame_size(lines: &mut [Line]) {
     }
 }
 
+/// 若 `push(<reg>)` 里的 reg 是**跨 ABI 都非易失**的被调者保存寄存器，返回其规范名。
+///
+/// 只认 `rbx/rbp/r12..r15` —— 这些在 SysV 与 Windows x64 里都要求被调者保存，跨平台可靠。
+/// `rsi/rdi` 视 ABI 而定（SysV 易失、Win 非易失），**不纳入**，宁少勿错。`rsp` 是栈指针、
+/// 不入此列（`push(rsp)` 不是"保存寄存器"）。
+fn callee_saved_name(op: &str) -> Option<&str> {
+    let name = op.trim();
+    matches!(name, "rbx" | "rbp" | "r12" | "r13" | "r14" | "r15").then_some(name)
+}
+
+/// 在函数序幕（开头到第一条 `rsp = rsp - 0xN` 之间）收集 `push(<被调者保存寄存器>)`，
+/// 在其后插入一行归组注释：`// 序幕保存被调者寄存器: rbx, rbp, r12`。
+///
+/// 只加**注释行**、不改任何语句语义。序幕边界（第一条 `rsp = rsp - 0xN`）找不到时**不猜**
+/// （可能是极简尾部函数，没有独立栈帧），直接返回。
+fn annotate_prologue_regs(lines: &mut Vec<Line>) {
+    // 找序幕边界：第一条 `rsp = rsp - 0xN`（栈帧分配）。
+    let Some(frame_idx) = lines
+        .iter()
+        .position(|l| l.text.starts_with("rsp = rsp - 0x"))
+    else {
+        return;
+    };
+    // 在 `[0, frame_idx)` 里按出现顺序收集 push 的被调者保存寄存器（去重保序）。
+    let mut regs: Vec<String> = Vec::new();
+    for line in &lines[..frame_idx] {
+        // 形如 `push(rbx); /* @0x… */`：取 `push(` 与第一个 `)` 之间的寄存器名。
+        let Some(rest) = line.text.strip_prefix("push(") else {
+            continue;
+        };
+        let reg = rest.split(')').next().unwrap_or(rest).trim();
+        if let Some(name) = callee_saved_name(reg) {
+            if !regs.iter().any(|r| r == name) {
+                regs.push(name.to_string());
+            }
+        }
+    }
+    if regs.is_empty() {
+        return;
+    }
+    let indent = lines[frame_idx].indent;
+    let note = format!("// 序幕保存被调者寄存器: {}", regs.join(", "));
+    lines.insert(frame_idx, Line { indent, text: note });
+}
+
 /// 解析出的跳表形状（见 [`Builder::parse_switch_shape`]）。
 struct SwitchShape {
     /// 索引寄存器。
@@ -178,6 +223,7 @@ pub fn decompile_structured(
         }
     }
 
+    annotate_prologue_regs(&mut builder.lines);
     annotate_frame_size(&mut builder.lines);
     let built = Built {
         lines: builder.lines,
@@ -1101,6 +1147,67 @@ mod tests {
         }];
         annotate_frame_size(&mut lines);
         assert_eq!(lines[0].text, "rsp = rsp + 0x20; /* @0x1000 */");
+    }
+
+    #[test]
+    fn prologue_regs_summary_collects_callee_saved_pushes() {
+        let mut lines = vec![
+            Line {
+                indent: 1,
+                text: "push(rbx); /* @0x1000 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "push(r12); /* @0x1001 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "push(rbp); /* @0x1002 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "rsp = rsp - 0x40; /* @0x1003 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "return; /* @0x1008 */".to_string(),
+            },
+        ];
+        annotate_prologue_regs(&mut lines);
+        // 在栈帧分配行前插入一行归组注释，按出现顺序列出 rbx, r12, rbp。
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[3].text, "// 序幕保存被调者寄存器: rbx, r12, rbp");
+        assert_eq!(lines[4].text, "rsp = rsp - 0x40; /* @0x1003 */");
+    }
+
+    #[test]
+    fn prologue_regs_summary_ignores_volatile_and_missing_frame() {
+        // rsi 跨 ABI 不一定非易失，不纳入；rsp 是栈指针不纳入。
+        let mut lines = vec![
+            Line {
+                indent: 1,
+                text: "push(rax); /* @0x1000 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "push(rsi); /* @0x1001 */".to_string(),
+            },
+            Line {
+                indent: 1,
+                text: "rsp = rsp - 0x10; /* @0x1002 */".to_string(),
+            },
+        ];
+        annotate_prologue_regs(&mut lines);
+        // 无可归纳的被调者保存寄存器 → 不插入任何行。
+        assert_eq!(lines.len(), 3);
+
+        // 没有栈帧分配（极简函数）时不猜序幕边界 → 不插入。
+        let mut noframe = vec![Line {
+            indent: 1,
+            text: "push(rbx); /* @0x0 */".to_string(),
+        }];
+        annotate_prologue_regs(&mut noframe);
+        assert_eq!(noframe.len(), 1);
     }
 
     fn jmp(addr: u64, target: u64) -> DecodedInsn {

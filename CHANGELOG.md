@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第十六片：序幕保存被调者寄存器归组注释
+
+- 在栈帧注释之上，把序幕里那串 `push(rbx)`/`push(r12)`… 归组为一行
+  `// 序幕保存被调者寄存器: rbx, rbp, r12, r13`，函数开头一眼看清它保存了哪些寄存器。
+- 判据：扫描**开头到第一条 `rsp = rsp - 0xN`（序幕边界）之间**的 `push(<reg>)`，只收**跨 ABI
+  都非易失**的被调者保存寄存器（`rbx/rbp/r12..r15`）；`rsi/rdi`（SysV 易失 vs Win 非易失，视
+  ABI 而定）与 `rsp`（栈指针）**不纳入**，宁少勿错；无明确序幕边界时不猜、不插入。**仅注释、零
+  语义改动**。
+- 效果（kernel32.dll x86_64 全量）：169 个函数序幕获得归组注释（其余经 `mov [rsp+N],reg` 的
+  home-space 保存方式未纳入本片，如实不在覆盖范围）。
+- 新增 2 项单测：收集 push 的 rbx/r12/rbp 并插在栈帧行前 / 易失(rax/rsr)与无栈帧边界情形不插入。
+- arch 103 / analyze 256(+2) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第十五片：函数序幕栈帧大小注释
 
 - 每个函数序幕的 `sub rsp, N`（渲染成 `rsp = rsp - 0xN`）现在尾注 `/* 栈帧 0xN 字节 */`，
