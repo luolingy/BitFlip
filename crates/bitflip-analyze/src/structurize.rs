@@ -232,7 +232,52 @@ fn simplify_single_width_slots(lines: &mut [Line]) {
     }
 }
 
-/// 在函数序幕（开头到第一条 `rsp = rsp - 0xN` 之间）收集 `push(<被调者保存寄存器>)`，
+/// 识别入参寄存器：x64 前四整型参数寄存器 `rcx/rdx/r8/r9`（SysV 与 Windows x64 顺序一致）。
+///
+/// 判据：按地址升序扫描，找每个候选寄存器**首次出现**的指令；若那次是"读、且不同时写"
+/// （即入口先读后写，说明它是传入参数），就记为 `argN`（N 按 ABI 槽位：rcx=1/rdx=2/r8=3/r9=4）。
+/// 入口先写（局部用途）或全程只写 → 不改名。**纯命名、语义等价**。按寄存器**名字**判定（事实），
+/// 不硬编码 arch 的寄存器编号（分层）。
+fn detect_param_regs(
+    by_addr: &BTreeMap<u64, &DecodedInsn>,
+    namer: RegisterNamer<'_>,
+) -> BTreeMap<u16, String> {
+    // ABI 槽位：名字 → argN。只认这四个（前四整型参数）。
+    let abi: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
+    let mut result: BTreeMap<u16, String> = BTreeMap::new();
+    for (idx, target_name) in abi.iter().enumerate() {
+        // 找该寄存器在地址升序里的第一次读/写。
+        for (&_addr, insn) in by_addr.iter() {
+            // 哪些 RegId 是这个名字？遍历该指令的 reads/writes 取交集。
+            let touches_read = insn
+                .reads
+                .iter()
+                .any(|r| namer(r.0).as_deref() == Some(*target_name));
+            let touches_write = insn
+                .writes
+                .iter()
+                .any(|r| namer(r.0).as_deref() == Some(*target_name));
+            if !touches_read && !touches_write {
+                continue;
+            }
+            // 首次出现即此指令：先读后写（读且不写）→ 判定为参数。
+            if touches_read && !touches_write {
+                // 取该寄存器名对应的 RegId（该指令里第一个匹配的名字）。
+                if let Some(rid) = insn
+                    .reads
+                    .iter()
+                    .find(|r| namer(r.0).as_deref() == Some(*target_name))
+                {
+                    result.insert(rid.0, format!("arg{}", idx + 1));
+                }
+            }
+            // 无论是否判定为参数，首次出现已处理，跳出。
+            break;
+        }
+    }
+    result
+}
+
 /// 在其后插入一行归组注释：`// 序幕保存被调者寄存器: rbx, rbp, r12`。
 ///
 /// 只加**注释行**、不改任何语句语义。序幕边界（第一条 `rsp = rsp - 0xN`）找不到时**不猜**
@@ -314,12 +359,20 @@ pub fn decompile_structured(
     let ipdom = compute_immediate_postdominators(&block_map);
     let natural_loops = compute_natural_loops(&block_map, &dom);
 
+    // 入参寄存器符号化：识别本函数"入口先读后写"的整型参数寄存器，渲染成 `arg1..arg4`
+    // （x64 SysV/Win 前四整型参数寄存器 rcx/rdx/r8/r9 顺序固定）。仅当入口**先读**才改名，
+    // 入口先写（局部用途）保持原寄存器名 —— 纯命名、语义等价。
+    let param_map = detect_param_regs(&by_addr, namer);
+    let base_namer = namer;
+    let param_namer =
+        move |id: u16| -> Option<String> { param_map.get(&id).cloned().or_else(|| base_namer(id)) };
+
     let mut builder = Builder {
         by_addr: &by_addr,
         blocks: &block_map,
         ipdom: &ipdom,
         natural_loops: &natural_loops,
-        namer,
+        namer: &param_namer,
         table_reader: resolvers.table,
         import_namer: resolvers.import,
         string_reader: resolvers.string,
@@ -1553,6 +1606,39 @@ mod tests {
 
     fn namer(_: u16) -> Option<String> {
         Some("r0".to_string())
+    }
+
+    #[test]
+    fn detect_param_regs_uses_read_before_write() {
+        use bitflip_arch::RegId;
+        // id 26=rcx（入口先读→arg1），27=rdx（入口先写→非参数）。
+        let name_map = |id: u16| -> Option<String> {
+            Some(
+                match id {
+                    26 => "rcx",
+                    27 => "rdx",
+                    19 => "rax",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+        let mk = |addr: u64, reads: &[u16], writes: &[u16]| -> DecodedInsn {
+            DecodedInsn {
+                reads: reads.iter().map(|&r| RegId(r)).collect(),
+                writes: writes.iter().map(|&r| RegId(r)).collect(),
+                ..jmp(addr, addr + 1)
+            }
+        };
+        // 0x1000：读 rcx（参数使用）——rcx 首触为读→arg1。
+        // 0x1001：写 rdx（局部）——rdx 首触为写→非参数。
+        let mut by: BTreeMap<u64, DecodedInsn> = BTreeMap::new();
+        by.insert(0x1000, mk(0x1000, &[26], &[19]));
+        by.insert(0x1001, mk(0x1001, &[19], &[27]));
+        let by_ref: BTreeMap<u64, &DecodedInsn> = by.iter().map(|(&a, i)| (a, i)).collect();
+        let params = detect_param_regs(&by_ref, &name_map);
+        assert_eq!(params.get(&26).map(String::as_str), Some("arg1"));
+        assert_eq!(params.get(&27), None, "入口先写的 rdx 不应判为参数");
     }
 
     fn build(insns: Vec<DecodedInsn>) -> PseudocodeFunction {
