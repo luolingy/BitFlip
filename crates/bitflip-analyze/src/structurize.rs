@@ -846,8 +846,10 @@ impl Builder<'_> {
                 u64::from(u32::from_le_bytes(chunk.try_into().expect("4 字节")))
             };
             let target = match shape.base {
-                // 偏移表：目标 = 基址 + 偏移（32 位无符号，`mov ecx` 零扩展到 64 位）。
-                Some(base) => base.wrapping_add(raw),
+                // 偏移表：目标 = 基址 + 偏移。表项是**有符号 32 位**偏移（往前跳的 case 就是
+                // 负数，例如 -4001）；必须符号扩展，否则 `0x140002000 + 0xFFFFF05F` 会算成
+                // `0x24000105F` 这种错到另一个段的地址（实测 switch fixture 上正是如此）。
+                Some(base) => base.wrapping_add_signed(i64::from(raw as u32 as i32)),
                 // 指针表：表项就是目标。
                 None => raw,
             };
@@ -1970,6 +1972,87 @@ mod tests {
         assert!(
             body.contains(&format!("case 1: goto {:#x};", base + 0x50)),
             "\n{body}"
+        );
+    }
+
+    #[test]
+    fn switch_offset_idiom_sign_extends_negative_offsets() {
+        // 偏移表的表项是**有符号 32 位**：往前跳的 case 是负数。若不符号扩展，
+        // `base + 0xFFFFF05F` 会算到另一个段（实测真实 fixture 的 case 目标正是这样错的）。
+        // 这里表项取 -0x100（= 0xFFFFFF00），目标应为 base - 0x100。
+        let lea_addr = 0x1008u64;
+        let rel = 0x2000i64; // base = (0x1008 + 7) + 0x2000
+        let mut lea = nop(lea_addr);
+        lea.len = 7;
+        lea.operands = vec![Operand::Reg(RegId(5)), Operand::PcRelative(rel)];
+        let mut mov = nop(0x100f);
+        mov.len = 6;
+        mov.operands = vec![
+            Operand::Reg(RegId(9)),
+            Operand::Mem(bitflip_arch::MemRef {
+                base: Some(RegId(5)),
+                index: Some(RegId(0)),
+                scale: 4,
+                index_extend: None,
+                disp: 0,
+                size: 4,
+                write: false,
+            }),
+        ];
+        let mut add = nop(0x1015);
+        add.operands = vec![Operand::Reg(RegId(9)), Operand::Reg(RegId(5))];
+        let mut jmp_reg = jmp(0x1019, 0);
+        jmp_reg.target = None;
+        jmp_reg.operands = vec![Operand::Reg(RegId(9))];
+        let insns = vec![
+            cmp_reg_imm(0x1000, 0, 1),
+            DecodedInsn {
+                flow: Flow::Branch { conditional: true },
+                target: Some(0x4000),
+                condition: Some(ConditionCode::UnsignedHigher),
+                ..jmp(0x1004, 0x4000)
+            },
+            lea,
+            mov,
+            add,
+            jmp_reg,
+            ret(0x4000),
+        ];
+        let base = lea_addr + 7 + rel as u64;
+        let neg: u32 = (-0x100i32) as u32; // 0xFFFFFF00
+        let reader = move |addr: u64, len: usize| -> Option<Vec<u8>> {
+            if addr != base {
+                return None;
+            }
+            let mut out = Vec::new();
+            out.extend_from_slice(&neg.to_le_bytes());
+            out.extend_from_slice(&0x40u32.to_le_bytes());
+            Some(out[..len.min(out.len())].to_vec())
+        };
+        let cfg = Cfg::build(&insns);
+        let f = decompile_structured(
+            insns[0].addr,
+            Some("f"),
+            &insns,
+            &cfg,
+            &namer,
+            crate::pseudo::Resolvers {
+                table: Some(&reader),
+                ..crate::pseudo::Resolvers::none()
+            },
+        );
+        let body = f.structured_body.as_ref().expect("正文").join("\n");
+        assert!(body.contains("switch (r0)"), "应还原 switch：\n{body}");
+        assert!(
+            body.contains(&format!("case 0: goto {:#x};", base.wrapping_sub(0x100))),
+            "负偏移必须符号扩展后加到基址：\n{body}"
+        );
+        assert!(
+            !body.contains(&format!(
+                "case 0: goto {:#x};",
+                base.wrapping_add(neg as u64)
+            )),
+            "不得当作无符号零扩展（那会算到另一个段）：\n{body}"
         );
     }
 

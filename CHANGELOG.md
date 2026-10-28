@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 修复 — 阶段 2 C1：switch 偏移表目标地址算错（符号扩展缺失）
+
+- **真实 bug**：MSVC x64 偏移跳表的表项是**有符号 32 位偏移**（往前跳的 case 就是负数），
+  `structurize` 里却按无符号零扩展，导致 `base + 0xFFFFF05F` 算成 `0x24000105F` 这种**落到另一个
+  段**的地址。实测 switch fixture：16 个 case 目标全部错位（应为 `0x1400010xx`，输出成 `0x2400010xx`）。
+- 修法：偏移表分支改用 `wrapping_add_signed(i64::from(raw as u32 as i32))`，按有符号解释表项。
+  `jumptable.rs` 侧早已按有符号处理（那里有注释与测试），本片补上 `structurize` 这一端的遗漏。
+- 验证自洽：fixture 修复后 `case 0: goto 0x14000105f` 与正文里分离区域的起点
+  `// @0x14000105f（分离区域起点）`**正好对上**，不是"看起来对"。
+- 顺带审计（只读）：kernel32 线性反汇编里 `jmp reg/mem` 仅 6 条，还原出 2 个 switch，其余多为
+  尾调用（跳表识别对尾调用有明确的"不是跳表"测试）——覆盖率合理，非识别失效。
+- 新增 1 项单测：负偏移表项必须符号扩展（并显式断言**不得**按零扩展算）。
+- arch 103 / analyze 274(+1) / core 76 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 2 B2：函数头"疑似签名"注释（只写能确定的事实）
 
 - 阶段 1 已能识别 `arg1..arg4` 与返回值，但函数头只写 `void f(void)`（占位形状），看不出这个
