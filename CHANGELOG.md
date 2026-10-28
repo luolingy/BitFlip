@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 测试 — 阶段 1 第二十五片：结构化伪代码端到端不变量测试（回归护栏）
+
+- 阶段 1 的可读性增强都没有**端到端断言**钉住——任何翻译/结构化改动都可能悄悄退化
+  （`无法翻译`/裸 `flags`/原始 `rsp + 0x` 形态）而单元测试全绿也发现不了。本片补上护栏。
+- 新增 `crates/bitflip-core/tests/pseudo_invariants.rs`：用**手写机器码的最小合成 ELF**
+  （自给自足，不依赖 `tests/fixtures`，CI 任何环境可跑）导出 `pseudo-c-structured`，断言不变量：
+  - 正向必须出现：`arg1`（入参符号化）、`return`（返回渲染）、`if (rbx `（条件真实比较）、
+    `v10`（单宽度栈槽化简）、`栈帧`（栈帧注释）；
+  - 反向必须**不**出现：`无法翻译`、`flags) goto`（退化占位）、`rsp + 0x`（未符号化的原始形态）。
+- 合成样本同时踩到了 `push rbx` 保存/序幕注释、`sub rsp` 栈帧、`test+je`→`if (rbx==0)`、
+  单宽度槽 `v10`、分支双路赋值——是一个"最小但覆盖多片成果"的端到端样例。
+- 测试数：core +1（`pseudo_invariants` 1 项）。arch 103 / analyze 269 / core 74(+1) /
+  server m6 17 / cli 40，`cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净；
+  arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第二十四片：`div`/`idiv` 隐式寄存器除法如实标注（不再"无法翻译"）
 
 - 收掉最后一批真实的单操作数"无法翻译"：x86 `idiv`/`div <op>` 是隐式寄存器除法，被除数是
