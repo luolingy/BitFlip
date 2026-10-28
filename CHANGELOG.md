@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### 修复 — 阶段 2 A2：有/无符号右移区分 + 比较转换用真实宽度（两个真实 bug）
+
+- **bug 1：`sar` 与 `shr` 渲染完全相同**（都是 `>>`），丢掉"高位补符号 vs 补 0"这一事实。
+  新增 `MnemonicClass::Shift { arithmetic: Option<bool> }`：左移 `None`、逻辑右移 `Some(false)`、
+  算术右移 `Some(true)`；渲染时按被移位寄存器的**实际宽度**补 `intN_t`/`uintN_t` 转换——
+  `sar ecx, 1` → `ecx = (int32_t)ecx >> 0x1`，`shr ax, 8` → `ax = (uint16_t)ax >> 0x8`。
+  左移符号无关，保持 `ecx = ecx << n` 简洁形式。ARM 三操作数形状 `asr dst, src, amt` 按
+  `dst = (intN_t)src >> amt` 还原（此前会错误地写成 `dst = dst >> src+amt`）。
+- **bug 2：比较里的强制转换写死 `int64_t`/`uint64_t`**，对 32 位寄存器是真实错误：
+  `(int64_t)eax < 0` 在 `eax=0xFFFFFFFF` 时为 false，而 32 位有符号应为 -1 < 0 = true。
+  改为按操作数寄存器的**实际宽度**转换（`(int32_t)eax < 0`、`(uint32_t)eax > (uint32_t)0x7f`）；
+  宽度取不到时退回 8 字节（不改变 64 位目标上的既有行为）。
+- 效果（kernel32.dll x86_64 全量）：算术右移 **47** 处、逻辑右移 **111** 处（此前无法区分）；
+  比较转换改为真实宽度；`无法翻译` 仍为 14（无回归）。
+- 新增 2 项单测：`sar`/`shr`/`shl` 三者渲染各异；32 位比较用 `int32_t`/`uint32_t` 而非写死 64 位。
+- arch 103 / analyze 272(+2) / core 76 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 2 A1：`movzx`/`movsx`/`movsxd` 扩宽语义（补宽度转换）
 
 - 阶段 1 把 `movzx/movsx/movsxd` 与普通 `mov` 一样渲染成 `dst = src`，**丢掉了扩宽语义**

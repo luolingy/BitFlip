@@ -585,6 +585,45 @@ pub(crate) fn translate(
                 None => Ok(Some(format!("{dst} = {rhs}"))),
             }
         }
+        MnemonicClass::Shift { arithmetic } => {
+            // 移位语义要区分**左移 / 逻辑右移 / 算术右移**：`sar` 高位补符号、`shr` 高位补 0。
+            // 只写 `>>` 会让两者长得一样，丢掉"符号怎么填"这一事实（§7）。
+            // 被移位值宽度取寄存器名（事实）；宽度拿不到就不加转换（不猜）。
+            if ops.len() < 2 {
+                return Err(format!("{name} 为单操作数指令，无法用赋值形式表达"));
+            }
+            let dst = lvalue(&ops[0], namer)?;
+            // x86 是 `dst, amt` 两操作数；ARM 是 `dst, src, amt` 三操作数。
+            let (shifted, amt_ops): (&Operand, &[Operand]) = if ops.len() >= 3 {
+                (&ops[1], &ops[2..])
+            } else {
+                (&ops[0], &ops[1..])
+            };
+            let base = expr_one(shifted, insn.addr, insn.len, namer, string_reader)?;
+            let amt = expr(amt_ops, insn.addr, insn.len, namer, string_reader)?;
+            let op = match arithmetic {
+                None => "<<",
+                Some(_) => ">>",
+            };
+            // 只有**寄存器**被移位值能确定宽度；内存/立即数不加转换。
+            let cast = match (shifted, arithmetic) {
+                (Operand::Reg(r), Some(arith)) => {
+                    let nm = namer(r.0).ok_or_else(|| format!("寄存器编号 {} 无名字", r.0))?;
+                    reg_width_from_name(&nm).map(|w| {
+                        if arith {
+                            signed_int_type(w)
+                        } else {
+                            int_type(w)
+                        }
+                    })
+                }
+                _ => None,
+            };
+            Ok(Some(match cast {
+                Some(ty) => format!("{dst} = ({ty}){base} {op} {amt}"),
+                None => format!("{dst} = {base} {op} {amt}"),
+            }))
+        }
         MnemonicClass::Move => {
             if ops.len() < 2 {
                 return Err(format!("{name} 为单操作数指令，无法用赋值形式表达"));
@@ -843,6 +882,19 @@ fn try_comparison(
     let lhs = expr_one(&p.operands[0], p.addr, p.len, namer, None).ok()?;
     let rhs = expr_one(&p.operands[1], p.addr, p.len, namer, None).ok()?;
 
+    // 比较的宽度：取涉及寄存器的**实际宽度**（`eax`→4、`rax`→8…，事实驱动）。
+    // 写死 `int64_t`/`uint64_t` 是真实错误：`(int64_t)eax < 0` 在 `eax=0xFFFFFFFF` 时为
+    // false，而 32 位有符号应为 -1 < 0 为 true。宽度取不到时退回 8 字节（保守且不改变
+    // 64 位目标上的既有行为）。
+    let cmp_width = match (&p.operands[0], &p.operands[1]) {
+        (Operand::Reg(a), _) => namer(a.0).and_then(|n| reg_width_from_name(&n)),
+        (_, Operand::Reg(b)) => namer(b.0).and_then(|n| reg_width_from_name(&n)),
+        _ => None,
+    }
+    .unwrap_or(8);
+    let s_ty = signed_int_type(cmp_width);
+    let u_ty = int_type(cmp_width);
+
     // `test a, a` 的自测形状：两操作数是同一寄存器 → 与 0 比较。
     let same_reg = match (&p.operands[0], &p.operands[1]) {
         (Operand::Reg(a), Operand::Reg(b)) => a.0 == b.0,
@@ -852,8 +904,8 @@ fn try_comparison(
         return Some(match cc {
             ConditionCode::Equal => format!("{lhs} == 0"),
             ConditionCode::NotEqual => format!("{lhs} != 0"),
-            ConditionCode::Minus => format!("(int64_t){lhs} < 0"),
-            ConditionCode::Plus => format!("(int64_t){lhs} >= 0"),
+            ConditionCode::Minus => format!("({s_ty}){lhs} < 0"),
+            ConditionCode::Plus => format!("({s_ty}){lhs} >= 0"),
             // 其它条件对"自测"没有简洁语义 → 不猜。
             _ => return None,
         });
@@ -869,10 +921,10 @@ fn try_comparison(
         ConditionCode::SignedGreaterThan => format!("{lhs} > {rhs}"),
         ConditionCode::SignedLessOrEqual => format!("{lhs} <= {rhs}"),
         // 无符号关系（cast 出来才诚实：同一标志位在有/无符号下含义不同）。
-        ConditionCode::CarryClear => format!("(uint64_t){lhs} < (uint64_t){rhs}"),
-        ConditionCode::CarrySet => format!("(uint64_t){lhs} >= (uint64_t){rhs}"),
-        ConditionCode::UnsignedHigher => format!("(uint64_t){lhs} > (uint64_t){rhs}"),
-        ConditionCode::UnsignedLowerOrSame => format!("(uint64_t){lhs} <= (uint64_t){rhs}"),
+        ConditionCode::CarryClear => format!("({u_ty}){lhs} < ({u_ty}){rhs}"),
+        ConditionCode::CarrySet => format!("({u_ty}){lhs} >= ({u_ty}){rhs}"),
+        ConditionCode::UnsignedHigher => format!("({u_ty}){lhs} > ({u_ty}){rhs}"),
+        ConditionCode::UnsignedLowerOrSame => format!("({u_ty}){lhs} <= ({u_ty}){rhs}"),
         // Minus/Plus/Overflow/NoOverflow/Always/Never 在 cmp 之后没有简洁比较语义 → 不猜。
         _ => return None,
     };
@@ -1093,6 +1145,10 @@ enum MnemonicClass {
     /// （源窄于目标，高位置 0 或按符号扩展），普通 `dst = src` 会丢掉这一步（宽度 bug）。
     /// 源宽度由源寄存器名（或内存操作数大小）确定；渲染成 `dst = (uintN_t)src` / `(intN_t)src`。
     Extend { signed: bool },
+    /// 移位：`arithmetic` 为 `None`（左移，符号无差别）、`Some(true)`（算术右移 `sar`，
+    /// 高位补符号）、`Some(false)`（逻辑右移 `shr`，高位补 0）。渲染时按被移位值的宽度补
+    /// 有/无符号转换 —— 否则 `sar`/`shr` 长得一模一样，丢掉"符号如何填充"这一事实。
+    Shift { arithmetic: Option<bool> },
     /// 不认识：退回保守赋值。
     Unknown,
 }
@@ -1244,17 +1300,12 @@ fn classify_mnemonic(mn: Option<&str>) -> MnemonicClass {
         },
         "idiv" => MnemonicClass::Div { signed: true },
         "div" => MnemonicClass::Div { signed: false },
-        "shl" | "sal" | "lsl" | "slli" => MnemonicClass::Binary {
-            op: "<<",
-            self_zero: false,
+        "shl" | "sal" | "lsl" | "slli" => MnemonicClass::Shift { arithmetic: None },
+        "shr" | "lsr" | "srli" => MnemonicClass::Shift {
+            arithmetic: Some(false),
         },
-        "shr" | "lsr" | "srli" => MnemonicClass::Binary {
-            op: ">>",
-            self_zero: false,
-        },
-        "sar" | "asr" | "srai" => MnemonicClass::Binary {
-            op: ">>",
-            self_zero: false,
+        "sar" | "asr" | "srai" => MnemonicClass::Shift {
+            arithmetic: Some(true),
         },
         "inc" => MnemonicClass::Unary {
             op: "",
@@ -2196,6 +2247,85 @@ mod tests {
         let mn = |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("mov".to_string()) };
         let r = translate(&i, &test_namer, None, None, Some(&mn), None);
         assert!(r.is_err(), "立即数源推不出宽度，应如实报错而不是猜：{r:?}");
+    }
+
+    #[test]
+    fn sar_and_shr_render_with_distinct_sign_semantics() {
+        // `sar`（算术右移，高位补符号）与 `shr`（逻辑右移，高位补 0）必须长得不一样，
+        // 否则"符号怎么填"这一事实就丢了。宽度取被移位寄存器名（eax=32 位）。
+        let namer = |id: u16| -> Option<String> {
+            Some(
+                match id {
+                    19 => "eax",
+                    26 => "rcx",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+        let mk = |mn: &'static str| -> Option<String> {
+            let i = insn(
+                0x1000,
+                3,
+                Flow::Fallthrough,
+                None,
+                vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(26))],
+            );
+            let resolver =
+                move |_m: bitflip_arch::MnemonicId| -> Option<String> { Some(mn.to_string()) };
+            translate(&i, &namer, None, None, Some(&resolver), None).unwrap()
+        };
+        // 算术右移 → 有符号转换（int32_t）。
+        assert_eq!(mk("sar").as_deref(), Some("eax = (int32_t)eax >> rcx"));
+        // 逻辑右移 → 无符号转换（uint32_t）。
+        assert_eq!(mk("shr").as_deref(), Some("eax = (uint32_t)eax >> rcx"));
+        // 左移：符号无关，不加转换（保持简洁）。
+        assert_eq!(mk("shl").as_deref(), Some("eax = eax << rcx"));
+    }
+
+    #[test]
+    fn comparison_cast_uses_operand_width_not_hardcoded_64() {
+        // 32 位比较必须用 int32_t/uint32_t：写死 int64_t 会把 -1 当 4294967295。
+        let namer = |id: u16| -> Option<String> {
+            Some(
+                match id {
+                    19 => "eax",
+                    27 => "edx",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+        let cmp32 = DecodedInsn {
+            reads: [RegId(19), RegId(27)].into_iter().collect(),
+            ..insn(
+                0x1000,
+                2,
+                Flow::Fallthrough,
+                None,
+                vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(27))],
+            )
+        };
+        // 无符号小于 → uint32_t 转换（不是写死的 uint64_t）。
+        assert_eq!(
+            try_comparison(ConditionCode::CarryClear, Some(&cmp32), &namer).as_deref(),
+            Some("(uint32_t)eax < (uint32_t)edx")
+        );
+        // 自测的"负数"判断 → int32_t（不是 int64_t）。
+        let test32 = DecodedInsn {
+            reads: [RegId(19)].into_iter().collect(),
+            ..insn(
+                0x1000,
+                2,
+                Flow::Fallthrough,
+                None,
+                vec![Operand::Reg(RegId(19)), Operand::Reg(RegId(19))],
+            )
+        };
+        assert_eq!(
+            try_comparison(ConditionCode::Minus, Some(&test32), &namer).as_deref(),
+            Some("(int32_t)eax < 0")
+        );
     }
 
     #[test]
