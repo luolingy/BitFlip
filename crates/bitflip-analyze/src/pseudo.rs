@@ -543,6 +543,16 @@ pub(crate) fn translate(
                 .map_or_else(|| "/* 条件未知 */ flags".to_string(), condition_text);
             Ok(Some(format!("{dst} = ({cond}) ? 1 : 0")))
         }
+        MnemonicClass::Div { signed } => {
+            // `div`/`idiv <op>`：x86 隐式寄存器除法，被除数是 `rdx:rax`（跨两个寄存器，
+            // 无法在 C 里用单表达式精确表达），商→rax、余数→rdx。这里如实渲染成一条**标注
+            // 语义的注释语句**：既不是瞎猜的赋值，也比"无法翻译"有信息量（§7：宁写清楚不猜）。
+            let op = expr(ops, insn.addr, insn.len, namer, string_reader)?;
+            let kind = if signed { "idiv" } else { "div" };
+            Ok(Some(format!(
+                "/* {kind} {op}：被除数 rdx:rax，商→rax，余数→rdx */"
+            )))
+        }
         MnemonicClass::Move => {
             if ops.len() < 2 {
                 return Err(format!("{name} 为单操作数指令，无法用赋值形式表达"));
@@ -1044,6 +1054,9 @@ enum MnemonicClass {
     Pop,
     /// `setcc <dst>`：按标志位把 dst 置 0/1（渲染成 `dst = (cond) ? 1 : 0`）。
     SetCc,
+    /// `div`/`idiv <op>`：单操作数的隐式寄存器除法（被除数 `rdx:rax`，商→`rax`、余数→`rdx`）。
+    /// 因为双寄存器被除数无法在 C 里精确表达，渲染成一条**如实标注语义**的注释语句。
+    Div { signed: bool },
     /// 不认识：退回保守赋值。
     Unknown,
 }
@@ -1179,6 +1192,8 @@ fn classify_mnemonic(mn: Option<&str>) -> MnemonicClass {
             op: "*",
             self_zero: false,
         },
+        "idiv" => MnemonicClass::Div { signed: true },
+        "div" => MnemonicClass::Div { signed: false },
         "shl" | "sal" | "lsl" | "slli" => MnemonicClass::Binary {
             op: "<<",
             self_zero: false,
@@ -2131,6 +2146,20 @@ mod tests {
         let mn = |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("mov".to_string()) };
         let r = translate(&i, &test_namer, None, None, Some(&mn), None);
         assert!(r.is_err(), "立即数源推不出宽度，应如实报错而不是猜：{r:?}");
+    }
+
+    #[test]
+    fn div_and_idiv_render_with_semantic_annotation() {
+        // idiv/div 是隐式寄存器除法（被除数 rdx:rax），无法单表达式精确表达 → 渲染成
+        // 带语义标注的语句，而不是"无法翻译"。
+        assert_eq!(
+            translate_with_mnemonic("idiv", vec![Operand::Reg(RegId(26))]).as_deref(),
+            Some("/* idiv rcx：被除数 rdx:rax，商→rax，余数→rdx */")
+        );
+        assert_eq!(
+            translate_with_mnemonic("div", vec![Operand::Reg(RegId(19))]).as_deref(),
+            Some("/* div rax：被除数 rdx:rax，商→rax，余数→rdx */")
+        );
     }
 
     #[test]

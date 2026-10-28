@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 1 第二十四片：`div`/`idiv` 隐式寄存器除法如实标注（不再"无法翻译"）
+
+- 收掉最后一批真实的单操作数"无法翻译"：x86 `idiv`/`div <op>` 是隐式寄存器除法，被除数是
+  `rdx:rax`（跨两个寄存器，无法在 C 里用单表达式精确表达），商→`rax`、余数→`rdx`。此前落入
+  `Unknown`（要求两操作数）→ 报"单操作数无法用赋值形式表达"。
+- 修法：新增 `MnemonicClass::Div { signed }`，`classify_mnemonic` 认 `div`/`idiv`；渲染成一条
+  **如实标注语义的注释语句**：`/* idiv ecx：被除数 rdx:rax，商→rax，余数→rdx */`——既不瞎猜
+  表达式，也比"无法翻译"有信息量（§7 宁写清楚不猜）。
+- 效果（kernel32.dll x86_64 全量）：`无法翻译` 16 → **14**；2 处 `idiv ecx` 现渲染为语义标注。
+  剩余 14 = 12 处立即数源 RIP 相对存储（有意保留的诚实拒绝，宽度未知）+ 1 处数据区误译噪声
+  （insn#741）+ 1 处杂项，均非真实语义缺口。
+- 新增 1 项单测：`idiv rcx` / `div rax` 渲染出带语义标注的语句。
+- arch 103 / analyze 269(+1) / core 73 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 1 第二十三片：函数头参数声明注释
 
 - 对识别出的入参（第二十二片），在函数体最顶生成一行 `// 参数: arg1=rcx, arg2=rdx, arg3=r8`，
