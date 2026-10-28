@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+### 测试 — 阶段 1 第二十六片：真实编译器产物上的结构化伪代码契约（PE + ELF）
+
+- 第二十五片的不变量只在**手写合成 ELF** 上验证；本片补上**真实编译器产物**的产物级契约，
+  确保管线在真实 PE/ELF 上同样成立（gen-fixtures.ps1 生成样本，CI 可复现）。
+- 对 `pe-x86_64.exe`（mingw）与 `elf-x86_64.exe`（clang -O1，无 libc）各导出 `pseudo-c-structured`，
+  断言与优化级别无关的通用契约：分解出 ≥3 个函数、**全文件无「无法翻译」**、出现 `return`、
+  出现 `argN` 入参符号化、花括号配平、语句带 `/* @0x… */` 来源地址；PE 样本另断言出现「栈帧」注释
+  （含真实 `sub rsp`）。
+- fixture 缺失时**响亮失败**并提示先跑 `gen-fixtures.ps1`（§7：跳过会让绿灯说谎）。
+- 测试数：core +2（`pseudo_invariants` 增至 3 项：合成 ELF + PE 真实样本 + ELF 真实样本）。
+  arch 103 / analyze 269 / core 76 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 测试 — 阶段 1 第二十五片：结构化伪代码端到端不变量测试（回归护栏）
 
 - 阶段 1 的可读性增强都没有**端到端断言**钉住——任何翻译/结构化改动都可能悄悄退化

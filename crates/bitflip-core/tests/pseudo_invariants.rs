@@ -10,7 +10,7 @@
 //! 这里用**手写机器码的最小合成 ELF**（无需外部 fixture），端到端导出 `pseudo-c-structured`，
 //! 断言若干**不变量**必须成立。合成样本自给自足，CI 上任何环境都能跑、不依赖 `tests/fixtures`。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bitflip_core::{export, ExportFormat, ExportOptions, OpenOptions, Session};
 
@@ -146,4 +146,106 @@ fn structured_pseudo_keeps_phase_one_readability_invariants() {
         !text.contains("rsp + 0x"),
         "固定栈槽应已符号化，不该残留 `rsp + 0x` 原形态。实际输出：\n{text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 真实编译器产物上的产物级契约（gen-fixtures.ps1 会生成下面这些样本，CI 可复现）
+// ---------------------------------------------------------------------------
+
+/// `tests/fixtures/generated/` 下的 fixture（由 `scripts/gen-fixtures.ps1` 生成，不入库）。
+fn generated_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join("generated")
+        .join(name)
+}
+
+/// 在真实编译器产物上导出结构化伪代码。fixture 缺失时**响亮失败**（§7：跳过会让绿灯说谎），
+/// 并提示先跑 `scripts/gen-fixtures.ps1`——CI 会在测试前生成它们。
+fn export_structured_of(name: &str) -> String {
+    let path = generated_fixture(name);
+    assert!(
+        path.exists(),
+        "缺少 fixture {}；先跑 scripts/gen-fixtures.ps1 生成样本（CI 会在测试前生成）",
+        path.display()
+    );
+    let session = Session::open(&path, OpenOptions::default()).expect("打开真实样本");
+    let (text, _report) = export(
+        &session,
+        ExportFormat::PseudoCStructured,
+        &ExportOptions::default(),
+    )
+    .expect("导出真实样本的 pseudo-c-structured");
+    text
+}
+
+/// 真实样本上的通用契约：无论 -O1 怎么优化，这些都**必须**成立。
+fn assert_real_sample_contract(name: &str, text: &str) {
+    // 1) 至少要分解出几个函数（样本里有 bf_add/bf_loop/bf_entry 等）。
+    let fn_count = text.matches("(void) {").count();
+    assert!(
+        fn_count >= 3,
+        "{}：应分解出至少 3 个函数，实际 {fn_count} 个。实际输出：\n{text}",
+        name
+    );
+
+    // 2) 全文件必须完全可翻译 —— 真实编译器产物里不该有「无法翻译」。
+    //    （剩余「无法翻译」只允许出现在刻意保留的诚实拒绝，不该出现在这些小样本里。）
+    assert!(
+        !text.contains("无法翻译"),
+        "{}：真实样本应完全可翻译，却出现了「无法翻译」。实际输出：\n{text}",
+        name
+    );
+
+    // 3) 返回值渲染：每个函数基本都以 return 收尾。
+    assert!(
+        text.contains("return"),
+        "{}：应出现 return 语句。实际输出：\n{text}",
+        name
+    );
+
+    // 4) 入参符号化：bf_add/bf_loop 有参数，应出现 argN 命名。
+    assert!(
+        text.contains("arg1") || text.contains("arg2") || text.contains("arg3"),
+        "{}：应出现 argN 入参符号化。实际输出：\n{text}",
+        name
+    );
+
+    // 5) 花括号必须配平 —— 结构化渲染的结构性底线。
+    let opens = text.matches('{').count();
+    let closes = text.matches('}').count();
+    assert_eq!(
+        opens, closes,
+        "{}：花括号不配平（{{={opens}, }}={closes}）。实际输出：\n{text}",
+        name
+    );
+
+    // 6) 每条渲染语句应可追溯到指令地址（行尾 `/* @0x… */`）。
+    assert!(
+        text.contains("/* @0x"),
+        "{}：语句应带 `/* @0x… */` 来源地址注释。实际输出：\n{text}",
+        name
+    );
+}
+
+#[test]
+fn pe_real_sample_meets_structured_contract() {
+    // PE 的 mingw 样本：含栈帧（bf_entry 的 sub rsp）。
+    let text = export_structured_of("pe-x86_64.exe");
+    assert_real_sample_contract("pe-x86_64.exe", &text);
+    // 这个样本里有真实栈帧分配 —— 栈帧注释能力必须在真实 PE 上生效。
+    assert!(
+        text.contains("栈帧"),
+        "pe-x86_64.exe：应有「栈帧」注释。实际输出：\n{text}"
+    );
+}
+
+#[test]
+fn elf_real_sample_meets_structured_contract() {
+    // ELF 的 x86-64 样本（clang -O1，无 libc）：跨格式的同一份契约。
+    let text = export_structured_of("elf-x86_64.exe");
+    assert_real_sample_contract("elf-x86_64.exe", &text);
 }
