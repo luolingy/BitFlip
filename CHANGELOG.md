@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 2 A1：`movzx`/`movsx`/`movsxd` 扩宽语义（补宽度转换）
+
+- 阶段 1 把 `movzx/movsx/movsxd` 与普通 `mov` 一样渲染成 `dst = src`，**丢掉了扩宽语义**
+  （源窄于目标：零扩展或符号扩展高位的步骤没了），是一个真实的宽度 bug。
+- 修法：新增 `MnemonicClass::Extend { signed }`（`movzx`→无符号、其余→有符号）。源宽度取源
+  **寄存器名**（`cl`=1、`cx`=2、`eax`=4、`rcx`=8…，事实驱动、零推断），渲染成带类型转换的形式：
+  `movzx eax, cl` → `eax = (uint8_t)cl`，`movsx eax, cx` → `eax = (int16_t)cx`。
+  **内存源不套转换**（`mem_text` 已带 `*(uintN_t*)` 类型，再套是噪声）；源宽度无证据时退回普通
+  赋值（不猜）。
+- 效果（kernel32.dll x86_64 全量）：新增 **343** 处扩宽转换（`eax = (uint8_t)dl`、
+  `rcx = (int32_t)eax` 等）；`无法翻译` 仍为 14（无回归）。
+- 新增 1 项单测：`movzx/movsx/movsxd` 各渲染出正确的 `uintN_t`/`intN_t` 转换、普通 `mov` 不受影响。
+- arch 103 / analyze 270(+1) / core 76 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 阶段 1 小结 — 反编译深度（结构化伪代码），27 片完成
 
 阶段 1 的目标是**反汇编 → 结构化伪代码**的深度：从"能反汇编并诚实标注可信度"（M2）推进到

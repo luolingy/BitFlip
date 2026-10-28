@@ -553,6 +553,38 @@ pub(crate) fn translate(
                 "/* {kind} {op}：被除数 rdx:rax，商→rax，余数→rdx */"
             )))
         }
+        MnemonicClass::Extend { signed } => {
+            // `movzx/movsx/movsxd dst, src`：**扩宽搬运**，不是普通 `dst = src`——高位置 0
+            // （零扩展）或按符号填满（符号扩展）。源宽度取源寄存器名/内存大小（事实）；
+            // 宽度拿不到时退回普通赋值（不猜），但会尽力标注。渲染成带类型转换的形式：
+            //   movzx eax, cl  →  eax = (uint8_t)cl
+            //   movsx eax, cl  →  eax = (int8_t)cl
+            if ops.len() < 2 {
+                return Err(format!("{name} 为单操作数指令，无法用赋值形式表达"));
+            }
+            let dst = lvalue(&ops[0], namer)?;
+            let rhs = expr(&ops[1..], insn.addr, insn.len, namer, string_reader)?;
+            // 只有**寄存器源**需要补宽度转换：内存源的 `mem_text` 已经带了 `*(uintN_t*)` 类型，
+            // 再套一层 `(uintN_t)` 是冗余噪声。寄存器的名字本身没体现出扩展宽度，故补上。
+            let ty = match &ops[1] {
+                Operand::Reg(r) => {
+                    let nm = namer(r.0).ok_or_else(|| format!("寄存器编号 {} 无名字", r.0))?;
+                    reg_width_from_name(&nm).map(|w| {
+                        if signed {
+                            signed_int_type(w)
+                        } else {
+                            int_type(w)
+                        }
+                    })
+                }
+                _ => None,
+            };
+            match ty {
+                Some(ty) => Ok(Some(format!("{dst} = ({ty}){rhs}"))),
+                // 源类型已由 mem_text 表达 / 宽度无证据：退回普通赋值，不编造宽度。
+                None => Ok(Some(format!("{dst} = {rhs}"))),
+            }
+        }
         MnemonicClass::Move => {
             if ops.len() < 2 {
                 return Err(format!("{name} 为单操作数指令，无法用赋值形式表达"));
@@ -1057,6 +1089,10 @@ enum MnemonicClass {
     /// `div`/`idiv <op>`：单操作数的隐式寄存器除法（被除数 `rdx:rax`，商→`rax`、余数→`rdx`）。
     /// 因为双寄存器被除数无法在 C 里精确表达，渲染成一条**如实标注语义**的注释语句。
     Div { signed: bool },
+    /// `movzx`/`movsx`/`movsxd`：零/符号扩展搬运。与普通 `mov` 的差别是**扩宽**语义
+    /// （源窄于目标，高位置 0 或按符号扩展），普通 `dst = src` 会丢掉这一步（宽度 bug）。
+    /// 源宽度由源寄存器名（或内存操作数大小）确定；渲染成 `dst = (uintN_t)src` / `(intN_t)src`。
+    Extend { signed: bool },
     /// 不认识：退回保守赋值。
     Unknown,
 }
@@ -1148,6 +1184,17 @@ fn int_type(width: u8) -> String {
     }
 }
 
+/// 按宽度给 C **有符号**整数类型名（用于 `movsx` 符号扩展的源类型转换）。
+fn signed_int_type(width: u8) -> String {
+    match width {
+        1 => "int8_t".to_string(),
+        2 => "int16_t".to_string(),
+        4 => "int32_t".to_string(),
+        8 => "int64_t".to_string(),
+        n => format!("/* {n} 字节 */ int8_t"),
+    }
+}
+
 /// 把可读助记符文本归类。只处理常见 x86/ARM 算术逻辑；未知返回 `Unknown`（走保守路径）。
 ///
 /// 依据是**指令语义**（事实），不是猜：`add` 就是加法、`xor r,r` 就是清零。给出正确运算
@@ -1163,7 +1210,10 @@ fn classify_mnemonic(mn: Option<&str>) -> MnemonicClass {
     match mn {
         // 空操作/对齐填充/控制流保护标记：无论是否带操作数，都不产生语句。
         "nop" | "endbr64" | "endbr32" | "hint" | "bti" => MnemonicClass::Nop,
-        "mov" | "movabs" | "movzx" | "movsx" | "movsxd" | "movz" | "movs" => MnemonicClass::Move,
+        "mov" | "movabs" | "movz" | "movs" => MnemonicClass::Move,
+        "movzx" | "movsx" | "movsxd" => MnemonicClass::Extend {
+            signed: mn != "movzx",
+        },
         "push" | "pushf" | "pushfq" => MnemonicClass::Push,
         "pop" | "popf" | "popfq" => MnemonicClass::Pop,
         "lea" | "adr" | "adrp" => MnemonicClass::Lea,
@@ -2146,6 +2196,43 @@ mod tests {
         let mn = |_m: bitflip_arch::MnemonicId| -> Option<String> { Some("mov".to_string()) };
         let r = translate(&i, &test_namer, None, None, Some(&mn), None);
         assert!(r.is_err(), "立即数源推不出宽度，应如实报错而不是猜：{r:?}");
+    }
+
+    #[test]
+    fn movzx_and_movsx_render_with_widening_cast() {
+        // 用能区分宽度的寄存器名（eax=32b, cl=8b, rcx=64b）验证扩宽转换。
+        let namer = |id: u16| -> Option<String> {
+            Some(
+                match id {
+                    19 => "eax", // dst 32 位
+                    26 => "rcx",
+                    40 => "cl", // src 8 位
+                    41 => "cx", // src 16 位
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+        let mk = |mn: &'static str, dst: u16, src: u16| -> Option<String> {
+            let i = insn(
+                0x1000,
+                3,
+                Flow::Fallthrough,
+                None,
+                vec![Operand::Reg(RegId(dst)), Operand::Reg(RegId(src))],
+            );
+            let resolver =
+                move |_m: bitflip_arch::MnemonicId| -> Option<String> { Some(mn.to_string()) };
+            translate(&i, &namer, None, None, Some(&resolver), None).unwrap()
+        };
+        // movzx eax, cl → 零扩展到 32 位（uint8_t 转换，再赋给 eax）。
+        assert_eq!(mk("movzx", 19, 40).as_deref(), Some("eax = (uint8_t)cl"));
+        // movsx eax, cx → 符号扩展（int16_t）。
+        assert_eq!(mk("movsx", 19, 41).as_deref(), Some("eax = (int16_t)cx"));
+        // movsxd eax, cl（实际是 32←32 的典型用法的简化）：仍走符号扩展渲染。
+        assert_eq!(mk("movsxd", 19, 40).as_deref(), Some("eax = (int8_t)cl"));
+        // 普通 mov 不带转换（不受影响）。
+        assert_eq!(mk("mov", 19, 26).as_deref(), Some("eax = rcx"));
     }
 
     #[test]
