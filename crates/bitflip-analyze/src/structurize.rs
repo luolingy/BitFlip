@@ -232,6 +232,52 @@ fn simplify_single_width_slots(lines: &mut [Line]) {
     }
 }
 
+/// 生成"疑似签名"注释：`// 疑似签名: ? f(? arg1, ? arg2)  /* 有返回值 */`。
+///
+/// 只写**能确定的事实**：参数个数（`detect_param_regs` 的产物）与"有无返回值"（正文里是否
+/// 出现 `return <表达式>;`）。返回类型与参数类型**一律写 `?`** —— 寄存器宽度推不出 C 类型
+/// （x64 的整型参数只占低 32 位，也可能是指针），不猜（§7）。
+///
+/// 既无参数又无返回值时返回 `None`：`void f(void)` 这一形状（无参无返回）不必再重复一行。
+fn signature_hint(
+    name: Option<&str>,
+    entry: u64,
+    args: &[String],
+    lines: &[Line],
+) -> Option<String> {
+    // 有返回值 = 正文里存在 `return <非空表达式>;`（`return;` 不算）。
+    let has_value = lines.iter().any(|l| {
+        l.text
+            .trim()
+            .strip_prefix("return ")
+            .is_some_and(|rest| !rest.trim_start().starts_with(';'))
+    });
+    if args.is_empty() && !has_value {
+        return None;
+    }
+    let ret = if has_value { "?" } else { "void" };
+    let fname = name.map_or_else(
+        || format!("sub_{entry:x}"),
+        std::string::ToString::to_string,
+    );
+    let params = if args.is_empty() {
+        "void".to_string()
+    } else {
+        args.iter()
+            .map(|a| format!("? {a}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let note = if has_value {
+        "有返回值"
+    } else {
+        "无返回值"
+    };
+    Some(format!(
+        "// 疑似签名: {ret} {fname}({params})  /* {note} */"
+    ))
+}
+
 /// 由参数映射生成函数头声明注释：`// 参数: arg1=rcx, arg2=rdx, arg3=r8`。
 ///
 /// 只列**确实被识别为参数**的寄存器（`detect_param_regs` 的产物），按 argN 的 N 升序；
@@ -393,6 +439,10 @@ pub fn decompile_structured(
     // 先据 param_map 生成函数头参数声明注释（`// 参数: arg1=rcx, arg2=rdx`），
     // 趁 `namer` 还能反查寄存器名、且 `param_map` 未被移进闭包时算好。
     let param_note = param_declaration(&param_map, namer);
+    // 参数名列表（arg1..arg4，升序）留到正文渲染后再算"疑似签名"用；此时 `param_map`
+    // 还没被移进下面的包装 namer。
+    let mut param_args: Vec<String> = param_map.values().cloned().collect();
+    param_args.sort();
     let base_namer = namer;
     let param_namer =
         move |id: u16| -> Option<String> { param_map.get(&id).cloned().or_else(|| base_namer(id)) };
@@ -464,6 +514,11 @@ pub fn decompile_structured(
     if let Some(note) = param_note {
         let indent = builder.lines.first().map_or(1, |l| l.indent);
         builder.lines.insert(0, Line { indent, text: note });
+    }
+    // 疑似签名放更前面：它概括"怎么调用"，比逐个参数的寄存器映射更宏观。
+    if let Some(sig) = signature_hint(name, entry, &param_args, &builder.lines) {
+        let indent = builder.lines.first().map_or(1, |l| l.indent);
+        builder.lines.insert(0, Line { indent, text: sig });
     }
     simplify_single_width_slots(&mut builder.lines);
     let built = Built {
@@ -1641,6 +1696,45 @@ mod tests {
 
     fn namer(_: u16) -> Option<String> {
         Some("r0".to_string())
+    }
+
+    #[test]
+    fn signature_hint_reports_shape_and_admits_unknown_types() {
+        let mk = |text: &str| Line {
+            indent: 1,
+            text: text.to_string(),
+        };
+        // 有参数 + 有返回值：返回类型与参数类型都写 `?`（不猜），并给出参数个数与返回情况。
+        let lines = vec![mk("rbx = arg1;"), mk("return edx;")];
+        assert_eq!(
+            signature_hint(Some("f"), 0x1000, &["arg1".to_string()], &lines).as_deref(),
+            Some("// 疑似签名: ? f(? arg1)  /* 有返回值 */")
+        );
+        // `return;`（无值）→ void；无参数 → `(void)`。
+        let lines = vec![mk("return;")];
+        assert_eq!(
+            signature_hint(None, 0x401000, &[], &lines).as_deref(),
+            None,
+            "无参数无返回值时不必重复 `void f(void)` 这一形状"
+        );
+        // 无参数但有返回值 → 仍值得给出（说明它不是 void 函数）。
+        let lines = vec![mk("return eax;")];
+        assert_eq!(
+            signature_hint(None, 0x401000, &[], &lines).as_deref(),
+            Some("// 疑似签名: ? sub_401000(void)  /* 有返回值 */")
+        );
+        // 有参数但无返回值 → void 返回。
+        let lines = vec![mk("return;")];
+        assert_eq!(
+            signature_hint(
+                Some("g"),
+                0x2000,
+                &["arg1".to_string(), "arg2".to_string()],
+                &lines
+            )
+            .as_deref(),
+            Some("// 疑似签名: void g(? arg1, ? arg2)  /* 无返回值 */")
+        );
     }
 
     #[test]
