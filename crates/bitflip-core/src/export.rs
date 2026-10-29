@@ -71,6 +71,9 @@ pub enum ExportFormat {
     /// 调用图（JSON）：已解析的调用边 + 汇总 + 未解析间接调用。**只列已解析的边**，
     /// 未解析的间接调用单独计数（`summary.unresolved_indirect`），可达集是**下界**。
     JsonCallGraph,
+    /// 可达性（JSON）：从某入口（`--function`）或全图根出发，按跳数分层枚举可达函数。
+    /// 只沿**已解析**的边走，所以可达集是**下界**（未解析的间接调用到不了）。
+    JsonReachability,
     /// 控制流图（Graphviz DOT）。
     DotCfg,
     /// 调用图（Graphviz DOT）：节点是函数，边是调用。只画**已解析**的调用边，未解析的
@@ -106,6 +109,7 @@ impl ExportFormat {
             Self::JsonStructs => "json-structs",
             Self::JsonLibraries => "json-libraries",
             Self::JsonCallGraph => "json-callgraph",
+            Self::JsonReachability => "json-reachability",
             Self::DotCfg => "dot-cfg",
             Self::DotCallGraph => "dot-callgraph",
             Self::PseudoC => "pseudo-c",
@@ -128,6 +132,7 @@ impl ExportFormat {
             Self::JsonStructs,
             Self::JsonLibraries,
             Self::JsonCallGraph,
+            Self::JsonReachability,
             Self::DotCfg,
             Self::DotCallGraph,
             Self::PseudoC,
@@ -521,6 +526,10 @@ fn export_with_disasm_prebuilt(
         ExportFormat::JsonCallGraph => {
             let analysis = session.analysis(&job)?;
             write_json_callgraph(&mut writer, &analysis, options, &meta, &mut notes)?
+        }
+        ExportFormat::JsonReachability => {
+            let analysis = session.analysis(&job)?;
+            write_json_reachability(&mut writer, &analysis, options, &meta, &mut notes)?
         }
         ExportFormat::DotCfg => {
             let analysis = session.analysis(&job)?;
@@ -2517,6 +2526,45 @@ fn write_json_callgraph(
         notes.push(format!("调用图说明：{note}"));
     }
     Ok(edges.len() as u64)
+}
+
+/// 可达性（JSON）。
+///
+/// 从 `--function` 指定的入口（`None` = 全图根）出发，按跳数分层枚举可达函数。数据来自
+/// `analysis.reachability()` —— **只沿已解析的边走**，所以可达集是**下界**：被 `call rax`
+/// 之类间接调用到的函数会显示成"不可达"，而它其实是活的。这点必须写进 `notes`（§7）。
+fn write_json_reachability(
+    writer: &mut ExportWriter,
+    analysis: &TargetAnalysis,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let reach = analysis.reachability(options.function, options.max_functions);
+    let unresolved = reach.unresolved_indirect;
+    let item_count = reach.functions.len();
+    let reach_notes = reach.notes.clone();
+
+    let document = json!({
+        "format_version": EXPORT_FORMAT_VERSION,
+        "producer": meta.producer,
+        "meta": meta,
+        "reachability": reach,
+    });
+
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|error| BitflipError::Internal(format!("序列化可达性失败：{error}")))?;
+    write_document(writer, &text, options, "可达性")?;
+
+    if unresolved > 0 {
+        notes.push(format!(
+            "有 {unresolved} 处未解析的间接调用：被它们调用的函数在这里会显示成**不可达**，但可能其实是活的。可达集是**下界**，不要当作死代码清单用"
+        ));
+    }
+    for note in &reach_notes {
+        notes.push(format!("可达性说明：{note}"));
+    }
+    Ok(item_count as u64)
 }
 
 /// 把一个已构造好的 JSON 文档写出去。

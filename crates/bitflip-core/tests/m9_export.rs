@@ -555,3 +555,48 @@ fn dot_callgraph_is_well_formed_and_filterable() {
         );
     }
 }
+
+#[test]
+fn reachability_export_is_consistent_and_marks_lower_bound() {
+    let session = open("pe-x86_64.exe");
+    let (text, report) = export(
+        &session,
+        ExportFormat::JsonReachability,
+        &ExportOptions::default(),
+    )
+    .expect("导出可达性");
+    let document = parse_document(&text);
+    let r = &document["reachability"];
+
+    let total = r["total_functions"].as_u64().expect("total_functions");
+    let reachable = r["reachable"].as_u64().expect("reachable");
+    let unreachable = r["unreachable"].as_u64().expect("unreachable");
+    assert_eq!(
+        reachable + unreachable,
+        total,
+        "可达 + 不可达 必须等于函数总数"
+    );
+    let listed = r["functions"].as_array().expect("functions 数组").len() as u64;
+    let truncated = r["truncated"].as_u64().expect("truncated");
+    assert_eq!(
+        listed + truncated,
+        reachable,
+        "列出的明细 + 截断条数 必须等于可达数"
+    );
+    assert_eq!(report.items, listed, "report.items 必须等于列出条数");
+
+    // 每条明细的 entry 是定长 hex。
+    for func in r["functions"].as_array().unwrap().iter().take(20) {
+        let entry = func["entry"].as_str().expect("entry");
+        assert_eq!(entry.len(), 16, "可达函数 entry 必须是定长 hex：{entry:?}");
+    }
+
+    // 有未解析间接调用时，notes 必须点明"下界/不可达不等于死代码"。
+    if r["unresolved_indirect"].as_u64().unwrap_or(0) > 0 {
+        assert!(
+            report.notes.iter().any(|n| n.contains("下界")),
+            "有未解析间接调用时 notes 必须说明是下界：{:?}",
+            report.notes
+        );
+    }
+}

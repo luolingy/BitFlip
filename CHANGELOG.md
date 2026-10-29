@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 3 D：`json-reachability` 导出（分层可达 + 下界说明）
+
+`analysis.reachability()` 早已存在（M6 交付物，API 可取），但**无 CLI 导出**。补齐：
+
+- 新增 `ExportFormat::JsonReachability`（短名 `json-reachability`）：从 `--function` 入口（缺省
+  = 全图根）出发，按跳数分层枚举可达函数（`total/reachable/unreachable/max_depth/depth_histogram/
+  functions/truncated`）。`--max-functions` 控制明细条数，截断条数如实报（`truncated`）。
+- **诚实边界**（§7）：只沿**已解析**的边走，未解析的间接调用到不了 —— 被 `call rax` 之类调到的
+  函数会显示成"不可达"却可能是活的。`notes` 明确写"可达集是下界，不要当作死代码清单用"。
+- 实测：`pe-x86_64.exe` 4 函数全可达、深度 2；kernel32 2951 函数全可达、最大深度 11、
+  未解析间接调用 4068（下界）、明细列出 512 条 + 截断 2439 条（都如实报）。
+- 新增 1 项 m9 端到端单测（用 `pe-x86_64.exe`）：可达+不可达=总数、明细+截断=可达数、
+  entry 定长 hex、有未解析时 notes 含"下界"。
+- arch 103 / analyze 276 / core 77 / server m6 17 / cli 40 / m9_export 12，`cargo test --workspace`
+  全绿；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 3 C：伪代码函数头"调用方/被调用"计数（跨函数上下文）
 
 承 3 A/B（调用图已有），把跨函数上下文放到**读代码的地方**——每个函数头一行：

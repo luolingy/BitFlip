@@ -412,8 +412,8 @@ pub struct ExportArgs {
     #[arg(value_name = "TARGET")]
     pub target: PathBuf,
     /// 导出格式：asm-intel、asm-att、json-functions、json-symbols、json-xrefs、
-    /// json-structs、json-libraries、json-callgraph、dot-cfg、dot-callgraph、pseudo-c、
-    /// pseudo-c-structured、dex-json、dex-smali、dex-dot-cfg
+    /// json-structs、json-libraries、json-callgraph、json-reachability、dot-cfg、dot-callgraph、
+    /// pseudo-c、pseudo-c-structured、dex-json、dex-smali、dex-dot-cfg
     ///
     /// 机器码视图（按地址选）：除 dex-* 之外的格式；DEX 视图（按类 / 方法选）：dex-*。
     /// 两套选择器不能混用：把 `--function` 给 DEX 格式会**报错**，不静默忽略。
