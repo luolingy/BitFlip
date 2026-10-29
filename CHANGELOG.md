@@ -5,6 +5,25 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 3 B：`dot-callgraph` 导出（Graphviz 调用图）
+
+承阶段 3 A（`json-callgraph`），补上**可视化**的调用图，复用既有 DOT 基建（`dot_quote`/`hex16`/
+预算与截断纪律同 `dot-cfg`）：
+
+- 新增 `ExportFormat::DotCallGraph`（短名 `dot-callgraph`）：单 `digraph bitflip_calls`，
+  `rankdir=LR`。节点是函数（标签 `名字 (hex)`，无名写「未识别 (hex)」），边是**已解析**的调用：
+  内部边实线、尾调用 `style=dotted,label="tail"`；外部目标（导入符号）画成**虚线椭圆节点**
+  （`x<callee>`，标签 `模块!函数`），不混进内部节点。未解析的间接调用不画边，数量写进注释头。
+- `--function` 画**自我图**（只含与该函数相关的边）；`--from/--to` 按调用方区间过滤。
+  DOT 头/尾没写完就是语法错误文件 —— 超预算时**明确失败**而非交半份（与 `dot-cfg` 同一纪律）。
+- 实测：`pe-x86_64.exe` 出 3 节点 2 边（`WinMainCRTStartup→bf_entry→bf_loop`，名字正确）；
+  kernel32 出 **3576 内部节点 / 6734 内部边**，0 外部边（PE x64 的导入调用是 `call [rip+iat]`，
+  在调用图里归入 unresolved 而非 external 边，符合事实），花括号配平。
+- 新增 1 项 m9 端到端单测（用 CI 保证的 `pe-x86_64.exe`）：digraph 头、花括号配平、有边、
+  未解析时 notes 含"下界"、自我图每条边都与该函数相关。
+- arch 103 / analyze 275 / core 77 / server m6 17 / cli 40 / m9_export 11，`cargo test --workspace`
+  全绿；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 3 A：`json-callgraph` 导出（把已算好的调用图接进 CLI）
 
 先做了**只读审计**：调用图（`build_call_graph`）、可达性、调用点命名在之前的阶段已实现，只是

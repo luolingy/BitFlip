@@ -73,6 +73,9 @@ pub enum ExportFormat {
     JsonCallGraph,
     /// 控制流图（Graphviz DOT）。
     DotCfg,
+    /// 调用图（Graphviz DOT）：节点是函数，边是调用。只画**已解析**的调用边，未解析的
+    /// 间接调用数写进注释头（此图是下界）。外部调用目标画成虚线节点。
+    DotCallGraph,
     /// C 风格伪代码（**有界子集**：单基本块表达式视图，不做控制流结构化）。
     ///
     /// 见 `docs/DECOMPILER-SCOPE.md`：这不是反编译器，条件跳转以 `goto` 出现，
@@ -104,6 +107,7 @@ impl ExportFormat {
             Self::JsonLibraries => "json-libraries",
             Self::JsonCallGraph => "json-callgraph",
             Self::DotCfg => "dot-cfg",
+            Self::DotCallGraph => "dot-callgraph",
             Self::PseudoC => "pseudo-c",
             Self::PseudoCStructured => "pseudo-c-structured",
             Self::DexJson => "dex-json",
@@ -125,6 +129,7 @@ impl ExportFormat {
             Self::JsonLibraries,
             Self::JsonCallGraph,
             Self::DotCfg,
+            Self::DotCallGraph,
             Self::PseudoC,
             Self::PseudoCStructured,
             Self::DexJson,
@@ -151,6 +156,7 @@ impl ExportFormat {
             Self::AsmIntel
                 | Self::AsmAtt
                 | Self::DotCfg
+                | Self::DotCallGraph
                 | Self::PseudoC
                 | Self::DexSmali
                 | Self::DexDotCfg
@@ -519,6 +525,10 @@ fn export_with_disasm_prebuilt(
         ExportFormat::DotCfg => {
             let analysis = session.analysis(&job)?;
             write_dot_cfg(&mut writer, &analysis, options, &meta, &mut notes)?
+        }
+        ExportFormat::DotCallGraph => {
+            let analysis = session.analysis(&job)?;
+            write_dot_callgraph(&mut writer, &analysis, options, &meta, &mut notes)?
         }
         ExportFormat::PseudoC => {
             let analysis = session.analysis(&job)?;
@@ -2640,6 +2650,165 @@ fn write_dot_cfg(
     }
 
     Ok(instructions)
+}
+
+/// 调用图（Graphviz DOT）：节点是函数，边是调用。
+///
+/// 与 `dot-cfg` 同形（用 `dot_quote` / `hex16` / 预算与截断纪律），但粒度是**函数间**：
+/// - 节点：每个内部函数入口一个，标签 `名字 (hex)`，无名写「未识别 (hex)」。
+/// - 内部边：`caller -> callee`，尾调用标 `tail`。
+/// - 外部边（导入符号）：目标画成**虚线节点**（形状 `ellipse`、虚线），标签 `模块!函数`；
+///   它们是镜像外的事实，不是函数入口，**不**混进内部节点。
+/// - 未解析的间接调用没有目标，不画边，只在注释头写数量（此图是下界）。
+///
+/// `--function` 时画**自我图**：只含与该函数相关的边（它作 caller 或 callee）。
+fn write_dot_callgraph(
+    writer: &mut ExportWriter,
+    analysis: &TargetAnalysis,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let graph = analysis.call_graph();
+    let name_of = |entry: u64| -> String {
+        analysis
+            .functions()
+            .iter()
+            .find(|func| u64::from_str_radix(&func.start, 16) == Ok(entry))
+            .map_or_else(
+                || "未识别".to_string(),
+                |func| {
+                    if func.named {
+                        func.name.clone()
+                    } else {
+                        "未识别".to_string()
+                    }
+                },
+            )
+    };
+
+    // 注释头（沿用 dot 的风格；写清"这是调用图、未解析数是下界"）。
+    let mut header = format!(
+        "// bitflip-export v{} format=dot-callgraph target={} arch={} generated_at={}\n\
+         // 节点是函数，边是调用。未识别名字的函数标为「未识别」。\n\
+         // 外部调用目标（导入符号）画成虚线椭圆节点；未解析的间接调用 {n} 处不画边（此图是下界）。\n",
+        EXPORT_FORMAT_VERSION,
+        meta.target,
+        meta.arch.as_deref().unwrap_or("unknown"),
+        meta.generated_at,
+        n = graph.summary.unresolved_indirect,
+    );
+    if let Some((from, to)) = options.range {
+        header.push_str(&format!("// range {} .. {}\n", hex16(from), hex16(to)));
+    }
+    if let Some(func) = options.function {
+        header.push_str(&format!("// function {}\n", hex16(func)));
+    }
+    header.push_str(
+        "digraph bitflip_calls {\n  rankdir=LR;\n  node [shape=box, fontname=\"Consolas\"];\n",
+    );
+    writer.push_raw(&header);
+
+    let function_hex = options.function.map(|f| format!("{f:016x}"));
+    let in_range = |address: &str| -> bool {
+        match options.range {
+            None => true,
+            Some((from, to)) => {
+                let value = u64::from_str_radix(address, 16).unwrap_or(0);
+                value >= from && value < to
+            }
+        }
+    };
+    let keep = |edge: &crate::analysis::CallEdgeWire| -> bool {
+        if let Some(func) = function_hex.as_deref() {
+            if edge.caller != func && edge.callee != func {
+                return false;
+            }
+        }
+        in_range(&edge.caller)
+    };
+    let edges: Vec<&crate::analysis::CallEdgeWire> =
+        graph.edges.iter().filter(|e| keep(e)).collect();
+
+    // 内部节点：边两端凡是 external==false 的都算。用 BTreeSet 保持输出稳定。
+    let mut internal: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for edge in &edges {
+        if !edge.external {
+            internal.insert(&edge.callee);
+        }
+        internal.insert(&edge.caller);
+    }
+    for entry in &internal {
+        let value = u64::from_str_radix(entry, 16).unwrap_or(0);
+        let label = format!("{} ({})", name_of(value), entry);
+        let line = format!("  n{entry} [label={}];\n", dot_quote(&label));
+        if !writer.push_line(&line) {
+            break;
+        }
+    }
+
+    // 边（内部实线 + 外部虚线节点）。
+    let mut emitted: u64 = 0;
+    for edge in &edges {
+        let line = if edge.external {
+            let name = edge.import_name.clone().map_or_else(
+                || edge.callee.clone(),
+                |n| {
+                    edge.import_module
+                        .as_ref()
+                        .map_or_else(|| n.clone(), |m| format!("{m}!{n}"))
+                },
+            );
+            format!(
+                "  x{} [label={}, shape=ellipse, style=dashed];\n  n{} -> x{} [style=dashed];\n",
+                edge.callee,
+                dot_quote(&name),
+                edge.caller,
+                edge.callee
+            )
+        } else {
+            let style = if edge.tail {
+                " [label=\"tail\", style=dotted]"
+            } else {
+                ""
+            };
+            format!("  n{} -> n{}{};\n", edge.caller, edge.callee, style)
+        };
+        emitted += 1;
+        if !writer.push_line(&line) {
+            break;
+        }
+    }
+    writer.push_raw("}\n");
+
+    // DOT 头/尾没写完就是语法错误文件 —— 明确失败而非交半份（与 dot-cfg 同一纪律）。
+    if let Some(truncation) = truncation_of(writer, "用 --function/--from/--to 缩小范围") {
+        return Err(BitflipError::Export(ExportError::OverBudget {
+            what: "DOT 调用图",
+            bytes: writer.len(),
+            limit: options.byte_limit.unwrap_or(u64::MAX),
+            message: format!(
+                "DOT 调用图超过字节预算（{} 字节），为避免交出语法错误的文件而中止",
+                writer.len()
+            ),
+            notes: vec![
+                format!(
+                    "字节预算用尽：{} 未写出（已写出 {}）",
+                    truncation.dropped, truncation.written
+                ),
+                "DOT 在预算用尽处停止写出，文件不完整（Graphviz 会报语法错误），因此未作为结果返回"
+                    .to_string(),
+            ],
+        }));
+    }
+
+    if graph.summary.unresolved_indirect > 0 {
+        notes.push(format!(
+            "调用图有 {} 处未解析的间接调用：这些边没有目标，本图与基于它的可达集都只是**下界**（真实调用更多）",
+            graph.summary.unresolved_indirect
+        ));
+    }
+    Ok(emitted)
 }
 
 /// DOT 的注释头。

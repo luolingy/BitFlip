@@ -486,3 +486,72 @@ fn callgraph_export_is_consistent_and_honest_about_unresolved_calls() {
     }
     assert_eq!(filtered["filtered"].as_bool(), Some(true), "应标记为已过滤");
 }
+
+#[test]
+fn dot_callgraph_is_well_formed_and_filterable() {
+    // 用 CI 保证生成的 `pe-x86_64.exe`。
+    let session = open("pe-x86_64.exe");
+    let (text, report) = export(
+        &session,
+        ExportFormat::DotCallGraph,
+        &ExportOptions::default(),
+    )
+    .expect("导出调用图 DOT");
+
+    // 语法底线：单个 digraph，花括号配平，有向边箭头。
+    assert!(text.starts_with("// bitflip-export"), "应有注释头");
+    assert!(
+        text.contains("digraph bitflip_calls {"),
+        "应是调用图 digraph"
+    );
+    assert_eq!(
+        text.matches('{').count(),
+        text.matches('}').count(),
+        "花括号必须配平（Graphviz 才不会报语法错误）"
+    );
+    assert!(text.contains(" -> "), "样本内部有调用，调用图应有边");
+    assert!(report.items > 0, "至少要画出一条边");
+
+    // 未解析间接调用若存在，notes 必须点明是下界。
+    if text.contains("未解析的间接调用") && !text.contains("未解析的间接调用 0 处")
+    {
+        assert!(
+            report.notes.iter().any(|n| n.contains("下界")),
+            "有未解析间接调用时 notes 必须说明只是下界：{:?}",
+            report.notes
+        );
+    }
+
+    // `--function` 自我图：只保留与该函数相关的边。
+    let default_edges = text.matches(" -> ").count();
+    let first_node = text
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix('n')
+                .and_then(|r| r.split_whitespace().next())
+                .filter(|s| s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .expect("至少一个节点 hex");
+    let func = u64::from_str_radix(first_node, 16).expect("hex");
+    let (filtered_text, _r) = export(
+        &session,
+        ExportFormat::DotCallGraph,
+        &ExportOptions {
+            function: Some(func),
+            ..ExportOptions::default()
+        },
+    )
+    .expect("导出自我调用图");
+    let func_hex = format!("{func:016x}");
+    assert!(
+        filtered_text.matches(" -> ").count() <= default_edges,
+        "自我图边数不应多于全图"
+    );
+    for line in filtered_text.lines().filter(|l| l.contains(" -> ")) {
+        assert!(
+            line.contains(&format!("n{func_hex}")),
+            "自我图每条边都必须与该函数相关：{line:?}"
+        );
+    }
+}
