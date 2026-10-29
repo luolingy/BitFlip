@@ -458,6 +458,8 @@ pub fn decompile_structured(
         string_reader: resolvers.string,
         mnemonic: resolvers.mnemonic,
         exception_handler: resolvers.exception_handler,
+        caller_count: resolvers.caller_count,
+        callee_count: resolvers.callee_count,
         visited: BTreeSet::new(),
         lines: Vec::new(),
         residual_gotos: 0,
@@ -534,6 +536,23 @@ pub fn decompile_structured(
             },
         );
     }
+    // 跨函数上下文：被/调用方计数（来自调用图，去重函数数；"未解析的间接调用计入下界"由导出层统一说明）。
+    if builder.caller_count.is_some() || builder.callee_count.is_some() {
+        let indent = builder.lines.first().map_or(1, |l| l.indent);
+        let callers = builder
+            .caller_count
+            .map_or_else(|| "?".to_string(), |n| n.to_string());
+        let callees = builder
+            .callee_count
+            .map_or_else(|| "?".to_string(), |n| n.to_string());
+        builder.lines.insert(
+            0,
+            Line {
+                indent,
+                text: format!("// 调用方: {callers} 个函数；被调用: {callees} 个内部函数"),
+            },
+        );
+    }
     simplify_single_width_slots(&mut builder.lines);
     let built = Built {
         lines: builder.lines,
@@ -590,6 +609,9 @@ struct Builder<'a> {
     mnemonic: Option<crate::pseudo::MnemonicResolver<'a>>,
     /// 该函数的异常处理器入口（绝对地址，若带 SEH 异常处理）。
     exception_handler: Option<u64>,
+    /// 调用方/被调用方的不同函数计数（来自调用图；`None` = 无调用图）。
+    caller_count: Option<usize>,
+    callee_count: Option<usize>,
     visited: BTreeSet<u64>,
     lines: Vec<Line>,
     residual_gotos: usize,
@@ -1787,6 +1809,37 @@ mod tests {
         assert!(
             !nbody.contains("含 SEH 异常处理"),
             "无处理器时不应出现异常注释：\n{nbody}"
+        );
+    }
+
+    #[test]
+    fn call_context_emits_caller_callee_counts_from_callgraph_facts() {
+        // 有调用图计数：函数头应写"调用方 N；被调用 M"（去重函数数，纯事实）。
+        let insns = vec![nop(0x1000), ret(0x1008)];
+        let cfg = Cfg::build(&insns);
+        let f = decompile_structured(
+            insns[0].addr,
+            Some("f"),
+            &insns,
+            &cfg,
+            &namer,
+            crate::pseudo::Resolvers {
+                caller_count: Some(3),
+                callee_count: Some(5),
+                ..crate::pseudo::Resolvers::none()
+            },
+        );
+        let body = f.structured_body.as_ref().expect("正文").join("\n");
+        assert!(
+            body.contains("// 调用方: 3 个函数；被调用: 5 个内部函数"),
+            "应输出调用方/被调用计数：\n{body}"
+        );
+        // 没有调用图（None）时不出这一行 —— 不能把"无调用图"写成"0 个调用方"。
+        let none = build(vec![nop(0x2000), ret(0x2008)]);
+        let nbody = none.structured_body.as_ref().expect("正文").join("\n");
+        assert!(
+            !nbody.contains("调用方:"),
+            "无调用图时不应输出调用方计数：\n{nbody}"
         );
     }
 

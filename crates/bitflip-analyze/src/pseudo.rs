@@ -1462,6 +1462,14 @@ pub struct Resolvers<'a> {
     /// 异常处理"的权威依据。渲染层据此在函数头写一行"含异常处理（handler @0x…）"，
     /// 但**不**伪造 try/catch 结构（作用域表随运行时而异，本层不猜，§7）。
     pub exception_handler: Option<u64>,
+    /// 调用本函数的**不同函数个数**（来自已构建的调用图，去重后的入边来源数）。
+    ///
+    /// 只报计数这一事实，不推断语义。`None` = 没有调用图可用（不是"零个调用方"）。
+    pub caller_count: Option<usize>,
+    /// 本函数调用的**不同内部函数个数**（去重后的内部出边目标数）。
+    ///
+    /// `None` = 没有调用图可用（不是"零个被调用"）。
+    pub callee_count: Option<usize>,
 }
 
 impl<'a> Resolvers<'a> {
@@ -1474,6 +1482,8 @@ impl<'a> Resolvers<'a> {
             string: None,
             mnemonic: None,
             exception_handler: None,
+            caller_count: None,
+            callee_count: None,
         }
     }
 }

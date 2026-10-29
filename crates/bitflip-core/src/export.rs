@@ -1031,7 +1031,51 @@ fn write_pseudo_c(
         None => std::collections::BTreeMap::new(),
     };
 
-    // 字符串解析：地址落在**可读、非写、非执行**的段（.rdata / __const 之类）里、且是一段
+    // 跨函数上下文：每个函数入口的"不同调用方数 / 不同内部被调用数"，来自已构建的调用图。
+    // 去重计数（同一调用点重复出现只算一次），只作计数事实；未解析间接调用在图上是下界，
+    // 由伪代码导出层统一按"下界"说明（这里不重复）。用 raw CallGraph（`callee: Option<u64>`）。
+    let callgraph = analysis.call_graph_raw();
+    // 每个入口的"不同调用方数 / 不同内部被调用数"。若函数是调用图的节点（作过 caller 或
+    // callee），缺失的一方就是**真实的 0**（没有入边=没人调用它）；若函数完全不在图里，
+    // 则是"无信息"（None），不能把"没出现在图里"写成"0 个调用方"（§7）。
+    let (caller_count, callee_count): (
+        std::collections::BTreeMap<u64, usize>,
+        std::collections::BTreeMap<u64, usize>,
+    ) = {
+        let mut callers: std::collections::BTreeMap<u64, std::collections::BTreeSet<u64>> =
+            std::collections::BTreeMap::new();
+        let mut callees: std::collections::BTreeMap<u64, std::collections::BTreeSet<u64>> =
+            std::collections::BTreeMap::new();
+        let mut nodes: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for edge in &callgraph.edges {
+            nodes.insert(edge.caller);
+            if let Some(callee) = edge.callee {
+                nodes.insert(callee);
+                callers.entry(callee).or_default().insert(edge.caller);
+                callees.entry(edge.caller).or_default().insert(callee);
+            }
+        }
+        let callers: std::collections::BTreeMap<u64, usize> = nodes
+            .iter()
+            .map(|&n| {
+                (
+                    n,
+                    callers.get(&n).map_or(0, std::collections::BTreeSet::len),
+                )
+            })
+            .collect();
+        let callees: std::collections::BTreeMap<u64, usize> = nodes
+            .iter()
+            .map(|&n| {
+                (
+                    n,
+                    callees.get(&n).map_or(0, std::collections::BTreeSet::len),
+                )
+            })
+            .collect();
+        (callers, callees)
+    };
+
     // 以 NUL 结尾的干净可打印字节时返回它。保守判定：段权限来自 loader（事实），字节可打印性
     // 直接判（事实），不假设 UTF-8/UTF-16 编码（只收 ASCII 可打印 + 常见空白），给错会误导。
     let string_reader = |addr: u64| -> Option<String> {
@@ -1158,6 +1202,8 @@ fn write_pseudo_c(
                     string: Some(&string_reader),
                     mnemonic: Some(&mnemonic),
                     exception_handler: exception_handlers.get(&entry).copied(),
+                    caller_count: caller_count.get(&entry).copied(),
+                    callee_count: callee_count.get(&entry).copied(),
                 },
             )
         } else {
@@ -1173,6 +1219,8 @@ fn write_pseudo_c(
                     string: Some(&string_reader),
                     mnemonic: Some(&mnemonic),
                     exception_handler: None,
+                    caller_count: None,
+                    callee_count: None,
                 },
             )
         };

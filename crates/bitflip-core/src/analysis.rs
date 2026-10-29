@@ -1938,6 +1938,15 @@ impl TargetAnalysis {
         &self.call_graph
     }
 
+    /// 原始调用图（`bitflip_analyze::CallGraph`，边上是 `callee: Option<u64>`）。
+    ///
+    /// 少数内部消费者（如伪代码导出的"调用方/被调用计数"）需要按函数入口做集合运算，
+    /// 用 raw 模型比在 wire 字符串上再解析更直接、也更不容易出错。
+    #[must_use]
+    pub fn call_graph_raw(&self) -> &bitflip_analyze::CallGraph {
+        &self.call_graph_raw
+    }
+
     /// 可达性（M6 交付物 7）。
     ///
     /// `entry` 给出时从该函数出发；为 `None` 时从**全部根**（入度为 0

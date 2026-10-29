@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 3 C：伪代码函数头"调用方/被调用"计数（跨函数上下文）
+
+承 3 A/B（调用图已有），把跨函数上下文放到**读代码的地方**——每个函数头一行：
+`// 调用方: N 个函数；被调用: M 个内部函数`。
+
+- 数据来自已构建的调用图（去重的**不同函数个数**），经 `Resolvers::caller_count/callee_count`
+  注入 `decompile_structured`。只报计数事实，不推断语义。
+- **诚实边界**（§7）：函数在调用图里作过节点（caller 或 callee）时，缺失的一方是**真实的 0**
+  （没有入边 = 没人调用它）；若函数完全不在图里，则**不输出**这一行（`None` = 无信息），绝不把
+  "没出现在图里"写成"0 个调用方"。未解析的间接调用使计数为**下界**（由导出层统一说明）。
+- 新增 `TargetAnalysis::call_graph_raw()`（内部消费者按入口做集合运算用原始模型，比在 wire 字符串上
+  再解析更稳）。
+- 实测 kernel32：417 个函数获得调用方/被调用计数（全为确定数字，无 `?`），`无法翻译` 仍为 14。
+- 新增 1 项 analyze 单测：有计数→出行且数字正确；无调用图→不出行（不当成 0）。
+- arch 103 / analyze 276(+1) / core 77 / server m6 17 / cli 40 / m9_export 11，`cargo test
+  --workspace` 全绿；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 3 B：`dot-callgraph` 导出（Graphviz 调用图）
 
 承阶段 3 A（`json-callgraph`），补上**可视化**的调用图，复用既有 DOT 基建（`dot_quote`/`hex16`/
