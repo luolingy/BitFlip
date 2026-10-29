@@ -2227,6 +2227,15 @@ impl Session {
         self.object_raw.as_ref()
     }
 
+    /// 目标的完整文件字节（只读）。
+    ///
+    /// 少数调用方（如导出时解码 `.pdata` 展开信息、读只读数据）需要在**已解析对象**
+    /// 之外直接摸原始字节。这里只暴露只读切片，不交出所有权。
+    #[must_use]
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// 用户给的签名库（没有就是 `None`）。
     #[must_use]
     pub fn signatures(&self) -> Option<&Arc<SignatureLibrary>> {

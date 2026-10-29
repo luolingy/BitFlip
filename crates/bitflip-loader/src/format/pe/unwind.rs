@@ -108,6 +108,23 @@ pub(crate) fn parse_unwind_info(
     let frame_reg_raw = header[3] & 0x0F;
     let frame_offset_scaled = (header[3] >> 4) & 0x0F;
 
+    // EHANDLER / UHANDLER 时，展开码数组之后（按 4 字节对齐）有一个或多个
+    // `ExceptionHandler` RVA。这里只读**第一个**（语言处理器的入口地址）——
+    // 它是"这个函数有异常处理"的权威依据。真正的 try/catch 结构在处理器内部的
+    // 作用域表里，那需要知道具体运行时（`__CxxFrameHandler3` / `__C_specific_handler`），
+    // 本层不猜（§7），只把"有处理器、处理器在哪"如实交上去。
+    //
+    // 布局：`codes_base` 起 `count_of_codes × 2` 字节，随后 4 字节对齐，再放 RVA。
+    let mut handler_rva: Option<u32> = None;
+    if flags & 0x03 != 0 {
+        let codes_bytes = count_of_codes * 2;
+        let aligned = codes_bytes.next_multiple_of(4);
+        let hoff = (offset + 4).saturating_add(aligned);
+        if let Ok(rva) = reader.u32(hoff, Endianness::Little, "ExceptionHandler RVA") {
+            handler_rva = Some(rva);
+        }
+    }
+
     // 版本 1 = x64（PE/COFF 规范："Version: currently 1"）。
     // 其他版本（如 ARM64 用的 2）操作码语义不同，只记录头字段。
     //
@@ -125,6 +142,7 @@ pub(crate) fn parse_unwind_info(
             frame_register: None,
             frame_offset: 0,
             ops: Vec::new(),
+            handler_rva,
             notes,
         });
     }
@@ -261,6 +279,7 @@ pub(crate) fn parse_unwind_info(
             frame_register,
             frame_offset,
             ops: Vec::new(),
+            handler_rva,
             notes,
         });
     }
@@ -403,6 +422,7 @@ pub(crate) fn parse_unwind_info(
         frame_register,
         frame_offset,
         ops,
+        handler_rva,
         notes,
     })
 }

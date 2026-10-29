@@ -457,6 +457,7 @@ pub fn decompile_structured(
         import_namer: resolvers.import,
         string_reader: resolvers.string,
         mnemonic: resolvers.mnemonic,
+        exception_handler: resolvers.exception_handler,
         visited: BTreeSet::new(),
         lines: Vec::new(),
         residual_gotos: 0,
@@ -520,6 +521,19 @@ pub fn decompile_structured(
         let indent = builder.lines.first().map_or(1, |l| l.indent);
         builder.lines.insert(0, Line { indent, text: sig });
     }
+    // 含异常处理：只写"有处理器、处理器在哪"（来自 .pdata 的事实），不伪造 try/catch。
+    if let Some(handler) = builder.exception_handler {
+        let indent = builder.lines.first().map_or(1, |l| l.indent);
+        builder.lines.insert(
+            0,
+            Line {
+                indent,
+                text: format!(
+                    "// 本函数含 SEH 异常处理（handler @{handler:#x}）；try/catch 结构见处理器作用域表，未展开"
+                ),
+            },
+        );
+    }
     simplify_single_width_slots(&mut builder.lines);
     let built = Built {
         lines: builder.lines,
@@ -574,6 +588,8 @@ struct Builder<'a> {
     string_reader: Option<StringReader<'a>>,
     /// 助记符解析器（编号 → 文本），用于还原算术/逻辑指令的真实语义。
     mnemonic: Option<crate::pseudo::MnemonicResolver<'a>>,
+    /// 该函数的异常处理器入口（绝对地址，若带 SEH 异常处理）。
+    exception_handler: Option<u64>,
     visited: BTreeSet<u64>,
     lines: Vec<Line>,
     residual_gotos: usize,
@@ -1736,6 +1752,41 @@ mod tests {
             )
             .as_deref(),
             Some("// 疑似签名: void g(? arg1, ? arg2)  /* 无返回值 */")
+        );
+    }
+
+    #[test]
+    fn exception_handler_emits_annotation_without_faking_try_catch() {
+        // 函数带 SEH 异常处理：应出现"含 SEH 异常处理"注释，带上处理器地址；
+        // 但**绝不**凭空造出 `try`/`catch` 结构（作用域表没解析，不猜，§7）。
+        let insns = vec![nop(0x1000), ret(0x1008)];
+        let cfg = Cfg::build(&insns);
+        let f = decompile_structured(
+            insns[0].addr,
+            Some("f"),
+            &insns,
+            &cfg,
+            &namer,
+            crate::pseudo::Resolvers {
+                exception_handler: Some(0x1800_28ef8),
+                ..crate::pseudo::Resolvers::none()
+            },
+        );
+        let body = f.structured_body.as_ref().expect("正文").join("\n");
+        assert!(
+            body.contains("// 本函数含 SEH 异常处理（handler @0x180028ef8）"),
+            "应出现含异常处理注释及处理器地址：\n{body}"
+        );
+        assert!(
+            !body.contains("try {") && !body.contains("catch ("),
+            "不得凭空伪造 try/catch 结构：\n{body}"
+        );
+        // 没有处理器时不出现该注释。
+        let none = build(vec![nop(0x2000), ret(0x2008)]);
+        let nbody = none.structured_body.as_ref().expect("正文").join("\n");
+        assert!(
+            !nbody.contains("含 SEH 异常处理"),
+            "无处理器时不应出现异常注释：\n{nbody}"
         );
     }
 

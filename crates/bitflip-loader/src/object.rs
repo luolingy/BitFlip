@@ -517,6 +517,15 @@ impl UnwindEntry {
             None => &[],
         }
     }
+
+    /// 异常处理器入口 RVA（仅当该函数带 EHANDLER/UHANDLER 时）。
+    ///
+    /// `None` 有两种可能：没解码（`is_deferred`），或确实没有处理器。
+    /// 与其它访问器一致——需要 `resolve()` 先解过，才回答"有没有"。
+    #[must_use]
+    pub fn exception_handler_rva(&self) -> Option<u32> {
+        self.decoded.as_ref().and_then(|detail| detail.handler_rva)
+    }
 }
 
 /// PE `UNWIND_INFO` 解码结果（x64 展开信息）。
@@ -548,6 +557,13 @@ pub struct PeUnwindInfo {
     pub frame_offset: u32,
     /// 展开操作序列（按前导顺序）。
     pub ops: Vec<PeUnwindOp>,
+    /// 异常处理器入口 RVA（仅当 `flags` 含 EHANDLER/UHANDLER 时存在）。
+    ///
+    /// 这是"该函数带异常处理"的权威依据：值是语言运行时处理器的入口
+    /// （如 `__CxxFrameHandler3` / `__C_specific_handler`）。真正的
+    /// try/catch/`__finally` 结构在处理器内部的作用域表里，格式随运行时
+    /// 而异，本层**不猜**（§7）——只如实报告"有处理器、处理器在哪"。
+    pub handler_rva: Option<u32>,
     /// 解码过程中的说明（无法定位、未知操作等）。
     pub notes: Vec<String>,
 }

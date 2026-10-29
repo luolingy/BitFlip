@@ -989,6 +989,29 @@ fn write_pseudo_c(
         })
     };
 
+    // 异常处理器表：函数入口 → 处理器绝对地址。来自 PE `.pdata` 的 `RUNTIME_FUNCTION`
+    // + `UNWIND_INFO`（EHANDLER/UHANDLER）。这是"该函数有异常处理"的权威依据。
+    //
+    // 需要在**克隆出的对象**上 `resolve_unwind`（解码推迟到真正要问的时刻），
+    // 再按 `begin` 建索引。非 PE 格式没有 `.pdata`，这张表为空 —— 如实为空，不猜。
+    let exception_handlers: std::collections::BTreeMap<u64, u64> = match session.object() {
+        Some(object) => {
+            let mut resolved = (**object).clone();
+            resolved.resolve_unwind(session.raw_bytes(), object.image_base);
+            let base = object.image_base;
+            resolved
+                .unwind
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .exception_handler_rva()
+                        .map(|rva| (entry.begin, base.saturating_add(u64::from(rva))))
+                })
+                .collect()
+        }
+        None => std::collections::BTreeMap::new(),
+    };
+
     // 字符串解析：地址落在**可读、非写、非执行**的段（.rdata / __const 之类）里、且是一段
     // 以 NUL 结尾的干净可打印字节时返回它。保守判定：段权限来自 loader（事实），字节可打印性
     // 直接判（事实），不假设 UTF-8/UTF-16 编码（只收 ASCII 可打印 + 常见空白），给错会误导。
@@ -1115,6 +1138,7 @@ fn write_pseudo_c(
                     import: Some(&import_namer),
                     string: Some(&string_reader),
                     mnemonic: Some(&mnemonic),
+                    exception_handler: exception_handlers.get(&entry).copied(),
                 },
             )
         } else {
@@ -1129,6 +1153,7 @@ fn write_pseudo_c(
                     import: Some(&import_namer),
                     string: Some(&string_reader),
                     mnemonic: Some(&mnemonic),
+                    exception_handler: None,
                 },
             )
         };

@@ -5,6 +5,28 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 2 C2a：函数头"含 SEH 异常处理"注释（只报事实，不伪造 try/catch）
+
+先做了**只读审计**（独立 Python 脚本读 kernel32.dll 的 `.pdata`）：1854 条 `RUNTIME_FUNCTION`，
+其中 **309 条 EHANDLER / 331 条 UHANDLER / 327 条 CHAININFO**。结论：x64 的 .pdata 能权威地
+说明"这个函数带异常处理器、处理器在哪"，但 try/catch 的**作用域结构**在处理器内部的作用域表里，
+格式随运行时（`__CxxFrameHandler3` / `__C_specific_handler`）而异 —— 直接展开成 try/catch 是高
+风险猜测，本片**不做**（§7）。
+
+- loader：`parse_unwind_info` 现在解析展开码数组之后对齐处的 `ExceptionHandler` RVA（仅当
+  `flags` 含 EHANDLER/UHANDLER）。`PeUnwindInfo` 加 `handler_rva` 字段，`UnwindEntry` 加
+  `exception_handler_rva()` 访问器。仍是"解码推迟"——按需 `resolve_unwind` 才解。
+- core：导出时克隆对象、`resolve_unwind` 一次，建"函数入口 → 处理器绝对地址"表，经
+  `Resolvers::exception_handler` 注入分析层。新增 `Session::raw_bytes()`（只读）供此用途。
+- structurize：函数头输出一行
+  `// 本函数含 SEH 异常处理（handler @0x...）；try/catch 结构见处理器作用域表，未展开`。
+- **交叉核对**（不止"我解析器自洽"）：对 `sub_180001290` 等四个函数，独立 Python 脚本算出的
+  `flags=3, handler=0x180028ef8` 与工具输出**逐字节一致**。kernel32 的 512 个可导出函数中
+  **96 个**带处理器注释（多个函数共享同一运行时处理器属正常，如 `__C_specific_handler`）。
+- 新增 1 项 analyze 单测：带处理器→出注释且不出 `try {`/`catch (`；无处理器→不出注释。
+- arch 103 / analyze 275(+1) / core 76 / server m6 17 / cli 40，`cargo test --workspace` 全绿；
+  fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 测试 — 阶段 2 D：把 A1/A2/B2 能力钉进端到端不变量（防回归）
 
 - 阶段 2 的四个能力此前只有单测，没有**端到端产物级**护栏。本片把其中三项补进自给自足的

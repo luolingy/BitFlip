@@ -783,6 +783,7 @@ mod tests {
             frame_register: None,
             frame_offset: 0,
             ops,
+            handler_rva: None,
             notes: Vec::new(),
         }
     }

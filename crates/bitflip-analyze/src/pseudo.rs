@@ -1456,6 +1456,12 @@ pub struct Resolvers<'a> {
     pub string: Option<StringReader<'a>>,
     /// 助记符解析器（编号 → 文本），用于还原算术/逻辑指令的真实语义。
     pub mnemonic: Option<MnemonicResolver<'a>>,
+    /// 该函数的异常处理器入口（绝对地址，若它带 SEH 异常处理）。
+    ///
+    /// 来自 PE `.pdata` 的 `UNWIND_INFO`（EHANDLER/UHANDLER）：这是"这个函数有
+    /// 异常处理"的权威依据。渲染层据此在函数头写一行"含异常处理（handler @0x…）"，
+    /// 但**不**伪造 try/catch 结构（作用域表随运行时而异，本层不猜，§7）。
+    pub exception_handler: Option<u64>,
 }
 
 impl<'a> Resolvers<'a> {
@@ -1467,6 +1473,7 @@ impl<'a> Resolvers<'a> {
             import: None,
             string: None,
             mnemonic: None,
+            exception_handler: None,
         }
     }
 }
