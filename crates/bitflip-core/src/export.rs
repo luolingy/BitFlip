@@ -68,6 +68,9 @@ pub enum ExportFormat {
     /// 依赖库识别（JSON）：按库聚合导入符号，回答"这个二进制依赖哪些库、每库贡献多少导入"。
     /// 数据来自导入表/依赖库列表（**客观**，不猜）。
     JsonLibraries,
+    /// 调用图（JSON）：已解析的调用边 + 汇总 + 未解析间接调用。**只列已解析的边**，
+    /// 未解析的间接调用单独计数（`summary.unresolved_indirect`），可达集是**下界**。
+    JsonCallGraph,
     /// 控制流图（Graphviz DOT）。
     DotCfg,
     /// C 风格伪代码（**有界子集**：单基本块表达式视图，不做控制流结构化）。
@@ -99,6 +102,7 @@ impl ExportFormat {
             Self::JsonXrefs => "json-xrefs",
             Self::JsonStructs => "json-structs",
             Self::JsonLibraries => "json-libraries",
+            Self::JsonCallGraph => "json-callgraph",
             Self::DotCfg => "dot-cfg",
             Self::PseudoC => "pseudo-c",
             Self::PseudoCStructured => "pseudo-c-structured",
@@ -119,6 +123,7 @@ impl ExportFormat {
             Self::JsonXrefs,
             Self::JsonStructs,
             Self::JsonLibraries,
+            Self::JsonCallGraph,
             Self::DotCfg,
             Self::PseudoC,
             Self::PseudoCStructured,
@@ -506,6 +511,10 @@ fn export_with_disasm_prebuilt(
         }
         ExportFormat::JsonLibraries => {
             write_json_libraries(&mut writer, session.parsed(), options, &meta, &mut notes)?
+        }
+        ExportFormat::JsonCallGraph => {
+            let analysis = session.analysis(&job)?;
+            write_json_callgraph(&mut writer, &analysis, options, &meta, &mut notes)?
         }
         ExportFormat::DotCfg => {
             let analysis = session.analysis(&job)?;
@@ -2381,6 +2390,75 @@ fn write_json_libraries(
         notes.push(format!("解析说明：{note}"));
     }
     Ok(filtered.len() as u64)
+}
+
+/// 调用图（JSON）。
+///
+/// 数据来自 `analysis.call_graph()` —— 它**只列已解析的调用边**，未解析的间接调用
+/// 单独计数（`summary.unresolved_indirect`）。可达集/边集都是**下界**：有间接调用
+/// 没有目标，真实调用图只会更大。这一点写进 `notes`，不让导出看起来比实际更完整。
+///
+/// `--function` 时只保留与该函数相关的边（它作调用方或被调用方）；`--from/--to`
+/// 时只保留调用方落在区间内的边。过滤只影响 `edges`，`summary` 仍是全图统计（它是
+/// 全图事实，按子集重算会产生自相矛盾的数字）。
+fn write_json_callgraph(
+    writer: &mut ExportWriter,
+    analysis: &TargetAnalysis,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let graph = analysis.call_graph();
+
+    // `--function` 归一化成 16 位十六进制串（与 wire 里的 caller/callee 形式一致）。
+    let function = options.function.map(|f| format!("{f:016x}"));
+    let in_range = |address: &str| -> bool {
+        match options.range {
+            None => true,
+            Some((from, to)) => {
+                let value = u64::from_str_radix(address, 16).unwrap_or(0);
+                value >= from && value < to
+            }
+        }
+    };
+    let keep = |edge: &crate::analysis::CallEdgeWire| -> bool {
+        if let Some(func) = function.as_deref() {
+            if edge.caller != func && edge.callee != func {
+                return false;
+            }
+        }
+        in_range(&edge.caller)
+    };
+
+    let edges: Vec<&crate::analysis::CallEdgeWire> =
+        graph.edges.iter().filter(|e| keep(e)).collect();
+    let filtered = options.function.is_some() || options.range.is_some();
+
+    let document = json!({
+        "format_version": EXPORT_FORMAT_VERSION,
+        "producer": meta.producer,
+        "meta": meta,
+        "filtered": filtered,
+        "summary": graph.summary,
+        "edges": edges,
+        "unresolved": graph.unresolved,
+        "graph_notes": graph.notes,
+    });
+
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|error| BitflipError::Internal(format!("序列化调用图失败：{error}")))?;
+    write_document(writer, &text, options, "调用图")?;
+
+    if graph.summary.unresolved_indirect > 0 {
+        notes.push(format!(
+            "调用图有 {} 处未解析的间接调用：这些边没有目标，此图与基于它的可达集都只是**下界**（真实调用更多）",
+            graph.summary.unresolved_indirect
+        ));
+    }
+    for note in &graph.notes {
+        notes.push(format!("调用图说明：{note}"));
+    }
+    Ok(edges.len() as u64)
 }
 
 /// 把一个已构造好的 JSON 文档写出去。

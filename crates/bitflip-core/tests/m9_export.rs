@@ -408,3 +408,81 @@ fn over_budget_json_fails_loudly_with_numbers_instead_of_half_a_document() {
         other => panic!("期望 OverBudget，得到 {other:?}"),
     }
 }
+
+#[test]
+fn callgraph_export_is_consistent_and_honest_about_unresolved_calls() {
+    // 用 CI 保证生成的 `pe-x86_64.exe`（gen-fixtures.ps1 产出），不依赖 m3-mingw-static。
+    let session = open("pe-x86_64.exe");
+    let (text, report) = export(
+        &session,
+        ExportFormat::JsonCallGraph,
+        &ExportOptions::default(),
+    )
+    .expect("导出调用图");
+    let document = parse_document(&text);
+
+    let edges = document["edges"].as_array().expect("edges 数组");
+    assert_eq!(
+        report.items as usize,
+        edges.len(),
+        "report.items 必须等于边数"
+    );
+    // summary.edges 是全图统计，必须与全量边数一致（未过滤时）。
+    assert_eq!(
+        document["summary"]["edges"]
+            .as_u64()
+            .expect("summary.edges") as usize,
+        edges.len(),
+        "未过滤时 summary.edges 必须等于边数组长度"
+    );
+    assert!(!edges.is_empty(), "样本内部有调用，调用图不该为空");
+
+    // 每条边 caller/callee 都是定长 16 位 hex；external 边要有 import 侧信息字段存在。
+    for edge in edges.iter().take(50) {
+        for key in ["caller", "callee"] {
+            let value = edge[key].as_str().expect("地址字段");
+            assert_eq!(value.len(), 16, "{key} 必须是定长 hex：{value:?}");
+        }
+        assert!(edge["external"].is_boolean(), "external 必须是布尔");
+    }
+
+    // 诚实性：有未解析间接调用时，notes 必须点明"此图是下界"，而不是假装完整。
+    let unresolved = document["summary"]["unresolved_indirect"]
+        .as_u64()
+        .expect("summary.unresolved_indirect");
+    if unresolved > 0 {
+        assert!(
+            report.notes.iter().any(|n| n.contains("下界")),
+            "存在未解析间接调用时，必须在 notes 里说明调用图只是下界：{:?}",
+            report.notes
+        );
+    }
+
+    // `--function` 过滤：只保留与该函数相关的边（它作 caller 或 callee），且真的减少。
+    let first_caller = edges[0]["caller"].as_str().expect("caller");
+    let func = u64::from_str_radix(first_caller, 16).expect("hex");
+    let (filtered_text, _r) = export(
+        &session,
+        ExportFormat::JsonCallGraph,
+        &ExportOptions {
+            function: Some(func),
+            ..ExportOptions::default()
+        },
+    )
+    .expect("导出单函数调用图");
+    let filtered = parse_document(&filtered_text);
+    let fedges = filtered["edges"].as_array().expect("edges 数组");
+    assert!(
+        fedges.len() < edges.len(),
+        "按函数过滤后边数必须减少（否则过滤没生效）"
+    );
+    let func_hex = format!("{func:016x}");
+    for edge in fedges {
+        assert!(
+            edge["caller"].as_str() == Some(&func_hex)
+                || edge["callee"].as_str() == Some(&func_hex),
+            "过滤后每条边都必须与该函数相关：{edge:?}"
+        );
+    }
+    assert_eq!(filtered["filtered"].as_bool(), Some(true), "应标记为已过滤");
+}

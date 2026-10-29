@@ -5,6 +5,27 @@
 
 ## [Unreleased]
 
+### 新增 — 阶段 3 A：`json-callgraph` 导出（把已算好的调用图接进 CLI）
+
+先做了**只读审计**：调用图（`build_call_graph`）、可达性、调用点命名在之前的阶段已实现，只是
+**只能经 Web API 取到，CLI 完全没有导出通道**。量化 kernel32 x86_64：7876 条 `call` 中
+3808 条直接内部调用、**4068 条经 IAT 跳板**（`call [rip+..]`，已在伪代码里解析成 `dll!Func`）、
+**0 条寄存器间接** —— 调用点命名与调用图对 kernel32 已接近完整。
+
+- 新增 `ExportFormat::JsonCallGraph`（短名 `json-callgraph`）：序列化 `analysis.call_graph()`
+  （已解析边 + `summary` 汇总 + `unresolved` 未解析间接调用 + `notes`）。CLI `export --format
+  json-callgraph` 与 HTTP 都可用（服务端走 `parse()`/`all()`，自动支持）。
+- **诚实边界**：只列**已解析**的边；未解析的间接调用单独计数并在 `notes` 里点明"此图与基于它的
+  可达集都只是**下界**"（真实调用更多）。带 `--function` 时只保留与该函数相关的边（作 caller 或
+  callee），`--from/--to` 时按调用方区间过滤；过滤只作用于 `edges`，`summary` 仍是全图统计
+  （按子集重算会产生自相矛盾的数字）。
+- 实测 kernel32：3748 节点 / 6734 边 / 4068 未解析 / 1614 根 / 3745 强连通分量。
+- 新增 1 项 m9 端到端单测（用 CI 保证生成的 `pe-x86_64.exe`）：`report.items == 边数`、
+  `summary.edges == 边数`、地址定长 hex、未解析时 notes 必含"下界"、`--function` 过滤真减少且每条
+  边都与该函数相关。
+- arch 103 / analyze 275 / core 77 / server m6 17 / cli 40 / m9_export 10，`cargo test --workspace`
+  全绿；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK。
+
 ### 新增 — 阶段 2 C2a：函数头"含 SEH 异常处理"注释（只报事实，不伪造 try/catch）
 
 先做了**只读审计**（独立 Python 脚本读 kernel32.dll 的 `.pdata`）：1854 条 `RUNTIME_FUNCTION`，
