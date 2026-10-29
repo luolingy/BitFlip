@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### 测试 — 阶段 2 D：把 A1/A2/B2 能力钉进端到端不变量（防回归）
+
+- 阶段 2 的四个能力此前只有单测，没有**端到端产物级**护栏。本片把其中三项补进自给自足的
+  合成 ELF 样本（`pseudo_invariants`），扩展样本机器码加入 `movzx eax, cl`、`sar eax, 1`、
+  `shr edx, 1` 三条指令，并断言：
+  - **A1**：`eax = (uint8_t)cl`（扩宽零扩展转换必须出现）；
+  - **A2**：`(int32_t)eax >>`（算术右移）与 `(uint32_t)edx >>`（逻辑右移）**两者都在**——
+    这条能立刻抓住"`sar`/`shr` 又变成同一个 `>>`"的回归；
+  - **B2**：出现「疑似签名」注释。
+- C1（switch 偏移符号扩展）不在此处重复：它已有 analyze 侧的专项单测
+  （`switch_offset_idiom_sign_extends_negative_offsets`），且 `switch-x86_64.exe` **不由任何
+  脚本生成**（本地遗留物，CI 上没有），拿它写契约会让 CI 响亮失败——按 §7 不引入"假装通过"。
+- 已用 `--nocapture` 核对四条断言**真实踩到**（不是空跑）：输出里确有 `(uint8_t)cl`、
+  `(int32_t)eax >> 0x1`、`(uint32_t)edx >> 0x1`、`// 疑似签名: void sub_401000(? arg1)`。
+- arch 103 / analyze 274 / core 76（`pseudo_invariants` 仍 3 项，断言从 7 条增至 10 条）/
+  server m6 17 / cli 40，`cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净；
+  arch-layering 门禁 OK。
+
 ### 修复 — 阶段 2 C1：switch 偏移表目标地址算错（符号扩展缺失）
 
 - **真实 bug**：MSVC x64 偏移跳表的表项是**有符号 32 位偏移**（往前跳的 case 就是负数），

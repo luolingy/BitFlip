@@ -20,24 +20,30 @@ const TEXT_VADDR: u64 = 0x401000;
 /// 被测函数的手写机器码（x86-64，Intel）：
 ///
 /// ```text
-/// 401000  53                 push rbx
-/// 401001  48 83 EC 20        sub  rsp, 0x20          ; 栈帧 0x20
-/// 401005  48 89 CB           mov  rbx, rcx           ; 入口先读 rcx → arg1
-/// 401008  48 85 DB           test rbx, rbx
-/// 40100b  74 06              je   0x401013           ; → if (rbx == 0)
-/// 40100d  8B 44 24 10        mov  eax, [rsp+0x10]    ; 单宽度槽 → v10
-/// 401011  EB 05              jmp  0x401018
-/// 401013  B8 05 00 00 00     mov  eax, 5
-/// 401018  C3                 ret                     ; → return <expr>
+/// 401000  53                    push rbx
+/// 401001  48 83 EC 20           sub  rsp, 0x20          ; 栈帧 0x20
+/// 401005  48 89 CB              mov  rbx, rcx           ; 入口先读 rcx → arg1
+/// 401008  48 85 DB              test rbx, rbx
+/// 40100b  74 0f                 je   0x40101c           ; → if (rbx == 0)
+/// 40100d  8B 44 24 10           mov  eax, [rsp+0x10]    ; 单宽度槽 → v10
+/// 401011  0F B6 C1              movzx eax, cl           ; → (uint8_t) 扩宽（A1）
+/// 401014  C1 F8 01              sar  eax, 1             ; → (int32_t) 算术右移（A2）
+/// 401017  C1 EA 01              shr  edx, 1             ; → (uint32_t) 逻辑右移（A2）
+/// 40101a  EB 05                 jmp  0x401021
+/// 40101c  B8 05 00 00 00        mov  eax, 5             ; default 分支
+/// 401021  C3                    ret                     ; → return <expr>
 /// ```
 const CODE: &[u8] = &[
     0x53, // push rbx
     0x48, 0x83, 0xEC, 0x20, // sub rsp, 0x20
     0x48, 0x89, 0xCB, // mov rbx, rcx
     0x48, 0x85, 0xDB, // test rbx, rbx
-    0x74, 0x06, // je 0x401013
+    0x74, 0x0f, // je 0x40101c
     0x8B, 0x44, 0x24, 0x10, // mov eax, [rsp+0x10]
-    0xEB, 0x05, // jmp 0x401018
+    0x0F, 0xB6, 0xC1, // movzx eax, cl
+    0xC1, 0xF8, 0x01, // sar eax, 1
+    0xC1, 0xEA, 0x01, // shr edx, 1
+    0xEB, 0x05, // jmp 0x401021
     0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5
     0xC3, // ret
 ];
@@ -145,6 +151,26 @@ fn structured_pseudo_keeps_phase_one_readability_invariants() {
     assert!(
         !text.contains("rsp + 0x"),
         "固定栈槽应已符号化，不该残留 `rsp + 0x` 原形态。实际输出：\n{text}"
+    );
+
+    // 5) 扩宽语义（阶段 2 A1）：`movzx eax, cl` 必须带零扩展宽度转换。
+    assert!(
+        text.contains("(uint8_t)cl"),
+        "A1 回归：movzx 应渲染成 eax = (uint8_t)cl。实际输出：\n{text}"
+    );
+    // 6) 有/无符号右移必须区分（阶段 2 A2）：sar → (int32_t)，shr → (uint32_t)。
+    assert!(
+        text.contains("(int32_t)eax >>"),
+        "A2 回归：sar 应渲染成 (int32_t)eax >> …（算术右移）。实际输出：\n{text}"
+    );
+    assert!(
+        text.contains("(uint32_t)edx >>"),
+        "A2 回归：shr 应渲染成 (uint32_t)edx >> …（逻辑右移）。实际输出：\n{text}"
+    );
+    // 7) 疑似签名（阶段 2 B2）：概括"怎么调用"（参数个数 + 有无返回值）。
+    assert!(
+        text.contains("// \u{7591}\u{4f3c}\u{7b7e}\u{540d}"), // "// 疑似签名"
+        "B2 回归：应出现「疑似签名」注释。实际输出：\n{text}"
     );
 }
 
