@@ -240,6 +240,22 @@ pub fn extract_hashes(bytes: &[u8]) -> Option<Vec<CodeResourceHash>> {
     Some(by_path.into_values().collect())
 }
 
+/// 对一段文件字节算出它的 CodeResources 条目（`path` + SHA-1 + SHA-256）。
+///
+/// 供 `.app` 批量重签后把"新文件的真实哈希"填回清单用。算法固定 SHA-1（`files`/`files2.hash`）
+/// 与 SHA-256（`files2.hash2`）—— 与真实 `codesign` 写清单的口径一致，但**本工具不产可信封印**
+/// （无 Apple 私钥），仅让清单哈希与磁盘文件自洽。
+#[must_use]
+pub fn hash_blob_for(path: &str, bytes: &[u8]) -> CodeResourceHash {
+    // `sha1` 与 `sha2` 共用同一个 `digest::Digest` trait，一个 import 就够两者用。
+    use sha1::Digest as _;
+    CodeResourceHash {
+        path: path.to_string(),
+        sha1: Some(sha1::Sha1::digest(bytes).to_vec()),
+        sha256: Some(sha2::Sha256::digest(bytes).to_vec()),
+    }
+}
+
 /// 重写 XML plist 里**指定路径**的哈希值：`files` 段的 `<data>` 换成 `sha1`，`files2` 段里
 /// `<key>hash</key><data>` 换成 `sha1`、`<key>hash2</key><data>` 换成 `sha256`（给哪个换哪个）。
 ///

@@ -11,6 +11,7 @@
 //! 下层永不反向依赖（CLAUDE.md §4）。
 
 mod analysis;
+pub mod appbundle;
 pub mod axml;
 pub mod dex;
 mod diff;
@@ -80,6 +81,15 @@ pub use bitflip_loader::format::macho::codesign::{resign_macho_file, ResignWrite
 pub use bitflip_loader::format::macho::code_resources::{
     extract_hashes as extract_code_resource_hashes, rewrite_hashes as rewrite_code_resource_hashes,
     CodeResourceHash,
+};
+
+/// `.app` 批量重签的可测核心（F 阶段）：枚举包里 Mach-O、读/重算 `CodeResources`、
+/// 计划与落盘。CLI 的 `resign-app` 只是薄封装。**只走 ad-hoc（不接证书、不产 CMS），
+/// 清单哈希自洽不等于可信封印**——边界见 [`appbundle`] 模块文档。
+pub use appbundle::{
+    affected_count, apply_resign_app, default_output, enumerate_machos, macho_kind,
+    plan_resign_app, plan_summary_line, AppBundleError, ApplyReport, CodeResourcesStatus,
+    MachoProbe, RelPath, ResignAppPlan,
 };
 
 pub use session::{

@@ -5,6 +5,32 @@
 
 ## [Unreleased]
 
+### 重构 — F 阶段：`.app` 批量重签的核心逻辑下沉到 `bitflip_core::appbundle`（可测）
+
+`.app` 批量重签（`resign-app`）此前所有逻辑都写在 CLI（`crates/bitflip-cli/src/resign_app.rs`：
+枚举 Mach-O、读/重算 `CodeResources`、复制整树、受影响条目映射），**无法被 core 单测覆盖**。
+本片把核心沉到新模块 `bitflip_core::appbundle`，CLI 退化为薄封装：
+
+- `enumerate_machos(root)`：递归枚举 `.app` 里所有 Mach-O（薄/fat，读头 4 字节判形态，
+  相对路径 `/` 分隔、排序），返回 `MachoProbe{rel,path,kind}`。不把整文件读进内存。
+- `plan_resign_app(root) -> ResignAppPlan`：**只读**计划。枚举 + 逐个试重签（算新字节不落盘）+
+  读旧 `CodeResources`（`CodeResourcesStatus::{Absent,NotXml,Parsed{entries,old}}`）+ 算出
+  "因重签而哈希失配"的条目（新文件 SHA-1/SHA-256 vs 清单旧哈希）。
+- `apply_resign_app(plan, out_dir) -> ApplyReport`：把整树复制到 `out_dir`、替换重签过的二进制、
+  重写 `CodeResources` 对应条目哈希（仅 XML plist；二进制 plist 如实跳过）。**绝不原地改**：
+  `out_dir == root` 或已存在都直接报错（`AppBundleError::{InPlace,OutputExists}`）。
+- 新增 loader 辅助 `code_resources::hash_blob_for(path, bytes)`（固定 SHA-1+SHA-256，与真实
+  `codesign` 写清单口径一致）；core 无需新增 sha 依赖。
+- **诚实边界不变**（§7）：只走 ad-hoc（不接证书、不产 CMS）；`CodeResources` 只做"哈希自洽"，
+  **不是可信封印**，真机仍需 `codesign` 复核——输出与文档都明确标注。
+- 测试：`appbundle` 5 项单测（形态识别、默认输出名、非目录/空目录、apply 拒绝原地/已存在）+
+  1 项 `#[ignore]` 真实样本端到端（`BITFLIP_APPBUNDLE_SAMPLE`）。实机核对 PojavLauncher.app：
+  枚举 **88** 个 Mach-O（全部可重签）、重签后 **80** 个重新 parse 且签名结论 `Intact/AdHoc`
+  自洽、另 **8** 个是**原本就解析不了**的真实 framework（导出 trie 畸形，非重签所致，如实跳过）、
+  `CodeResources` **303** 条保持且能重算、抽查 5 个受影响条目的清单哈希与新文件逐一相等。
+- 数字：arch 103 / analyze 276 / core 78(+5) / server m6 17 / cli 40，`cargo test --workspace`
+  全绿；fmt/clippy(-D warnings) 干净；arch-layering 门禁 OK（55 文件）。
+
 ### 新增 — 阶段 3 D：`json-reachability` 导出（分层可达 + 下界说明）
 
 `analysis.reachability()` 早已存在（M6 交付物，API 可取），但**无 CLI 导出**。补齐：
