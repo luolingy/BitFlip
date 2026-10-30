@@ -78,6 +78,9 @@ Thumbs.db
 
 # 鎶撳彇澶栭儴鏂囨。鏃剁殑涓存椂鐩綍锛堝唴瀹逛负绗笁鏂归〉闈紝涓嶅叆搴擄級
 ida-docs-scratch/
-# Python 字节码缓存（scripts/*.py 被 preflight 直接调用）
+# Python 锟街斤拷锟诫缓锟芥（scripts/*.py 锟斤拷 preflight 直锟接碉拷锟矫ｏ拷
 __pycache__/
 *.pyc
+
+# 鏃犱汉鍊煎畧浼氳瘽璐︽湰锛堟湰鍦扮姸鎬侊紝涓嶅叆搴擄級
+.unattended/
