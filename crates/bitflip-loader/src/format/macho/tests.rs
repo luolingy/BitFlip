@@ -855,6 +855,45 @@ fn a_hand_written_trie_pins_the_spec_layout() {
 }
 
 #[test]
+fn a_trie_with_an_empty_edge_label_is_accepted_not_rejected() {
+    // 空边标签是合法的"跳板"节点：这一步不追加名字字符，直接走到子节点。
+    // ld64 一般不写，但其他链接器/后处理会生成；必须如实解析，不能判成"文件被构造"。
+    // 布局：根 --""--> 跳板 --"_main"--> 叶子(导出 _main @ 基址+0x10)。
+    let bytes = fixture::build_export_trie(&[
+        fixture::TrieNodeSpec::branch(vec![("", 1)]),
+        fixture::TrieNodeSpec::branch(vec![("_main", 2)]),
+        fixture::TrieNodeSpec::leaf(fixture::TrieTerminalSpec::Regular { address: 0x10 }),
+    ]);
+    let image = fixture::dyld_image_with_trie(&bytes);
+    let file = read(&image.bytes).expect("带空边标签的 trie 必须能解析（不判成被构造）");
+    assert_eq!(file.exports.len(), 1, "空标签不产生导出，只有叶子那条");
+    assert_eq!(file.exports[0].name, "_main", "空标签不追加名字字符");
+    assert_eq!(
+        file.exports[0].address,
+        Some(fixture::DYLD_TEXT_VMADDR + 0x10)
+    );
+}
+
+#[test]
+fn stacked_empty_edge_labels_still_accumulate_real_name_segments() {
+    // 连续两个空标签跳板，然后才是一条真标签：名字应只剩真标签那部分，不因空标签错乱。
+    let bytes = fixture::build_export_trie(&[
+        fixture::TrieNodeSpec::branch(vec![("", 1)]),
+        fixture::TrieNodeSpec::branch(vec![("", 2)]),
+        fixture::TrieNodeSpec::branch(vec![("_x", 3)]),
+        fixture::TrieNodeSpec::leaf(fixture::TrieTerminalSpec::Regular { address: 0x20 }),
+    ]);
+    let image = fixture::dyld_image_with_trie(&bytes);
+    let file = read(&image.bytes).expect("多层空标签也应能解析");
+    assert_eq!(file.exports.len(), 1);
+    assert_eq!(file.exports[0].name, "_x");
+    assert_eq!(
+        file.exports[0].address,
+        Some(fixture::DYLD_TEXT_VMADDR + 0x20)
+    );
+}
+
+#[test]
 fn a_cyclic_trie_is_rejected_instead_of_looping_forever() {
     let image = fixture::dyld_image_with_trie(&fixture::cyclic_export_trie());
     let error = read(&image.bytes).expect_err("环状 trie 必须拒绝");

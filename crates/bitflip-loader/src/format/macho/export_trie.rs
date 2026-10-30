@@ -54,6 +54,10 @@
 //!
 //! 这些一律是**错误**而不是"尽量读"：坏 trie 里继续走只会给出错名字或错地址，
 //! 那比拒绝更糟（§7）。
+//!
+//! **不在此表的一类**：**空边标签**。节点可以带一个空标签子节点作为"跳板"（这一步不追加
+//! 名字字符，直接走到子节点，是路径压缩的边界情形）。ld64 一般不写，但其他链接器/后处理会
+//! 生成；它不产生名字、名字前缀原样传下去，不会掩盖环或超深，所以**合法、如实继续走**。
 
 use crate::reader::ParseError;
 
@@ -223,12 +227,11 @@ pub fn parse(payload: &[u8], base: u64, dylibs: &[String]) -> Result<Vec<MachOEx
                     "导出 trie 的节点 +{offset:#x} 的边标签（+{label_start:#x}）不是合法 UTF-8"
                 ))
             })?;
-            if label.is_empty() {
-                return Err(ParseError::Inconsistent(format!(
-                    "导出 trie 的节点 +{offset:#x} 有空的边标签：那一步不产生名字，\
-                     真实链接器不会这样写（文件被构造）"
-                )));
-            }
+            // 空边标签是**合法**的：节点可以带一个空标签子节点作为"跳板"——这一步不追加
+            // 任何名字字符，直接走到子节点（路径压缩的边界情形）。ld64 一般不写，但其他
+            // 链接器/后处理（strip、壳、LTO、自研链接器）会生成。空标签不产生名字、名字前缀
+            // 原样传给子节点，不会掩盖环或超深（那些由 visited / MAX_TRIE_DEPTH / 节点数上限
+            // 独立检测），所以这里**不报错**，如实继续走。
             cursor = nul + 1;
             let child = read_uleb(payload, &mut cursor, "child_node_offset", offset)?;
             let child = usize::try_from(child).map_err(|_| {

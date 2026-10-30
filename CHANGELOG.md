@@ -5,6 +5,26 @@
 
 ## [Unreleased]
 
+### 修复 — 导出 trie 把**空边标签**误判为"文件被构造"，导致 8 个真实 framework 无法解析
+
+对 PojavLauncher.app 做 `.app` 批量重签时发现：8 个真实 framework/动态库
+（`MetalANGLE`、`libOSMesa.8`、`libglapi.0`、`libjnidispatch`、`liblwjgl_stb`、
+`liblwjgl_vma`、`libshaderc`、`libvirgl_test_server`）全部因同一原因**解析失败**：
+"导出 trie 的节点 +0x… 有空的边标签：…文件被构造"。
+
+- 根因：`export_trie` 解析器把**空边标签**当成硬错误。但空边标签是**合法**的——节点可带一个
+  空标签子节点作"跳板"（这一步不追加名字字符、名字前缀原样传下去，是路径压缩的边界情形）。
+  ld64 一般不写，但其他链接器/后处理（strip、壳、LTO、自研链接器）会生成。
+- 修复：删掉该硬错误，空标签**如实继续走**。安全性不降级——环由 `visited` 检测、超深/超长/
+  超节点数各有独立上限，空标签不产生名字也不会掩盖这些（都是独立检测）。
+- 验证：上述 8 个文件改成**全部解析成功**，内容合理（如 `libshaderc`：4 段/12 节/导入 229/
+  导出 3374/符号 15285/函数起点 10169）。`.app` 批量重签端到端（真实 PojavLauncher.app）从
+  "80 个解析自洽 + 8 个原本解析不了"提升到 **88 个全部自洽、0 跳过**。
+- 新增 2 项 loader 单测：单层空标签跳板 + 多层空标签叠加，都断言导出名正确（空标签不追加字符）。
+  环状 trie 仍被拒绝（回归确认）。
+- 数字：loader lib 328(+2) / analyze 276 / arch 103 / core 78 / server m6 17 / cli 40，
+  `cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净；arch-layering OK。
+
 ### 重构 — F 阶段：`.app` 批量重签的核心逻辑下沉到 `bitflip_core::appbundle`（可测）
 
 `.app` 批量重签（`resign-app`）此前所有逻辑都写在 CLI（`crates/bitflip-cli/src/resign_app.rs`：
