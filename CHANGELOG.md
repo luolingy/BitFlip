@@ -5,6 +5,24 @@
 
 ## [Unreleased]
 
+### 新增 — `.app` 批量重签的**合成样本** CI 回归（摆脱 `#[ignore]`，进常驻 CI）
+
+此前 `.app` 批量重签的端到端核对只有 `appbundle_real_app.rs`（`#[ignore]`，需真实 `.app`，CI
+没有样本、不跑）。这条补齐为**合成样本**测试 `appbundle_synthetic.rs`，可在 CI 常驻运行：
+
+- 用 loader 的公开签名 API（`build_code_directory`/`build_superblob`）在测试里**现造**一个
+  最小的已签名薄 Mach-O 64 位小端（`__TEXT` + `__LINKEDIT` + `LC_CODE_SIGNATURE`，
+  `codeLimit == dataoff`），拼成含"主可执行 + `Frameworks/*.dylib`"的小 `.app`，附一份
+  XML-plist 形态的 `CodeResources`（占位哈希）。
+- 端到端断言：枚举 2 个 Mach-O（相对路径 `/` 分隔）→ 计划 2 个可重签、`CodeResources` 2 条且
+  全受影响 → `apply` 写到新目录、**原包一字节不动**、保持相对路径 → 重签后 `Session::open`
+  两个二进制签名结论 `Intact`/`AdHoc` → `CodeResources` 条目数不丢、受影响条目的 SHA-256 被重算
+  成磁盘新文件的真实哈希（自洽）。
+- 边界：合成二进制无 CMS、无 Apple 私钥，只验证"结构自洽 + 哈希自洽"，**不是**可信封印。
+- 数字：core 测试新增 1 个（`appbundle_synthetic` 1 passed，CI 常跑）；`appbundle_real_app`
+  仍 `#[ignore]`（真实样本手动跑）。`cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净；
+  arch-layering OK。
+
 ### 修复 — 导出 trie 把**空边标签**误判为"文件被构造"，导致 8 个真实 framework 无法解析
 
 对 PojavLauncher.app 做 `.app` 批量重签时发现：8 个真实 framework/动态库
