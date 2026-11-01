@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+### 修复 — 表格超限用例的**机器速度依赖**（PLAN §5.2 记的已知红灯）
+
+`crates/bitflip-script/tests/tables.rs` 的 `an_oversized_table_is_refused_before_it_is_built`
+过去用 `new Array(300000).fill('x').map(v => [v])` 造 30 万格，**先在 JS 里真的物化并 map
+出 30 万个格子**，慢机器上会先撞上脚本 5s 执行上限（报"超时"而不是它要断言的"表格超限"），
+于是 PLAN §5.2 把这条记成"机器速度依赖的已知红灯"。
+
+- 修法：改用 `new Array(300000)`（**稀疏**数组）——它的 `length` 就是 30 万，元素全是空穴、
+  构造 O(1)，足以触发"行数 × 列数超限"的**前置检查**（该检查在逐格解析之前，无需真造格子）。
+- 断言不变（报错要同时给出实际用量 `300000` 与上限 `MAX_TABLE_CELLS`），仍能区分"超时"与
+  "表格超限"（超时是 `ScriptError::Timeout`，措辞里不含这两个数字）。
+- 效果：该用例耗时从 2.5s+ 降到 0.08s，不再依赖机器速度；本机 `cargo test --workspace` 全绿。
+
 ### 新增 — `.app` 批量重签的**合成样本** CI 回归（摆脱 `#[ignore]`，进常驻 CI）
 
 此前 `.app` 批量重签的端到端核对只有 `appbundle_real_app.rs`（`#[ignore]`，需真实 `.app`，CI

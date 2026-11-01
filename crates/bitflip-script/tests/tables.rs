@@ -218,10 +218,12 @@ fn an_oversized_table_is_refused_before_it_is_built() {
     let host = Host::new(None);
     // 上限的检查发生在逐格解析**之前**：否则脚本会先吃掉几百兆内存再被告知
     // 超限，而那时的内存已经花掉了。
-    let message = run_err(
-        &host,
-        "bitflip.table('大表', ['a'], new Array(300000).fill('x').map(v => [v]));",
-    );
+    //
+    // 只用 `new Array(300000)` 造一个**稀疏**数组：它的 `length` 就是 30 万，
+    // 而元素全是空穴，构造是 O(1)。这足够触发"行数 × 列数超限"的前置检查，
+    // 又不需要真的 `.fill().map()` 出 30 万个格子 —— 后者在慢机器上会先撞上
+    // 脚本 5s 执行上限（报"超时"而不是"表格超限"），正是这条用例过去会红的原因。
+    let message = run_err(&host, "bitflip.table('大表', ['a'], new Array(300000));");
     assert!(
         message.contains("300000") && message.contains(&MAX_TABLE_CELLS.to_string()),
         "报错要同时给出实际用量与上限：{message}"

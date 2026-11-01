@@ -2110,6 +2110,10 @@ CFG 构建真正要的也正是这四列；缺的只是 `Cfg::build` 目前收 `
   是**机器速度依赖**（`cargo test --workspace` 因此在本机不是全绿）。
   正确修法是让这条用例不再依赖"30 万个单元格能在 5s 内跑完"（缩小数组，
   或显式调大该用例的执行时限），属 M7 范围的待办。**不要靠调 `--test-threads` 绕过。**
+  **已修（2026-10-19）**：改用 `new Array(300000)` 稀疏数组（`length` 即 30 万、元素全是空穴、
+  构造 O(1)），足以触发"行数 × 列数超限"的前置检查（该检查在逐格解析之前，无需真造格子）。
+  耗时 2.5s+ → 0.08s，不再依赖机器速度；`cargo test --workspace` 本机全绿。断言不变
+  （仍要求报错同时给出实际用量 `300000` 与上限 `MAX_TABLE_CELLS`）。
 - **已知红灯（据实记录，2026-10-14，M2a 期间发现）**：
   `crates/bitflip-analyze/tests/callgraph_scale.rs` 的两条
   （`ten_thousand_function_graph_builds_without_blowing_the_stack`、
