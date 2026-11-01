@@ -46,10 +46,12 @@ use crate::object::{
 use crate::reader::{Endianness, ParseError, Reader};
 use crate::ObjectKind;
 
+mod checksum;
 mod import;
 mod inspect;
 mod reloc;
 pub(crate) mod unwind;
+pub use checksum::{update_pe_checksum, PeChecksumReport};
 // 显式列出跨模块用到的函数，而不是写 `use import::*`：这些名字出现在 `parse`
 // 里的位置就是"PE 解析有哪几步"，读者一眼能看出依赖方向（本模块调度、子模块
 // 干活）。glob 导入会让"这个函数到底哪来的"变成要翻文件才知道的事。

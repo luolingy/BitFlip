@@ -76,6 +76,20 @@ pub fn run_patch(args: &PatchArgs) -> anyhow::Result<()> {
         }
     );
     println!("原文件      {}（未改动）", args.target.display());
+    // PE 映像：报出 CheckSum 是否被重算（改字节后不重算，某些加载器会拒绝加载）。
+    if let Some(cs) = &report.pe_checksum {
+        match (cs.original, cs.recomputed) {
+            (Some(old), Some(new)) => println!(
+                "PE 校验和   0x{old:08x} → 0x{new:08x}（{}）",
+                if cs.changed {
+                    "已重算写回"
+                } else {
+                    "无需改动"
+                }
+            ),
+            _ => println!("PE 校验和   （未定位到 CheckSum 字段，未改）"),
+        }
+    }
     Ok(())
 }
 

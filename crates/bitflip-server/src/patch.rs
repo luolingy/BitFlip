@@ -178,6 +178,13 @@ pub(super) async fn apply(State(state): State<AppState>, Json(body): Json<ApplyB
         "sections": report.sections,
         "size_before": report.size_before,
         "size_after": report.size_after,
+        // PE 映像的 CheckSum 重算记账（非 PE 为 null）。
+        "pe_checksum": report.pe_checksum.as_ref().map(|cs| serde_json::json!({
+            "field_offset": cs.field_offset,
+            "original": cs.original,
+            "recomputed": cs.recomputed,
+            "changed": cs.changed,
+        })),
         "original_untouched": true,
     }))
     .into_response()

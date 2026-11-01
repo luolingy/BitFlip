@@ -187,6 +187,8 @@ pub struct ApplyReport {
     pub size_before: u64,
     /// 写之后的文件字节数（等长替换，正常应等于 `size_before`）。
     pub size_after: u64,
+    /// PE 映像的 CheckSum 重算记账；非 PE 目标为 `None`（该格式没有这个字段）。
+    pub pe_checksum: Option<bitflip_loader::format::pe::PeChecksumReport>,
 }
 
 /// 一个已打开、默认只读的打补丁目标。
@@ -576,6 +578,15 @@ impl PatchTarget {
             patched[start..start + site.new.len()].copy_from_slice(&site.new);
         }
 
+        // PE 映像：改字节后 CheckSum 字段就对不上了，按规范重算并写回（只动那 4 个字节）。
+        // 非 PE（或 .obj 无可选头）时 `update_pe_checksum` 不碰字节、返回 field_offset=None。
+        let pe_checksum = if self.object.kind == ObjectKind::Pe {
+            let report = bitflip_loader::format::pe::update_pe_checksum(&mut patched);
+            Some(report)
+        } else {
+            None
+        };
+
         // 副本已存在就不覆盖（要覆盖得走 `apply_overwriting`）。
         if plan.copy_path.exists() {
             return Err(PatchError::CopyExists {
@@ -583,10 +594,10 @@ impl PatchTarget {
             });
         }
 
-        std::fs::write(&plan.copy_path, &patched).map_err(|source| PatchError::Write {
-            path: plan.copy_path.clone(),
-            source,
-        })?;
+        // **原子写**：先写同目录下的临时文件，fsync，再 rename 到目标副本路径。这样
+        // 要么最终文件完整出现，要么（中途失败）目标路径上什么都没有 —— 不会留下半个
+        // 写坏的副本。临时文件与目标同目录，保证 rename 是同一文件系统内的原子操作。
+        write_atomic(&plan.copy_path, &patched)?;
 
         Ok(ApplyReport {
             copy_path: plan.copy_path.clone(),
@@ -595,6 +606,7 @@ impl PatchTarget {
             sections: plan.touched_sections(),
             size_before: self.bytes.len() as u64,
             size_after: patched.len() as u64,
+            pe_checksum,
         })
     }
 
@@ -636,6 +648,49 @@ struct SectionView {
     file_size: u64,
     /// 节的显示名（`段名,节名`）。
     label: String,
+}
+
+/// **原子写**：写同目录临时文件 → flush + fsync → rename 到目标路径。
+///
+/// 为什么不用 `std::fs::write`：它中途失败会在目标路径留下**半个文件**（截断或写了一半），
+/// 而那个路径正是用户要拿去运行的 `.patched` 副本 —— 半份可执行文件比"没有文件"更糟。
+/// 临时文件与目标同目录，保证 `rename` 在同一文件系统内是原子的：要么完整出现，要么不出现，
+/// 绝不会出现"写坏的副本"这个中间态。失败时清理临时文件，不留垃圾。
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PatchError> {
+    use std::io::Write as _;
+
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    // 临时名带上进程号，避免并发写同一个副本时互撞。
+    let tmp_name = format!("{}.tmp.{}", file_name.to_string_lossy(), std::process::id());
+    let tmp_path = path.with_file_name(tmp_name);
+
+    let io_err = |p: &Path| {
+        let p = p.to_path_buf();
+        move |source| PatchError::Write { path: p, source }
+    };
+
+    // 写临时文件并 fsync，确保 rename 前数据已落盘。
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(source) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(io_err(&tmp_path)(source));
+    }
+
+    // rename 原子替换。
+    if let Err(source) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(io_err(path)(source));
+    }
+    Ok(())
 }
 
 /// `xxx` → `xxx.patched`。与目标同目录，避免跨盘。
@@ -1056,5 +1111,119 @@ mod tests {
         assert!(plan.sites[0].section.is_none(), "未加载节不该被当落点");
         assert!(plan.touched_sections().is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── 原子写 + PE checksum（本轮加固）─────────────────────────────────────
+
+    #[test]
+    fn apply_is_atomic_and_leaves_no_temp_file() {
+        // 用**独立子目录**，这样"扫同目录找残留临时文件"不会被其它并发测试
+        // （同一个进程 pid、同一个 temp 根）的临时文件干扰。
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("bitflip-patch-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建测试目录");
+        let path = dir.join("atomic.exe");
+        std::fs::write(&path, minimal_elf64_exec()).expect("写原文件");
+
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.unlock();
+        let plan = target.plan(&[(0x401000, vec![0x90u8])]).expect("计划");
+        let report = target.apply(&plan).expect("应当写成功");
+
+        // 副本完整且等于预期长度。
+        let copy = std::fs::read(&report.copy_path).expect("读副本");
+        assert_eq!(copy.len(), std::fs::read(&path).unwrap().len());
+
+        // 同目录下不应残留临时文件（形如 `<副本名>.tmp.<pid>`）。
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "不应残留临时文件：{leftover:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elf_target_has_no_pe_checksum() {
+        let path = write_temp("nope.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.unlock();
+        let plan = target.plan(&[(0x401000, vec![0x90u8])]).expect("计划");
+        let report = target.apply(&plan).expect("写副本");
+        assert!(
+            report.pe_checksum.is_none(),
+            "ELF 目标没有 PE checksum 字段，应为 None"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&report.copy_path);
+    }
+
+    /// 最小的可解析 PE32+ 映像（`AMD64`）：`.text` 在 VA 0x1000 / 文件偏移 0x200。
+    /// 字段偏移照 PE 规范拼（见 `format::pe::minimal_pe64` 的同一布局），够 loader 解析出
+    /// 段/节、够 `read` 定位 CheckSum 字段。用于验证"打补丁后 PE checksum 会被重算"。
+    fn minimal_pe64() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x400];
+        bytes[0..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let coff = 0x84;
+        bytes[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes()); // AMD64
+        bytes[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+        bytes[coff + 16..coff + 18].copy_from_slice(&0xf0u16.to_le_bytes()); // SizeOfOptionalHeader
+        bytes[coff + 18..coff + 20].copy_from_slice(&0x0022u16.to_le_bytes());
+        let opt = coff + 20;
+        bytes[opt..opt + 2].copy_from_slice(&0x020bu16.to_le_bytes()); // PE32+ magic
+        bytes[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // entry
+        bytes[opt + 24..opt + 32].copy_from_slice(&0x140000000u64.to_le_bytes()); // imagebase
+        bytes[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // sect align
+        bytes[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes()); // file align
+        bytes[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes()); // SizeOfImage
+        bytes[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes()); // SizeOfHeaders
+        bytes[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // subsystem
+        bytes[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // nrva
+        let sec = opt + 0xf0;
+        bytes[sec..sec + 5].copy_from_slice(b".text");
+        bytes[sec + 8..sec + 12].copy_from_slice(&0x800u32.to_le_bytes()); // VirtualSize
+        bytes[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
+        bytes[sec + 16..sec + 20].copy_from_slice(&0x400u32.to_le_bytes()); // SizeOfRawData
+        bytes[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes()); // PointerToRawData
+        bytes[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXEC|READ
+        bytes
+    }
+
+    #[test]
+    fn pe_apply_recomputes_checksum() {
+        let path = write_temp("pe-checksum.exe", &minimal_pe64());
+        let mut target = PatchTarget::open(&path).expect("打开 PE");
+        target.unlock();
+        // .text 在 RVA 0x1000，映像基址 0x140000000 ⇒ VA 0x140001000 / 文件 0x200。
+        let plan = target
+            .plan(&[(0x1400_01000u64, vec![0x90u8])])
+            .expect("计划");
+        let report = target.apply(&plan).expect("写副本");
+
+        let checksum = report
+            .pe_checksum
+            .as_ref()
+            .expect("PE 目标必须有 pe_checksum 记账");
+        assert!(checksum.field_offset.is_some(), "应定位到 CheckSum 字段");
+        assert!(checksum.changed, "改过字节后 CheckSum 应被重算并写回");
+        assert!(checksum.recomputed.is_some());
+
+        // 磁盘上副本的 CheckSum 字段应等于记账里的 recomputed。
+        let copy = std::fs::read(&report.copy_path).expect("读副本");
+        let field = checksum.field_offset.unwrap() as usize;
+        let on_disk = u32::from_le_bytes([
+            copy[field],
+            copy[field + 1],
+            copy[field + 2],
+            copy[field + 3],
+        ]);
+        assert_eq!(Some(on_disk), checksum.recomputed);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&report.copy_path);
     }
 }

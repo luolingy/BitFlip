@@ -5,6 +5,28 @@
 
 ## [Unreleased]
 
+### 新增 — M9 写回加固：原子落盘 + PE CheckSum 重算
+
+补上 M9 验收标准 2 的两条安全要求（此前 `apply` 直接 `std::fs::write` 写副本，且 PE 改字节后
+不重算 CheckSum）：
+
+- **原子写**（`bitflip-patch::apply`）：改为"写同目录临时文件 → flush + fsync → rename 到目标
+  副本路径"。`std::fs::write` 中途失败会在副本路径留下**半个文件**，而那是用户要拿去运行的
+  `.patched`；rename 在同一文件系统内原子，保证要么完整出现、要么不出现，绝不出现"写坏的副本"。
+  失败时清理临时文件，不留垃圾（有测试钉住"同目录无 `.tmp.<pid>` 残留"）。
+- **PE CheckSum 重算**（新模块 `bitflip-loader::format::pe::checksum`）：`update_pe_checksum`
+  按 Microsoft `CheckSumMappedFile` 规范（16 位小端求和 + 进位折叠 + 文件长度，CheckSum 字段
+  自身按 0 计）重算并写回 `IMAGE_OPTIONAL_HEADER.CheckSum`。只对真正的 PE 映像（`MZ`+`PE\0\0`
+  +非零 `SizeOfOptionalHeader`）动手，`.obj`/ELF/Mach-O 一律不碰（返回 `field_offset=None`）。
+  打补丁改字节后不重算，某些加载器/受保护进程会以"映像损坏"拒绝加载。
+- **两端透出**：CLI `patch --apply` 打印 `PE 校验和 0x… → 0x…（已重算写回）`；服务端
+  `POST /api/patch/apply` 响应增 `pe_checksum` 字段（非 PE 为 `null`）。
+- 诚实边界：PE CheckSum **不是**安全量、不等于文件 hash，链接器甚至可省略（可能为 0）；
+  本工具只让它与文件自洽，不校签名（签名是 M12 的事）。
+- 测试：loader 4 条（非 PE / .obj 无可选头 / 定位+写回幂等 / 改字节后变化）；patch 3 条
+  （原子写无残留 / ELF 无 PE checksum / PE 打补丁后 checksum 重算且磁盘值等于记账）。
+  全量 `cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净；arch-layering OK。
+
 ### 修复 — 表格超限用例的**机器速度依赖**（PLAN §5.2 记的已知红灯）
 
 `crates/bitflip-script/tests/tables.rs` 的 `an_oversized_table_is_refused_before_it_is_built`
