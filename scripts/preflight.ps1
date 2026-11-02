@@ -233,6 +233,14 @@ try {
             Write-Host "          & .\scripts\cargo.ps1 build --workspace;"
             Write-Host "          python scripts/gen-diff-fixture.py --out tests/fixtures/generated/diff-pe-x86_64)"
         }
+
+        # M9: patch-then-run acceptance (criterion 1). Compiles a tiny PE, patches
+        # one byte through the CLI, RUNS the copy and asserts the observable
+        # output changed -- "compiles" is not "runs". Skips honestly without a
+        # compiler (the script checks and reports by itself).
+        Invoke-Step -Name 'patch-then-run acceptance (M9)' -Action {
+            & (Join-Path $PSScriptRoot 'm9-patch-exec-acceptance.ps1') | Out-Host
+        } | Out-Null
     }
 
     Write-Host ""
