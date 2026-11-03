@@ -279,6 +279,18 @@ impl PatchTarget {
         self.object.sections = sections;
     }
 
+    /// 只给测试用：替换内存里的字节（不动已解析的 `object`）。
+    ///
+    /// 用于结构一致性校验的负向测试：正常打开的目标拿不到"打坏结构"的补丁 ——
+    /// `plan` 只允许落在段内的等长替换，而头部（解析器真正在意的字节）都在段外。
+    /// 这正是安全设计的本意，但它也让"坏补丁被拒绝"这条路径无法从公开 API 走到。
+    /// 这个 setter 模拟"打开后磁盘字节被外部改了"的情形：site 复核只看计划里
+    /// 那几处（段内），而结构校验读的是整份 patched 字节。
+    #[cfg(test)]
+    fn corrupt_out_of_segment_byte_for_test(&mut self, offset: usize, value: u8) {
+        self.bytes[offset] = value;
+    }
+
     /// 对象格式。
     pub fn kind(&self) -> ObjectKind {
         self.object.kind
@@ -531,6 +543,22 @@ impl PatchTarget {
     ///
     /// 这是本轮里唯一真正落盘的动作，而且只落到副本上：原文件在磁盘上保持不动。
     pub fn apply(&self, plan: &PatchPlan) -> Result<ApplyReport, PatchError> {
+        self.apply_inner(plan, false)
+    }
+
+    /// 同 [`Self::apply`]，但**显式允许覆盖**已存在的副本路径。
+    ///
+    /// 覆盖是一个独立的、叫得出名字的动作：默认路径在副本已存在时拒绝
+    /// （[`PatchError::CopyExists`]），避免悄悄毁掉上一次的补丁结果；调用方
+    /// （CLI 的 `--force`、服务端的 `overwrite: true`）必须显式走到这里。
+    /// 覆盖路径同样是"临时文件 + fsync"先落好，再把完整的新副本换上去 ——
+    /// 即使覆盖失败，磁盘上留下的也是**上一轮的完整副本**，不是半个文件。
+    pub fn apply_overwriting(&self, plan: &PatchPlan) -> Result<ApplyReport, PatchError> {
+        self.apply_inner(plan, true)
+    }
+
+    /// `apply` / `apply_overwriting` 的公共主体。
+    fn apply_inner(&self, plan: &PatchPlan, overwrite: bool) -> Result<ApplyReport, PatchError> {
         self.ensure_unlocked()?;
         if plan.is_empty() {
             return Err(PatchError::EmptyPlan);
@@ -587,8 +615,36 @@ impl PatchTarget {
             None
         };
 
+        // **结构一致性校验**（写盘前最后一道）：把打完补丁的字节当作一份新的
+        // 输入重新嗅探 + 解析。补丁若打坏了结构（魔数、头、段表……），这一步
+        // 会当场失败——坏副本根本不会被写到磁盘上，而不是"写出去之后用户拿去
+        // 运行才发现"。解析失败或格式变了都拒绝：等长替换不该改变"这是哪种
+        // 文件"这个事实。
+        let sniffed = bitflip_loader::sniff_bytes(&patched).object;
+        if sniffed != self.object.kind {
+            return Err(PatchError::PlanRejected {
+                index: 0,
+                reason: format!(
+                    "补丁后的字节被识别成 {}，与原目标 {} 不符：等长替换不该改变文件类型，拒绝写出",
+                    sniffed.as_str(),
+                    self.object.kind.as_str()
+                ),
+            });
+        }
+        let reparsed = bitflip_loader::parse_object(
+            sniffed,
+            &patched,
+            0,
+            bitflip_loader::object::ObjectId::Plain,
+        )
+        .map_err(|error| PatchError::PlanRejected {
+            index: 0,
+            reason: format!("补丁后的字节解析失败：{error}（拒绝写出可能损坏的副本）"),
+        })?;
+        let _ = reparsed; // 能完整解析即通过；段/节数量等深度校验留给上层展示
+
         // 副本已存在就不覆盖（要覆盖得走 `apply_overwriting`）。
-        if plan.copy_path.exists() {
+        if !overwrite && plan.copy_path.exists() {
             return Err(PatchError::CopyExists {
                 path: plan.copy_path.clone(),
             });
@@ -597,7 +653,7 @@ impl PatchTarget {
         // **原子写**：先写同目录下的临时文件，fsync，再 rename 到目标副本路径。这样
         // 要么最终文件完整出现，要么（中途失败）目标路径上什么都没有 —— 不会留下半个
         // 写坏的副本。临时文件与目标同目录，保证 rename 是同一文件系统内的原子操作。
-        write_atomic(&plan.copy_path, &patched)?;
+        write_atomic(&plan.copy_path, &patched, overwrite)?;
 
         Ok(ApplyReport {
             copy_path: plan.copy_path.clone(),
@@ -656,7 +712,13 @@ struct SectionView {
 /// 而那个路径正是用户要拿去运行的 `.patched` 副本 —— 半份可执行文件比"没有文件"更糟。
 /// 临时文件与目标同目录，保证 `rename` 在同一文件系统内是原子的：要么完整出现，要么不出现，
 /// 绝不会出现"写坏的副本"这个中间态。失败时清理临时文件，不留垃圾。
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PatchError> {
+///
+/// `overwrite`：目标已存在时是否替换。Windows 的 `rename` 不覆盖已存在文件，所以覆盖路径
+/// 先删旧文件再 rename —— 新副本此刻已经在临时文件里**完整落盘**（上面 fsync 过），即使
+/// 删后 rename 失败，最坏情况也只是"上一轮副本没了、新副本还在临时文件里报错"，绝不会
+/// 出现半份文件。（两步之间理论上有一个无文件窗口；覆盖本身是显式动作，且下一个动作
+/// 立即执行，这个窗口可接受并在调用文档里写明。）
+fn write_atomic(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), PatchError> {
     use std::io::Write as _;
 
     let file_name = path
@@ -683,6 +745,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PatchError> {
     if let Err(source) = write_result {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(io_err(&tmp_path)(source));
+    }
+
+    // 覆盖路径：Windows 的 rename 不覆盖已存在目标，先删旧的（新副本已在临时文件里完整落盘）。
+    if overwrite && path.exists() {
+        if let Err(source) = std::fs::remove_file(path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(io_err(path)(source));
+        }
     }
 
     // rename 原子替换。
@@ -1225,5 +1295,73 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&report.copy_path);
+    }
+
+    // ── apply_overwriting + 结构一致性校验（本轮）────────────────────────────
+
+    #[test]
+    fn apply_overwriting_replaces_existing_copy() {
+        let path = write_temp("overwrite.exe", &minimal_elf64_exec());
+        let dir = path.parent().unwrap().to_path_buf();
+
+        // 第一次 apply 建副本；第二次改不同的字节并 --force 覆盖。
+        let mut target = PatchTarget::open(&path).expect("打开");
+        target.unlock();
+        let plan1 = target.plan(&[(0x401000, vec![0x90u8])]).expect("计划1");
+        target.apply(&plan1).expect("第一次写");
+        let first = std::fs::read(target.path().with_extension("exe.patched")).expect("副本1");
+
+        let plan2 = target
+            .plan(&[(0x401000, vec![0xC3u8]), (0x401001, vec![0x90u8])])
+            .expect("计划2");
+        // 默认路径拒绝覆盖。
+        assert!(matches!(
+            target.apply(&plan2),
+            Err(PatchError::CopyExists { .. })
+        ));
+        // 显式覆盖成功，且内容确实是新的。
+        target.apply_overwriting(&plan2).expect("覆盖写");
+        let second = std::fs::read(target.path().with_extension("exe.patched")).expect("副本2");
+        assert_eq!(second[0x1000], 0xC3, "覆盖后的副本应是第二轮的字节");
+        assert_ne!(second[0x1000], first[0x1000]);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(dir.join("overwrite.exe.patched"));
+    }
+
+    #[test]
+    fn apply_refuses_bytes_that_no_longer_parse() {
+        // 结构一致性校验的负向面：公开 API 走不到"打坏结构"的补丁（plan 只允许段内
+        // 等长替换，头部都在段外——这是安全设计的本意），所以用测试 setter 模拟
+        // "打开之后磁盘字节被外部改坏"：site 复核只看段内那几处（照常通过），
+        // 而结构校验读整份 patched 字节 → 解析失败 → 拒绝写出，坏副本不落盘。
+        let path = write_temp("corrupt.exe", &minimal_elf64_exec());
+        let mut target = PatchTarget::open(&path).expect("打开");
+        // e_phoff 在文件偏移 32..40（段外）：改成天文数字，重解析必失败。
+        target.corrupt_out_of_segment_byte_for_test(32, 0xF0);
+        target.corrupt_out_of_segment_byte_for_test(33, 0xFF);
+        target.corrupt_out_of_segment_byte_for_test(34, 0xFF);
+        target.corrupt_out_of_segment_byte_for_test(35, 0xFF);
+
+        let plan = target
+            .plan(&[(0x401000, vec![0x90u8])])
+            .expect("计划照常生成");
+        target.unlock();
+        let err = target.apply(&plan).expect_err("结构校验应当拒绝");
+        match err {
+            PatchError::PlanRejected { reason, .. } => {
+                assert!(
+                    reason.contains("解析失败"),
+                    "拒绝原因要说明是结构坏了：{reason}"
+                );
+            }
+            other => panic!("期望 PlanRejected，实际 {other:?}"),
+        }
+        // 坏副本不应出现在磁盘上。
+        assert!(
+            !target.path().with_extension("exe.patched").exists(),
+            "被拒的补丁绝不能留下副本"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

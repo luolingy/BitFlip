@@ -40,6 +40,9 @@ pub struct ApplyBody {
     /// **显式解锁**：必须是 `true` 才会写盘。缺省/`false` 一律拒绝。
     #[serde(default)]
     pub confirm_unlock: bool,
+    /// 副本已存在时**显式允许覆盖**。缺省 `false` —— 默认拒绝覆盖。
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 /// 把 wire 的一串改动解析成 `bitflip-patch` 要的 `(vaddr, bytes)`。
@@ -163,9 +166,16 @@ pub(super) async fn apply(State(state): State<AppState>, Json(body): Json<ApplyB
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
     };
     target.unlock();
-    let report = match target.apply(&plan) {
-        Ok(report) => report,
-        Err(error) => return error_response(StatusCode::CONFLICT, &error.to_string()),
+    let report = if body.overwrite {
+        match target.apply_overwriting(&plan) {
+            Ok(report) => report,
+            Err(error) => return error_response(StatusCode::CONFLICT, &error.to_string()),
+        }
+    } else {
+        match target.apply(&plan) {
+            Ok(report) => report,
+            Err(error) => return error_response(StatusCode::CONFLICT, &error.to_string()),
+        }
     };
 
     Json(serde_json::json!({
@@ -305,6 +315,7 @@ mod tests {
         let body = ApplyBody {
             edits: one_edit(),
             confirm_unlock: false,
+            overwrite: false,
         };
         let response = apply(State(state), Json(body)).await;
         assert_eq!(
@@ -344,6 +355,7 @@ mod tests {
         let body = ApplyBody {
             edits: one_edit(),
             confirm_unlock: true,
+            overwrite: false,
         };
         let response = apply(State(state), Json(body)).await;
         assert_eq!(response.status(), StatusCode::OK, "确认后应当写出副本");
@@ -354,5 +366,43 @@ mod tests {
         assert_eq!(before, after, "原文件必须不变");
         let patched = std::fs::read(&copy).expect("读副本");
         assert_eq!(&patched[0x1000..0x1002], &[0x90, 0x90], "副本应被改");
+    }
+
+    #[tokio::test]
+    async fn apply_overwrite_replaces_existing_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _path) = state_with_elf(dir.path());
+        let copy = dir.path().join("sample.elf.patched");
+
+        // 第一轮：正常写出。
+        let body = ApplyBody {
+            edits: one_edit(),
+            confirm_unlock: true,
+            overwrite: false,
+        };
+        // 每次请求都要新的 state（AppState 持有目标路径，共享无妨，但 clone 语义见上）。
+        let response = apply(State(state.clone()), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(copy.exists(), "第一轮应写出副本");
+
+        // 第二轮不带 overwrite：409。
+        let body = ApplyBody {
+            edits: one_edit(),
+            confirm_unlock: true,
+            overwrite: false,
+        };
+        let response = apply(State(state.clone()), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "默认拒绝覆盖");
+
+        // 第三轮带 overwrite：200，副本仍是完整可解析的。
+        let body = ApplyBody {
+            edits: one_edit(),
+            confirm_unlock: true,
+            overwrite: true,
+        };
+        let response = apply(State(state), Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK, "显式覆盖应当成功");
+        let patched = std::fs::read(&copy).expect("读覆盖后的副本");
+        assert_eq!(&patched[0x1000..0x1002], &[0x90, 0x90], "内容仍是本轮补丁");
     }
 }

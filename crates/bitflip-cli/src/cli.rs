@@ -601,6 +601,10 @@ pub struct PatchArgs {
     /// 写副本 `xxx.patched`。不给就只读预览计划，不写盘。
     #[arg(long)]
     pub apply: bool,
+    /// 副本已存在时**显式允许覆盖**（与 `--apply` 连用）。默认拒绝覆盖 ——
+    /// 悄悄毁掉上一次的补丁结果比报错更糟。
+    #[arg(long)]
+    pub force: bool,
     /// 输出 JSON（稳定的 wire 契约，供脚本消费）
     #[arg(long)]
     pub json: bool,

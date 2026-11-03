@@ -45,12 +45,26 @@ pub fn run_patch(args: &PatchArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // `--apply` 就是那次显式解锁。
+    // `--apply` 就是那次显式解锁；`--force` 是第二个显式动作（覆盖已存在的副本）。
     let mut target = target;
     target.unlock();
-    let report = target.apply(&plan).map_err(|error| apply_error(&error))?;
+    let report = if args.force {
+        target
+            .apply_overwriting(&plan)
+            .map_err(|error| apply_error(&error))?
+    } else {
+        target.apply(&plan).map_err(|error| apply_error(&error))?
+    };
     println!();
-    println!("已写出副本  {}", report.copy_path.display());
+    println!(
+        "已写出副本  {}{}",
+        report.copy_path.display(),
+        if args.force {
+            "（已覆盖旧副本）"
+        } else {
+            ""
+        }
+    );
     println!(
         "改动        {} 字节 · 段 {} · 节 {}",
         report.changed_bytes,
@@ -334,6 +348,7 @@ mod tests {
             target,
             edit: edits.into_iter().map(str::to_string).collect(),
             apply,
+            force: false,
             json,
             raw: RawOverrideArgs::default(),
         }
