@@ -5,6 +5,25 @@
 
 ## [Unreleased]
 
+### 新增 — 导出 JSON 的 **schema 快照测试**（M9「未做」清单最后一条小项落地）
+
+新测试 `crates/bitflip-core/tests/m9_export_schema.rs`，把导出 JSON 的**schema（键与类型形状）**
+钉成快照——此前只有"信封里有 `format_version`"这类**存在性**断言，"悄悄删掉一个字段/改个字段名"
+这种破坏外部消费方的变更现有测试全绿：
+
+- **信封不变量**（`json-functions` / `json-libraries` / `json-xrefs` 三视图）：`meta` 的 11 个
+  字段、`meta.format_versions` 的 5 个字段整集钉死；`format_versions` 每项必须是**版本数字或
+  `null`**（"没用到"绝不能写成 0，那是另一个语义）。
+- **逐视图整集快照**：`json-functions`（6 个顶层键）与 `json-libraries`（9 个顶层键，含库条目
+  的 6 字段形状）——多一个键、少一个键、改名都红，报错信息直接写明"这是对外契约：有意变更请
+  更新快照并记 CHANGELOG"。
+- **刻意不快照数据内容**：函数/库列表随样本与版本变化，快照值只会制造无意义的维护负担。
+  快照边界是 schema，不是值。
+- **反向验证过**：临时从快照里删掉 `analysis_notes` 再跑 → 立刻红、指路清晰（快照真的抓得住
+  schema 漂移，不是永真的空检查）；随后还原。fixture 缺失时响亮失败（与 `m9_export.rs` 同款，
+  不做静默 SKIP）。
+- `cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净。
+
 ### 新增 — 补丁写回收尾：`apply_overwriting` 显式覆盖 + **结构一致性校验**
 
 写回路径补上最后两块（此前注释提到 `apply_overwriting` 但未实现；且写出的副本从不在写前
