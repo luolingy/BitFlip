@@ -189,60 +189,8 @@ pub fn build_call_edges(
     (edges, summary)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 共享合成样本（`#[path]` 引入，与其它 dex 测试同一份来源）。
-    #[path = "../../../../bitflip-loader/tests/common/dex_fixture.rs"]
-    #[allow(dead_code)]
-    mod fixture;
-
-    #[test]
-    fn self_recursive_invoke_resolves_to_internal_edge() {
-        let bytes = fixture::build_with_invoke();
-        let structure = bitflip_loader::parse_dex_structure(&bytes).expect("合成样本可解析");
-        let (edges, summary) = build_call_edges(&bytes, &structure);
-
-        assert_eq!(summary.methods_scanned, 2, "<init> 与 bar 都有字节码");
-        assert_eq!(summary.total_edges(), 1, "只有 bar 里那一条 invoke");
-        assert_eq!(
-            summary.internal, 1,
-            "bar 调 method@1 = 自己，两端都在本 DEX"
-        );
-        assert_eq!(summary.external, 0);
-
-        let edge = &edges[0];
-        assert_eq!(edge.caller, "Lcom/example/Foo;->bar(I)V");
-        assert_eq!(edge.callee.as_deref(), Some("Lcom/example/Foo;->bar(I)V"));
-        assert_eq!(edge.kind, DexEdgeKind::Internal);
-        assert_eq!(
-            edge.callee_index,
-            Some(edge.caller_index),
-            "自递归：两端是同一个方法"
-        );
-        assert_eq!(edge.code_unit, 0, "调用点在方法开头");
-    }
-
-    #[test]
-    fn plain_fixture_has_no_edges() {
-        // `build()`（无 invoke）应得 0 边：没有调用点就没有边，
-        // 但两个方法照样被扫过 —— 账目两头都对。
-        let bytes = fixture::build();
-        let structure = bitflip_loader::parse_dex_structure(&bytes).expect("合成样本可解析");
-        let (edges, summary) = build_call_edges(&bytes, &structure);
-        assert!(edges.is_empty());
-        assert_eq!(summary.methods_scanned, 2);
-        assert_eq!(summary.internal + summary.external, 0);
-    }
-
-    #[test]
-    fn determinism_same_input_same_edges() {
-        let bytes = fixture::build_with_invoke();
-        let structure = bitflip_loader::parse_dex_structure(&bytes).expect("合成样本可解析");
-        let (a, sa) = build_call_edges(&bytes, &structure);
-        let (b, sb) = build_call_edges(&bytes, &structure);
-        assert_eq!(a, b);
-        assert_eq!(sa, sb);
-    }
-}
+// 合成样本的测试放在**集成测试** `tests/m11_dex_xref.rs`：这里用 `#[path]` 引
+// loader 的共享 fixture 在 Linux 上解析不到（`#[cfg(test)] mod` 的 `#[path]`
+// 相对基准跨平台行为不一致——本地 Windows 过、CI Linux 挂，2026-11-04 实测）。
+// 集成测试目录的相对路径（`../../bitflip-loader/...`）在两边都稳，m2c 那条
+// 测试已验证过这条路线。
