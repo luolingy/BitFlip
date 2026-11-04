@@ -201,8 +201,13 @@ try {
             throw "diff body did not parse; cannot continue"
         }
 
-        Check -Label "diff carries format_version 1" -Ok ($report.format_version -eq 1) `
+        Check -Label "diff carries format_version 2 (instruction_diff landed in v2)" -Ok ($report.format_version -eq 2) `
             -Detail "$($report.format_version)"
+        # 指令级差分（v2 新增）：df_changed 是改动条目，必须带 instruction_diff。
+        $changed = @($report.entries | Where-Object { $_.kind -eq 'changed' })
+        Check -Label "changed entry carries instruction_diff (v2 contract)" `
+            -Ok ($changed.Count -gt 0 -and $null -ne $changed[0].instruction_diff) `
+            -Detail "changed=$($changed.Count) ops=$(@($changed[0].instruction_diff).Count)"
         Check -Label "diff carries a producer string" `
             -Ok ($report.producer -like 'bitflip *') -Detail $report.producer
         Check -Label "normalization is rva (both bases are known)" `

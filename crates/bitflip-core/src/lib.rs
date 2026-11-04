@@ -15,6 +15,7 @@ pub mod appbundle;
 pub mod axml;
 pub mod dex;
 mod diff;
+mod diff_instr;
 mod disasm;
 mod error;
 mod export;
@@ -34,6 +35,7 @@ pub use diff::{
     diff, diff_with_disasm, render_text as render_diff_text, DiffEntry, DiffKind, DiffOptions,
     DiffReport, DiffScope, DiffTotals, MatchBasis, Normalization, DIFF_FORMAT_VERSION,
 };
+pub use diff_instr::{diff_instructions, InstrOpWire, InstrSide, INSTR_DIFF_FORMAT_VERSION};
 pub use disasm::{
     hex16, parse_address, Cursor, Disasm, DisasmStats, InsnPage, InsnWire, DEFAULT_PAGE_SIZE,
     DISASM_FORMAT_VERSION, MAX_PAGE_SIZE,

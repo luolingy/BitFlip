@@ -55,7 +55,11 @@ use crate::session::Session;
 ///
 /// 与 [`crate::EXPORT_FORMAT_VERSION`] **独立**演进：差分报告与导出正文是两份
 /// 不同的对外契约，改动其一不该逼着另一方也跳版本号。
-pub const DIFF_FORMAT_VERSION: u32 = 1;
+///
+/// v2（2026-10-19）：`DiffEntry` 增加可选 `instruction_diff`（指令级操作序列，
+/// 只在 `Changed` 上出现）。纯新增字段且缺省 `null`，旧消费方仍能解析；跳版本
+/// 是为了让"能感知到新字段"的消费方有明确的代次锚点。
+pub const DIFF_FORMAT_VERSION: u32 = 2;
 
 /// 参与差分的条目类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -204,6 +208,11 @@ pub struct DiffEntry {
     pub v1_instructions: Option<u64>,
     /// 指令条数（v2）；无区间时 `None`。
     pub v2_instructions: Option<u64>,
+    /// **指令级差分**（函数内的"逐条怎么变"）。只在 `Changed` 且两侧都有已知
+    /// 区间时给出；其它类别恒为 `None` —— "未变"没有操作可列，"增/删"整条
+    /// 就是操作本身，再列一遍是噪音。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction_diff: Option<Vec<crate::diff_instr::InstrOpWire>>,
     /// 内容不同的原因（人话），`Unchanged` 时为空。
     pub detail: Option<String>,
 }
@@ -518,6 +527,45 @@ pub fn render_text(report: &DiffReport) -> String {
         if let Some(detail) = &entry.detail {
             let _ = write!(out, "  # {detail}");
         }
+        // 指令级摘录：前几条操作（equal 不算"变化"，只列 replace/insert/delete/block）。
+        // 全列会把大函数的正文贴进清单；逐条全文在 JSON 的 `instruction_diff` 里。
+        type OpRef<'a> = &'a crate::diff_instr::InstrOpWire;
+        if let Some(ops) = &entry.instruction_diff {
+            let changes: Vec<OpRef<'_>> = ops
+                .iter()
+                .filter(|op| !matches!(op, crate::diff_instr::InstrOpWire::Equal { .. }))
+                .collect();
+            if !changes.is_empty() {
+                let mut parts = Vec::new();
+                for op in changes.iter().take(4) {
+                    parts.push(match op {
+                        crate::diff_instr::InstrOpWire::Replace {
+                            v1_text, v2_text, ..
+                        } => {
+                            format!("{v1_text} -> {v2_text}")
+                        }
+                        crate::diff_instr::InstrOpWire::Insert { text, .. } => {
+                            format!("+{text}")
+                        }
+                        crate::diff_instr::InstrOpWire::Delete { text, .. } => {
+                            format!("-{text}")
+                        }
+                        crate::diff_instr::InstrOpWire::Block { .. } => {
+                            "（整段未逐条展开）".to_string()
+                        }
+                        crate::diff_instr::InstrOpWire::Equal { .. } => unreachable!("已过滤"),
+                    });
+                }
+                let more = changes.len() - parts.len();
+                let mut line = format!("  ▸ 指令级：{}", parts.join("；"));
+                if more > 0 {
+                    line.push_str(&format!(
+                        "（还有 {more} 条，全文见 JSON 的 instruction_diff）"
+                    ));
+                }
+                let _ = write!(out, "{line}");
+            }
+        }
         let _ = writeln!(out);
     }
     out
@@ -551,6 +599,9 @@ struct FuncSnapshot {
     /// 位于不同基址）被报成"改动"；再往前一版把地址写进哈希，于是连"搬家"
     /// 都报不出来。
     loose_hash: Option<[u8; 32]>,
+    /// 函数体的归一化指令序列（地址抹平后的文本 + 编码长度），供指令级差分
+    /// 使用。与哈希同一次遍历产出，不多扫一遍反汇编。无区间时 `None`。
+    instructions: Option<InsnTexts>,
 }
 
 /// 对两个目标做差分。
@@ -804,16 +855,20 @@ fn normalized(address: u64, base: u64, normalization: &Normalization) -> Option<
 /// 为什么两档都必须有：见 [`FuncSnapshot::loose_hash`]。总结成一句 ——
 /// **"没改"和"搬了家"是两件事，"搬了家"和"被改了"也是两件事**，
 /// 一个哈希分不出来，硬用一个就会给出假报告。
+/// 函数体的归一化指令序列（文本 + 编码长度），指令级差分与指纹共用。
+type InsnTexts = std::sync::Arc<Vec<(String, u8)>>;
+
 fn code_fingerprints(
     disasm: &Disasm,
     start: u64,
     end: u64,
     base: u64,
     image_end: u64,
-) -> ([u8; 32], [u8; 32], u64) {
+) -> ([u8; 32], [u8; 32], u64, InsnTexts) {
     let mut strict = Sha256::new();
     let mut loose = Sha256::new();
     let mut count: u64 = 0;
+    let mut text: Vec<(String, u8)> = Vec::new();
     let mut cursor = disasm.cursor(0);
     while let Some(insn) = cursor.render_next() {
         let address = u64::from_str_radix(&insn.address, 16).unwrap_or(0);
@@ -834,11 +889,18 @@ fn code_fingerprints(
         loose.update(b":");
         loose.update(loose_text.as_bytes());
         loose.update(b"|");
+        // 指令级差分用与弱指纹同一档归一化（地址抹平）——绝对地址那一维
+        // 由"移动"类目承载，逐条对齐只看形状。
+        text.push((strict_text, insn.length));
         count += 1;
     }
-    (strict.finalize().into(), loose.finalize().into(), count)
+    (
+        strict.finalize().into(),
+        loose.finalize().into(),
+        count,
+        std::sync::Arc::new(text),
+    )
 }
-
 /// 把指令文本里**落在镜像地址范围内**的字面量换成"它指向的 RVA"，其余原样保留。
 ///
 /// # 为什么必须是"落在镜像范围内"而不是"减掉函数起点"（实测踩到的坑）
@@ -863,7 +925,7 @@ fn code_fingerprints(
 /// 后果是"可能漏报一处改动"，不会凭空造出改动；而且它必须同时满足
 /// "值正好落在镜像范围里"这个条件，概率很低。这个取舍是有意的：把普通
 /// 立即数一律抹平会漏报得多得多（每一个常量差异都漏）。
-fn normalize_addresses(text: &str, base: u64, image_end: u64) -> String {
+pub(crate) fn normalize_addresses(text: &str, base: u64, image_end: u64) -> String {
     rewrite_hex_literals(text, |value| {
         if base != 0 && value >= base && value < image_end {
             Some(format!("@{:#x}", value - base))
@@ -947,12 +1009,13 @@ fn snapshot(
         if end.is_none() {
             without_end += 1;
         }
-        let (hash, loose, count) = match end {
+        let (hash, loose, count, instructions) = match end {
             Some(end) if end > start => {
-                let (hash, loose, count) = code_fingerprints(disasm, start, end, base, image_end);
-                (Some(hash), Some(loose), Some(count))
+                let (hash, loose, count, instructions) =
+                    code_fingerprints(disasm, start, end, base, image_end);
+                (Some(hash), Some(loose), Some(count), Some(instructions))
             }
-            _ => (None, None, None),
+            _ => (None, None, None, None),
         };
         out.push(FuncSnapshot {
             name: if func.named && !func.name.is_empty() {
@@ -970,6 +1033,7 @@ fn snapshot(
             instruction_count: count,
             strict_hash: hash,
             loose_hash: loose,
+            instructions,
         });
     }
     if without_end > 0 {
@@ -1274,6 +1338,30 @@ fn diff_functions(
 fn compare_pair(one: &FuncSnapshot, two: &FuncSnapshot, basis: MatchBasis) -> DiffEntry {
     let (kind, detail) = classify(one, two);
 
+    // 指令级差分：只在"改动"且两侧都有指令序列时算——未变没有操作可列，
+    // 增/删整条就是操作本身。基址/镜像范围那一维已经融进归一化文本
+    // （`code_fingerprints` 里做过），这里不再需要。
+    let instruction_diff = if kind == DiffKind::Changed {
+        match (&one.instructions, &two.instructions) {
+            (Some(a), Some(b)) => {
+                let side_a = crate::diff_instr::InstrSide {
+                    instructions: a,
+                    base: 0,
+                    image_end: 0,
+                };
+                let side_b = crate::diff_instr::InstrSide {
+                    instructions: b,
+                    base: 0,
+                    image_end: 0,
+                };
+                Some(crate::diff_instr::diff_instructions(&side_a, &side_b))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     DiffEntry {
         kind,
         match_basis: basis,
@@ -1286,6 +1374,7 @@ fn compare_pair(one: &FuncSnapshot, two: &FuncSnapshot, basis: MatchBasis) -> Di
         v2_size: two.size,
         v1_instructions: one.instruction_count,
         v2_instructions: two.instruction_count,
+        instruction_diff,
         detail,
     }
 }
@@ -1380,6 +1469,7 @@ fn orphan_entry(
         v2_size,
         v1_instructions,
         v2_instructions,
+        instruction_diff: None,
         detail: None,
     }
 }
@@ -1448,6 +1538,7 @@ fn diff_sections(
                     v2_size: Some(two.2),
                     v1_instructions: None,
                     v2_instructions: None,
+                    instruction_diff: None,
                     detail,
                 }
             }
@@ -1463,6 +1554,7 @@ fn diff_sections(
                 v2_size: None,
                 v1_instructions: None,
                 v2_instructions: None,
+                instruction_diff: None,
                 detail: None,
             },
             (None, Some(two)) => DiffEntry {
@@ -1477,6 +1569,7 @@ fn diff_sections(
                 v2_size: Some(two.2),
                 v1_instructions: None,
                 v2_instructions: None,
+                instruction_diff: None,
                 detail: None,
             },
             (None, None) => continue,
@@ -1532,6 +1625,7 @@ fn diff_symbols(
             v2_size: None,
             v1_instructions: None,
             v2_instructions: None,
+            instruction_diff: None,
             detail,
         });
     }
@@ -1576,6 +1670,7 @@ mod tests {
             v2_size: None,
             v1_instructions: None,
             v2_instructions: None,
+            instruction_diff: None,
             detail: None,
         }
     }
