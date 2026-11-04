@@ -94,6 +94,9 @@ pub enum ExportFormat {
     DexSmali,
     /// DEX 一个方法的 CFG（Graphviz DOT），与 [`Self::DotCfg`] 同形。
     DexDotCfg,
+    /// DEX 的调用边表（M11）：每条 `invoke-*` 调用点一行，internal/external 两档。
+    /// 见 `docs/APK-DEX-DESIGN.md` §M2c 之后新加的 M11 节。
+    DexXrefs,
 }
 
 impl ExportFormat {
@@ -117,6 +120,7 @@ impl ExportFormat {
             Self::DexJson => "dex-json",
             Self::DexSmali => "dex-smali",
             Self::DexDotCfg => "dex-dot-cfg",
+            Self::DexXrefs => "dex-xrefs",
         }
     }
 
@@ -140,6 +144,7 @@ impl ExportFormat {
             Self::DexJson,
             Self::DexSmali,
             Self::DexDotCfg,
+            Self::DexXrefs,
         ]
     }
 
@@ -171,7 +176,10 @@ impl ExportFormat {
     /// 是不是 DEX 视图的格式（决定入口走哪条路、哪些选项有意义）。
     #[must_use]
     pub const fn is_dex(self) -> bool {
-        matches!(self, Self::DexJson | Self::DexSmali | Self::DexDotCfg)
+        matches!(
+            self,
+            Self::DexJson | Self::DexSmali | Self::DexDotCfg | Self::DexXrefs
+        )
     }
 }
 
@@ -477,7 +485,10 @@ fn export_with_disasm_prebuilt(
     let mut notes: Vec<String> = Vec::new();
 
     let items: u64 = match format {
-        ExportFormat::DexJson | ExportFormat::DexSmali | ExportFormat::DexDotCfg => {
+        ExportFormat::DexJson
+        | ExportFormat::DexSmali
+        | ExportFormat::DexDotCfg
+        | ExportFormat::DexXrefs => {
             write_dex(session, &mut writer, format, options, &mut meta, &mut notes)?
         }
         ExportFormat::AsmIntel | ExportFormat::AsmAtt => {
@@ -1347,6 +1358,7 @@ fn write_dex(
     match format {
         ExportFormat::DexJson => write_dex_json(&input, &selected, writer, options, meta, notes),
         ExportFormat::DexSmali => write_dex_smali(&input, &selected, writer, options, meta, notes),
+        ExportFormat::DexXrefs => write_dex_xrefs(&input, &selected, writer, options, meta, notes),
         _ => write_dex_dot_cfg(&input, &selected, writer, options, meta, notes),
     }
 }
@@ -1702,6 +1714,104 @@ fn write_dex_json(
         notes.push("（渲染失败的条数见 `symbols.render_failures`）".to_string());
     }
     Ok(classes.len() as u64)
+}
+
+/// DEX 的调用边表（M11，`dex-xrefs`）。
+///
+/// 形状独立（**不复用**机器码 `json-xrefs` 的键名，ADR-0021 的同一条理由：
+/// DEX 没有线性地址，`from_address`/`to_address` 那套字段名搬过来只会误导）。
+/// 类/方法筛选沿用 `select_dex_classes`：`--class`/`--search`/`--method` 都能
+/// 把边表收窄到感兴趣的范围。`--no-symbols` 对这个格式**有意义**：关掉后
+/// `callee` 是池索引文本（`method@5`），不解析成签名。
+fn write_dex_xrefs(
+    input: &crate::dex::DexInput,
+    selected: &[(usize, String)],
+    writer: &mut ExportWriter,
+    options: &ExportOptions,
+    meta: &ExportMeta,
+    notes: &mut Vec<String>,
+) -> Result<u64, BitflipError> {
+    let structure = &input.structure;
+    let symbols = structure.symbols();
+    let resolver: Option<&dyn crate::dex::DexSymbolResolver> = if options.no_symbols {
+        None
+    } else {
+        Some(&symbols)
+    };
+
+    // 收窄到被选中的类：caller 属于选中类才参与。边本身按 (caller_index,
+    // code_unit, callee_method_idx) 排序去重前先按遍历序产出 —— 构建函数
+    // 已经按下标顺序走了，这里不重排（重排会掩盖构建顺序的问题）。
+    let selected_callers: std::collections::BTreeSet<usize> = selected
+        .iter()
+        .flat_map(|(class, _)| structure.class_methods(*class))
+        .collect();
+
+    let (mut edges, summary) = crate::dex_xref::build_call_edges(&input.bytes, structure);
+    let total_before_filter = edges.len();
+    edges.retain(|edge| selected_callers.contains(&(edge.caller_index as usize)));
+    let filtered = total_before_filter - edges.len();
+    if filtered > 0 {
+        notes.push(format!(
+            "类/方法筛选生效：有 {filtered} 条边落在未选中的类里，已按筛选范围收窄"
+        ));
+    }
+
+    let edge_values: Vec<serde_json::Value> = edges
+        .iter()
+        .map(|edge| {
+            let callee = match (&resolver, edge.callee.as_deref()) {
+                // 关掉符号：给池索引文本，不编占位符。
+                (None, _) => Some(format!("method@{}", edge.callee_method_idx)),
+                (Some(_), text) => text.map(str::to_string),
+            };
+            json!({
+                "caller_index": edge.caller_index,
+                "caller": edge.caller,
+                "code_unit": hex16(u64::from(edge.code_unit)),
+                "callee_method_idx": edge.callee_method_idx,
+                "callee": callee,
+                "kind": edge.kind.as_str(),
+                "callee_index": edge.callee_index,
+            })
+        })
+        .collect();
+
+    if summary.callee_name_unavailable > 0 {
+        notes.push(format!(
+            "有 {} 条边的被调用者拿不到池文本：文件里是 `callee: null` —— 不是占位符，是\"没解析到\"",
+            summary.callee_name_unavailable
+        ));
+    }
+    if summary.methods_parse_failed > 0 {
+        notes.push(format!(
+            "有 {} 个方法投影失败：它们的调用点因此不在表里 —— 少给了什么写在这里，不冒充完整",
+            summary.methods_parse_failed
+        ));
+    }
+
+    let document = json!({
+        "format_version": crate::dex_xref::DEX_XREF_FORMAT_VERSION,
+        "producer": meta.producer,
+        "meta": meta,
+        "member": input.name,
+        "role": input.role,
+        "size": input.bytes.len(),
+        "summary": {
+            "methods_scanned": summary.methods_scanned,
+            "methods_parse_failed": summary.methods_parse_failed,
+            "internal": summary.internal,
+            "external": summary.external,
+            "callee_name_unavailable": summary.callee_name_unavailable,
+        },
+        "edges": edge_values,
+        "notes": notes,
+    });
+
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|error| BitflipError::Internal(format!("序列化 DEX 调用边表失败：{error}")))?;
+    write_document(writer, &text, options, "DEX 调用边表")?;
+    Ok(edges.len() as u64)
 }
 
 /// DEX 的 smali 风格文本。

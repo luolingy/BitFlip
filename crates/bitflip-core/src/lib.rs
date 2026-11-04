@@ -14,6 +14,7 @@ mod analysis;
 pub mod appbundle;
 pub mod axml;
 pub mod dex;
+pub mod dex_xref;
 mod diff;
 mod diff_instr;
 mod disasm;

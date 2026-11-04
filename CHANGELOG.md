@@ -5,6 +5,32 @@
 
 ## [Unreleased]
 
+### 新增 — M11 第一块：DEX 调用边表（`dex-xrefs`，交叉引用/调用图的事实层）
+
+新导出格式 `dex-xrefs`（`export` 子命令与 `GET /api/export` 同路，视图由 `format` 判别——
+沿用 M2c 定下的那条规矩：字节预算/截断报告的机器只有一份）。每个 `invoke-*` 调用点一行：
+
+- **只做事实，不做猜测**：边是"bar 在码元 X 调用了 method@N"——分支可达性、虚分派的
+  实际实现、反射落点都不是这条边的职责。分类两档、判据可验证：**internal**（被调用者的
+  完整 smali 标识与本 DEX 某个**已定义**方法全等）/ **external**（不在本 DEX，如 framework）。
+  没有第三档"猜它大概是"。
+- **编号空间的坑（真机实测踩到，据实记录）**：`method_ids` **池**下标与 `class_data`
+  **定义**表下标是两套编号。第一版拿池下标查定义表，真实 APK 上 **44%（84194 条）的
+  callee 变成 null**——不是"外部方法本来就没文本"，而是查错了表。修后统一走渲染同款
+  的 `DexSymbols`（按池下标解析、拿不到就报 Unavailable、绝不写占位符），internal 判定
+  用池文本与定义签名**全等**。修后同一 APK：**null=0**，internal 85302 / external 107089
+  （和 = 192391 条边，账目闭合），扫描数 50934 与 `dex-json` 的 `method_count_with_code`
+  一致——三个独立口径互证。
+- **合成样本的码元陷阱**：给共享 fixture 加 `build_with_invoke()`（`bar` 自递归一条
+  `invoke-virtual`）。第一版把首码元写成 `0x6e10`，解码出 opcode `0x10`——Dalvik 码元是
+  **小端 16 位**，opcode 在低字节，35c 首码元应为 `0x106e`。独立探针程序（绕开测试断言
+  直接打印解码列）定位，修正后 3 条单测过（自递归 internal 边、零调用样本、确定性）。
+- **账目与降级**：`summary` 五个数（scanned/parse_failed/internal/external/null_name）都在
+  文件里；投影失败的方法如实计数、它的调用点缺席写在 notes；`--class`/`--search`/`--method`
+  筛选收窄边表（被筛掉的边数进 notes）。
+- 真机验证 `ah-app-release.apk` 的 `classes.dex`：192391 条边、73MB 边表 67 秒导出
+  （release 级数据量证明列式构建不物化字符串的设计成立）。
+
 ### 新增 — **指令级差分**（M9 交付物 4 的最后一块：函数内的"逐条怎么变"）
 
 形状按拍板执行：**锚点块匹配外层 + 段内 LCS**，两级输出。此前差分只到函数粒度

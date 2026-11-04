@@ -132,6 +132,167 @@ fn push_code_item(out: &mut Vec<u8>) {
     push_u16(out, 0x000e); // return-void（规范 §F.2.1 的 10x 格式）
 }
 
+/// `code_item`（规范 §4.5.12）：一条 `invoke-virtual` 自递归 + `return-void`。
+///
+/// `invoke-virtual {v0}, method@1`（规范 §F.2.2 的 35c 格式，宽度 3 码元）：
+/// `6E` 是 opcode，`10` 打包 `A=1`（寄存器数）与 `@0`（高 4 位寄存器号 v0），
+/// 随后 `0001` 是 method_ids 下标 1（`bar` 自己）。指令里的 v0 是寄存器号
+/// （`A=1` 表示用 1 个寄存器），`ins_size=1`/`outs_size=1` 与之一致
+/// —— `bar(I)V` 的参数占 1 个寄存器。
+///
+/// 只给 **xref/callgraph 测试**用：`build()` 的样本一条调用都没有，
+/// 改它会让四个 crate 共用的断言（指令数、CFG 块数）一起变。
+#[allow(dead_code)]
+pub fn build_with_invoke() -> Vec<u8> {
+    // 与 `build()` 同一套装配，只把 bar 的 code_item 换掉。
+    // 复用 `build` 的主体最省事：先把原版拿来，在字节层"重做"太脆 ——
+    // 这里直接内联一份变体构造（与 build() 逐段同构，差异标 `※`）。
+    let string_ids_off = HEADER_SIZE;
+    let type_ids_off = string_ids_off + (STRINGS.len() as u32) * 4;
+    let proto_ids_off = type_ids_off + (TYPES.len() as u32) * 4;
+    let field_ids_off = proto_ids_off + 2 * 12;
+    let method_ids_off = field_ids_off + (FIELDS.len() as u32) * 8;
+    let class_defs_off = method_ids_off + (METHODS.len() as u32) * 8;
+    let data_off = class_defs_off + 32;
+
+    assert!(data_off.is_multiple_of(4), "数据段起点必须 4 对齐");
+
+    let mut data: Vec<u8> = Vec::new();
+
+    let mut string_offs = Vec::new();
+    for s in STRINGS {
+        string_offs.push(data_off + data.len() as u32);
+        push_uleb(&mut data, utf16_len(s));
+        data.extend_from_slice(s.as_bytes());
+        data.push(0);
+    }
+
+    align4(&mut data);
+    let type_list_i_off = data_off + data.len() as u32;
+    push_u32(&mut data, 1);
+    push_u16(&mut data, 0);
+
+    align4(&mut data);
+    let code_off_init = data_off + data.len() as u32;
+    push_code_item(&mut data); // <init> 原样：一条 return-void
+    align4(&mut data);
+    let code_off_bar = data_off + data.len() as u32;
+    // ※ bar 的 code_item：invoke-virtual（3 码元）+ return-void（1 码元）。
+    push_u16(&mut data, 1); // registers_size（this 在 v0）
+    push_u16(&mut data, 1); // ins_size
+    push_u16(&mut data, 1); // outs_size
+    push_u16(&mut data, 0); // tries_size
+    push_u32(&mut data, 0); // debug_info_off
+    push_u32(&mut data, 4); // insns_size（3 + 1 码元）
+                            // 码元是小端 16 位：opcode 在低字节。35c 第一码元 = 0x106e
+                            // （低字节 0x6E = invoke-virtual，高字节 0x10 打包 A=1 与寄存器 v0）。
+    push_u16(&mut data, 0x106e);
+    push_u16(&mut data, 0x0001); // method@1（bar 自己）
+    push_u16(&mut data, 0x0000); // 35c 的 @GG 高位：寄存器表（v0）
+    push_u16(&mut data, 0x000e); // return-void
+
+    align4(&mut data);
+    let class_data_off = data_off + data.len() as u32;
+    push_class_data(&mut data, [code_off_init, code_off_bar]);
+
+    align4(&mut data);
+    let map_off = data_off + data.len() as u32;
+
+    let file_size = {
+        let map_len = 4 + 12 * 12;
+        data_off + data.len() as u32 + map_len
+    };
+    let mut map: Vec<(u16, u32, u32)> = vec![
+        (0x0000, 1, 0),
+        (0x0001, STRINGS.len() as u32, string_ids_off),
+        (0x0002, TYPES.len() as u32, type_ids_off),
+        (0x0003, 2, proto_ids_off),
+        (0x0004, FIELDS.len() as u32, field_ids_off),
+        (0x0005, METHODS.len() as u32, method_ids_off),
+        (0x0006, 1, class_defs_off),
+        (0x1000, 1, map_off),
+        (0x1001, 1, type_list_i_off),
+        (0x2000, 1, class_data_off),
+        (0x2001, 2, code_off_init),
+        (0x2002, STRINGS.len() as u32, string_offs[0]),
+    ];
+    map.sort_by_key(|entry| entry.0);
+    push_u32(&mut data, map.len() as u32);
+    for (ty, size, off) in &map {
+        push_u16(&mut data, *ty);
+        push_u16(&mut data, 0);
+        push_u32(&mut data, *size);
+        push_u32(&mut data, *off);
+    }
+    assert_eq!(data_off + data.len() as u32, file_size, "file_size 算错了");
+
+    let mut out = vec![0u8; data_off as usize];
+    out[..8].copy_from_slice(MAGIC);
+    put_u32(&mut out, 32, file_size);
+    put_u32(&mut out, 36, HEADER_SIZE);
+    put_u32(&mut out, 40, ENDIAN_CONSTANT);
+    put_u32(&mut out, 44, 0);
+    put_u32(&mut out, 48, 0);
+    put_u32(&mut out, 52, map_off);
+    put_u32(&mut out, 56, STRINGS.len() as u32);
+    put_u32(&mut out, 60, string_ids_off);
+    put_u32(&mut out, 64, TYPES.len() as u32);
+    put_u32(&mut out, 68, type_ids_off);
+    put_u32(&mut out, 72, 2);
+    put_u32(&mut out, 76, proto_ids_off);
+    put_u32(&mut out, 80, FIELDS.len() as u32);
+    put_u32(&mut out, 84, field_ids_off);
+    put_u32(&mut out, 88, METHODS.len() as u32);
+    put_u32(&mut out, 92, method_ids_off);
+    put_u32(&mut out, 96, 1);
+    put_u32(&mut out, 100, class_defs_off);
+    put_u32(&mut out, 104, file_size - data_off);
+    put_u32(&mut out, 108, data_off);
+
+    for (i, off) in string_offs.iter().enumerate() {
+        put_u32(&mut out, (string_ids_off as usize) + i * 4, *off);
+    }
+    for (i, s) in TYPES.iter().enumerate() {
+        put_u32(&mut out, (type_ids_off as usize) + i * 4, *s as u32);
+    }
+    let protos: [(u32, u32, u32); 2] = [(6, 4, 0), (7, 4, type_list_i_off)];
+    for (i, (shorty, ret, params)) in protos.iter().enumerate() {
+        let base = (proto_ids_off as usize) + i * 12;
+        put_u32(&mut out, base, *shorty);
+        put_u32(&mut out, base + 4, *ret);
+        put_u32(&mut out, base + 8, *params);
+    }
+    for (i, (class, ty, name)) in FIELDS.iter().enumerate() {
+        let base = (field_ids_off as usize) + i * 8;
+        out[base..base + 2].copy_from_slice(&class.to_le_bytes());
+        out[base + 2..base + 4].copy_from_slice(&ty.to_le_bytes());
+        put_u32(&mut out, base + 4, *name as u32);
+    }
+    for (i, (class, proto, name)) in METHODS.iter().enumerate() {
+        let base = (method_ids_off as usize) + i * 8;
+        out[base..base + 2].copy_from_slice(&class.to_le_bytes());
+        out[base + 2..base + 4].copy_from_slice(&proto.to_le_bytes());
+        put_u32(&mut out, base + 4, *name as u32);
+    }
+    let cd = class_defs_off as usize;
+    put_u32(&mut out, cd, CLASS_TYPE);
+    put_u32(&mut out, cd + 4, ACC_PUBLIC);
+    put_u32(&mut out, cd + 8, 2);
+    put_u32(&mut out, cd + 12, 0);
+    put_u32(&mut out, cd + 16, SOURCE_FILE_STR as u32);
+    put_u32(&mut out, cd + 20, 0);
+    put_u32(&mut out, cd + 24, class_data_off);
+    put_u32(&mut out, cd + 28, 0);
+
+    out.extend_from_slice(&data);
+
+    let signature = sha1(&out[32..]);
+    out[12..32].copy_from_slice(&signature);
+    let checksum = adler32(&out[12..]);
+    put_u32(&mut out, 8, checksum);
+    out
+}
+
 /// `class_data_item`（规范 §4.5.11）：静态字段 `x`、实例字段 `s`、
 /// 直接方法 `<init>`、虚方法 `bar`。
 ///
