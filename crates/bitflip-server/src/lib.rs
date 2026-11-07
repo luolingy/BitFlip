@@ -10,6 +10,7 @@
 //!
 //! 令牌与 Origin 是**同时**生效的两道门，不是二选一。
 
+mod apk;
 mod assets;
 mod dex;
 mod patch;
@@ -107,6 +108,8 @@ pub struct AppState {
     /// 5 万+ 方法），点开一个类就重解析一次会让 DEX 视图完全不可用。
     /// 失败也缓存：畸形 DEX 不会因为多刷新几次就变得能解析。
     dex: Arc<dex::DexCache>,
+    /// 资源表缓存（M3），按成员名索引（失败也缓存，与 DEX 同一条理由）。
+    resources: Arc<apk::ResourcesCache>,
     /// 脚本运行器（M7，单槽）。
     ///
     /// 放在 `AppState` 里而不是每个请求各建一个：取消端点必须能找到
@@ -128,6 +131,7 @@ impl AppState {
             session: None,
             disasm: Arc::new(std::sync::OnceLock::new()),
             dex: Arc::new(dex::DexCache::default()),
+            resources: Arc::new(apk::ResourcesCache::default()),
             script: Arc::new(script::ScriptRunner::new(bitflip_script::Limits {
                 timeout: script::DEFAULT_TIMEOUT,
             })),
@@ -499,6 +503,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dex/classes", get(dex::classes))
         .route("/api/dex/class", get(dex::class))
         .route("/api/dex/method", get(dex::method))
+        // ── M3：APK 容器层（清单 + 资源表） ──
+        // 与 DEX 同一条边界：清单与资源表没有线性地址，不进 sections/insns。
+        .route("/api/apk/manifest", get(apk::manifest))
+        .route("/api/apk/resources", get(apk::resources))
+        .route("/api/apk/resource", get(apk::resource))
         // 标注是**主数据**，可读可写可删；写路径不触发重新分析。
         .route(
             "/api/annotations",

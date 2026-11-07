@@ -126,7 +126,7 @@ pub struct ManifestArgs {
     pub raw: RawOverrideArgs,
 }
 
-/// `resources` 参数（M3 第二片 · A 方案：资源表结构快照）。
+/// `resources` 参数（M3 第二、三片：结构快照 + 单条值查询）。
 #[derive(Debug, Args)]
 pub struct ResourcesArgs {
     /// 目标：APK，或一个独立的 .arsc 文件
@@ -138,6 +138,10 @@ pub struct ResourcesArgs {
     /// 输出 JSON（稳定的 wire 契约）
     #[arg(long)]
     pub json: bool,
+    /// 按资源 id 查一条资源（名字 + 值），如 `--lookup 0x7f010000`；
+    /// 与 `--json` 互斥
+    #[arg(long, value_name = "ID", conflicts_with = "json")]
+    pub lookup: Option<String>,
     /// 架构 / 基址覆盖（原始二进制需要）
     #[command(flatten)]
     pub raw: RawOverrideArgs,

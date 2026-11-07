@@ -5,6 +5,33 @@
 
 ## [Unreleased]
 
+### 新增 — M3 第三片：资源值查询 + HTTP 端点（manifest / resources / resource）
+
+- **CLI**：`resources <TARGET> --lookup 0x7f010000` —— 按资源 id 查一条（名字 +
+  值），接受 `0x7f010000` / `7f010000` / 十进制三种写法（清单引用是十六进制、
+  脚本带 `0x`、手数的是十进制，都收下并归一成 `0x…` 回显）。**查不到不是错误**：
+  `name`/`value` 为 `null`（"表里没这个条目"是合法答案）；写不成 id 才报错。
+- **loader**：`ArscStructure::parse_table()` 保留库的 `ARSC` 实例（值层入口
+  `resource_name` / `resource_value`），与一次性快照 `parse()` 并存。
+- **HTTP**（server）：`GET /api/apk/manifest`（清单摘要，与 CLI `manifest --json`
+  同一 wire 形状）、`GET /api/apk/resources`（结构快照）、`GET /api/apk/resource?id=…`
+  （单条值查询）。与 DEX 端点族同一条边界：清单与资源表没有线性地址，不进
+  `sections`/`insns`。按成员名 memo 缓存（**失败也缓存**，与 DEX 同一条理由）。
+- **实测坑（据实记录）**：
+  1. **entry_id 是稀疏的**：第一版值层测试假设 `0x7f00xxxx` 连续铺满，逐 id 扫描
+     一个名字都解不出 —— 而条目明明存在。真实表的 entry_id 稀疏分布，测试改成
+     **从结构快照取真实存在的 (类型, 条目) 组合**去查（快照的 config 切面恰好
+     给了 type_id 与条目数）。教训：**值查询的入口必须由结构快照喂**，不能猜 id。
+  2. **库的 `ARSC` 不 `Sync`**（内部 `RefCell` 名字缓存）：HTTP 缓存是
+     `Arc<Mutex<ArscTable>>` —— 查询纯内存查找，不长时间持锁。
+  3. **链接器 PDB LIMIT（LNK1318）**：F 盘被 41.9GB 的 target 增量目录吃满后
+     链接失败。清掉 `debug/incremental`（12.6GB）恢复 —— 记入运维备忘：
+     target 增量目录要定期清。
+- HTTP 真机验证（ah-app-release.apk）：`?id=0x7f010000` → `anim/abc_fade_in` /
+  `res/vp.xml`；resources 快照 72 285 条目；manifest 摘要 107 activity；缺 id → 400。
+- `cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净；arch-layering OK；
+  许可闸过。
+
 ### 新增 — M3 第二片：`resources.arsc` 结构快照（A 方案，`bitflip-cli resources`）
 
 新子命令 `resources <TARGET> [--member NAME] [--json]`（与 `manifest` 同族：摘要 /

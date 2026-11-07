@@ -222,6 +222,31 @@ impl ArscStructure {
         Ok(structure)
     }
 
+    /// 解析成**带值查询能力**的表（M3 第三片）。
+    ///
+    /// 结构快照（[`Self::parse`]）是"拍完就走"的一次性产物；这个入口保留
+    /// 库的 `ARSC` 实例本身，让调用方能按资源 id 查值与名字。要**缓存复用**
+    /// 的场合（HTTP 服务端）用它。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Self::parse`] 相同。
+    pub fn parse_table(bytes: &[u8]) -> Result<ArscTable, ArscError> {
+        if bytes.len() > MAX_ARSC_BYTES {
+            return Err(ArscError::TooLarge {
+                size: bytes.len(),
+                limit: MAX_ARSC_BYTES,
+            });
+        }
+        let mut cursor = bytes;
+        let inner = ARSC::new(&mut cursor).map_err(|source| ArscError::Parse { source })?;
+        let structure = Self::snapshot(&inner);
+        if structure.packages.is_empty() {
+            return Err(ArscError::NoPackages);
+        }
+        Ok(ArscTable { structure, inner })
+    }
+
     fn snapshot(arsc: &ARSC) -> Self {
         let mut packages: Vec<ArscPackageSnapshot> = Vec::new();
         let mut total_entries = 0u64;
@@ -308,6 +333,32 @@ impl ArscStructure {
     }
 }
 
+/// 一份**可查询**的资源表：结构快照 + 库的 `ARSC` 实例（值层入口）。
+#[derive(Debug)]
+pub struct ArscTable {
+    /// 结构快照（与 [`ArscStructure::parse`] 产出同形，确定性有保证）。
+    pub structure: ArscStructure,
+    inner: ARSC,
+}
+
+impl ArscTable {
+    /// 按资源 id 查**名字**（`0x7f0d0001` → `string/app_name`）。
+    ///
+    /// 查不到（包/类型/条目任一层不存在）是 `None` —— 不是错误，也不是占位符。
+    #[must_use]
+    pub fn resource_name(&self, id: u32) -> Option<String> {
+        self.inner.get_resource_name(id)
+    }
+
+    /// 按资源 id 查**值**（字符串 / 颜色 / 布尔等，库已解成可读文本）。
+    ///
+    /// 引用链会被库递归解析；`Complex`（批量值）与查不到的条目是 `None`。
+    #[must_use]
+    pub fn resource_value(&self, id: u32) -> Option<String> {
+        self.inner.get_resource_value(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +418,58 @@ mod tests {
         let zeros = vec![0u8; 64];
         let result = ArscStructure::parse(&zeros);
         assert!(result.is_err(), "垃圾输入必须报错，不能当空表");
+    }
+
+    #[test]
+    #[ignore = "需要本机真实 APK（32MB）；用 -- --ignored 手动跑"]
+    fn real_apk_value_lookup_resolves_strings() {
+        let Some(bytes) = real_arsc_bytes() else {
+            panic!("真实 APK 不在 {REAL_APK}");
+        };
+        let table = ArscStructure::parse_table(&bytes).expect("真实资源表应可解析");
+        // 结构快照与 parse() 同形。
+        assert_eq!(table.structure.entry_count, 72_285);
+
+        // **从结构快照里取真实存在的 (包, 类型, 条目) 组合**去查值 —— 不能
+        // 假设 entry_id 从 0 连续铺满（这张真实表是稀疏 id：0x7f00xxxx 窗口
+        // 逐 id 扫描一个名字都解不出，而条目明明存在）。快照里的 config 切面
+        // 恰好给出了真实的 type_id 与条目数，拼成 id 去查。
+        let mut named = 0u64;
+        let mut valued = 0u64;
+        let mut first_pair: Option<(u32, String, Option<String>)> = None;
+        for package in &table.structure.packages {
+            let base = u32::from(package.package_id) << 24;
+            for config in &package.configs {
+                for ty in &config.types {
+                    for entry_id in 0..ty.entry_count.min(16) {
+                        let id = base
+                            | (u32::from(ty.type_id) << 16)
+                            | u32::try_from(entry_id).expect("16 位以内");
+                        let name = table.resource_name(id);
+                        let value = table.resource_value(id);
+                        if name.is_some() {
+                            named += 1;
+                        }
+                        if value.is_some() {
+                            valued += 1;
+                        }
+                        if first_pair.is_none() && name.is_some() && value.is_some() {
+                            first_pair = Some((id, name.clone().expect("刚判过"), value));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(named > 0, "真实存在的条目里应有可解名字的");
+        assert!(valued > 0, "真实存在的条目里应有可解值的");
+        let (id, name, _value) = first_pair.expect("至少一组全解析");
+        assert!(name.contains('/'), "名字形状是 type/key：{name}");
+
+        // 查不到的 id 是 None（不是错误、不是占位符）。
+        assert_eq!(table.resource_name(0x7fff_ffff), None);
+        assert_eq!(table.resource_value(0x7fff_ffff), None);
+
+        // 确定性：同一 id 两次查询结果一致（库有名字缓存，缓存不得改变结果）。
+        assert_eq!(table.resource_name(id), Some(name));
     }
 }

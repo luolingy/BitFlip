@@ -1,25 +1,42 @@
-//! `bitflip-cli resources`：看 APK 资源表（M3 第二片 · A 方案）。
+//! `bitflip-cli resources`：看 APK 资源表（M3 第二、三片）。
 //!
 //! 与 `manifest` 同一族：子命令按**主题**命名（资源表），不按容器命名。
-//! 两个出口共用**同一次解析**：摘要（默认）、稳定的 wire JSON（`--json`）。
+//! 三个出口共用**同一次解析**：摘要（默认）、稳定的 wire JSON（`--json`）、
+//! 单条值查询（`--lookup ID`，第三片）。
 //!
-//! # 这份输出里**没有**资源值
+//! # 结构与值的边界
 //!
-//! A 方案只报结构（包/类型/配置/条目计数）。`@7f0d0001` 对应的字符串/颜色
-//! 不是这份输出的职责 —— 那是值层（下一片）。命令行摘要会写明这一点，
-//! 免得"没看到值"被读成"解析失败"。
+//! 默认与 `--json` 出口只报**结构**（包/类型/配置/条目计数）——`@7f0d0001`
+//! 对应的具体字符串/颜色在这里**不出现**，摘要末尾写明这一点。要查值用
+//! `--lookup`：那是专门的出口，返回名字 + 值（库已解成可读文本）。
 
 use anyhow::Result;
 
 use crate::cli::ResourcesArgs;
 
-/// 跑 `resources` 子命令：解析一次，按开关打印摘要 / JSON。
+/// 跑 `resources` 子命令：解析一次，按开关打印摘要 / JSON / 单条查询。
 ///
 /// # Errors
 ///
-/// 打开目标失败、目标里没有资源表、或资源表解析不了 —— 都带着**具体原因**返回。
+/// 打开目标失败、目标里没有资源表、资源表解析不了、或 `--lookup` 的 id
+/// 写得不是资源 id —— 都带着**具体原因**返回。
 pub fn run_resources(args: &ResourcesArgs) -> Result<()> {
     let session = bitflip_core::Session::open(&args.target, args.raw.to_open_options()?)?;
+
+    // 单条查询走**带值层**的表；整表快照不需要它（快照本来就不含值）。
+    // 两个出口互斥：一个是"整张表长什么样"，一个是"这一条是什么"，混在
+    // 一个输出里两者都会失真。
+    if let Some(wanted) = args.lookup.as_deref() {
+        let report =
+            bitflip_core::resources::lookup_resource(&session, args.member.as_deref(), wanted)?;
+        let text = serde_json::to_string_pretty(&report)?;
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+        return Ok(());
+    }
+
     let report = bitflip_core::resources::read_resources(&session, args.member.as_deref())?;
 
     let text = if args.json {
@@ -78,7 +95,9 @@ fn summary(report: &bitflip_core::resources::ResourcesReport) -> String {
             names.join("、")
         ));
     }
-    out.push_str("说明：这是结构快照（A 方案）—— 不含资源值（字符串/颜色/布局）；值层在后续版本\n");
+    out.push_str(
+        "说明：这是结构快照 —— 不含资源值；查某一条资源用 `resources <TARGET> --lookup 0x7f...`\n",
+    );
     out
 }
 

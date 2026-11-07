@@ -13,7 +13,7 @@
 
 use crate::{BitflipError, Session};
 
-pub use bitflip_loader::format::arsc::{ArscError, ArscStructure, MAX_ARSC_BYTES};
+pub use bitflip_loader::format::arsc::{ArscError, ArscStructure, ArscTable, MAX_ARSC_BYTES};
 
 /// 资源表结构快照 + 出处信息。
 #[derive(Debug, Clone)]
@@ -112,5 +112,62 @@ pub fn read_resources(
         member: member_name,
         size,
         structure,
+    })
+}
+
+/// 一条资源的查询结果（M3 第三片：值层）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResourceLookup {
+    /// 归档成员名；单文件目标时是 `None`。
+    pub member: Option<String>,
+    /// 查询用的资源 id（调用方给什么就回什么，归一成 `0x…` 形式）。
+    pub id: String,
+    /// 资源名（`string/app_name`）；查不到时是 `null` —— 不是占位符。
+    pub name: Option<String>,
+    /// 资源值（库解出的可读文本）；`Complex`/查不到时是 `null`。
+    pub value: Option<String>,
+}
+
+/// 按资源 id 查一条资源（名字 + 值）。
+///
+/// `id` 接受 `0x7f010000` / `7f010000` / `2130771968` 三种写法 —— 清单里的
+/// 引用是十六进制、脚本习惯带 `0x`、手数出来的可能是十进制，都收下并在
+/// 响应里归一成 `0x…`。**查不到不是错误**：`name`/`value` 返回 `null`，
+/// 因为"这个 id 在表里没有条目"是一个合法答案；写不成资源 id 才是错误。
+///
+/// # Errors
+///
+/// 目标里没有资源表、表解析不了，或 `id` 解析不出 u32。
+pub fn lookup_resource(
+    session: &Session,
+    member: Option<&str>,
+    id_text: &str,
+) -> Result<ResourceLookup, BitflipError> {
+    let normalized = id_text.trim().trim_start_matches("@");
+    let id = if let Some(hex) = normalized
+        .strip_prefix("0x")
+        .or_else(|| normalized.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16)
+    } else if normalized.chars().all(|c| c.is_ascii_hexdigit()) && normalized.len() == 8 {
+        // 8 位裸十六进制（清单引用 `@7f010000` 去掉 @ 的形状）。
+        u32::from_str_radix(normalized, 16)
+    } else {
+        normalized.parse::<u32>()
+    }
+    .map_err(|_| {
+        BitflipError::InvalidInput(format!(
+            "{id_text} 不是资源 id：要 8 位十六进制（`0x7f010000` / `7f010000`）或十进制"
+        ))
+    })?;
+
+    let (bytes, member_name) = input_bytes(session, member)?;
+    let table = ArscStructure::parse_table(&bytes)
+        .map_err(|error| BitflipError::InvalidInput(error.to_string()))?;
+    Ok(ResourceLookup {
+        member: member_name,
+        id: format!("{id:#010x}"),
+        name: table.resource_name(id),
+        value: table.resource_value(id),
     })
 }

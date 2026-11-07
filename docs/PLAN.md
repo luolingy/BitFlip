@@ -1573,8 +1573,10 @@ MSVC 修饰名反修饰、静态库 PDB。
   计数与层级，配置报原始判定字段，**值不解**；真实 APK 实测 1 包 / 19 类型 /
   131 配置 / 72 285 条目，双导出确定性。两个坑据实记录在
   `docs/APK-DEX-DESIGN.md` §M3：包号在低字节、库对全零输入容忍式产出空表
-  ——快照层加了 `NoPackages` 闸）、HTTP `GET /api/apk/manifest`、网页里的清单
-  视图 —— 这三项是 M3 的下一片。
+  ——快照层加了 `NoPackages` 闸）、~~HTTP `GET /api/apk/manifest`~~（**已落地
+  2026-11-07，同批还有 `/api/apk/resources` 与 `/api/apk/resource?id=…`**——
+  值层 `parse_table` + CLI `--lookup` 同批；entry_id 稀疏的坑见 CHANGELOG：
+  值查询的入口必须由结构快照喂，不能猜 id 连扫）、网页里的清单视图。
 
 **进展 · DEX 的放大攻击面（2026-10-17，据实记录）**：M1 推迟验收里的第 3 条
 （"解析预算没接，恶意构造的 DEX 可以靠超大计数顶内存"）核实并关掉了，但**结论
