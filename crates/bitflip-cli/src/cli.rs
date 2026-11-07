@@ -80,6 +80,8 @@ pub enum Command {
     Dex(DexArgs),
     /// 查看 APK 清单（AXML）：包名、版本、组件、权限，或还原出的 XML
     Manifest(ManifestArgs),
+    /// 查看 APK 资源表（resources.arsc）的结构快照：包/类型/配置/条目计数
+    Resources(ResourcesArgs),
     /// 列出识别出的函数
     Functions(FunctionsArgs),
     /// 在目标里定位一个符号（函数名或地址）
@@ -116,6 +118,23 @@ pub struct ManifestArgs {
     /// 打印还原出的 XML 文本，而不是字段摘要
     #[arg(long)]
     pub xml: bool,
+    /// 输出 JSON（稳定的 wire 契约）
+    #[arg(long)]
+    pub json: bool,
+    /// 架构 / 基址覆盖（原始二进制需要）
+    #[command(flatten)]
+    pub raw: RawOverrideArgs,
+}
+
+/// `resources` 参数（M3 第二片 · A 方案：资源表结构快照）。
+#[derive(Debug, Args)]
+pub struct ResourcesArgs {
+    /// 目标：APK，或一个独立的 .arsc 文件
+    #[arg(value_name = "TARGET")]
+    pub target: PathBuf,
+    /// 归档成员名；默认 APK 里的 `resources.arsc`
+    #[arg(long, value_name = "NAME")]
+    pub member: Option<String>,
     /// 输出 JSON（稳定的 wire 契约）
     #[arg(long)]
     pub json: bool,

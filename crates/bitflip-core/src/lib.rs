@@ -21,6 +21,7 @@ mod disasm;
 mod error;
 mod export;
 mod import_edges;
+pub mod resources;
 mod session;
 mod structs;
 mod timing;

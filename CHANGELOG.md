@@ -5,6 +5,32 @@
 
 ## [Unreleased]
 
+### 新增 — M3 第二片：`resources.arsc` 结构快照（A 方案，`bitflip-cli resources`）
+
+新子命令 `resources <TARGET> [--member NAME] [--json]`（与 `manifest` 同族：摘要 /
+稳定 wire JSON `format_version: 1`）。**A 方案边界（用户拍板）**：只报结构——
+包 / 类型 / 配置 / 条目计数与层级；配置报原始判定字段；**值不解**
+（`@7f0d0001` 对应的字符串/颜色是下一片，wire 形状先定住，加字段是加法不是改形）。
+
+- **解析仍交给 `apk-info-axml`**（`ARSC::new`，清单那边已被真实验证过的事实层），
+  我们只做遍历与计数——不写第二份二进制解析器。顺序确定性自己兜：库的
+  `packages()` 是 HashMap 迭代，快照先收再排（包按 id、类型按 type_id）。
+- **两个实测坑（据实记录）**：
+  1. **包号在低字节**：`ResTable_package.id` 存的就是 `0x7f` 这种小值，不是
+     `0x7f000000`。第一版右移 24 位把应用包算成 `0x00`。
+  2. **库是容忍式的**：`package_count == 0` 只记日志、字符串池头不对会"跳过
+     垃圾继续"——全零字节也能"解析成功"产出一支空表（实测）。快照层加了
+     健全性闸：解出 **0 个包直接报错**（`ArscError::NoPackages`）——"0 个包的
+     资源表"与"这不是资源表"在结果上一模一样，而后者才是真相。
+- **配置键是有损掩码的教训**：第一版把配置压成一个 `CONFIG_*` 判定位掩码，
+  真实表上两份维度相同、字段值不同的配置被压成两个一模一样的切面。改成报
+  **完整判定字段**（`ArscConfigIdentity`，`size` 未覆盖的字段报 `null`）。
+- 真实样本（`ah-app-release.apk`）实测：`resources.arsc` 1 006 584 字节，
+  1 个包（`0x7f com.weavi.ahh`）、19 种资源类型、131 个配置切面、72 285 条
+  资源项（含 58 988 个 `NoEntry` 空位——如实报数）；双导出 SHA-256 一致；
+  垃圾输入响亮报错。
+- `cargo test --workspace` 全绿；fmt/clippy(-D warnings) 干净；arch-layering OK。
+
 ### 新增 — M11 第一块：DEX 调用边表（`dex-xrefs`，交叉引用/调用图的事实层）
 
 新导出格式 `dex-xrefs`（`export` 子命令与 `GET /api/export` 同路，视图由 `format` 判别——

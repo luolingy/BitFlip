@@ -1568,8 +1568,13 @@ MSVC 修饰名反修饰、静态库 PDB。
   `get_xml_string` 缩进不同 —— 量级一致，**不是数据丢了**。
 * **测试**：合成样本 3 条（`axml_manifest.rs`，按规范逐字节拼，含"根不是 manifest"分支）、
   单元测试 3 条（上限、魔数判据、垃圾输入）、真实样本 1 条（`axml_real_apk.rs`，`#[ignore]`）。
-* **仍未做**：`resources.arsc`、HTTP `GET /api/apk/manifest`、网页里的清单视图 ——
-  这三项是 M3 的下一片。
+* **仍未做**：~~`resources.arsc`~~（**A 方案结构快照已于 2026-11-04 落地**：
+  `bitflip-loader::format::arsc` + `bitflip-cli resources`——包/类型/配置/条目
+  计数与层级，配置报原始判定字段，**值不解**；真实 APK 实测 1 包 / 19 类型 /
+  131 配置 / 72 285 条目，双导出确定性。两个坑据实记录在
+  `docs/APK-DEX-DESIGN.md` §M3：包号在低字节、库对全零输入容忍式产出空表
+  ——快照层加了 `NoPackages` 闸）、HTTP `GET /api/apk/manifest`、网页里的清单
+  视图 —— 这三项是 M3 的下一片。
 
 **进展 · DEX 的放大攻击面（2026-10-17，据实记录）**：M1 推迟验收里的第 3 条
 （"解析预算没接，恶意构造的 DEX 可以靠超大计数顶内存"）核实并关掉了，但**结论

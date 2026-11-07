@@ -35,6 +35,7 @@
 //! | [`zip`] | ZIP 容器（APK / JAR / XAPK 外壳） | 单文件。**只做容器层**：成员枚举与按需取出 |
 //! | [`dex`] | DEX（Dalvik Executable） | 单文件。**只做结构模型**：类/字段/方法清单，不解码字节码、不建 CFG |
 //! | [`axml`] | AXML（Android 二进制 XML） | 单文件。**只解清单**：`AndroidManifest.xml` 的字段摘要；不读 `resources.arsc`，`@` 引用原样保留 |
+//! | [`arsc`] | `resources.arsc`（Android 资源表） | 单文件。**结构快照（A 方案）**：包/类型/配置层级 + 计数账目，不解值层 |
 //! | [`macho`] | Mach-O（thin）+ fat 容器 | M12 第一～三片：头/段/节/入口/`LC_UUID`/dylib/`LC_SYMTAB`/`LC_FUNCTION_STARTS`；dyld 绑定、objc/swift、代码签名校验**都没有**。fat 切片能枚举（[`macho::fat`]）且已接进会话 |
 //!
 //! ELF 的内部拆分**故意没和 PE 一起做**：PE 那一次是纯粹的搬移（逐字节校验过），
@@ -45,6 +46,7 @@
 //! 理由同 PE 的拆分：读的时候解决的是两个不同问题 —— "这一层对象长什么样"与
 //! "一个文件里有几层、该选哪层"。
 
+pub mod arsc;
 pub mod axml;
 pub mod coff;
 pub mod dex;

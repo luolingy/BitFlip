@@ -11,6 +11,7 @@ mod members;
 mod patch;
 mod resign;
 mod resign_app;
+mod resources;
 mod serve;
 mod signature;
 mod structs;
@@ -34,6 +35,7 @@ pub use members::{run_functions, run_members, run_symbol};
 pub use patch::run_patch;
 pub use resign::run_resign;
 pub use resign_app::run_resign_app;
+pub use resources::run_resources;
 pub use serve::{serve_blocking, ServeRequest};
 pub use signature::run_signature;
 pub use structs::run_structs;
@@ -69,6 +71,7 @@ pub fn cli_main() -> ExitCode {
         Command::Members(args) => report(run_members(&args)),
         Command::Dex(args) => report(run_dex(&args)),
         Command::Manifest(args) => report(run_manifest(&args)),
+        Command::Resources(args) => report(run_resources(&args)),
         Command::Functions(args) => report(run_functions(&args)),
         Command::Symbol(args) => report(run_symbol(&args)),
         Command::Signature(args) => report(run_signature(&args)),

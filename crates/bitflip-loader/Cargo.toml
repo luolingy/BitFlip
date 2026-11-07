@@ -18,6 +18,9 @@ apk-info-axml = { workspace = true }
 # `Element`（AXML 的元素/属性树）来自这里 —— 我们直接遍历它，理由见 workspace 清单。
 apk-info-xml = { workspace = true }
 droidsaw-dex = { workspace = true }
+# 资源表结构快照要进 wire JSON（`resources` 子命令的 --json 出口）——
+# 与 core 侧同一份 serde。
+serde = { workspace = true }
 thiserror = { workspace = true }
 zip = { workspace = true }
 # 代码签名完整性校验要按 CodeDirectory 的 hashType 重算 SHA-1 / SHA-256。
