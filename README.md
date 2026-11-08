@@ -2,14 +2,21 @@
 
 > 本地优先、跨平台的静态二进制逆向分析平台 —— 单文件可执行 + 本地 Web UI。
 
-BitFlip 面向可执行文件、动态库与静态库的静态逆向分析：PE（exe/dll/sys/obj/lib）、
-ELF（exec/so/o/a）、raw 固件镜像，以及 x86/x64/ARM64/ARM/RISC-V/MIPS 等架构的指令解码。
-打开方式是 `bitflip <target>`，它在 `127.0.0.1` 上启动本地 HTTP 服务并用浏览器打开 UI ——
-UI 走 Web 是为了跨平台，不需要为每个平台维护原生 GUI 外壳。
+BitFlip 面向可执行文件、动态库、静态库、Apple（Mach-O/`.app`/`.ipa`）与 Android
+（APK/DEX/清单/资源）的静态逆向分析：PE（exe/dll/sys/obj/lib）、ELF（exec/so/o/a）、
+Mach-O（thin/fat）、APK/DEX 容器、raw 固件镜像，以及 x86/x64/ARM64/ARM/RISC-V/MIPS/
+PowerPC 等架构的指令解码。打开方式是 `bitflip <target>`，它在 `127.0.0.1` 上启动本地
+HTTP 服务并用浏览器打开 UI —— UI 走 Web 是为了跨平台，不需要为每个平台维护原生 GUI 外壳。
 
-**状态：M2 已完成（能反汇编并诚实地标注可信度）；阶段 1（反编译深度）已完成——可把函数还原成结构化伪代码。** 现在能做的事：
+> 设计原则：**说的就是真的。** 任何"没分析出来"的地方都明确显示"未解析/未知"，而不是猜测
+> 填充（不做 `func_xxx` / `loc_xxx` 假名、不把未知当 0、不把截断当完整）。
+> 当前能力矩阵与已知边界见 [docs/CAPABILITY-MATRIX.md](docs/CAPABILITY-MATRIX.md)，
+> 变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-- 打开目标、识别容器/对象格式/架构/入口点（PE、COFF、ELF、ar 与 MSVC `.lib`、raw；Mach-O 仅识别）；
+**状态：M0–M12 主线里程碑已落地**（PE/ELF/COFF/静态库/raw、Mach-O 与 Apple 容器、
+APK/DEX、脚本层、签名与调试信息、补丁、导出与差分、重签）。现在能做的事：
+
+- 打开目标、识别容器/对象格式/架构/入口点（PE、COFF、ELF、ar 与 MSVC `.lib`、raw、Mach-O/`.app`/`.ipa`、APK/DEX）；
 - **完整解析 ELF32/64 与 PE32/PE32+**：段表、节表、导入表、导出表、符号表、重定位、`.pdata`、
   `.NET` CLI 头（仅识别）、架构相关标志位；
 - **`bitflip info <目标>`**：人类可读的段/节/导入/导出清单，或 `--json` 拿到带版本号的稳定 schema；
@@ -116,6 +123,29 @@ cargo build --release -p bitflip-app
 node scripts/build-web.mjs     # rolldown 直出，不依赖子进程
 ```
 
+## CLI 子命令（无头 / CI）
+
+`bitflip-cli` 提供与 GUI 等价的无头能力：
+
+| 子命令 | 用途 |
+| --- | --- |
+| `info <TARGET>` | 识别格式、架构、段/节、导入/导出（`--json` 稳定 schema） |
+| `members <TARGET>` | 列出归档成员（`.lib` / `.a` / `.zip`） |
+| `dex <APK\|.dex>` | 查看 DEX：类、方法、指令、文本 CFG（`--class` / `--method` / `--search`） |
+| `manifest <APK>` | AndroidManifest 字段摘要 / `--xml` / `--json`（M3） |
+| `resources <APK>` | resources.arsc 结构快照 / `--lookup 0x7f010000`（M3） |
+| `functions <TARGET>` | 函数清单（来源 + 置信度 + 源位置） |
+| `symbol <TARGET> <NAME\|ADDR>` | 定位符号 |
+| `signature build\|info` | 签名库：从静态库生成 / 查看 |
+| `export <TARGET> --format …` | 导出（反汇编 / JSON / DOT / DEX 共 17 种格式） |
+| `diff <v1> <v2>` | 两版本差分（函数/节/符号/指令级） |
+| `patch <TARGET>` | 打补丁：预览（只读）/ `--apply` 写 `.patched` 副本 |
+| `structs <TARGET>` | 推断疑似结构体字段布局（启发式，非真实 C 类型） |
+| `resign <MACHO>` | 重签一个 Mach-O 副本（ad-hoc，`--apply` 才写盘） |
+| `resign-app <APP>` | 批量重签 `.app` 并让 CodeResources 自洽 |
+| `serve <TARGET>` | 启动本地 Web 服务 |
+| `version` | 打印版本与各层 API 版本 |
+
 ## 安全模型
 
 BitFlip 是本地工具，不是网络服务：只绑回环地址；每次启动生成 32 字节随机令牌
@@ -123,13 +153,17 @@ BitFlip 是本地工具，不是网络服务：只绑回环地址；每次启动
 API 同时校验令牌与 `Origin`，挡住"恶意网页在用户浏览器里偷打本机 API"这类请求。
 `--host 0.0.0.0` 能做，但会有明确警告。
 
+写操作默认安全：打补丁/重签都只写**副本**（`xxx.patched` / `xxx.resigned`），原文件不动；
+打补丁需显式 `--apply`（服务端要 `confirm_unlock: true`）。
+
 ## 文档
 
 | 文档 | 内容 |
 |------|------|
-| [docs/PLAN.md](docs/PLAN.md) | 长期计划：里程碑 M0–M10、验收标准、性能预算、风险登记 |
+| [docs/PLAN.md](docs/PLAN.md) | 长期计划：里程碑 M0–M12、验收标准、性能预算、风险登记 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构：crate 布局、数据模型、HTTP/WS 协议、存储设计 |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | 已定决策（ADR）与待决决策门 |
+| [docs/CAPABILITY-MATRIX.md](docs/CAPABILITY-MATRIX.md) | 当前能力矩阵与已知边界（发布说明用） |
 | [CLAUDE.md](CLAUDE.md) | 仓库规则：硬约束、语言、构建、提交前自检 |
 | [web/README.md](web/README.md) | 前端构建与开发模式 |
 
@@ -142,6 +176,9 @@ crates/
   bitflip-arch/     指令解码与架构描述（ABI、寄存器、调用约定）
   bitflip-analyze/  分析流水线：作业、进度、取消、阶段 S1–S9
   bitflip-symbols/  符号来源与优先级（符号表、导出、unwind、DWARF/PDB、签名库）
+  bitflip-signature/ 签名库：从静态库/对象抽函数指纹，匹配后自动命名（FLIRT 风格）
+  bitflip-debug/   调试信息：DWARF、PDB、CodeView、MSVC 名字反修饰
+  bitflip-script/   脚本层（rquickjs / JavaScript）：读分析结果、写标注、自定义表
   bitflip-patch/    可执行文件打补丁（默认只读；显式解锁后写 .patched 副本，不原地覆写）
   bitflip-project/  工程库（可写）：用户标注为主数据，分析结果为可重建派生物
   bitflip-server/   本地 HTTP/WS 服务 + 内嵌 SPA

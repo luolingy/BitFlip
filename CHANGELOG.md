@@ -3,6 +3,55 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.0.0] - 2026-11-08
+
+首个正式版：M0–M12 主线里程碑全部落地。本版把此前只在 CLI / HTTP 上可用的
+**导出、差分、APK 清单/资源** 接入 Web 界面，并补齐发布所需的**用户文档、
+能力矩阵与版本收口**。能力总览见 [`docs/CAPABILITY-MATRIX.md`](docs/CAPABILITY-MATRIX.md)。
+
+### 新增（Web 界面）
+
+- **导出视图**（左侧「导出」）：反汇编（Intel/AT&T）、函数/符号/交叉引用 JSON、
+  DOT CFG、DEX（`dex-json`/`dex-smali`/`dex-dot-cfg`）。正文与 `bitflip-cli export`
+  同源；**截断与降级在横幅里如实显示**（响应头 `x-bitflip-truncated` /
+  `x-bitflip-warning-N`），可下载或在新标签打开。
+- **差分视图**（左侧「差分」）：选择 v2 文件与范围（函数/节/符号/全部）、只看某类差异。
+  报告**第一行永远是地址归一化方式**（RVA / 同基址 / 不可比）；未命名函数不造假名；
+  被截断时给出 `dropped` 账目。
+- **APK 清单 / 资源视图**（左侧「APK 清单 / 资源」）：AndroidManifest 字段摘要与
+  组件/权限计数（解不出的资源引用原样保留并计数），resources.arsc 结构快照
+  （包/配置/类型/条目）与按 id 查值。
+
+### 文档
+
+- 新增根 [`README.md`](README.md)（快速上手、CLI 子命令表、安全模型、目录结构）。
+- 新增 [`docs/CAPABILITY-MATRIX.md`](docs/CAPABILITY-MATRIX.md)：一页纸能力矩阵与
+  **已知的诚实的未做/未验证项**（发布说明用）。
+- 更新 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §7.1：补丁写回已落地（此前标注
+  "尚未实现"已过期）。
+- 更新 [`docs/MACHO-RESIGN-DESIGN.md`](docs/MACHO-RESIGN-DESIGN.md)：状态由"未实现"
+  更正为"ad-hoc 重签已实现（1–7 阶段）"，仅正式重签（带证书/私钥）明确不做。
+
+### 版本与契约
+
+- workspace 版本 `0.0.1` → **`1.0.0`**；各 crate 同步。
+- 本次改动只新增 Web 视图与前端 API 客户端，**未改任何 Rust wire 结构**，
+  故 `CORE_API_VERSION` / `SERVER_API_VERSION` / 各 `*_FORMAT_VERSION` 均**不变**。
+
+### 发版说明（据实）
+
+- `cargo test --workspace`：**1471 passed / 0 failed / 30 ignored**；
+  `cargo clippy --all-targets -- -D warnings` 干净；`cargo build --workspace` 通过；
+  `npm run typecheck` 通过；SPA 打包通过（`build-web.mjs`），产物含全部新视图端点。
+- **顺带修复一条 `main` 上既有的过期测试**：`crates/bitflip-core/tests/m9_diff.rs`
+  的 `text_output_is_self_describing_and_marks_every_entry` 硬编码断言头部为
+  `# bitflip-diff v1`，而 `DIFF_FORMAT_VERSION` 早在指令级差分落地时已升到 `2`
+  （该测试当时没跟着更新，`main` 上一直是红的）。现改为引用 `DIFF_FORMAT_VERSION`
+  常量，避免再次漂移。**不是本版功能改动，是测试与代码脱节。**
+- 端到端 Playwright 主链路**仍未落地**（见 CAPABILITY-MATRIX §5 第 7 条）；
+  本次为 Web 新增入口，浏览器观感未逐项截图存档。
+- ELF 补丁可执行性本机无可跑 Linux 环境，**未在自动 CI 验证**（PE 那一半已真跑验收）。
+
 ## [Unreleased]
 
 ### 新增 — M3 第三片：资源值查询 + HTTP 端点（manifest / resources / resource）

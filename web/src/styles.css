@@ -1541,3 +1541,32 @@ button:not(:disabled):hover {
 /* "有缺口"的计数用告警色：0 与非 0 必须一眼分得开。 */
 .dex-warn {
   color: var(--warn);
+
+/* 差分类别徽标：五类必须一眼分得开（新增/删除/改动/移动/未变）。 */
+.diff-kind {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 18px;
+}
+.diff-kind-added {
+  color: var(--ok, #2e7d32);
+  background: rgba(46, 125, 50, 0.12);
+}
+.diff-kind-removed {
+  color: var(--bad, #c62828);
+  background: rgba(198, 40, 40, 0.12);
+}
+.diff-kind-changed {
+  color: var(--warn, #ef6c00);
+  background: rgba(239, 108, 0, 0.12);
+}
+.diff-kind-moved {
+  color: var(--accent, #1565c0);
+  background: rgba(21, 101, 192, 0.12);
+}
+.diff-kind-unchanged {
+  color: var(--text-dim, #6b7280);
+  background: rgba(107, 114, 128, 0.1);
+}

@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-analyze"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bitflip-arch",
  "bitflip-loader",
@@ -210,14 +210,14 @@ dependencies = [
 
 [[package]]
 name = "bitflip-app"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bitflip-cli",
 ]
 
 [[package]]
 name = "bitflip-arch"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "capstone",
  "tracing",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-cli"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bitflip-core",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-core"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bitflip-analyze",
  "bitflip-arch",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-debug"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bitflip-arch",
  "bitflip-loader",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-loader"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "apk-info-axml",
  "apk-info-xml",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-patch"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bitflip-loader",
  "thiserror",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-project"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-script"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bitflip-core",
  "rquickjs",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-server"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "axum",
  "bitflip-core",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-signature"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "bitflip-arch",
  "bitflip-loader",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "bitflip-symbols"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "thiserror",
 ]

@@ -525,7 +525,10 @@ fn text_output_is_self_describing_and_marks_every_entry() {
     let report = report();
     let text = render_diff_text(&report);
 
-    assert!(text.starts_with("# bitflip-diff v1"), "{text}");
+    assert!(
+        text.starts_with(&format!("# bitflip-diff v{DIFF_FORMAT_VERSION}")),
+        "{text}"
+    );
     assert!(text.contains("comparable"), "{text}");
     assert!(text.contains("# 账目："), "{text}");
     assert!(text.contains("+ 新增"), "{text}");

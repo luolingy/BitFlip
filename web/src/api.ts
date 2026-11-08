@@ -1832,6 +1832,373 @@ export function fetchScriptLibrary(token: string | null): Promise<ScriptLibraryW
   return request<ScriptLibraryWire>("/api/script/library", token);
 }
 
+// ── 导出 / 差分（M9）与 APK 清单 / 资源表（M3） ──────────────────────────────
+//
+// 这三类都不是"按地址取数据"的视图，形状各自独立，所以单独成块。
+
+/** 导出格式（与 `bitflip-core::ExportFormat` 的 wire 短名一一对应）。 */
+export interface ExportFormatOption {
+  /** wire 短名，例如 `asm-intel` / `json-functions` / `dex-json`。 */
+  value: string;
+  /** 面向界面的中文名。 */
+  label: string;
+  /** 是否 DEX 视图专用（选了它就要填 `member`）。 */
+  dex: boolean;
+}
+
+/**
+ * 界面提供的导出格式清单。
+ *
+ * 只列**当前目标类型普遍适用**的一组；更多格式走 CLI。每一项的 `dex`
+ * 决定界面是否需要显示 DEX 选择器 —— 这不是"猜",后端 `check_options`
+ * 会对错配给出 400。
+ */
+export const EXPORT_FORMATS: readonly ExportFormatOption[] = [
+  { value: "asm-intel", label: "反汇编文本（Intel）", dex: false },
+  { value: "asm-att", label: "反汇编文本（AT&T，仅 x86）", dex: false },
+  { value: "json-functions", label: "函数清单（JSON）", dex: false },
+  { value: "json-symbols", label: "符号表（JSON）", dex: false },
+  { value: "json-xrefs", label: "交叉引用（JSON）", dex: false },
+  { value: "dot-cfg", label: "控制流图（DOT）", dex: false },
+  { value: "dex-json", label: "DEX 视图（JSON）", dex: true },
+  { value: "dex-smali", label: "DEX 视图（smali 文本）", dex: true },
+  { value: "dex-dot-cfg", label: "DEX 控制流图（DOT）", dex: true },
+];
+
+/** 一次导出的结果：正文与响应头里的账目。 */
+export interface ExportResult {
+  /** 导出正文（文本或 JSON 字符串）。 */
+  body: string;
+  /** `x-bitflip-format`。 */
+  format: string | null;
+  /** `x-bitflip-items`。 */
+  items: number | null;
+  /** `x-bitflip-truncated`。 */
+  truncated: boolean;
+  /** `Content-Type`。 */
+  contentType: string | null;
+  /** 响应头里的降级/截断说明（`x-bitflip-warning-N`）。 */
+  warnings: string[];
+}
+
+/** 导出查询参数。 */
+export interface ExportParams {
+  format: string;
+  from?: string | undefined;
+  to?: string | undefined;
+  function?: string | undefined;
+  member?: string | undefined;
+  class?: string | undefined;
+  method?: string | undefined;
+  /** 字节上限；`0` = 不限。 */
+  limit?: number | undefined;
+}
+
+/** 把导出参数拼成查询串。 */
+function exportQuery(params: ExportParams): string {
+  const q = new URLSearchParams({ format: params.format });
+  if (params.from) q.set("from", params.from);
+  if (params.to) q.set("to", params.to);
+  if (params.function) q.set("function", params.function);
+  if (params.member) q.set("member", params.member);
+  if (params.class) q.set("class", params.class);
+  if (params.method) q.set("method", params.method);
+  if (params.limit !== undefined) q.set("limit", String(params.limit));
+  return q.toString();
+}
+
+/**
+ * 执行一次导出，把正文与响应头里的账目一起带回。
+ *
+ * 与普通 JSON 端点不同：导出正文是**任意字节**（可能是几百 KB 的反汇编文本），
+ * 元信息走响应头。这里必须读 `headers` 才能把"截断了多少"如实显示出来。
+ */
+export async function fetchExport(
+  token: string | null,
+  params: ExportParams,
+): Promise<ExportResult> {
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["x-bitflip-token"] = token;
+  }
+  const response = await fetch(`/api/export?${exportQuery(params)}`, { headers });
+  if (!response.ok) {
+    let message = `导出失败（HTTP ${response.status}）`;
+    try {
+      const body: unknown = await response.json();
+      if (body && typeof body === "object" && "error" in body) {
+        const raw = (body as { error: unknown }).error;
+        if (typeof raw === "string") message = raw;
+      }
+    } catch {
+      // 响应体不是 JSON：保留默认信息。
+    }
+    throw new ApiError(response.status, message);
+  }
+  const body = await response.text();
+  const warnings: string[] = [];
+  for (let index = 1; ; index += 1) {
+    const value = response.headers.get(`x-bitflip-warning-${index}`);
+    if (value === null) break;
+    // HTTP 头是 ASCII，中文按 %XX 编码（服务端约定）；这里解码回来。
+    try {
+      warnings.push(decodeURIComponent(value));
+    } catch {
+      warnings.push(value);
+    }
+  }
+  const itemsRaw = response.headers.get("x-bitflip-items");
+  return {
+    body,
+    format: response.headers.get("x-bitflip-format"),
+    items: itemsRaw !== null ? Number(itemsRaw) : null,
+    truncated: response.headers.get("x-bitflip-truncated") === "true",
+    contentType: response.headers.get("content-type"),
+    warnings,
+  };
+}
+
+/** 差分类别（与 `bitflip-core::DiffKind` 的 wire 短名一致）。 */
+export type DiffKindWire = "added" | "removed" | "changed" | "moved" | "unchanged";
+
+/** 差分范围（与 `bitflip-core::DiffScope` 一致）。 */
+export interface DiffScopeOption {
+  value: string;
+  label: string;
+}
+
+export const DIFF_SCOPES: readonly DiffScopeOption[] = [
+  { value: "functions", label: "函数" },
+  { value: "sections", label: "节表" },
+  { value: "symbols", label: "符号" },
+  { value: "all", label: "全部三类" },
+];
+
+/** 差分计数。对应 `bitflip-core::DiffTotals`。 */
+export interface DiffTotalsWire {
+  added: number;
+  removed: number;
+  changed: number;
+  moved: number;
+  unchanged: number;
+}
+
+/** 一条指令级操作。对应 `bitflip-core::diff_instr::InstrOpWire`（带标签联合）。 */
+export type InstrOpWire =
+  | { op: "equal"; v1: number; v2: number; text: string }
+  | { op: "replace"; v1: number; v2: number; v1_text: string; v2_text: string }
+  | { op: "insert"; v2: number; text: string }
+  | { op: "delete"; v1: number; text: string }
+  | {
+      op: "block";
+      v1_range: [number, number] | null;
+      v2_range: [number, number] | null;
+      reason: string;
+    };
+
+/** 一个差分条目。对应 `bitflip-core::DiffEntry`。 */
+export interface DiffEntryWire {
+  kind: DiffKindWire;
+  match_basis: string;
+  name: string | null;
+  source: string | null;
+  normalized: string;
+  v1_address: string | null;
+  v2_address: string | null;
+  v1_size: number | null;
+  v2_size: number | null;
+  v1_instructions: number | null;
+  v2_instructions: number | null;
+  instruction_diff?: InstrOpWire[];
+  detail: string | null;
+}
+
+/** 地址归一化方式（带标签联合）。对应 `bitflip-core::Normalization`。 */
+export type NormalizationWire =
+  | { method: "rva"; v1_base: number; v2_base: number }
+  | { method: "same-base"; base: number }
+  | { method: "unavailable"; reason: string };
+
+/** 差分报告。对应 `bitflip-core::DiffReport`。 */
+export interface DiffReportWire {
+  format_version: number;
+  producer: string;
+  scope: string;
+  v1_path: string;
+  v2_path: string;
+  v1_image_base: number;
+  v2_image_base: number;
+  normalization: NormalizationWire;
+  v1_total: number;
+  v2_total: number;
+  totals: DiffTotalsWire;
+  entries: DiffEntryWire[];
+  truncated: boolean;
+  dropped: number;
+  notes: string[];
+}
+
+/** 差分类别短名 → 中文标签。 */
+export const DIFF_KIND_LABELS: Record<DiffKindWire, string> = {
+  added: "新增",
+  removed: "删除",
+  changed: "改动",
+  moved: "移动",
+  unchanged: "未变",
+};
+
+/** 匹配判据短名 → 中文标签。 */
+export const MATCH_BASIS_LABELS: Record<string, string> = {
+  "name+address": "名字+地址",
+  "content+size": "内容+大小",
+  "name-only": "仅名字",
+  "address-only": "仅地址",
+  "address-only-content-differs": "仅地址（内容不同）",
+};
+
+/** 归一化方式 → 中文说明（与后端 `describe_zh` 同义）。 */
+export function describeNormalization(normalization: NormalizationWire): string {
+  switch (normalization.method) {
+    case "rva":
+      return `RVA（各自减镜像基址）：v1 ${formatAddress(
+        normalization.v1_base.toString(16).padStart(16, "0"),
+      )}，v2 ${formatAddress(normalization.v2_base.toString(16).padStart(16, "0"))}`;
+    case "same-base":
+      return `虚拟地址（两边基址相同 ${formatAddress(
+        normalization.base.toString(16).padStart(16, "0"),
+      )}）`;
+    case "unavailable":
+      return `地址不可比：${normalization.reason}`;
+  }
+}
+
+/** 执行一次差分（当前目标为 v1，`against` 为 v2）。 */
+export async function fetchDiff(
+  token: string | null,
+  against: string,
+  options: { scope?: string | undefined; only?: DiffKindWire | undefined; entries?: number | undefined } = {},
+): Promise<DiffReportWire> {
+  const q = new URLSearchParams({ against });
+  if (options.scope) q.set("scope", options.scope);
+  if (options.only) q.set("only", options.only);
+  if (options.entries !== undefined) q.set("entries", String(options.entries));
+  return request<DiffReportWire>(`/api/diff?${q.toString()}`, token);
+}
+
+// ── APK 清单 / 资源表（M3） ──────────────────────────────────────────────────
+
+/** 清单字段摘要。对应 `bitflip-server::apk` 的 `facts`。 */
+export interface ManifestFactsWire {
+  root: string;
+  package: string | null;
+  version_code: number | null;
+  version_name: string | null;
+  min_sdk: number | null;
+  target_sdk: number | null;
+  main_activities: string[];
+  activities: number;
+  services: number;
+  receivers: number;
+  providers: number;
+  permissions: string[];
+  unresolved_references: number;
+  notes: string[];
+}
+
+/** `GET /api/apk/manifest` 响应。 */
+export interface ManifestResponse {
+  server_api_version: number;
+  format_version: number;
+  member: string;
+  size: number;
+  headline: string;
+  facts: ManifestFactsWire;
+}
+
+/** 一个资源类型切片的统计。对应 `bitflip-loader` 的 `ArscTypeSnapshot`。 */
+export interface ArscTypeSnapshot {
+  type_id: number;
+  type_name: string | null;
+  entry_count: number;
+  no_entry_count: number;
+}
+
+/** 一个配置切面。对应 `bitflip-loader` 的 `ArscConfigSnapshot`。 */
+export interface ArscConfigSnapshot {
+  config: Record<string, string | number | null>;
+  types: ArscTypeSnapshot[];
+}
+
+/** 一个包。对应 `bitflip-loader` 的 `ArscPackageSnapshot`。 */
+export interface ArscPackageSnapshot {
+  package_id: number;
+  name: string;
+  type_strings: number;
+  key_strings: number;
+  config_count: number;
+  configs: ArscConfigSnapshot[];
+  entry_count: number;
+  no_entry_count: number;
+}
+
+/** 资源表结构快照。对应 `bitflip-loader` 的 `ArscStructure`。 */
+export interface ArscStructure {
+  packages: ArscPackageSnapshot[];
+  entry_count: number;
+  no_entry_count: number;
+}
+
+/** `GET /api/apk/resources` 响应。 */
+export interface ResourcesResponse {
+  server_api_version: number;
+  format_version: number;
+  member: string;
+  size: number;
+  structure: ArscStructure;
+}
+
+/** `GET /api/apk/resource` 响应。 */
+export interface ResourceLookupResponse {
+  server_api_version: number;
+  member: string;
+  id: string;
+  name: string | null;
+  value: string | null;
+}
+
+/** 取 APK 清单摘要。无清单/非 APK 时后端 400，转成 `null`。 */
+export function fetchManifest(token: string | null): Promise<ManifestResponse | null> {
+  return requestOrNull<ManifestResponse>("/api/apk/manifest", token);
+}
+
+/** 取资源表结构快照。 */
+export function fetchResources(
+  token: string | null,
+  member?: string,
+): Promise<ResourcesResponse | null> {
+  const q = new URLSearchParams();
+  if (member) q.set("member", member);
+  const qs = q.toString();
+  return requestOrNull<ResourcesResponse>(
+    `/api/apk/resources${qs ? `?${qs}` : ""}`,
+    token,
+  );
+}
+
+/** 按资源 id 查一条（名字 + 值）。 */
+export function fetchResource(
+  token: string | null,
+  id: string,
+  member?: string,
+): Promise<ResourceLookupResponse | null> {
+  const q = new URLSearchParams({ id });
+  if (member) q.set("member", member);
+  return requestOrNull<ResourceLookupResponse>(
+    `/api/apk/resource?${q.toString()}`,
+    token,
+  );
+}
+
 /**
  * 取一页表数据。
  *

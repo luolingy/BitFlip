@@ -360,8 +360,13 @@ impl Session {
 
 ### 7.1 导出：已经落地的实际形态（M9 / M2c）
 
-上面那段是**目标形态的草图**，其中补丁与写回（`set_patch` / `apply_patches`）**尚未实现**。
-已经落地的是导出，实际接口与草图有出入，以本节为准：
+上面那段是**目标形态的草图**。现在**导出与补丁写回都已落地**：导出（六种机器码格式 +
+四种 DEX 格式）见本节；补丁写回（`bitflip-patch`：plan/validate/apply 三段式、默认只读、
+显式 unlock、只写 `xxx.patched` 副本、原子写、PE CheckSum 重算、结构一致性校验）见 M9
+记录与 `crates/bitflip-patch`。`set_patch` / `apply_patches` 的实际形状以 `bitflip-core`
+的 `Session` 与 `bitflip-patch` 的公开 API 为准，与下方草图略有出入。
+
+导出实际接口与草图有出入，以本节为准：
 
 ```rust
 /// 导出格式版本。与 `format_version` 一起构成对外契约。

@@ -1,7 +1,7 @@
 {
   "name": "bitflip-web",
   "private": true,
-  "version": "0.0.1",
+  "version": "1.0.0",
   "type": "module",
   "description": "BitFlip · 比特翻转 —— 本地 Web 界面（构建产物被 rust-embed 内嵌进二进制）",
   "scripts": {
