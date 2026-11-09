@@ -1,0 +1,182 @@
+name: Release
+
+# 打包并发布正式版。
+#
+# 触发方式：
+#   1. 推一个 `v*` 标签（例如 `git tag v1.0.0 && git push upstream v1.0.0`）；
+#   2. 或者在 Actions 页面手动 workflow_dispatch，指定 tag/版本号。
+#
+# 产物：Windows `.zip` 与 Linux `.tar.gz`，各含 `bitflip`（GUI 入口）与
+# `bitflip-cli`（无头入口）两个二进制 + 一份 README/许可证。SPA 在构建期
+# 由 rust-embed 内嵌进二进制，所以**运行期零依赖**（不需要 Node/DLL 附带）。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签（例如 v1.0.0）。留空则用 `v<包版本>`。"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # 创建 Release 需要
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (x86_64)
+            os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            archive: zip
+          - name: Linux (x86_64)
+            os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 先把 SPA 构建出来，release 二进制才会用 rust-embed 内嵌它（运行期零依赖）。
+      - name: 构建前端
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: 构建 release 二进制
+        run: cargo build --release -p bitflip-app -p bitflip-cli
+
+      # `.cargo/config.toml` 把 target-dir 钉在仓库内的 `.cargo-target`（ADR-0004），
+      # 所以产物不在默认的 ./target 下。下面统一从这里取。
+      - name: 断言前端确实被内嵌（否则发出去的会是占位页）
+        shell: bash
+        run: |
+          BIN=".cargo-target/release"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            "$BIN/bitflip-cli.exe" version | tee /tmp/ver.txt
+          else
+            "$BIN/bitflip-cli" version | tee /tmp/ver.txt
+          fi
+          grep -q '已内嵌' /tmp/ver.txt
+
+      - name: 打包（Windows / zip）
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $src = ".cargo-target/release"
+          $stage = "dist/bitflip-${{ matrix.triple }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "$src/bitflip.exe" $stage
+          Copy-Item "$src/bitflip-cli.exe" $stage
+          Copy-Item README.md, CHANGELOG.md, LICENSE-MIT, LICENSE-APACHE $stage
+          Copy-Item docs/CAPABILITY-MATRIX.md $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/bitflip-${{ matrix.triple }}.zip" -Force
+          Get-ChildItem dist
+
+      - name: 打包（Linux / tar.gz）
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=".cargo-target/release"
+          stage="dist/bitflip-${{ matrix.triple }}"
+          mkdir -p "$stage"
+          cp "$src/bitflip" "$src/bitflip-cli" "$stage/"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          cp docs/CAPABILITY-MATRIX.md "$stage/"
+          tar -C dist -czf "dist/bitflip-${{ matrix.triple }}.tar.gz" "bitflip-${{ matrix.triple }}"
+          ls -l dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitflip-${{ matrix.triple }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: 发布 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 列出待发布的文件
+        run: ls -lR dist
+
+      # 从 CHANGELOG 里摘出对应版本的说明作为 Release 正文；取不到就退回一句通用的。
+      - name: 提取发布说明
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.tag }}"
+          if [ -z "$version" ]; then
+            version="${GITHUB_REF_NAME}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # CHANGELOG 用 `## [1.0.0] - ...` 这样的标题；去掉前导 v 再找。
+          bare="${version#v}"
+          awk -v ver="$bare" '
+            $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > notes.md || true
+          if [ ! -s notes.md ]; then
+            echo "本版本 ${version} 的说明见仓库 CHANGELOG.md。" > notes.md
+          fi
+          {
+            echo "构建产物含两个二进制：\`bitflip\`（起本地 Web 服务并打开浏览器）与"
+            echo "\`bitflip-cli\`（无头 / CI）。SPA 已内嵌，运行期零依赖"
+            echo "（不需要 Node、不需要附带 DLL）。"
+            echo ""
+            echo "能力矩阵与已知边界见 \`docs/CAPABILITY-MATRIX.md\`。"
+            echo ""
+            echo "---"
+            echo ""
+            cat notes.md
+          } > release-body.md
+          cat release-body.md
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.notes.outputs.version }}
+          name: BitFlip ${{ steps.notes.outputs.version }}
+          body_path: release-body.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
